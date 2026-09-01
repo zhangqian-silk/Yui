@@ -18,7 +18,6 @@ import {
 } from "node:fs";
 import { join } from "node:path";
 
-import { withUpgradeCoordinationLock } from "../storage/upgradeCoordination.js";
 import {
   createRuntimeObservation,
   isRuntimeTokenEvidence,
@@ -50,8 +49,8 @@ export type RuntimeTurnCompletedInput = Readonly<{
   adapterId: "codex" | "claude";
   launchId?: string;
   nativeSessionId: string;
-  turnId: string;
-  runId?: string;
+  nativeTurnId: string;
+  turnId?: string;
   title?: string;
   summary: string;
 }>;
@@ -103,7 +102,7 @@ export type RuntimeEventInboxHooks = Readonly<{
 
 /**
  * Durable ingress for facts emitted by native Agent hooks. It deliberately
- * owns no FileTaskStore lock: immutable files are acknowledged only after the
+ * owns no TaskStore lock: immutable files are acknowledged only after the
  * Controller commits their authoritative aggregate effect.
  */
 export class FileRuntimeEventInbox {
@@ -252,26 +251,19 @@ export class FileRuntimeEventInbox {
   private publish<TEvent extends RuntimeLifecycleEvent>(
     event: TEvent
   ): RuntimeEventEnqueueResult<TEvent> {
-    // The fence check and the complete durable write share one sibling
-    // coordination lock with upgrade's final inbox scan/copy/two-step switch.
-    // A hook that passed admission before the fence was placed either finishes
-    // under this lock (so its event is copied) or waits and receives an
-    // UpgradeFenceError after the cutover holder releases the lock.
-    return withUpgradeCoordinationLock(this.home, () => {
-      this.hooks.afterAdmission?.();
-      if (event.type === "runtime-observation"
-        && isRuntimeTokenEvidence(event.observation)) {
-        const existing = this.list().find((candidate) => (
-          candidate.type === "runtime-observation"
-          && candidate.taskId === event.taskId
-          && candidate.observation.eventId === event.observation.eventId
-        ));
-        if (existing !== undefined) {
-          return { event: existing as TEvent, created: false };
-        }
+    this.hooks.afterAdmission?.();
+    if (event.type === "runtime-observation"
+      && isRuntimeTokenEvidence(event.observation)) {
+      const existing = this.list().find((candidate) => (
+        candidate.type === "runtime-observation"
+        && candidate.taskId === event.taskId
+        && candidate.observation.eventId === event.observation.eventId
+      ));
+      if (existing !== undefined) {
+        return { event: existing as TEvent, created: false };
       }
-      return this.publishUnlocked(event);
-    });
+    }
+    return this.publishUnlocked(event);
   }
 
   private publishUnlocked<TEvent extends RuntimeLifecycleEvent>(
@@ -404,8 +396,8 @@ function runtimeEventId(
     provider.adapterId,
     provider.launchId ?? null,
     provider.nativeSessionId,
-    "turnId" in provider ? provider.turnId : null,
-    provider.runId ?? null
+    provider.nativeTurnId,
+    provider.turnId ?? null
   ];
   return `turn-${createHash("sha256").update(JSON.stringify(common)).digest("hex")}`;
 }
@@ -425,10 +417,10 @@ function normalizeNativeTurnCompletedInput(
       ? {}
       : { launchId: requireIdentityText(input.launchId, "Launch id") }),
     nativeSessionId: requireIdentityText(input.nativeSessionId, "Native session id"),
-    turnId: requireIdentityText(input.turnId, "Turn id"),
-    ...(input.runId === undefined
+    nativeTurnId: requireIdentityText(input.nativeTurnId, "Provider native Turn id"),
+    ...(input.turnId === undefined
       ? {}
-      : { runId: requireIdentityText(input.runId, "Run id") }),
+      : { turnId: requireIdentityText(input.turnId, "Turn id") }),
     ...(input.title === undefined
       ? {}
       : { title: requireIdentityText(input.title, "Session title") }),
@@ -521,16 +513,16 @@ function parseNativeTurnCompletedEvent(value: Record<string, any>): RuntimeTurnC
   const expected = scope === "task"
     ? [
         "schemaVersion", "id", "type", "receivedAt", "scope", "taskId",
-        "roleName", "agentId", "adapterId", "nativeSessionId", "turnId", "summary",
+        "roleName", "agentId", "adapterId", "nativeSessionId", "nativeTurnId", "summary",
         ...(value.launchId === undefined ? [] : ["launchId"]),
-        ...(value.runId === undefined ? [] : ["runId"]),
+        ...(value.turnId === undefined ? [] : ["turnId"]),
         ...(value.title === undefined ? [] : ["title"])
       ]
     : [
         "schemaVersion", "id", "type", "receivedAt", "scope",
-        "roleName", "agentId", "adapterId", "nativeSessionId", "turnId", "summary",
+        "roleName", "agentId", "adapterId", "nativeSessionId", "nativeTurnId", "summary",
         ...(value.launchId === undefined ? [] : ["launchId"]),
-        ...(value.runId === undefined ? [] : ["runId"]),
+        ...(value.turnId === undefined ? [] : ["turnId"]),
         ...(value.title === undefined ? [] : ["title"])
       ];
   if ((scope !== "task" && scope !== "global")
@@ -545,8 +537,8 @@ function parseNativeTurnCompletedEvent(value: Record<string, any>): RuntimeTurnC
     adapterId: value.adapterId,
     ...(value.launchId === undefined ? {} : { launchId: value.launchId }),
     nativeSessionId: value.nativeSessionId,
-    turnId: value.turnId,
-    ...(value.runId === undefined ? {} : { runId: value.runId }),
+    nativeTurnId: value.nativeTurnId,
+    ...(value.turnId === undefined ? {} : { turnId: value.turnId }),
     ...(value.title === undefined ? {} : { title: value.title }),
     summary: value.summary
   });
@@ -614,7 +606,7 @@ function hasSameIdentity(left: RuntimeLifecycleEvent, right: RuntimeLifecycleEve
     && (!("nativeSessionId" in left)
       || !("nativeSessionId" in right)
       || left.nativeSessionId === right.nativeSessionId)
-    && (!("runId" in left) || !("runId" in right) || left.runId === right.runId)
+    && (!("turnId" in left) || !("turnId" in right) || left.turnId === right.turnId)
     && (!("turnId" in left) || !("turnId" in right) || left.turnId === right.turnId)
     && (!("jobId" in left) || !("jobId" in right) || left.jobId === right.jobId);
 }

@@ -6,7 +6,7 @@ import {
   setCodexThreadName,
   type CodexThreadNameRequest
 } from "../execution/codexThreadNaming.js";
-import { openCompatibleFileTaskStore } from "../storage/compatibleTaskStore.js";
+import { openCurrentTaskStore } from "../storage/currentTaskStore.js";
 
 export type CodexSessionNotification = Readonly<{
   scope: "task" | "global";
@@ -16,8 +16,8 @@ export type CodexSessionNotification = Readonly<{
   adapterId: "codex";
   launchId: string;
   nativeSessionId: string;
-  turnId: string;
-  runId?: string;
+  nativeTurnId: string;
+  turnId?: string;
   title?: string;
   lastAssistantMessage: string;
 }>;
@@ -51,8 +51,8 @@ export async function runSessionNotifyCommand(
     adapterId: params.adapterId,
     launchId: params.launchId,
     nativeSessionId: params.nativeSessionId,
-    turnId: params.turnId,
-    ...(params.runId === undefined ? {} : { runId: params.runId }),
+    nativeTurnId: params.nativeTurnId,
+    ...(params.turnId === undefined ? {} : { turnId: params.turnId }),
     ...(params.title === undefined ? {} : { title: params.title }),
     summary: params.lastAssistantMessage
   });
@@ -92,11 +92,11 @@ export function parseCodexSessionNotification(
     throw new Error("Codex notify payload type is invalid.");
   }
   const nativeSessionId = requireText(payload["thread-id"], "Codex thread-id");
-  const turnId = requireText(payload["turn-id"], "Codex turn-id");
+  const nativeTurnId = requireText(payload["turn-id"], "Codex turn-id");
   const lastAssistantMessage = requireAssistantMessage(payload["last-assistant-message"]);
-  const runId = environment.YUI_RUN_ID === undefined
+  const turnId = environment.YUI_TURN_ID === undefined
     ? undefined
-    : requireText(environment.YUI_RUN_ID, "YUI_RUN_ID");
+    : requireText(environment.YUI_TURN_ID, "YUI_TURN_ID");
   const title = environment.YUI_SESSION_TITLE === undefined
     ? undefined
     : requireText(environment.YUI_SESSION_TITLE, "YUI_SESSION_TITLE");
@@ -111,8 +111,8 @@ export function parseCodexSessionNotification(
     adapterId: requireCodexAdapter(environment.YUI_ADAPTER_ID),
     launchId: requireText(environment.YUI_LAUNCH_ID, "YUI_LAUNCH_ID"),
     nativeSessionId,
-    turnId,
-    ...(runId === undefined ? {} : { runId }),
+    nativeTurnId,
+    ...(turnId === undefined ? {} : { turnId }),
     ...(title === undefined ? {} : { title }),
     lastAssistantMessage
   } as const;
@@ -170,11 +170,11 @@ function shouldSetThreadName(
   if (
     params.scope !== "task"
     || params.title === undefined
-    || params.runId === undefined
+    || params.turnId === undefined
   ) return false;
   try {
-    const store = openCompatibleFileTaskStore(home);
-    return store.getAgentRun(params.taskId!, params.runId)?.mode === "new";
+    const store = openCurrentTaskStore(home);
+    return store.getTurn(params.taskId!, params.turnId)?.mode === "new";
   } catch {
     return false;
   }

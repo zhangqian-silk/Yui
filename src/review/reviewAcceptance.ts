@@ -1,11 +1,11 @@
 import type { TaskEvent } from "../event/taskEvent.js";
-import type { AgentRun } from "../run/agentRun.js";
+import type { Turn } from "../turn/turn.js";
 import type { ReviewFinding } from "./reviewFinding.js";
 import type { ReviewRound } from "./reviewRound.js";
 import { isSemanticReviewRound } from "./reviewOutcomeClassifier.js";
 
 export type ReviewAcceptanceEvidenceStore = Readonly<{
-  listAgentRuns(taskId: string): readonly AgentRun[];
+  listTurns(taskId: string): readonly Turn[];
   listReviewFindings(taskId: string): readonly ReviewFinding[];
   listEvents(taskId: string): readonly TaskEvent[];
 }>;

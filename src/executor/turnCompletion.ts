@@ -8,8 +8,8 @@ export type PendingTurnCompletion = Readonly<{
   roleName: string;
   agentId: string;
   nativeSessionId: string;
+  nativeTurnId: string;
   turnId: string;
-  runId: string;
   summary: string;
   observedAt: string;
   dueAt: string;
@@ -20,8 +20,8 @@ export type CreatePendingTurnCompletionInput = Readonly<{
   roleName: string;
   agentId: string;
   nativeSessionId: string;
+  nativeTurnId: string;
   turnId: string;
-  runId: string;
   summary: string;
   observedAt: Date;
   dueAt: Date;
@@ -33,8 +33,8 @@ const PENDING_TURN_COMPLETION_FIELDS = [
   "roleName",
   "agentId",
   "nativeSessionId",
+  "nativeTurnId",
   "turnId",
-  "runId",
   "summary",
   "observedAt",
   "dueAt"
@@ -52,8 +52,8 @@ export function createPendingTurnCompletion(
     roleName: requireSafeIdentity(input.roleName, "Role name"),
     agentId: requireSafeIdentity(input.agentId, "Agent id"),
     nativeSessionId: requireText(input.nativeSessionId, "Native session id"),
-    turnId: requireText(input.turnId, "Turn id"),
-    runId: requireSafeIdentity(input.runId, "Run id"),
+    nativeTurnId: requireText(input.nativeTurnId, "Provider native Turn id"),
+    turnId: requireSafeIdentity(input.turnId, "Turn id"),
     summary: requireText(input.summary, "Turn summary"),
     observedAt,
     dueAt
@@ -81,8 +81,8 @@ export function validatePendingTurnCompletion(value: unknown): PendingTurnComple
     roleName: requireSafeIdentityValue(input.roleName, "Role name"),
     agentId: requireSafeIdentityValue(input.agentId, "Agent id"),
     nativeSessionId: requireTextValue(input.nativeSessionId, "Native session id"),
-    turnId: requireTextValue(input.turnId, "Turn id"),
-    runId: requireSafeIdentityValue(input.runId, "Run id"),
+    nativeTurnId: requireTextValue(input.nativeTurnId, "Provider native Turn id"),
+    turnId: requireSafeIdentityValue(input.turnId, "Turn id"),
     summary: requireTextValue(input.summary, "Turn summary"),
     observedAt,
     dueAt

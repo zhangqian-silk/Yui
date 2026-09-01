@@ -1,6 +1,6 @@
 import type { TaskEvent } from "../event/taskEvent.js";
 import type { TaskMessage } from "../message/message.js";
-import type { AgentRun } from "../run/agentRun.js";
+import type { Turn } from "../turn/turn.js";
 import type { Task } from "../task/task.js";
 import type { ReviewRound } from "../review/reviewRound.js";
 import { renderWakeReason } from "../scheduler/wakeReason.js";
@@ -52,7 +52,7 @@ export type WakeEnvelopeReader = Readonly<{
   getTask(taskId: string): Task | null;
   listEvents(taskId: string): readonly TaskEvent[];
   listMessages(taskId: string): readonly TaskMessage[];
-  listAgentRuns(taskId: string): readonly AgentRun[];
+  listTurns(taskId: string): readonly Turn[];
   listReviewRounds(taskId: string): readonly ReviewRound[];
 }>;
 
@@ -73,7 +73,7 @@ export function buildTaskWakeEnvelope(
       .filter((record) => Date.parse(record.createdAt) > fromTime).length,
     messages: operationalTaskRecords(reader.listMessages(request.taskId), events, "message")
       .filter((record) => Date.parse(record.createdAt) > fromTime).length,
-    runs: operationalTaskRecords(reader.listAgentRuns(request.taskId), events, "agent-run")
+    turns: operationalTaskRecords(reader.listTurns(request.taskId), events, "turn")
       .filter((record) => Date.parse(record.createdAt) > fromTime).length
   };
   const activeReviews = reader.listReviewRounds(request.taskId).filter((round) => (
@@ -95,7 +95,7 @@ export function buildTaskWakeEnvelope(
   const lines: string[] = [
     `Wake: ${request.wakeId} — delta since ${request.fromCursor}`,
     `  Reasons: ${renderReasons(request.reasons)}`,
-    `  Changed: ${counts.events} events, ${counts.messages} messages, ${counts.runs} runs`
+    `  Changed: ${counts.events} events, ${counts.messages} messages, ${counts.turns} Turns`
       + ` → yui task wake show ${request.taskId} ${request.wakeId}`,
     `  Active Task Reviews: ${activeReviews.length === 0
       ? "none"

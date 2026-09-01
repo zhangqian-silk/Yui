@@ -88,6 +88,7 @@ export type AgentDriverCapabilities = Readonly<{
     preInputReadiness: "exact" | "unavailable";
     promptAcceptance: "exact" | "unavailable";
     turnLifecycle: "exact" | "partial" | "unavailable";
+    goalLifecycle: "exact" | "partial" | "unavailable";
     operations: readonly AgentRuntimeOperation[];
     waiting: readonly AgentRuntimeWaitReason[];
     usage: AgentRuntimeUsageMode;
@@ -175,9 +176,9 @@ export type AgentDriverMappedHook = Readonly<{
 export type AgentDriverHookClassification = Readonly<{
   /** How a first Session Hook may establish identity before projection exists. */
   startupSession?: "preallocated" | "discovered";
-  /** Terminal Hooks remain admissible after the exact Run has yielded. */
+  /** Terminal Hooks remain admissible after the exact Turn has completed. */
   terminal?: boolean;
-  /** Existing native child identity that can recover its original Run fence. */
+  /** Existing native child identity that can recover its original Turn fence. */
   continuationId?: string;
   continuationGeneration?: number;
 }>;
@@ -319,6 +320,9 @@ export function validateAgentDriverCapabilities(
   if (!["exact", "partial", "unavailable"].includes(observation.turnLifecycle)) {
     throw new Error("Agent Driver turn lifecycle capability is invalid.");
   }
+  if (!["exact", "partial", "unavailable"].includes(observation.goalLifecycle)) {
+    throw new Error("Agent Driver Goal lifecycle capability is invalid.");
+  }
   if (!USAGE_MODES.includes(observation.usage)) {
     throw new Error("Agent Driver usage capability is invalid.");
   }
@@ -390,6 +394,7 @@ export function validateAgentDriverCapabilities(
       preInputReadiness: observation.preInputReadiness,
       promptAcceptance: observation.promptAcceptance,
       turnLifecycle: observation.turnLifecycle,
+      goalLifecycle: observation.goalLifecycle,
       operations: Object.freeze(uniqueMembers(
         observation.operations,
         OPERATIONS,

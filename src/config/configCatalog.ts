@@ -1,5 +1,5 @@
 import type { YuiConfig } from "../storage/taskStore.js";
-import { MAX_RUN_CAP } from "../telemetry/telemetryConfig.js";
+import { MAX_TURN_CAP } from "../telemetry/telemetryConfig.js";
 import {
   MAX_CONTEXT_BUDGET_TOKENS,
   MIN_CONTEXT_BUDGET_TOKENS
@@ -33,7 +33,7 @@ export const CONFIG_DEFINITIONS = Object.freeze([
   { key: "agent-launch-inactivity-timeout-seconds", domain: "runtime", property: "agentLaunchInactivityTimeoutSeconds", label: "Agent launch inactivity timeout", summary: "Maximum launch silence before startup fails, 15-3600 seconds (default: 300).", takesEffect: "After the Controller restarts." },
   { key: "delivery-timeout-seconds", domain: "runtime", property: "deliveryTimeoutSeconds", label: "Delivery timeout", summary: "Total control-plane delivery retry budget, 5-600 seconds (default: 120).", takesEffect: "After the Controller restarts; internal retry cadence remains automatic." },
   { key: "leader-next-action", domain: "workflow", property: "leaderNextActionMode", label: "Leader next-action mode", summary: "Leader next-action mode: display, warn, or enforce (default: display).", takesEffect: "The next Leader next-action projection or gate." },
-  { key: "leader-semantic-budget-turns", domain: "workflow", property: "leaderSemanticBudgetTurns", label: "Leader semantic budget", summary: "Consecutive yielded Leader turns without durable delivery progress before warning, 1-20 (default: 3).", takesEffect: "The next Leader delivery guard evaluation." },
+  { key: "leader-semantic-budget-turns", domain: "workflow", property: "leaderSemanticBudgetTurns", label: "Leader semantic budget", summary: "Consecutive completed Leader turns without durable delivery progress before warning, 1-20 (default: 3).", takesEffect: "The next Leader delivery guard evaluation." },
   { key: "context-budget", domain: "workflow", property: "contextBudget", label: "Legacy context budget (inactive)", summary: `Compatibility-only soft and hard values in ${MIN_CONTEXT_BUDGET_TOKENS}-${MAX_CONTEXT_BUDGET_TOKENS}; they are parsed but never control Session or workflow behavior.`, takesEffect: "No runtime effect; Session Token metrics are read-only observations." },
   { key: "review", domain: "workflow", property: "review", label: "Review", summary: "Optional global WorkItem review rule: a configured Role plus always, leader, or final trigger and optional finding-ledger behavior. Setup leaves it disabled so the Leader may review directly or delegate selectively.", takesEffect: "The next Candidate snapshot; in-flight Candidates and ReviewRounds keep their policy." },
 
@@ -44,8 +44,8 @@ export const CONFIG_DEFINITIONS = Object.freeze([
   { key: "tmux-bin", domain: "tools", property: "tmuxBin", label: "Tmux bin", summary: "Command or path to the tmux binary (default: tmux).", takesEffect: "The next CLI-owned tmux invocation; restart the Controller for Controller-owned launches." },
   { key: "tmux-history-limit", domain: "tools", property: "tmuxHistoryLimit", label: "Tmux history limit", summary: "History lines retained for newly created tmux sessions, 1000-1000000 (default: 100000).", takesEffect: "New tmux sessions; existing sessions report drift until recreated." },
   { key: "telemetry-enabled", domain: "tools", property: "telemetryEnabled", label: "Diagnostic telemetry", summary: "Enable the optional SQLite diagnostic telemetry projection (default: false); requires a SQLite Home.", takesEffect: "Standalone telemetry commands immediately; scheduler writes after Controller restart." },
-  { key: "telemetry-terminal-keep", domain: "tools", property: "telemetryTerminalKeep", label: "Telemetry terminal keep", summary: "Positive-integer rows retained per terminal Run generation (default: 200).", takesEffect: "Explicit retention immediately; automatic retention after the Controller restarts." },
-  { key: "telemetry-run-cap", domain: "tools", property: "telemetryRunCap", label: "Telemetry Run cap", summary: `Positive-integer maximum rows retained per Run, at most ${MAX_RUN_CAP} (default: 50000).`, takesEffect: "Explicit retention immediately; automatic write-time capping after the Controller restarts." }
+  { key: "telemetry-terminal-keep", domain: "tools", property: "telemetryTerminalKeep", label: "Telemetry terminal keep", summary: "Positive-integer rows retained per terminal Turn generation (default: 200).", takesEffect: "Explicit retention immediately; automatic retention after the Controller restarts." },
+  { key: "telemetry-turn-cap", domain: "tools", property: "telemetryTurnCap", label: "Telemetry Turn cap", summary: `Positive-integer maximum rows retained per Turn, at most ${MAX_TURN_CAP} (default: 50000).`, takesEffect: "Explicit retention immediately; automatic write-time capping after the Controller restarts." }
 ] as const satisfies readonly ConfigDefinition[]);
 
 export type ConfigKey = typeof CONFIG_DEFINITIONS[number]["key"];

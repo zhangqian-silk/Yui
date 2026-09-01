@@ -49,7 +49,7 @@ export function foldContinuationObservation(
   const base = existing ?? createProviderContinuation({
     taskId: observation.fence.taskId!,
     roleName: observation.fence.roleName,
-    runId: observation.fence.runId!,
+    turnId: observation.fence.turnId!,
     identity,
     ...(observation.fence.parentContinuationId === undefined
       ? {}
@@ -160,9 +160,7 @@ export function applyContinuationObservationAtomically(
           refs: [factRef],
           occurredAt: observation.observedAt ?? observation.receivedAt,
           source: "continuation-manager",
-          dedupeKey: observation.semanticKey,
-          deliveryMode: "followup",
-          lane: "normal"
+          dedupeKey: observation.semanticKey
         }
       });
     }
@@ -172,7 +170,7 @@ export function applyContinuationObservationAtomically(
 
 function continuationIdentity(observation: RuntimeObservation): ProviderContinuationIdentity {
   const fence = observation.fence;
-  if (fence.taskId === undefined || fence.runId === undefined
+  if (fence.taskId === undefined || fence.turnId === undefined
     || fence.conversationId === undefined || fence.activationId === undefined
     || fence.continuationId === undefined) {
     throw new Error("Continuation observation fence is incomplete.");

@@ -1,18 +1,18 @@
 ---
 name: yui-worker
-description: Complete one bounded WorkItem as a native subagent or Task Role AgentRun, then return honest evidence through the assigned protocol.
+description: Complete one bounded WorkItem as a native subagent or Task Role Turn, then return honest evidence through the assigned protocol.
 ---
 
 # Yui Worker
 
-Follow `yui-runtime` first. For a managed Run, load its exact Context Pack and
+Follow `yui-runtime` first. For a managed Turn, load its exact Context Pack and
 use only the returned WorkItem, refs, workspace, writable Project IDs, and
 completion actions. The launch Envelope is a pointer, not an execution brief.
 
 Complete only the assigned substantial, independently owned WorkItem. The Leader owns Task direction,
 decomposition, acceptance, integration, scope expansion, and conflict
 decisions. A Worker must not create or rebind Yui worktrees, Sessions, Roles,
-Runs, WorkItems, ReviewRounds, or integration state.
+Turns, WorkItems, ReviewRounds, or integration state.
 
 Keep the layers distinct:
 
@@ -21,7 +21,7 @@ Keep the layers distinct:
 - This Skill supplies portable Worker behavior.
 - Agent-native Project Skills plus Project Policy and Knowledge supply build,
   test, migration, release, and review rules.
-- The exact WorkItem and Context Snapshot supply this Run's objective, scope,
+- The exact WorkItem and Context Snapshot supply this Turn's objective, scope,
   acceptance, dependencies, and evidence contract.
 
 Do not promote a Project convention into generic Worker policy or infer Task
@@ -30,8 +30,8 @@ pack.
 
 ## Execute within the exact boundary
 
-- Preserve the Task, WorkItem, Role, Run, native Session, and workspace
-  identities supplied by Yui. A new Run is another attempt or continuation of
+- Preserve the Task, WorkItem, Role, Turn, native Session, and workspace
+  identities supplied by Yui. A new Turn is another attempt or continuation of
   the same delivery unit; do not request a fresh Role or Session merely because
   implementation entered another step or repair round.
 - Follow the configured Profile's responsibilities, constraints, access
@@ -76,27 +76,25 @@ the Leader consumes it, the child may need to rerun. Do not claim Yui
 durability for a native result you only emitted in the provider transcript.
 When the child brief requires a durable, independently recoverable result,
 the Leader must dispatch the work as a Yui WorkItem/ExecutionGroup instead —
-native subagents never own a Yui Run, receipt, or workspace.
+native subagents never own a Yui Turn, receipt, or workspace.
 
-## Task Role AgentRun
+## Task Role Turn
 
 Summarize the outcome for the Leader's next judgment, not as a transcript or
 file-by-file log. Include the observable result, important mechanism and
 boundary, changed paths and commit state, checks, skipped validation, blockers,
 residual risk, and bounded next action. Use a checkpoint only for material
-semantic progress during a long Run; it does not replace the final handoff.
+semantic progress during a long Turn; it does not replace the final handoff.
 
 For a native subagent, return one consolidated child result through the native
 child-result mechanism. Do not run Yui lifecycle commands or invent a child
-Yui Session/Run.
+Yui Session/Turn.
 
-For a managed Task Role, use only the exact completion action returned by the
-Run Context Pack and follow `yui-runtime`'s direct-once/final-action rule. An
-execution yield creates immutable Candidate evidence but does not accept,
-capture, integrate, or complete the WorkItem. A review yield creates review
-evidence only; the Leader decides disposition. If the exact handoff is denied,
-stale, or mismatched, report that blocker once and stop without wrappers,
-permission broadening, or another Run target.
+For a managed Task Role, end the Provider Turn with one complete, truthful
+result. Yui persists it automatically on the exact Turn. That result does not
+accept, capture, integrate, or complete the WorkItem; the Leader decides its
+disposition. If context or scope is stale or mismatched, report that blocker
+once and stop without wrappers, permission broadening, or another Turn target.
 
 Leave managed workspaces intact after handoff. Their owner lifecycle and
 cleanup belong to the Leader and Yui Core.

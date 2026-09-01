@@ -18,7 +18,7 @@ import {
   type ReviewFindingSeverity
 } from "./reviewFinding.js";
 import type { ReviewCheck, ReviewRound, TaskReviewCandidate } from "./reviewRound.js";
-import type { AgentRun } from "../run/agentRun.js";
+import type { Turn } from "../turn/turn.js";
 
 /**
  * Issue 06: cross-Round Review finding ledger operations.
@@ -43,7 +43,7 @@ export type ReviewFindingStorePort = Readonly<{
   getConfig(): YuiConfig;
   getReviewRound(taskId: string, reviewRoundId: string): ReviewRound | null;
   listReviewRounds(taskId: string): ReviewRound[];
-  listAgentRuns(taskId: string): AgentRun[];
+  listTurns(taskId: string): Turn[];
   nextReviewFindingId(taskId: string): string;
   getReviewFinding(taskId: string, findingId: string): ReviewFinding | null;
   listReviewFindings(taskId: string): ReviewFinding[];
@@ -673,7 +673,7 @@ export function buildTaskFinalReviewFindingContext(
   try {
     ledgerContext = renderFindingLedgerContext(summarizeFindingLedger(store, taskId));
   } catch {
-    ledgerContext = "Finding ledger: unavailable (SQLite backend required; run `yui update` to migrate this Home).";
+    ledgerContext = "Finding ledger: unavailable (a current SQLite Home is required).";
   }
   const lines = [
     "Review convergence context:",

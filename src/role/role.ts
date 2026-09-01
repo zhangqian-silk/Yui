@@ -61,7 +61,7 @@ export type TaskRole = RoleAgentOwner & {
 export type Role = TaskRole;
 
 export type AgentSwitchRuntime = {
-  activeRun: boolean;
+  activeTurn: boolean;
   nativeProcessRunning: boolean;
 };
 
@@ -244,7 +244,7 @@ export function switchActiveRoleAgent(
     : updateGlobalRole(role, { activeAgentId: normalizedTarget }, now);
   // A running process keeps its immutable effective identity. The desired
   // switch becomes visible only when the next launch is planned.
-  const updatedSessions = runtime.activeRun || runtime.nativeProcessRunning
+  const updatedSessions = runtime.activeTurn || runtime.nativeProcessRunning
     ? sessions
     : {
         ...sessions,
@@ -300,8 +300,13 @@ export function unbindRoleAgent(
     const taskSessions = sessions.owner.scope === "task"
       ? sessions as TaskRoleSessionSet
       : null;
-    if (taskSessions?.inFlight?.agentId === normalizedAgentId) {
-      throw new Error(`Cannot unbind Role Agent with an active Run: ${normalizedAgentId}.`);
+    if (taskSessions?.providerBinding?.turn !== null
+      && taskSessions?.providerBinding?.turn !== undefined
+      && taskSessions.activeAgentId === normalizedAgentId
+      && ["submitting", "accepted", "running"].includes(
+        taskSessions.providerBinding.turn.status
+      )) {
+      throw new Error(`Cannot unbind Role Agent with an active Turn: ${normalizedAgentId}.`);
     }
     const targetSession = sessions.sessions[normalizedAgentId];
     if (targetSession !== undefined && targetSession.status === "active") {

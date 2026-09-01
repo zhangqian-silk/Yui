@@ -6,7 +6,7 @@ import {
   collectRuntimeBuildIdentity,
   createProductionRuntimeIdentityPorts
 } from "../observability/runtimeIdentity.js";
-import { readCompatibleHomeIdentity } from "../storage/compatibleTaskStore.js";
+import { readCurrentHomeIdentity } from "../storage/currentTaskStore.js";
 import {
   detectRunningRelease,
   readActiveReleasePointer,
@@ -82,7 +82,7 @@ export function describeCliHomeInvocation(input: Readonly<{
         : "unverified-local";
   let homeId = "unknown";
   try {
-    homeId = readCompatibleHomeIdentity(input.home).homeId;
+    homeId = readCurrentHomeIdentity(input.home).homeId;
   } catch {
     // The primary migration error remains authoritative when identity is unreadable.
   }
@@ -153,7 +153,7 @@ function fenceError(
 ): Error {
   let homeId = "unknown";
   try {
-    homeId = readCompatibleHomeIdentity(input.home).homeId;
+    homeId = readCurrentHomeIdentity(input.home).homeId;
   } catch {
     // The release fence must still diagnose and reject an unreadable Home.
   }

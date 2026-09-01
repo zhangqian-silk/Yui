@@ -341,7 +341,7 @@ function bindRole(args: string[], store: GlobalRoleStore): string {
         ),
         agentId,
         {
-          activeRun: false,
+          activeTurn: false,
           nativeProcessRunning: activeSession !== undefined
             && activeSession.status === "active"
         },

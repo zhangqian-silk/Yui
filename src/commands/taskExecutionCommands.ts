@@ -1,13 +1,9 @@
 import { createTaskEvent } from "../event/taskEvent.js";
-import {
-  terminalizeTaskRoleRunSession,
-  type TaskRoleSessionSet
-} from "../executor/agentExecutor.js";
 import { recordExecutionLaneResult } from "../execution/executionGroup.js";
 import { usageError } from "../errors/cliError.js";
 import { requestDurableJobCancel } from "../job/durableJob.js";
 import { finishReviewRound, updateReviewExecutionGroup } from "../review/reviewRound.js";
-import { failAgentRun, type AgentRun } from "../run/agentRun.js";
+import { failTurn, type Turn } from "../turn/turn.js";
 import { queueLeaderWakeup } from "../scheduler/wakeupQueue.js";
 import type { TaskStore } from "../storage/taskStore.js";
 import {
@@ -30,7 +26,7 @@ export type TaskExecutionStopResult = Readonly<{
   taskId: string;
   changed: boolean;
   roleNames: readonly string[];
-  terminatedRunIds: readonly string[];
+  terminatedTurnIds: readonly string[];
   cancelledJobIds: readonly string[];
   output: string;
 }>;
@@ -99,34 +95,35 @@ export function stopTaskExecutionCommand(
     const changed = task.executionGate.state !== "stopped";
     tx.saveTask(stopTaskExecution(task, now));
 
-    const activeRuns = tx.listAgentRuns(task.id).filter((run) => run.status === "active");
+    const activeTurns = tx.listTurns(task.id).filter((run) => run.status === "active");
     const activeJobs = tx.listDurableJobs(task.id)
       .filter((job) => job.status === "queued" || job.status === "running");
     for (const job of activeJobs) {
       tx.saveDurableJob(task.id, requestDurableJobCancel(job, now));
     }
-    failExecutionAttempts(tx, task.id, activeRuns, request.reason, now);
-    for (const run of activeRuns) {
-      tx.saveAgentRun(failAgentRun(run, `Task execution stopped: ${request.reason}`, now));
+    failExecutionAttempts(tx, task.id, activeTurns, request.reason, now);
+    for (const run of activeTurns) {
+      tx.saveTurn(failTurn(
+        run,
+        "cancelled",
+        `Task execution stopped: ${request.reason}`,
+        now
+      ));
       if (run.executionGroupId !== undefined && run.executionLaneId !== undefined) {
-        tx.clearActiveExecutionLaneRun(task.id, run.executionGroupId, run.executionLaneId);
+        tx.clearActiveExecutionLaneTurn(task.id, run.executionGroupId, run.executionLaneId);
       }
-      tx.clearActiveAgentRun(task.id, run.roleName);
+      tx.clearActiveTurn(task.id, run.roleName);
     }
 
-    const roleNames = taskRuntimeRoleNames(tx, task.id, activeRuns);
+    const roleNames = taskRuntimeRoleNames(tx, task.id, activeTurns);
     for (const roleName of roleNames) {
-      tx.clearActiveAgentRun(task.id, roleName);
-      const sessions = tx.getTaskRoleSessionSet(task.id, roleName);
-      if (sessions !== null && sessions.inFlight !== null) {
-        tx.saveTaskRoleSessionSet(terminalizeCurrentRun(sessions, now));
-      }
+      tx.clearActiveTurn(task.id, roleName);
     }
     // A stop is allowed to discard stale pointer projections even when their
-    // historical Runs are already terminal.
-    for (const run of tx.listAgentRuns(task.id)) {
+    // historical Turns are already terminal.
+    for (const run of tx.listTurns(task.id)) {
       if (run.executionGroupId !== undefined && run.executionLaneId !== undefined) {
-        tx.clearActiveExecutionLaneRun(task.id, run.executionGroupId, run.executionLaneId);
+        tx.clearActiveExecutionLaneTurn(task.id, run.executionGroupId, run.executionLaneId);
       }
     }
 
@@ -143,7 +140,7 @@ export function stopTaskExecutionCommand(
       {
         by: actor,
         reason: request.reason,
-        terminatedRuns: String(activeRuns.length)
+        terminatedRuns: String(activeTurns.length)
       },
       now
     ));
@@ -152,11 +149,11 @@ export function stopTaskExecutionCommand(
       taskId: task.id,
       changed,
       roleNames,
-      terminatedRunIds: activeRuns.map(({ id }) => id),
+      terminatedTurnIds: activeTurns.map(({ id }) => id),
       cancelledJobIds: activeJobs.map(({ id }) => id),
       output: changed
         ? `Stopped Task execution: ${task.id}. Progress was preserved; `
-          + `${activeRuns.length} active attempt(s) were terminated and `
+          + `${activeTurns.length} active attempt(s) were terminated and `
           + `${activeJobs.length} DurableJob(s) were cancelled.`
         : `Task execution is already stopped: ${task.id}. Runtime cleanup will be verified.`
     };
@@ -180,7 +177,7 @@ export function startTaskExecutionCommand(
     if (task.executionGate.state === "enabled") {
       return { taskId: task.id, changed: false, output: `Task execution is already enabled: ${task.id}.` };
     }
-    if (tx.listAgentRuns(task.id).some((run) => run.status === "active")
+    if (tx.listTurns(task.id).some((run) => run.status === "active")
       || tx.listDurableJobs(task.id).some((job) => job.status === "queued" || job.status === "running")) {
       throw usageError(`Task still has an active execution attempt: ${task.id}.`);
     }
@@ -236,23 +233,14 @@ function requireOperatorOrUser(
   return actor;
 }
 
-function terminalizeCurrentRun(sessions: TaskRoleSessionSet, now: Date): TaskRoleSessionSet {
-  const inFlight = sessions.inFlight!;
-  return terminalizeTaskRoleRunSession(sessions, {
-    agentId: inFlight.agentId,
-    runId: inFlight.runId,
-    receiptId: inFlight.receiptId
-  }, now);
-}
-
 function taskRuntimeRoleNames(
   store: TaskStore,
   taskId: string,
-  runs: readonly AgentRun[]
+  turns: readonly Turn[]
 ): readonly string[] {
   const names = new Set<string>(store.listRoles(taskId).map(({ name }) => name));
   for (const sessions of store.listRoleSessionSets(taskId)) names.add(sessions.owner.roleName);
-  for (const run of runs) names.add(run.roleName);
+  for (const turn of turns) names.add(turn.roleName);
   for (const owner of store.listSessionOwners()) {
     if (owner.owner.scope === "task" && owner.owner.taskId === taskId) {
       names.add(owner.owner.roleName);
@@ -264,7 +252,7 @@ function taskRuntimeRoleNames(
 function failExecutionAttempts(
   store: TaskStore,
   taskId: string,
-  runs: readonly AgentRun[],
+  turns: readonly Turn[],
   reason: string,
   now: Date
 ): void {
@@ -273,17 +261,17 @@ function failExecutionAttempts(
   const reviewRounds = new Map(store.listReviewRounds(taskId).map((round) => [round.id, round]));
   const affectedReviewRoundIds = new Set<string>();
 
-  for (const run of runs) {
-    if (run.executionGroupId === undefined || run.executionLaneId === undefined) continue;
-    if (run.workItemId !== undefined) {
-      const item = workItems.get(run.workItemId);
+  for (const turn of turns) {
+    if (turn.executionGroupId === undefined || turn.executionLaneId === undefined) continue;
+    if (turn.workItemId !== undefined) {
+      const item = workItems.get(turn.workItemId);
       const group = item === undefined
         ? undefined
-        : workItemExecutionGroupById(item, run.executionGroupId);
-      const lane = group?.lanes.find(({ id }) => id === run.executionLaneId);
+        : workItemExecutionGroupById(item, turn.executionGroupId);
+      const lane = group?.lanes.find(({ id }) => id === turn.executionLaneId);
       if (item !== undefined && group !== undefined && lane !== undefined
         && item.currentExecutionGroupId === group.id
-        && !["yielded", "completed", "failed", "skipped"].includes(lane.status)) {
+        && !["completed", "failed", "skipped"].includes(lane.status)) {
         const updated = updateWorkItemExecutionGroup(
           item,
           recordExecutionLaneResult(group, lane.id, { summary }, "failed", now),
@@ -292,15 +280,15 @@ function failExecutionAttempts(
         workItems.set(item.id, updated);
       }
     }
-    if (run.reviewRoundId !== undefined) {
-      affectedReviewRoundIds.add(run.reviewRoundId);
-      const round = reviewRounds.get(run.reviewRoundId);
-      const group = round?.executionGroup?.id === run.executionGroupId
+    if (turn.reviewRoundId !== undefined) {
+      affectedReviewRoundIds.add(turn.reviewRoundId);
+      const round = reviewRounds.get(turn.reviewRoundId);
+      const group = round?.executionGroup?.id === turn.executionGroupId
         ? round.executionGroup
         : undefined;
-      const lane = group?.lanes.find(({ id }) => id === run.executionLaneId);
+      const lane = group?.lanes.find(({ id }) => id === turn.executionLaneId);
       if (round !== undefined && group !== undefined && lane !== undefined
-        && !["yielded", "completed", "failed", "skipped"].includes(lane.status)) {
+        && !["completed", "failed", "skipped"].includes(lane.status)) {
         reviewRounds.set(round.id, updateReviewExecutionGroup(
           round,
           recordExecutionLaneResult(group, lane.id, { summary }, "failed", now)

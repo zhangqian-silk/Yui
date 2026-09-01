@@ -1,25 +1,25 @@
 ---
 name: yui-runtime
-description: Load and use the authorized context for every Yui-managed Leader, Worker, Reviewer, Operator, or custom Role Run, and complete that Run through its bounded control-plane protocol.
+description: Load and use the authorized context for every Yui-managed Leader, Worker, Reviewer, Operator, or custom Role Turn, and complete that Turn through its bounded control-plane protocol.
 ---
 
 # Yui Runtime
 
-Treat the Session Manifest and Run Bootstrap Envelope as pointers, never as the
+Treat the Session Manifest and Turn Bootstrap Envelope as pointers, never as the
 Task brief. Do not infer Task facts from the launch command, process list,
-workspace layout, native transcript, or an earlier Run.
+workspace layout, native transcript, or an earlier Turn.
 
-For every managed Task Run:
+For every managed Task Turn:
 
-1. Read the exact Run identity from the newest Bootstrap Envelope.
+1. Read the exact Turn identity from the newest Bootstrap Envelope.
 2. Before acting, load its authorized pack with the Session CLI named by the
    current Session Manifest:
 
    ```sh
-   "$YUI_SESSION_CLI" task run context "$YUI_TASK_ID/<run-id>" --json
+   "$YUI_SESSION_CLI" task turn context "$YUI_TASK_ID/<turn-id>" --json
    ```
 
-3. Verify that the returned Task, Run, Role, purpose, Snapshot digest, workspace,
+3. Verify that the returned Task, Turn, Role, purpose, Snapshot digest, workspace,
    and Adapter match the Envelope and Session Manifest. Stop and report a
    context-load failure if the pack is missing, stale, unauthorized, malformed,
    or mismatched. Never request an inline/full-prompt fallback.
@@ -28,7 +28,7 @@ For every managed Task Run:
    `refId`:
 
    ```sh
-   "$YUI_SESSION_CLI" task run context expand "$YUI_TASK_ID/<run-id>" <ref-id> --store <store> --mode full --json
+   "$YUI_SESSION_CLI" task turn context expand "$YUI_TASK_ID/<turn-id>" <ref-id> --store <store> --mode full --json
    ```
 
    A bare `<ref-id>` remains supported only when it identifies exactly one
@@ -40,8 +40,8 @@ For every managed Task Run:
    from transcript memory.
 
 The pack's authority view and writable Project IDs are hard boundaries. A
-native subagent inherits the parent Run's refs and authority; it does not gain a
-new Yui actor, Run, Session, or cross-Task read permission.
+native subagent inherits the parent Turn's refs and authority; it does not gain a
+new Yui actor, Turn, Session, or cross-Task read permission.
 
 For a global Operator or custom GlobalRole Session, load the stable authorized view
 before routing or acting:
@@ -52,18 +52,17 @@ before routing or acting:
 
 Global context grants no Task implementation workspace. Read a Task only after
 the Operator has routed to its public/task-authorized context command; never
-invent a Task Run identity for a GlobalRole.
+invent a Task Turn identity for a GlobalRole.
 
-Provider acceptance, Context load, and workflow completion are separate facts.
-Do not treat a live pane, process output, final response, or completed Provider
-Turn as a Yui yield. For a managed Task Run, use the exact current Run's
-supported checkpoint/yield command as the final control-plane action, then stop
-immediately. If that direct command is denied or stale, report the blocker once
-and stop; do not wrap, retry, broaden permissions, or target another Run.
+Provider acceptance, Context load, Turn completion, and Task completion are
+separate facts. For a managed Task Turn, end the Provider Turn with one truthful
+final report. Yui automatically correlates that native terminal with the exact
+current Turn and persists the report; no completion command is required. The
+Leader alone decides whether the WorkItem or Task is complete.
 
 After a failed Provider Turn, read the referenced `runtime.agent-error` fact.
 The failed Turn is immutable; a recovery is always a new Turn. Continue on the
-same native Session when it remains recoverable, and load only the current Run
+same native Session when it remains recoverable, and load only the current Turn
 delta instead of replaying its original Assignment. A new Host process does not
 imply a new Session, and a new Session must never be substituted silently for
 the persisted native Session id.

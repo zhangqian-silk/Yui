@@ -465,7 +465,7 @@ async function runReleaseWorkflowLocked(
       // For irreversible steps, mark as unknown and stop so the effect is
       // never re-submitted blindly. For reversible steps, mark as failed.
       // The exception is re-thrown so the caller sees the crash; the workflow
-      // state is already persisted for recovery on the next run.
+      // state is already persisted for recovery on the next turn.
       const message = error instanceof Error ? error.message : String(error);
       const crashNow = clock();
       if (effectiveIrreversibility === "irreversible") {

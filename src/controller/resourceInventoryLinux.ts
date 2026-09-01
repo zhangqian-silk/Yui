@@ -15,7 +15,7 @@ import {
   inspectStorageSchema,
   type StorageSchemaState
 } from "../storage/storageSchema.js";
-import { openCompatibleFileTaskStore } from "../storage/compatibleTaskStore.js";
+import { openCurrentTaskStore } from "../storage/currentTaskStore.js";
 import { NodeCommandExecutor } from "../tmux/commandExecutor.js";
 import {
   TmuxManager,
@@ -61,9 +61,9 @@ export type ControllerInventoryScanOptions = Readonly<{
   /** Reuse the caller's one full pane inventory when already available. */
   panes?: readonly RuntimePaneFact[];
   inspectStorage?: (home: string) => StorageSchemaState;
-  openCompatibleStore?: (
+  openCurrentStore?: (
     home: string
-  ) => ReturnType<typeof openCompatibleFileTaskStore>;
+  ) => ReturnType<typeof openCurrentTaskStore>;
   /**
    * Test seam for the shared tmux socket directory enumeration. Production
    * always enumerates with the real readdir+lstat path; scope=current must
@@ -812,26 +812,21 @@ function inspectRuntimeDomain(
 function loadHomeState(
   home: string,
   warnings: string[],
-  options: Pick<ControllerInventoryScanOptions, "inspectStorage" | "openCompatibleStore">
+  options: Pick<ControllerInventoryScanOptions, "inspectStorage" | "openCurrentStore">
 ): Readonly<{
   storageStatus: RuntimeHomeFact["storageStatus"];
   homeId?: string;
   roles: RuntimeRoleFact[];
 }> {
   const schema = (options.inspectStorage ?? inspectStorageSchema)(home);
-  const recordOnlyOlder = schema.status === "unsupported"
-    && schema.incompatibleComponent === "record"
-    && schema.direction === "older"
-    && schema.currentLayoutVersion === schema.latestLayoutVersion
-    && schema.currentAggregateSchemaVersion === schema.latestAggregateSchemaVersion;
-  if (schema.status !== "current" && !recordOnlyOlder) {
+  if (schema.status !== "current") {
     return {
       storageStatus: schema.status,
       roles: []
     };
   }
   try {
-    const store = (options.openCompatibleStore ?? openCompatibleFileTaskStore)(home);
+    const store = (options.openCurrentStore ?? openCurrentTaskStore)(home);
     const roles: RuntimeRoleFact[] = [...store.listGlobalRoles()]
       .sort((left, right) => numericCompare(left.name, right.name))
       .map((role) => {
@@ -851,7 +846,7 @@ function loadHomeState(
     const appendTaskRole = (task: Task, role: TaskRole): void => {
       const session = activeLiveRoleAgentSession(store.getRoleSessionSet(task.id, role.name));
       const binding = role.agentBindings[role.activeAgentId];
-      const run = store.getActiveAgentRun(task.id, role.name);
+      const run = store.getActiveTurn(task.id, role.name);
       const agentId = session?.effective.agentId ?? role.activeAgentId;
       const adapterId = session?.effective.adapterId ?? binding?.adapterId;
       roles.push({
@@ -864,13 +859,13 @@ function loadHomeState(
         ...(adapterId === undefined ? {} : { adapterId }),
         ...(session === null ? {} : { nativeSessionId: session.nativeSessionId }),
         ...(session?.launchId === undefined ? {} : { launchId: session.launchId }),
-        ...(run === null ? {} : { runId: run.id })
+        ...(run === null ? {} : { turnId: run.id })
       });
     };
 
     // Layout-7 SQLite owns bounded active-Task and current-Session indexes.
     // Use those indexes only as selectors, then point-read the authoritative
-    // Task/Role/Session/Run records so an index row cannot bypass ownership
+    // Task/Role/Session/Turn records so an index row cannot bypass ownership
     // fences. The legacy File store intentionally retains its complete
     // listTasks fallback because it has no equivalent active selector.
     const hotStore = store as typeof store & Readonly<{

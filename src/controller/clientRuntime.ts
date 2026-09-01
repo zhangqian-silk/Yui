@@ -23,7 +23,7 @@ import {
   YUI_MANAGED_RUNTIME_ENVIRONMENT_NAMES
 } from "../agent/launchEnvironment.js";
 import type { TaskStore } from "../storage/taskStore.js";
-import { openCompatibleFileTaskStore } from "../storage/compatibleTaskStore.js";
+import { openCurrentTaskStore } from "../storage/currentTaskStore.js";
 import { yuiTmuxServerName, type TmuxManager } from "../tmux/tmuxManager.js";
 import type { FileSchedulerStoreAdapter } from "./fileSchedulerStoreAdapter.js";
 import type { DormantRuntimeOwnerCandidate } from "../scheduler/ports.js";
@@ -48,14 +48,10 @@ const ENVIRONMENT_REFRESH_TIMEOUT_MS = 500;
 const CONFIGURATION_REFRESH_TIMEOUT_MS = 500;
 const CONTROLLER_OPERATIONAL_ENVIRONMENT = [
   ...AGENT_OPERATIONAL_ENVIRONMENT_NAMES,
-  // Issue 01: YUI_STORE_BACKEND/YUI_STORE_WORKER are reserved for tests and
-  // explicit recovery commands. A Controller spawned by such a command must
-  // inherit the forced backend; otherwise a layout-7 test Home silently opens
-  // SQLite, creates yui.db, and diverges from the file store the test writes.
-  "YUI_STORE_BACKEND",
+  // The worker toggle changes process placement, not storage authority.
   "YUI_STORE_WORKER",
   // rr13/test: Forward the liveness seam so an integration test's Controller
-  // subprocess does not reap a saved active Leader Run without a real tmux role.
+  // subprocess does not reap a saved active Leader Turn without a real tmux role.
   "YUI_TEST_ROLE_LIVENESS_PRESENT",
   ...EPHEMERAL_DOMAIN_ENVIRONMENT_NAMES
 ] as const;
@@ -93,7 +89,7 @@ export type ControllerLaunchIdentity = Readonly<{
 }>;
 
 /**
- * Direct FileTaskStore writers must not extend state while an older Controller
+ * Direct TaskStore writers must not extend state while an older Controller
  * is still reading the same YUI_HOME.
  */
 export async function assertFileTaskControllerStorageCompatible(
@@ -423,7 +419,7 @@ function controllerSpawnEnvironment(
 ): NodeJS.ProcessEnv {
   const allowed = new Set<string>(CONTROLLER_OPERATIONAL_ENVIRONMENT);
   try {
-    for (const agent of openCompatibleFileTaskStore(home).listConfiguredAgents()) {
+    for (const agent of openCurrentTaskStore(home).listConfiguredAgents()) {
       for (const name of nativeAgentEnvironmentNames(agent.adapterId)) allowed.add(name);
       for (const binding of agent.environment) allowed.add(binding.sourceName);
     }
@@ -433,7 +429,7 @@ function controllerSpawnEnvironment(
   }
   // Merge with process.env so a partial source (e.g. a managed-Session env
   // that only carries YUI_SESSION_SCOPE/YUI_TASK_ID) still forwards
-  // operational vars like YUI_STORE_BACKEND and PATH. The source wins on
+  // operational vars like YUI_STORE_WORKER and PATH. The source wins on
   // conflict; the whitelist still gates every forwarded name.
   const effectiveSource: NodeJS.ProcessEnv = { ...process.env, ...source };
   const environment: NodeJS.ProcessEnv = {};
@@ -617,8 +613,8 @@ export class FileTaskWorkflowRuntime implements TaskWorkflowRuntimePort {
   async stopTaskRoleSessions(taskId: string, roleNames: readonly string[]): Promise<void> {
     const targets = [];
     for (const roleName of [...new Set(roleNames)]) {
-      if (this.store.getActiveAgentRun(taskId, roleName) !== null) {
-        throw new Error(`Role has an active Run: ${taskId}/${roleName}.`);
+      if (this.store.getActiveTurn(taskId, roleName) !== null) {
+        throw new Error(`Role has an active Turn: ${taskId}/${roleName}.`);
       }
       const target = this.schedulerStore.enqueueRuntimeCleanup({
         scope: "task",
@@ -663,8 +659,8 @@ export class FileTaskWorkflowRuntime implements TaskWorkflowRuntimePort {
     launchId?: string;
     sessionUpdatedAt: string;
   }>): Promise<void> {
-    if (this.store.getActiveAgentRun(input.taskId, input.roleName) !== null) {
-      throw new Error(`Role has an active Run: ${input.taskId}/${input.roleName}.`);
+    if (this.store.getActiveTurn(input.taskId, input.roleName) !== null) {
+      throw new Error(`Role has an active Turn: ${input.taskId}/${input.roleName}.`);
     }
     const owner = {
       scope: "task" as const,

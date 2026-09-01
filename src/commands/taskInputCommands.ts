@@ -18,14 +18,13 @@ import {
 import { defaultTableWidth, renderTable } from "../output/table.js";
 import { formatTimestamp } from "../output/timePresentation.js";
 import { type Role } from "../role/role.js";
-import { agentRunDeliveryReceiptId, type AgentRun } from "../run/agentRun.js";
+import type { Turn } from "../turn/turn.js";
 import { enqueueWork } from "../coordination/workMailboxQueue.js";
 import type { MailboxTarget } from "../coordination/workMailbox.js";
 import {
-  isRoleRunStalled,
-  RUN_RECOVERED_EVENT
-} from "../scheduler/roleRunStall.js";
-import { terminalizeExactTaskRun } from "../lifecycle/exactRunTerminalization.js";
+  isRoleTurnStalled,
+  TURN_RECOVERED_EVENT
+} from "../scheduler/roleTurnStall.js";
 import type { TaskStore } from "../storage/taskStore.js";
 import {
   hasRuntimeCleanupObligation,
@@ -38,7 +37,6 @@ import {
 } from "../runtime/sessionOwnerIdentity.js";
 import type { Task } from "../task/task.js";
 import {
-  formatAgentRunReceiptId,
   resolveTaskRecordReference
 } from "../task/taskRecordReference.js";
 
@@ -135,38 +133,17 @@ function createRequest(
       { question, choices, blockedRefs, policy },
       now
     );
-    const wasStalled = isRoleRunStalled(tx.listEvents(task.id), origin.run.id);
+    const wasStalled = isRoleTurnStalled(tx.listEvents(task.id), origin.turn.id);
     tx.saveInputRequest(task.id, created);
     enqueueWork(tx, { kind: "operator" }, "input-requested", now, [
       { type: "input", taskId: task.id, id: created.id }
     ], {
       source: "input-request",
-      dedupeKey: `operator-input:${task.id}:${created.id}`,
-      deliveryMode: "followup",
-      lane: "normal"
+      dedupeKey: `operator-input:${task.id}:${created.id}`
     });
-    const terminal = terminalizeExactTaskRun(tx, {
-      taskId: task.id,
-      roleName: LEADER_ROLE,
-      agentId: origin.run.effective.agentId,
-      runId: origin.run.id,
-      receiptId: agentRunDeliveryReceiptId(origin.run),
-      ...(origin.requester.nativeSessionId === undefined
-        ? {}
-        : { nativeSessionId: origin.requester.nativeSessionId }),
-      outcome: {
-        status: "yielded",
-        summary: `Waiting for input ${created.id}: ${created.question}`
-      }
-    }, now);
-    if (terminal.disposition !== "applied") {
-      throw usageError(
-        `Task Leader Run changed while requesting input: ${origin.run.id}/${terminal.reason}.`
-      );
-    }
     if (wasStalled) {
-      recordTaskEvent(tx, task.id, RUN_RECOVERED_EVENT, {
-        runId: origin.run.id,
+      recordTaskEvent(tx, task.id, TURN_RECOVERED_EVENT, {
+        turnId: origin.turn.id,
         roleName: LEADER_ROLE,
         progressAt: now.toISOString(),
         kind: "input-request"
@@ -174,7 +151,7 @@ function createRequest(
     }
     recordTaskEvent(tx, task.id, "input.requested", {
       requestId: created.id,
-      requesterRunId: created.requester.runId,
+      requesterTurnId: created.requester.turnId,
       policy: created.policy.kind
     }, now);
     return created;
@@ -338,40 +315,39 @@ function requireLeaderInputOrigin(
 ): Readonly<{
   requester: InputRequester;
   role: Role;
-  run: AgentRun;
+  turn: Turn;
   sessions: TaskRoleSessionSet | null;
 }> {
   const env = environment ?? {};
   const role = requireRole(store, taskId, LEADER_ROLE);
-  const run = store.getActiveAgentRun(taskId, LEADER_ROLE);
+  const turn = store.getActiveTurn(taskId, LEADER_ROLE);
   if (
     env.YUI_SESSION_SCOPE !== "task"
     || env.YUI_TASK_ID !== taskId
     || env.YUI_ROLE !== LEADER_ROLE
-    || run === null
-    || env.YUI_AGENT_ID !== run.effective.agentId
-    || run.status !== "active"
-    || run.pushedAt === undefined
-    || run.workItemId !== undefined
+    || turn === null
+    || env.YUI_AGENT_ID !== turn.effective.agentId
+    || turn.status !== "active"
+    || turn.workItemId !== undefined
   ) {
-    throw usageError("Task input request requires the active Leader Run environment.");
+    throw usageError("Task input request requires the active Leader Turn environment.");
   }
   const sessions = store.getTaskRoleSessionSet(taskId, LEADER_ROLE);
   const nativeSessionId = trimmed(env.YUI_NATIVE_SESSION_ID);
   if (nativeSessionId !== undefined
-    && sessions?.sessions[run.effective.agentId]?.nativeSessionId !== nativeSessionId) {
+    && sessions?.sessions[turn.effective.agentId]?.nativeSessionId !== nativeSessionId) {
     throw usageError("Task input request native session does not match the active Leader session.");
   }
   return {
     requester: {
       taskId,
       roleName: "leader",
-      agentId: run.effective.agentId,
-      runId: run.id,
+      agentId: turn.effective.agentId,
+      turnId: turn.id,
       ...(nativeSessionId === undefined ? {} : { nativeSessionId })
     },
     role,
-    run,
+    turn,
     sessions
   };
 }
@@ -511,8 +487,8 @@ function parseInputBlockedRef(value: string, taskId: string): InputBlockedRef {
   const separator = value.indexOf(":");
   const type = value.slice(0, separator);
   const id = value.slice(separator + 1).trim();
-  if ((type !== "work-item" && type !== "run") || separator <= 0 || id.length === 0) {
-    throw usageError("--blocks must use work-item:<id> or run:<id>.");
+  if ((type !== "work-item" && type !== "turn") || separator <= 0 || id.length === 0) {
+    throw usageError("--blocks must use work-item:<id> or turn:<id>.");
   }
   return { type, taskId, id };
 }
@@ -525,7 +501,7 @@ function validateBlockedInputOwnership(
   for (const reference of references) {
     const record = reference.type === "work-item"
       ? store.getWorkItem(taskId, reference.id)
-      : store.getAgentRun(taskId, reference.id);
+      : store.getTurn(taskId, reference.id);
     if (record === null) throw dataError(`Blocked ${reference.type} not found: ${reference.id}.`);
   }
 }
@@ -567,7 +543,7 @@ function renderInputRequest(request: InputRequest, timeZone: string | undefined)
     `Task: ${request.taskId}`,
     `Status: ${request.status}`,
     `Question: ${request.question}`,
-    `Requested by: ${request.requester.agentId}/${request.requester.runId}`,
+    `Requested by: ${request.requester.agentId}/${request.requester.turnId}`,
     ...(request.choices.length === 0
       ? ["Answer type: text"]
       : ["Choices:", ...request.choices.map((choice) => `  ${choice.key}: ${choice.label}`)]),

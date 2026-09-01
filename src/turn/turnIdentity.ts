@@ -2,7 +2,7 @@ import { MAX_SESSION_TITLE_LENGTH } from "../runtime/sessionTitle.js";
 
 /**
  * Prefixes managed launch input with its session title. The bootstrap body
- * exposes the exact current Run identity to the Agent, while structured
+ * exposes the exact current Turn identity to the Agent, while structured
  * delivery metadata and control hooks retain the delivery fence.
  */
 export function prefixYuiTitleInput(
@@ -11,10 +11,10 @@ export function prefixYuiTitleInput(
 ): string {
   const text = input.replace(/\r/g, "").trim();
   if (text.length === 0) throw new Error("Managed input body is required.");
-  return `${requireRunTitle(title)}\n\n${text}`;
+  return `${requireTurnTitle(title)}\n\n${text}`;
 }
 
-function requireRunTitle(value: string): string {
+function requireTurnTitle(value: string): string {
   const title = value.trim();
   if (
     title.length === 0
@@ -22,7 +22,7 @@ function requireRunTitle(value: string): string {
     || /[\r\n\0]/u.test(title)
     || !title.startsWith("Yui ")
   ) {
-    throw new Error("Run title is invalid.");
+    throw new Error("Turn title is invalid.");
   }
   return title;
 }

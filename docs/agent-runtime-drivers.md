@@ -1,4 +1,4 @@
-# Agent Runtime Drivers
+# AgentRuntime Drivers
 
 Yui observes managed Agent CLIs through an open Agent Driver boundary. Codex,
 Claude Code, and future CLIs translate their native events at that boundary;
@@ -23,7 +23,7 @@ core never invokes provider commands.
 
 Yui core owns shared semantics:
 
-- exact generation and Run fences;
+- exact generation and Turn fences;
 - durable admission, replay, and idempotency;
 - runtime state projection;
 - workflow progress and workflow-stall policy;
@@ -51,11 +51,11 @@ accepted observer source --> Controller sampler --> usage -+--> runtime-observat
                                                         runtime status projection
 ```
 
-Every Run-scoped observation carries Task, Role, Run, Agent, Driver, launch,
+Every Turn-scoped observation carries Task, Role, Turn, Agent, Driver, launch,
 Session generation, native Session, native Turn, and transport receipt
 identity. `turn.accepted` durably binds the provider's native Turn to that exact
-Run. Every later fact resolves through this binding, so a delayed terminal event
-cannot refresh, fail, or complete a successor Run after a reused process has
+Turn. Every later fact resolves through this binding, so a delayed terminal event
+cannot refresh, fail, or complete a successor Turn after a reused process has
 advanced.
 
 The stable vocabulary separates:
@@ -73,7 +73,7 @@ hidden `internal runtime-hook` ingress. Managed Codex takes exact Session,
 acceptance, and Turn lifecycle facts from its ordinary App Server subscription
 and does not install Yui-specific Hooks. The core selects the registered Driver
 from the exact launch envelope; a Driver may map native payloads, but it cannot
-choose or forge authority, Driver identity, Run fences, ordering, or canonical
+choose or forge authority, Driver identity, Turn fences, ordering, or canonical
 event IDs.
 
 Native identity is also a Driver responsibility. Built-in Drivers resolve
@@ -96,7 +96,7 @@ The taxonomy contains `availability`, `rate-limit`, `transport`, `access`,
 `unknown`. These are observations, not recommended actions. A Driver recognizes
 its own native error shapes; it does not start a replacement Session, count
 attempts, or impose backoff. The Leader or Operator reads the fact with current
-Run, Host, Session, and Turn state and chooses the next atomic operation.
+Turn, Host, and Session state and chooses the next atomic operation.
 
 The taxonomy describes evidence; it is not a second lifecycle state machine.
 Drivers recognize native shapes, Core records the standardized fact, and the
@@ -111,20 +111,21 @@ Yui maintains two independent clocks:
    structured work. Tool/subagent boundaries and explicit activity identities
    refresh it; token usage snapshots and a live tmux pane do not.
 2. **Workflow progress** answers whether the managed Task advanced through a
-   Yui outcome such as a checkpoint, yield, block, Candidate, Review, or
+   Yui outcome such as a checkpoint, block, Candidate, Review, or
    completion. Tokens, CPU, RSS, and provider Turn completion never refresh
    this clock.
 
 This prevents a looping or merely busy Agent from hiding a workflow stall. It
 also prevents a quiet model call from being mislabeled as workflow failure.
-Provider Turn completion leaves the Run open for the bounded workflow-outcome
-grace period; if no exact Yui outcome commits, the Run fails visibly.
+Provider Turn completion automatically stores the exact Turn result. It does not
+decide whether the WorkItem or Task is complete; the Leader makes that judgment
+from durable evidence.
 
-A durable AgentRun may span multiple provider Turns while provider-structured
-native subagent operations remain active. In that state, Turn completion is an
-intermediate provider boundary: the Run remains active, and later child
-completion notifications continue the parent Session under the same Run fence.
-Once native operations drain, the normal workflow-outcome grace applies again.
+A durable Turn corresponds to exactly one provider Turn. Structured native
+subagent operations are observable facts within that Turn, but they do not
+extend or reopen the Turn after the parent Provider reports its terminal. Later
+facts wake the Leader as new durable context rather than continuing a closed
+Turn.
 
 ## Token evidence
 
@@ -176,7 +177,7 @@ stream while preserving the same source/sample contract and canonical events.
 ## Bounded durability
 
 `runtime.observation` is a compact state boundary, not an append-only
-transcript. The exact Run retains the ordered canonical usage occurrences
+transcript. The exact Turn retains the ordered canonical usage occurrences
 needed for cumulative deltas and one latest confirmed activity boundary;
 completed operation pairs are removed; terminal observations clear obsolete
 operation and waiting snapshots. Detailed high-volume diagnostics may go to
@@ -225,7 +226,7 @@ Size and retention boundaries:
 
 Critical, non-repeatable, or independently verifiable work must use a Yui
 WorkItem/ExecutionGroup, not a native subagent. Only a managed Lane owns an
-independent Run, receipt, and workspace.
+independent Turn, receipt, and workspace.
 
 ## Adding another Agent CLI
 
@@ -238,7 +239,7 @@ view. The Driver must:
 2. resolve its stable native Session and Turn identities and map native events into the canonical vocabulary at its edge;
 3. expose an independently sampled, incremental observer when structured usage
    or activity is available, including explicit health;
-4. provide the full exact identity fence for every Run-scoped fact;
+4. provide the full exact identity fence for every Turn-scoped fact;
 5. map every native failure to a standard Agent error code and preserve the
    complete native error, using `unknown` when no mapping is justified;
 6. prove stale-generation rejection, replay idempotency, out-of-order replay,

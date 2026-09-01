@@ -37,7 +37,7 @@ export function projectFirstProgressAdvisory(input: Readonly<{
     ? []
     : [
         ...input.events
-          .filter((event) => typeof event.payload.leaderRunId === "string")
+          .filter((event) => typeof event.payload.leaderTurnId === "string")
           .map((event) => ({ at: event.createdAt, ref: `event:${event.id}` })),
         ...input.workItems
           .filter((item) => item.status !== "retired")

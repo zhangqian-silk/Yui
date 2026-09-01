@@ -9,7 +9,7 @@ import {
   inspectStorageSchema,
   type StorageSchemaState
 } from "../storage/storageSchema.js";
-import { openCompatibleFileTaskStore } from "../storage/compatibleTaskStore.js";
+import { openCurrentTaskStore } from "../storage/currentTaskStore.js";
 import {
   yuiVersionIdentity,
   type YuiVersionIdentity
@@ -21,7 +21,6 @@ import {
   runtimeLifecycleTarget
 } from "./lifecycleReservation.js";
 import { nativeSessionIdForLaunch } from "./preallocatedNativeSession.js";
-import { agentRunDeliveryReceiptId } from "../run/agentRun.js";
 import { writeTextFileAtomically } from "../storage/durableFile.js";
 
 export const EXACT_CONTROL_ARGUMENT = "--yui-control";
@@ -54,7 +53,7 @@ export type ExactTaskRuntimeDescriptor = Readonly<{
   agentId: string;
   adapterId: AgentAdapterId;
   workspace: string;
-  runId?: string;
+  turnId?: string;
   launchId?: string;
   nativeSessionId?: string;
 }>;
@@ -76,7 +75,7 @@ export type ExactControlPlanePreflightOptions = Readonly<{
     incompatibleComponent?: "layout" | "aggregate" | "record";
     direction?: "older" | "newer";
   }>;
-  openCompatibleStore?: (
+  openCurrentStore?: (
     home: string
   ) => Pick<FileTaskStore, "getConfig">;
   callController?: (
@@ -121,7 +120,7 @@ export function createExactTaskRuntimeDescriptor(input: Readonly<{
   agentId: string;
   adapterId: AgentAdapterId;
   workspace: string;
-  runId?: string;
+  turnId?: string;
   launchId?: string;
   nativeSessionId?: string;
 }>): ExactTaskRuntimeDescriptor {
@@ -134,7 +133,7 @@ export function createExactTaskRuntimeDescriptor(input: Readonly<{
     agentId: requireIdentity(input.agentId, "Agent id"),
     adapterId: requireAdapter(input.adapterId),
     workspace: canonicalPath(input.workspace),
-    ...(input.runId === undefined ? {} : { runId: requireIdentity(input.runId, "Run id") }),
+    ...(input.turnId === undefined ? {} : { turnId: requireIdentity(input.turnId, "Turn id") }),
     ...(input.launchId === undefined
       ? {}
       : { launchId: requireIdentity(input.launchId, "Launch id") }),
@@ -181,7 +180,7 @@ export function parseExactTaskRuntimeDescriptor(value: string): ExactTaskRuntime
     agentId: requireText(record.agentId, "Agent id"),
     adapterId: requireAdapter(record.adapterId),
     workspace: requireText(record.workspace, "Task runtime workspace"),
-    ...(record.runId === undefined ? {} : { runId: requireText(record.runId, "Run id") }),
+    ...(record.turnId === undefined ? {} : { turnId: requireText(record.turnId, "Turn id") }),
     ...(record.launchId === undefined
       ? {}
       : { launchId: requireText(record.launchId, "Launch id") }),
@@ -195,7 +194,7 @@ export function exactControlPlaneDigest(descriptor: ExactControlPlaneDescriptor)
   return createHash("sha256").update(serializeExactDescriptor(descriptor)).digest("hex");
 }
 
-/** Stable per Task/Role/Agent location; volatile Run/launch/native fields are content. */
+/** Stable per Task/Role/Agent location; volatile Turn/launch/native fields are content. */
 export function exactTaskRuntimeDescriptorPath(
   home: string,
   descriptor: ExactTaskRuntimeDescriptor
@@ -285,15 +284,7 @@ export async function assertExactControlPlanePreflight(
   assertContinuityIdentity("Local CLI", descriptor.identity, localIdentity);
   const storage = (options.inspectStorage ?? inspectStorageSchema)(descriptor.yuiHome);
   if (storage.status !== "current") {
-    const exactRecordOnlyOlder = storage.status === "unsupported"
-      && storage.incompatibleComponent === "record"
-      && storage.direction === "older"
-      && storage.currentLayoutVersion === descriptor.identity.storageLayoutVersion
-      && storage.currentAggregateSchemaVersion === descriptor.identity.aggregateSchemaVersion;
-    if (!exactRecordOnlyOlder) {
-      throw new Error(`Exact control-plane storage is not current: ${storage.status}.`);
-    }
-    (options.openCompatibleStore ?? openCompatibleFileTaskStore)(descriptor.yuiHome).getConfig();
+    throw new Error(`Exact control-plane storage is not current: ${storage.status}.`);
   }
   if (storage.currentLayoutVersion !== descriptor.identity.storageLayoutVersion) {
     throw new Error(
@@ -313,7 +304,7 @@ export async function assertExactControlPlanePreflight(
   // A frozen descriptor authenticates the command that created it; it no
   // longer pins the Home's deployment pointer for the lifetime of a Session.
   // Continuity is the protocol/storage contract checked above and the durable
-  // Task/Role/Run identity checked below. This lets a compatible Controller or
+  // Task/Role/Turn identity checked below. This lets a compatible Controller or
   // active release advance without invalidating a still-current Session.
 
   if (options.checkController !== false) {
@@ -342,15 +333,7 @@ export async function assertCompatibleControlPlanePreflight(
   const identity = validateVersionIdentity(options.identity ?? yuiVersionIdentity());
   const storage = (options.inspectStorage ?? inspectStorageSchema)(home);
   if (storage.status !== "current") {
-    const compatibleRecordOnlyOlder = storage.status === "unsupported"
-      && storage.incompatibleComponent === "record"
-      && storage.direction === "older"
-      && storage.currentLayoutVersion === identity.storageLayoutVersion
-      && storage.currentAggregateSchemaVersion === identity.aggregateSchemaVersion;
-    if (!compatibleRecordOnlyOlder) {
-      throw new Error(`Managed control-plane storage is not current: ${storage.status}.`);
-    }
-    (options.openCompatibleStore ?? openCompatibleFileTaskStore)(home).getConfig();
+    throw new Error(`Managed control-plane storage is not current: ${storage.status}.`);
   }
   if (storage.currentLayoutVersion !== identity.storageLayoutVersion) {
     throw new Error(
@@ -425,9 +408,9 @@ export function assertExactTaskRuntimeEnvironment(
   );
   // A reused native pane retains its original process environment. Volatile
   // identity therefore comes only from the atomically published descriptor
-  // plus durable state, never from stale ambient Run/launch/native variables.
+  // plus durable state, never from stale ambient Turn/launch/native variables.
   if (!resolved.fromFile) {
-    assertOptionalEnvironment(runtime.runId, environment.YUI_RUN_ID, "Run id");
+    assertOptionalEnvironment(runtime.turnId, environment.YUI_TURN_ID, "Turn id");
     assertOptionalEnvironment(runtime.launchId, environment.YUI_LAUNCH_ID, "Launch id");
     assertOptionalEnvironment(
       runtime.nativeSessionId,
@@ -442,7 +425,7 @@ export type ExactTaskRuntimeStatePort = Pick<
   TaskStore,
   | "getTask"
   | "getRole"
-  | "getActiveAgentRun"
+  | "getActiveTurn"
   | "getTaskRoleSessionSet"
   | "getWorkMailbox"
 >;
@@ -471,18 +454,18 @@ export function assertExactTaskRuntimeState(
   if (role === null || role.activeAgentId !== runtime.agentId) {
     throw new Error("Exact Task runtime Role or Agent is not current.");
   }
-  const run = store.getActiveAgentRun(runtime.taskId, runtime.roleName);
-  if (runtime.runId === undefined) {
-    if (run !== null) throw new Error("Exact Task runtime Run is not current.");
+  const run = store.getActiveTurn(runtime.taskId, runtime.roleName);
+  if (runtime.turnId === undefined) {
+    if (run !== null) throw new Error("Exact Task runtime Turn is not current.");
   } else if (
     run === null
-    || run.id !== runtime.runId
+    || run.id !== runtime.turnId
     || run.status !== "active"
     || run.effective.agentId !== runtime.agentId
     || run.effective.adapterId !== runtime.adapterId
     || canonicalPath(run.effective.workspace.root) !== runtime.workspace
   ) {
-    throw new Error("Exact Task runtime Run is not current.");
+    throw new Error("Exact Task runtime Turn is not current.");
   }
 
   const sessions = store.getTaskRoleSessionSet(runtime.taskId, runtime.roleName);
@@ -520,15 +503,6 @@ export function assertExactTaskRuntimeState(
       runtime.agentId,
       runtime.adapterId
     );
-  const preallocatedBeforeInFlightProjection = exactPreallocatedReservation
-    && (sessions?.inFlight === null || sessions?.inFlight === undefined);
-  if (runtime.runId !== undefined && (
-    sessions?.inFlight?.agentId !== runtime.agentId
-    || sessions.inFlight.runId !== runtime.runId
-    || sessions.inFlight.receiptId !== agentRunDeliveryReceiptId(run!)
-  ) && !preallocatedBeforeInFlightProjection) {
-    throw new Error("Exact Task runtime in-flight Run fence is not current.");
-  }
   if (runtime.launchId === undefined || (!reservation && !sessionLaunch)) {
     throw new Error("Exact Task runtime launch fence is not current.");
   }
@@ -583,17 +557,17 @@ export function refreshExactTaskRuntimeDescriptorSource(
 }
 
 /**
- * Advances a reused Hook's own exact source to the current durable Run/launch
+ * Advances a reused Hook's own exact source to the current durable Turn/launch
  * generation before the volatile fence. The stable identity (control digest,
  * Task, Role, Agent, adapter, workspace) and the native Session are preserved;
- * only the volatile Run/launch fields advance. A source may never jump to a
+ * only the volatile Turn/launch fields advance. A source may never jump to a
  * replacement native Session.
  */
 export function refreshReusedTaskRuntimeDescriptorSource(
   source: string,
   home: string,
   store: ExactTaskRuntimeStatePort,
-  current: Readonly<{ runId: string; launchId: string; nativeSessionId: string }>
+  current: Readonly<{ turnId: string; launchId: string; nativeSessionId: string }>
 ): ExactTaskRuntimeDescriptor {
   const resolved = readTaskRuntimeSource(source, home);
   if (!resolved.fromFile) {
@@ -601,7 +575,7 @@ export function refreshReusedTaskRuntimeDescriptorSource(
   }
   const previous = resolved.descriptor;
   if (previous.nativeSessionId === undefined) {
-    if (previous.runId !== current.runId || previous.launchId !== current.launchId) {
+    if (previous.turnId !== current.turnId || previous.launchId !== current.launchId) {
       throw new Error(
         "Task runtime descriptor source cannot bind a native Session from another generation."
       );
@@ -615,7 +589,7 @@ export function refreshReusedTaskRuntimeDescriptorSource(
   }
   const refreshed = createExactTaskRuntimeDescriptor({
     ...previous,
-    runId: current.runId,
+    turnId: current.turnId,
     launchId: current.launchId,
     nativeSessionId: current.nativeSessionId
   });

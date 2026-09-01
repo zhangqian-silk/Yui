@@ -49,10 +49,10 @@ export type TaskBaseFreshness = Readonly<{
   workspaceClean: boolean | null;
   /** Physical HEAD of the workspace checkout, when resolvable. */
   physicalHead?: string;
-  /** Active Run workspace snapshot baseCommit, when an active Run exists. */
-  runSnapshotCommit?: string;
-  /** Active Run id whose workspace snapshot is reported. */
-  runSnapshotRunId?: string;
+  /** Active Turn workspace snapshot baseCommit, when an active Turn exists. */
+  turnSnapshotCommit?: string;
+  /** Active Turn id whose workspace snapshot is reported. */
+  turnSnapshotId?: string;
   trackedRef?: string;
   trackedCommit?: string;
   remoteOnlyChangedFiles: readonly string[];
@@ -160,10 +160,10 @@ export async function inspectTaskBaseFreshness(
   const task = requireTask(store, taskId);
   const git = options.git ?? newGitWorkspace();
   const workspace = store.getTaskWorkspace(taskId);
-  // Collect active Run workspace snapshots once so every Project entry can
-  // report whether a live Run is pinned to a different commit.
-  const activeRuns = store.listAgentRuns(taskId)
-    .filter((run) => run.status === "active" && run.workspace !== undefined);
+  // Collect active Turn workspace snapshots once so every Project entry can
+  // report whether a live Turn is pinned to a different commit.
+  const activeTurns = store.listTurns(taskId)
+    .filter((turn) => turn.status === "active" && turn.workspace !== undefined);
   const entries = await Promise.all(task.projectBindings.map(async (binding) => {
     const project = requireProject(store, binding.projectId);
     const entry = workspace === null ? undefined : workspaceProjectEntry(workspace, project.id);
@@ -175,11 +175,11 @@ export async function inspectTaskBaseFreshness(
     } catch {
       physicalHead = undefined;
     }
-    // Find the first active Run whose workspace snapshot covers this Project.
-    const runSnapshot = activeRuns.find((run) => {
-      if (run.workspace === undefined) return false;
-      const runEntry = workspaceProjectEntry(run.workspace, project.id);
-      return runEntry !== undefined;
+    // Find the first active Turn whose workspace snapshot covers this Project.
+    const turnSnapshot = activeTurns.find((turn) => {
+      if (turn.workspace === undefined) return false;
+      const turnEntry = workspaceProjectEntry(turn.workspace, project.id);
+      return turnEntry !== undefined;
     });
     const provenance = latestBaseProvenance(store.listEvents(taskId), project.id);
     const tracked = await resolveTracked(git, project, workspacePath, options.refresh === true);
@@ -202,11 +202,11 @@ export async function inspectTaskBaseFreshness(
       workspacePath,
       workspaceClean,
       ...(physicalHead === undefined ? {} : { physicalHead }),
-      ...(runSnapshot?.workspace === undefined
+      ...(turnSnapshot?.workspace === undefined
         ? {}
         : {
-            runSnapshotCommit: workspaceProjectEntry(runSnapshot.workspace, project.id)?.baseCommit,
-            runSnapshotRunId: runSnapshot.id
+            turnSnapshotCommit: workspaceProjectEntry(turnSnapshot.workspace, project.id)?.baseCommit,
+            turnSnapshotId: turnSnapshot.id
           }),
       ...(tracked === undefined ? {} : {
         trackedRef: tracked.ref,
@@ -279,7 +279,7 @@ export function renderTaskBaseFreshnessReport(report: TaskBaseFreshnessReport): 
       `- ${entry.directory}: ${entry.projectId} @ ${entry.baseCommit}`,
       `  status: ${entry.status}; workspace: ${entry.workspaceClean === null ? "unknown" : entry.workspaceClean ? "clean" : "dirty"}`,
       `  physical HEAD: ${entry.physicalHead ?? "-"}`,
-      `  Run snapshot: ${entry.runSnapshotCommit ?? "-"}${entry.runSnapshotRunId === undefined ? "" : ` (${entry.runSnapshotRunId})`}`,
+      `  Turn snapshot: ${entry.turnSnapshotCommit ?? "-"}${entry.turnSnapshotId === undefined ? "" : ` (${entry.turnSnapshotId})`}`,
       `  observed remote: ${entry.observedRemoteUrl ?? "-"}`,
       `  tracked: ${entry.trackedCommit ?? "-"}${entry.trackedRef === undefined ? "" : ` (${entry.trackedRef})`}`,
       `  observed: ${entry.observedTrackingCommit ?? "-"}${entry.observedAt === undefined ? "" : ` at ${entry.observedAt}`}`

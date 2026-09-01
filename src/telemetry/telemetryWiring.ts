@@ -2,14 +2,14 @@ import { existsSync } from "node:fs";
 import { join } from "node:path";
 
 import {
-  resolveRunCap,
+  resolveTurnCap,
   resolveTerminalKeep
 } from "./telemetryConfig.js";
 import { resolveTelemetryEnabled } from "../config/yuiConfig.js";
 import type { YuiConfig } from "../storage/taskStore.js";
 import { SqliteTelemetryStore } from "./sqliteTelemetryStore.js";
 import type { SchedulerTelemetry } from "./telemetryStore.js";
-import { COMMITTED_DATABASE_FILENAME } from "../storage/upgrade/sqliteStateMigration.js";
+import { CURRENT_DATABASE_FILENAME as COMMITTED_DATABASE_FILENAME } from "../storage/currentTaskStore.js";
 
 /**
  * Open the telemetry sidecar for a Home, resolved from the durable Yui
@@ -39,7 +39,7 @@ export function openSchedulerTelemetry(
   const store = new SqliteTelemetryStore(home, {
     mode,
     terminalKeep: resolveTerminalKeep(config.telemetryTerminalKeep),
-    runCap: resolveRunCap(config.telemetryRunCap)
+    turnCap: resolveTurnCap(config.telemetryTurnCap)
   });
   return { mode, sink: store, reader: store, retention: store };
 }

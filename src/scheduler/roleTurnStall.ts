@@ -2,14 +2,14 @@ import type { TaskEvent } from "../event/taskEvent.js";
 import {
   selectedSchedulerRoles,
   selectedActiveSchedulerTasks,
-  type RunProgressFacts,
+  type TurnProgressFacts,
   type SchedulerReconcileSelection,
   type SchedulerRoleSession,
   type SchedulerRoleResourceEvidence,
   type SchedulerStorePort,
   type TmuxDeliveryPort
 } from "./ports.js";
-import type { RoleLiveStatusSnapshot } from "./roleRunLiveness.js";
+import type { RoleLiveStatusSnapshot } from "./roleTurnLiveness.js";
 import { nextPendingBatch } from "../coordination/workMailbox.js";
 import {
   RUNTIME_DIAGNOSTIC_AFTER_MS,
@@ -17,22 +17,22 @@ import {
 } from "../runtime/runtimeHealthPolicy.js";
 
 /**
- * Default window of no durable progress before a live-but-idle Run becomes a
- * traceable needs-attention signal. It is deliberately long: a healthy Run that
+ * Default window of no durable progress before a live-but-idle Turn becomes a
+ * traceable needs-attention signal. It is deliberately long: a healthy Turn that
  * is simply slow keeps its structured checkpoint fresh and never crosses it.
  */
 export const DEFAULT_STALL_WINDOW_MS = SEMANTIC_STALL_WINDOW_MS;
 /** Cheap workflow-stall candidate filter; the real threshold remains 30m. */
 export const DEFAULT_WORKFLOW_STALL_CANDIDATE_AGE_MS = RUNTIME_DIAGNOSTIC_AFTER_MS;
-export const RUN_PROGRESS_EVENT = "run.progress";
-export const RUN_STALLED_EVENT = "run.stalled";
-export const RUN_RECOVERED_EVENT = "run.recovered";
-export const RUN_DIAGNOSTIC_FINISHED_EVENT = "runtime.diagnostic-finished";
+export const TURN_PROGRESS_EVENT = "turn.progress";
+export const TURN_STALLED_EVENT = "turn.stalled";
+export const TURN_RECOVERED_EVENT = "turn.recovered";
+export const TURN_DIAGNOSTIC_FINISHED_EVENT = "runtime.diagnostic-finished";
 /** Structured, non-Message recovery evidence written by an explicit Leader. */
 
 /** Workflow-semantic events that count for the durable progress clock. */
 const ACTIVITY_EVENT_TYPES = new Set([
-  RUN_PROGRESS_EVENT,
+  TURN_PROGRESS_EVENT,
   "message.sent",
   "input.answered",
   "input.auto-answered",
@@ -46,29 +46,29 @@ const ACTIVITY_EVENT_TYPES = new Set([
   "integration.failed"
 ]);
 
-export type RoleRunStallKind = "delivery-stalled" | "workflow-not-progressing";
-export type RoleRunStallClassification =
+export type RoleTurnStallKind = "delivery-stalled" | "workflow-not-progressing";
+export type RoleTurnStallClassification =
   | "working"
   | "waiting-user"
   | "waiting-on-workers"
   | "truly-stalled";
 
 /** Provider acceptance is deliberately separate from transport and pane state. */
-export type RoleRunProviderAcceptance = "accepted" | "rejected" | "ambiguous";
+export type RoleTurnProviderAcceptance = "accepted" | "rejected" | "ambiguous";
 
 /** Optional advisory process sample carried by one scheduler inventory pass. */
-export type RoleRunResourceEvidence = SchedulerRoleResourceEvidence;
+export type RoleTurnResourceEvidence = SchedulerRoleResourceEvidence;
 
-export type RoleRunResourceEvidenceSnapshot = ReadonlyMap<
+export type RoleTurnResourceEvidenceSnapshot = ReadonlyMap<
   string,
-  RoleRunResourceEvidence
+  RoleTurnResourceEvidence
 >;
 
-export type RoleRunHealthProjection = Readonly<{
+export type RoleTurnHealthProjection = Readonly<{
   candidate: boolean;
   stalled: boolean;
-  classification: RoleRunStallClassification;
-  providerAcceptance: RoleRunProviderAcceptance;
+  classification: RoleTurnStallClassification;
+  providerAcceptance: RoleTurnProviderAcceptance;
   hostLiveness: "present" | "absent" | "unknown";
   nativeSession: "matching" | "missing" | "stopped" | "broken" | "unknown";
   resourceActivity: boolean;
@@ -81,10 +81,9 @@ export type RoleRunHealthProjection = Readonly<{
  * as exact-generation diagnostic evidence; it never changes the durable
  * progress clock, suppresses workflow attention, or authorizes recovery.
  */
-export function projectRoleRunHealth(input: Readonly<{
+export function projectRoleTurnHealth(input: Readonly<{
   progressAt: string;
   createdAt: string;
-  deliveredAt?: string;
   now: Date;
   windowMs?: number;
   diagnosticAfterMs?: number;
@@ -95,30 +94,29 @@ export function projectRoleRunHealth(input: Readonly<{
     nativeSessionId?: string;
     launchId?: string;
   }> | null;
-  providerAcceptance?: RoleRunProviderAcceptance;
-  resource?: RoleRunResourceEvidence;
+  providerAcceptance?: RoleTurnProviderAcceptance;
+  resource?: RoleTurnResourceEvidence;
   roleName?: string;
   waitingUser?: boolean;
   waitingOnWorkers?: boolean;
   staleLeaderMailbox?: boolean;
-}>): RoleRunHealthProjection {
+}>): RoleTurnHealthProjection {
   const windowMs = input.windowMs ?? DEFAULT_STALL_WINDOW_MS;
   const diagnosticAfterMs = input.diagnosticAfterMs
     ?? DEFAULT_WORKFLOW_STALL_CANDIDATE_AGE_MS;
   if (!Number.isFinite(windowMs) || windowMs <= 0) {
-    throw new Error("Role run stall window must be a positive number of milliseconds.");
+    throw new Error("Role Turn stall window must be a positive number of milliseconds.");
   }
-  const evaluation = evaluateRoleRunStall({
+  const evaluation = evaluateRoleTurnStall({
     progressAt: input.progressAt,
     now: input.now,
     windowMs
   });
   const idleMs = evaluation.idleMs;
-  const candidateStart = input.deliveredAt ?? input.createdAt;
-  const candidateAge = input.now.getTime() - Date.parse(candidateStart);
+  const candidateAge = input.now.getTime() - Date.parse(input.createdAt);
   const candidate = Number.isFinite(candidateAge) && candidateAge >= windowMs;
   const providerAcceptance = input.providerAcceptance
-    ?? (input.deliveredAt === undefined ? "ambiguous" : "accepted");
+    ?? "ambiguous";
   const hostLiveness = input.hostLiveness;
   const session = input.nativeSession;
   const nativeSession = session === null || session === undefined
@@ -141,7 +139,7 @@ export function projectRoleRunHealth(input: Readonly<{
   // no persisted nativeSessionId.  With a present host, durable no-progress
   // evidence is still actionable in that case.  Only an explicit stopped or
   // broken Session blocks the projection; identity mismatches are fenced by
-  // reconcileStalledRoleRuns below before this projection is routed.
+  // reconcileStalledRoleTurns below before this projection is routed.
   const workflowStall = candidate
     && evaluation.stalled
     && hostLiveness === "present"
@@ -151,7 +149,7 @@ export function projectRoleRunHealth(input: Readonly<{
   const stalled = workflowStall
     && !waitingUser
     && !waitingOnWorkers;
-  const classification: RoleRunStallClassification = waitingUser
+  const classification: RoleTurnStallClassification = waitingUser
     ? "waiting-user"
     : waitingOnWorkers
       ? "waiting-on-workers"
@@ -173,7 +171,7 @@ export function projectRoleRunHealth(input: Readonly<{
   };
 }
 
-export type RoleRunStallEvaluation = Readonly<{
+export type RoleTurnStallEvaluation = Readonly<{
   stalled: boolean;
   /**
    * A stall observed against a progress point no prior attention already
@@ -188,21 +186,21 @@ export type RoleRunStallEvaluation = Readonly<{
 /**
  * Pure stall decision. Given the last durable progress timestamp and whatever
  * progress point the previous attention (if any) recorded, decide whether the
- * Run is stalled and whether this is new evidence worth surfacing again.
+ * Turn is stalled and whether this is new evidence worth surfacing again.
  */
-export function evaluateRoleRunStall(input: Readonly<{
+export function evaluateRoleTurnStall(input: Readonly<{
   progressAt: string;
   now: Date;
   windowMs?: number;
   lastAttentionProgressAt?: string;
-}>): RoleRunStallEvaluation {
+}>): RoleTurnStallEvaluation {
   const windowMs = input.windowMs ?? DEFAULT_STALL_WINDOW_MS;
   if (!Number.isFinite(windowMs) || windowMs <= 0) {
-    throw new Error("Role run stall window must be a positive number of milliseconds.");
+    throw new Error("Role Turn stall window must be a positive number of milliseconds.");
   }
   const progressMs = Date.parse(input.progressAt);
   if (!Number.isFinite(progressMs)) {
-    throw new Error("Role run stall progress timestamp is invalid.");
+    throw new Error("Role Turn stall progress timestamp is invalid.");
   }
   const idleMs = input.now.getTime() - progressMs;
   const stalled = idleMs >= windowMs;
@@ -211,13 +209,13 @@ export function evaluateRoleRunStall(input: Readonly<{
 }
 
 /**
- * Latest durable progress timestamp for an active Run. Provider acceptance
- * (deliveredAt), explicit workflow checkpoints, and semantic domain activity
- * count as progress. Provider operations, tokens, CPU/memory and bookkeeping
- * timestamps are intentionally excluded.
+ * Latest durable progress timestamp for an active Turn. Turn creation,
+ * explicit workflow checkpoints, and semantic domain activity count as
+ * progress. Provider operations, tokens, CPU/memory and bookkeeping are
+ * intentionally excluded.
  */
 export function latestDurableProgressAt(input: Readonly<{
-  deliveredAt?: string;
+  startedAt: string;
   /**
    * Retained for narrow ports that still provide these fields, but deliberately
    * ignored: bookkeeping refreshes must not reset a semantic progress clock.
@@ -228,29 +226,29 @@ export function latestDurableProgressAt(input: Readonly<{
   latestActivityAt?: string;
 }>): string {
   const candidates = [
-    input.deliveredAt,
+    input.startedAt,
     input.latestCheckpointAt,
     input.latestActivityAt
   ].filter((value): value is string => (
     typeof value === "string" && Number.isFinite(Date.parse(value))
   ));
   if (candidates.length === 0) {
-    throw new Error("No durable progress timestamp is available for the Run.");
+    throw new Error("No durable progress timestamp is available for the Turn.");
   }
   return candidates.reduce((latest, value) => (
     Date.parse(value) > Date.parse(latest) ? value : latest
   ));
 }
 
-/** Most recent semantic timestamp carried by a Run progress event. */
-export function latestRunProgressAt(
+/** Most recent semantic timestamp carried by a Turn progress event. */
+export function latestTurnProgressAt(
   events: readonly TaskEvent[],
-  runId: string
+  turnId: string
 ): string | undefined {
   let latest: string | undefined;
   for (const event of events) {
-    if (event.type !== RUN_PROGRESS_EVENT) continue;
-    if (event.payload.runId !== runId) continue;
+    if (event.type !== TURN_PROGRESS_EVENT) continue;
+    if (event.payload.turnId !== turnId) continue;
     const progressAt = typeof event.payload.progressAt === "string"
       && Number.isFinite(Date.parse(event.payload.progressAt))
       ? event.payload.progressAt
@@ -267,32 +265,31 @@ export function latestRunProgressAt(
 
 /**
  * Resolve the exact semantic progress fence shared by resource production and
- * stall consumption for one active Run. The richer adapter fold remains
- * authoritative when available; the retained Run progress/activity events are
+ * stall consumption for one active Turn. The richer adapter fold remains
+ * authoritative when available; the retained Turn progress/activity events are
  * the provider-neutral fallback. Resource evidence carries this value as an
  * exact fence, but never advances it.
  */
-export function currentRoleRunProgressAt(
+export function currentRoleTurnProgressAt(
   store: Readonly<{
     listEvents?: (taskId: string) => readonly TaskEvent[];
-    getRunDurableProgress?: SchedulerStorePort["getRunDurableProgress"];
-    getRunProgressFacts?: SchedulerStorePort["getRunProgressFacts"];
+    getTurnDurableProgress?: SchedulerStorePort["getTurnDurableProgress"];
+    getTurnProgressFacts?: SchedulerStorePort["getTurnProgressFacts"];
   }>,
   taskId: string,
   roleName: string,
-  run: Readonly<{ id: string; createdAt: string; deliveredAt?: string }>,
+  run: Readonly<{ id: string; createdAt: string }>,
   events?: readonly TaskEvent[],
-  progressFacts?: RunProgressFacts
+  progressFacts?: TurnProgressFacts
 ): Readonly<{ progressAt: string; evidence?: string }> {
   let richerProgress: Readonly<{ progressAt: string; evidence?: string }> | null | undefined;
   try {
-    richerProgress = store.getRunDurableProgress?.(taskId, roleName, run.id);
+    richerProgress = store.getTurnDurableProgress?.(taskId, roleName, run.id);
   } catch {
-    // A related-record fold is advisory. The retained Run/Event fence remains
+    // A related-record fold is advisory. The retained Turn/Event fence remains
     // usable when that optional read is unavailable.
     richerProgress = undefined;
   }
-  if (run.deliveredAt === undefined) return { progressAt: run.createdAt };
   // The richer fold is authoritative when present; skip the per-candidate
   // full-history scans that every stall candidate otherwise pays.
   if (richerProgress !== undefined && richerProgress !== null) {
@@ -303,28 +300,28 @@ export function currentRoleRunProgressAt(
         : { evidence: richerProgress.evidence })
     };
   }
-  // A present fold port is authoritative even when this Run has no entry. Do
+  // A present fold port is authoritative even when this Turn has no entry. Do
   // not evaluate a default history argument or fall back to listEvents in
   // that case: an absent entry is the folded empty fact.
-  const folded = store.getRunProgressFacts !== undefined;
+  const folded = store.getTurnProgressFacts !== undefined;
   const foldedFacts = folded
-    ? progressFacts ?? store.getRunProgressFacts?.(taskId, run.id)
+    ? progressFacts ?? store.getTurnProgressFacts?.(taskId, run.id)
     : undefined;
   if (folded) {
     const fallbackProgressAt = latestDurableProgressAt({
-      deliveredAt: run.deliveredAt,
+      startedAt: run.createdAt,
       latestCheckpointAt: foldedFacts?.latestCheckpointAt,
       latestActivityAt: foldedFacts?.latestActivityAt
     });
     return { progressAt: fallbackProgressAt };
   }
-  // Legacy ports retain the per-Run event-history fallback. Resolve the
+  // Legacy ports retain the per-Turn event-history fallback. Resolve the
   // history only in this branch so fold-backed callers perform zero scans.
   const history = events ?? store.listEvents?.(taskId) ?? [];
   const fallbackProgressAt = latestDurableProgressAt({
-    deliveredAt: run.deliveredAt,
-    latestCheckpointAt: latestRunProgressAt(history, run.id),
-    latestActivityAt: latestRunActivityAt(history, run.id)
+    startedAt: run.createdAt,
+    latestCheckpointAt: latestTurnProgressAt(history, run.id),
+    latestActivityAt: latestTurnActivityAt(history, run.id)
   });
   return {
     progressAt: fallbackProgressAt
@@ -332,18 +329,17 @@ export function currentRoleRunProgressAt(
 }
 
 /**
- * Computes the current semantic progress fence for an exact Run. The optional
+ * Computes the current semantic progress fence for an exact Turn. The optional
  * related-record readers mirror the adapter's Work/Review/Integration fold;
- * narrow scheduler ports can omit them and still retain Run/Event evidence.
+ * narrow scheduler ports can omit them and still retain Turn/Event evidence.
  */
-export function latestRunDurableProgressAt(
+export function latestTurnDurableProgressAt(
   store: Readonly<{
-    getAgentRun(taskId: string, runId: string): Readonly<{
+    getTurn(taskId: string, turnId: string): Readonly<{
       id: string;
       taskId: string;
       roleName: string;
       createdAt: string;
-      deliveredAt?: string;
       workItemId?: string;
     }> | null;
     listEvents(taskId: string): readonly TaskEvent[];
@@ -367,19 +363,19 @@ export function latestRunDurableProgressAt(
     }>[];
     listInputRequests?(taskId: string): readonly Readonly<{
       updatedAt: string;
-      requester: Readonly<{ runId?: string }>;
+      requester: Readonly<{ turnId?: string }>;
       blockedRefs: readonly Readonly<{ type: string; id: string }>[];
     }>[];
   }>,
   taskId: string,
   roleName: string,
-  runId: string,
+  turnId: string,
   precomputed?: { latestCheckpointAt?: string; latestActivityAt?: string }
 ): Readonly<{ progressAt: string; evidence?: string }> | null {
-  const run = store.getAgentRun(taskId, runId);
+  const run = store.getTurn(taskId, turnId);
   if (run === null || run.taskId !== taskId || run.roleName !== roleName) return null;
   // The adapter folds checkpoint/activity once per revision. When the fold
-  // port exists, a missing per-Run entry is an authoritative empty fold: use
+  // port exists, a missing per-Turn entry is an authoritative empty fold: use
   // its (possibly undefined) values directly and never re-scan the whole
   // history per candidate. Legacy callers without the port omit precomputed
   // and keep the per-candidate full-history scans.
@@ -387,17 +383,15 @@ export function latestRunDurableProgressAt(
   const events = folded ? undefined : store.listEvents(taskId);
   const latestCheckpointAt = folded
     ? precomputed!.latestCheckpointAt
-    : latestRunProgressAt(events!, run.id);
+    : latestTurnProgressAt(events!, run.id);
   const latestActivityAt = folded
     ? precomputed!.latestActivityAt
-    : latestRunActivityAt(events!, run.id);
-  const baseline = run.deliveredAt === undefined
-    ? run.createdAt
-    : latestDurableProgressAt({
-        deliveredAt: run.deliveredAt,
-        latestCheckpointAt,
-        latestActivityAt
-      });
+    : latestTurnActivityAt(events!, run.id);
+  const baseline = latestDurableProgressAt({
+    startedAt: run.createdAt,
+    latestCheckpointAt,
+    latestActivityAt
+  });
   if (run.workItemId === undefined) {
     return { progressAt: baseline };
   }
@@ -415,8 +409,8 @@ export function latestRunDurableProgressAt(
     ?? [];
   const inputProgress = store.listInputRequests?.(taskId)
     .filter((request) => (
-      request.requester.runId === run.id
-      || request.blockedRefs.some((ref) => ref.type === "run" && ref.id === run.id)
+      request.requester.turnId === run.id
+      || request.blockedRefs.some((ref) => ref.type === "turn" && ref.id === run.id)
     ))
     ?? [];
   const related = [
@@ -435,10 +429,7 @@ export function latestRunDurableProgressAt(
       : latest,
     undefined
   );
-  // Before provider acceptance the Run clock remains anchored to creation,
-  // while related records are retained as diagnostic evidence only.
-  return run.deliveredAt !== undefined
-    && latestRelatedAt !== undefined
+  return latestRelatedAt !== undefined
     && Date.parse(latestRelatedAt) > Date.parse(baseline)
     ? { progressAt: latestRelatedAt, evidence: "work-review-integration" }
     : {
@@ -447,15 +438,15 @@ export function latestRunDurableProgressAt(
       };
 }
 
-/** Most recent createdAt of a Run-scoped event of one type, if any. */
-export function latestRunEventTime(
+/** Most recent createdAt of a Turn-scoped event of one type, if any. */
+export function latestTurnEventTime(
   events: readonly TaskEvent[],
   type: string,
-  runId: string
+  turnId: string
 ): string | undefined {
   let latest: string | undefined;
   for (const event of events) {
-    if (event.type !== type || event.payload.runId !== runId) continue;
+    if (event.type !== type || event.payload.turnId !== turnId) continue;
     if (latest === undefined || Date.parse(event.createdAt) > Date.parse(latest)) {
       latest = event.createdAt;
     }
@@ -463,20 +454,20 @@ export function latestRunEventTime(
   return latest;
 }
 
-/** Most recent non-control event carrying a Run identity. */
-export function latestRunActivityAt(
+/** Most recent non-control event carrying a Turn identity. */
+export function latestTurnActivityAt(
   events: readonly TaskEvent[],
-  runId: string
+  turnId: string
 ): string | undefined {
   let latest: string | undefined;
   for (const event of events) {
     if (
       !ACTIVITY_EVENT_TYPES.has(event.type)
-      || event.payload.runId !== runId
-      || event.type === RUN_STALLED_EVENT
-      || event.type === RUN_RECOVERED_EVENT
+      || event.payload.turnId !== turnId
+      || event.type === TURN_STALLED_EVENT
+      || event.type === TURN_RECOVERED_EVENT
     ) continue;
-    const activityAt = event.type === RUN_PROGRESS_EVENT
+    const activityAt = event.type === TURN_PROGRESS_EVENT
       && typeof event.payload.progressAt === "string"
       && Number.isFinite(Date.parse(event.payload.progressAt))
       ? event.payload.progressAt
@@ -488,14 +479,14 @@ export function latestRunActivityAt(
   return latest;
 }
 
-/** The progress point recorded by the most recent stall attention for a Run. */
+/** The progress point recorded by the most recent stall attention for a Turn. */
 export function latestStallProgressAt(
   events: readonly TaskEvent[],
-  runId: string
+  turnId: string
 ): string | undefined {
   let latest: TaskEvent | undefined;
   for (const event of events) {
-    if (event.type !== RUN_STALLED_EVENT || event.payload.runId !== runId) continue;
+    if (event.type !== TURN_STALLED_EVENT || event.payload.turnId !== turnId) continue;
     if (latest === undefined || Date.parse(event.createdAt) > Date.parse(latest.createdAt)) {
       latest = event;
     }
@@ -506,11 +497,11 @@ export function latestStallProgressAt(
 /** Latest stall episode identity used for source-idempotent attention. */
 export function latestStallEvidenceKey(
   events: readonly TaskEvent[],
-  runId: string
+  turnId: string
 ): Readonly<{ progressAt: string; evidenceKey: string }> | undefined {
   let latest: TaskEvent | undefined;
   for (const event of events) {
-    if (event.type !== RUN_STALLED_EVENT || event.payload.runId !== runId) continue;
+    if (event.type !== TURN_STALLED_EVENT || event.payload.turnId !== turnId) continue;
     if (latest === undefined || Date.parse(event.createdAt) > Date.parse(latest.createdAt)) {
       latest = event;
     }
@@ -522,35 +513,35 @@ export function latestStallEvidenceKey(
   };
 }
 
-type MutableRunProgressFacts = {
+type MutableTurnProgressFacts = {
   latestCheckpointAt?: string;
   latestActivityAt?: string;
   latestStall?: { progressAt: string; evidenceKey: string };
 };
 
 /**
- * Folds a Task's event history into per-Run progress facts in one O(events)
+ * Folds a Task's event history into per-Turn progress facts in one O(events)
  * pass. The adapter builds this once per durable revision and serves the
  * stall reconciliation from it, replacing the per-candidate full-history
  * clones and scans that turned one pass into an O(candidates x events) hot
- * read. The fold mirrors latestRunProgressAt/latestRunActivityAt/
+ * read. The fold mirrors latestTurnProgressAt/latestTurnActivityAt/
  * latestStallProgressAt/latestStallEvidenceKey exactly.
  */
-export function foldRunProgressFacts(
+export function foldTurnProgressFacts(
   events: readonly TaskEvent[]
-): Map<string, RunProgressFacts> {
-  const byRun = new Map<string, MutableRunProgressFacts>();
+): Map<string, TurnProgressFacts> {
+  const byTurn = new Map<string, MutableTurnProgressFacts>();
   const latestStallCreatedAt = new Map<string, string>();
   for (const event of events) {
-    const runId = event.payload.runId;
-    if (typeof runId !== "string") continue;
-    let facts = byRun.get(runId) as MutableRunProgressFacts | undefined;
+    const turnId = event.payload.turnId;
+    if (typeof turnId !== "string") continue;
+    let facts = byTurn.get(turnId) as MutableTurnProgressFacts | undefined;
     if (facts === undefined) {
       facts = {};
-      byRun.set(runId, facts);
+      byTurn.set(turnId, facts);
     }
     const type = event.type;
-    const isProgress = type === RUN_PROGRESS_EVENT;
+    const isProgress = type === TURN_PROGRESS_EVENT;
     if (isProgress) {
       const validProgress = typeof event.payload.progressAt === "string"
         && Number.isFinite(Date.parse(event.payload.progressAt));
@@ -566,11 +557,11 @@ export function foldRunProgressFacts(
         || Date.parse(progressAt) > Date.parse(facts.latestActivityAt)) {
         facts.latestActivityAt = progressAt;
       }
-    } else if (type === RUN_STALLED_EVENT) {
-      const previousCreatedAt = latestStallCreatedAt.get(runId);
+    } else if (type === TURN_STALLED_EVENT) {
+      const previousCreatedAt = latestStallCreatedAt.get(turnId);
       if (previousCreatedAt === undefined
         || Date.parse(event.createdAt) > Date.parse(previousCreatedAt)) {
-        latestStallCreatedAt.set(runId, event.createdAt);
+        latestStallCreatedAt.set(turnId, event.createdAt);
         facts.latestStall = typeof event.payload.progressAt === "string"
           ? {
               progressAt: event.payload.progressAt as string,
@@ -581,15 +572,15 @@ export function foldRunProgressFacts(
           : undefined;
       }
     } else if (ACTIVITY_EVENT_TYPES.has(type)
-      && type !== RUN_STALLED_EVENT
-      && type !== RUN_RECOVERED_EVENT) {
+      && type !== TURN_STALLED_EVENT
+      && type !== TURN_RECOVERED_EVENT) {
       if (facts.latestActivityAt === undefined
         || Date.parse(event.createdAt) > Date.parse(facts.latestActivityAt)) {
         facts.latestActivityAt = event.createdAt;
       }
     }
   }
-  return byRun as Map<string, RunProgressFacts>;
+  return byTurn as Map<string, TurnProgressFacts>;
 }
 
 /** Yield the event loop so already-written control requests stay responsive. */
@@ -598,20 +589,20 @@ function yieldEventLoop(): Promise<void> {
 }
 
 /**
- * True while a Run remains in an unresolved stall episode: a stall was raised
+ * True while a Turn remains in an unresolved stall episode: a stall was raised
  * and no later checkpoint has advanced its durable progress since. This is the
  * projection the runtime-health view reads to surface needs-attention.
  */
-export function isRoleRunStalled(
+export function isRoleTurnStalled(
   events: readonly TaskEvent[],
-  runId: string
+  turnId: string
 ): boolean {
   let stalled: TaskEvent | undefined;
   let recoveredAt: string | undefined;
   let progressAt: string | undefined;
   for (const event of events) {
-    if (event.payload.runId !== runId) continue;
-    if (event.type === RUN_STALLED_EVENT) {
+    if (event.payload.turnId !== turnId) continue;
+    if (event.type === TURN_STALLED_EVENT) {
       if (event.payload.status === "diagnostic-only") continue;
       if (stalled === undefined
         || Date.parse(event.createdAt) > Date.parse(stalled.createdAt)) {
@@ -619,14 +610,14 @@ export function isRoleRunStalled(
       }
       continue;
     }
-    if (event.type === RUN_RECOVERED_EVENT) {
+    if (event.type === TURN_RECOVERED_EVENT) {
       if (recoveredAt === undefined
         || Date.parse(event.createdAt) > Date.parse(recoveredAt)) {
         recoveredAt = event.createdAt;
       }
       continue;
     }
-    if (event.type !== RUN_PROGRESS_EVENT) continue;
+    if (event.type !== TURN_PROGRESS_EVENT) continue;
     const candidate = typeof event.payload.progressAt === "string"
       && Number.isFinite(Date.parse(event.payload.progressAt))
       ? event.payload.progressAt
@@ -647,53 +638,53 @@ export function isRoleRunStalled(
   return progressAt === undefined || Date.parse(progressAt) <= Date.parse(stalledProgressAt);
 }
 
-export type RoleRunStallResult = Readonly<{
+export type RoleTurnStallResult = Readonly<{
   taskId: string;
   roleName: string;
-  runId: string;
+  turnId: string;
   status: "raised" | "already-raised";
-  kind: RoleRunStallKind;
+  kind: RoleTurnStallKind;
   classification: "truly-stalled";
   idleMs: number;
 }>;
 
 /**
- * Low-frequency health pass for active Task Role Runs. An unaccepted Run is
+ * Low-frequency health pass for active Task Role Turns. An unaccepted Turn is
  * watched as delivery-stalled after the reasonable delivery window; an
- * accepted Run is displayed as checkpoint-overdue after fifteen minutes, but
+ * accepted Turn is displayed as checkpoint-overdue after fifteen minutes, but
  * this scheduler performs no runtime inspection until the thirty-minute
  * diagnostic window is due.
- * Leader Runs are only persisted when classification reaches truly-stalled —
+ * Leader Turns are only persisted when classification reaches truly-stalled —
  * healthy downstream work, open user input, and recent own progress remain
  * structured waiting/working facts. No branch sends terminal bytes, retries,
- * replaces a Session, or changes Run status.
+ * replaces a Session, or changes Turn status.
  */
-export async function reconcileStalledRoleRuns(
+export async function reconcileStalledRoleTurns(
   store: SchedulerStorePort,
   delivery: Pick<TmuxDeliveryPort, "inspectRole" | "inspectRoles">,
   now: Date,
   selection?: SchedulerReconcileSelection,
   windowMs = DEFAULT_STALL_WINDOW_MS,
   liveStatuses?: RoleLiveStatusSnapshot,
-  resourceEvidence?: RoleRunResourceEvidenceSnapshot,
+  resourceEvidence?: RoleTurnResourceEvidenceSnapshot,
   diagnosticAfterMs = DEFAULT_WORKFLOW_STALL_CANDIDATE_AGE_MS
-): Promise<RoleRunStallResult[]> {
+): Promise<RoleTurnStallResult[]> {
   // Dirty mailbox passes are intentionally not a second scheduler. Full
-  // reconcile owns the all-active-Run scan; dirty passes may still route the
+  // reconcile owns the all-active-Turn scan; dirty passes may still route the
   // existing mailbox work without manufacturing another episode.
   if (selection !== undefined && !selection.full) return [];
   if (
-    (store.getRunProgressFacts === undefined && store.listEvents === undefined)
-    || store.recordRoleRunStall === undefined
+    (store.getTurnProgressFacts === undefined && store.listEvents === undefined)
+    || store.recordRoleTurnStall === undefined
   ) return [];
-  // When the fold port exists, a missing per-Run entry is an authoritative
+  // When the fold port exists, a missing per-Turn entry is an authoritative
   // empty fold: the stall reconciliation must not re-scan the whole history
   // per candidate. Legacy stores without the port keep the per-candidate
   // scans.
-  const foldPortPresent = store.getRunProgressFacts !== undefined;
+  const foldPortPresent = store.getTurnProgressFacts !== undefined;
   const candidates = selectedActiveSchedulerTasks(store, selection).flatMap((task) => (
     selectedSchedulerRoles(store, task.id, selection).flatMap((role) => {
-      const run = store.getActiveAgentRun(task.id, role.name);
+      const run = store.getActiveTurn(task.id, role.name);
       if (run === null || run.status !== "active") return [];
       return [{
         task,
@@ -719,13 +710,13 @@ export async function reconcileStalledRoleRuns(
     run,
     now,
     windowMs,
-    latestRunEventTime(diagnosticEvents(task.id), RUN_DIAGNOSTIC_FINISHED_EVENT, run.id)
+    latestTurnEventTime(diagnosticEvents(task.id), TURN_DIAGNOSTIC_FINISHED_EVENT, run.id)
   ));
   const stallCandidates = cadenceCandidates.filter(({ task, role, run }) => {
     const progressFacts = foldPortPresent
-      ? store.getRunProgressFacts?.(task.id, run.id)
+      ? store.getTurnProgressFacts?.(task.id, run.id)
       : undefined;
-    const progressAt = currentRoleRunProgressAt(
+    const progressAt = currentRoleTurnProgressAt(
       store,
       task.id,
       role.name,
@@ -737,9 +728,9 @@ export async function reconcileStalledRoleRuns(
       run,
       now,
       windowMs,
-      latestRunEventTime(
+      latestTurnEventTime(
         diagnosticEvents(task.id),
-        RUN_DIAGNOSTIC_FINISHED_EVENT,
+        TURN_DIAGNOSTIC_FINISHED_EVENT,
         run.id
       ),
       progressAt
@@ -749,10 +740,10 @@ export async function reconcileStalledRoleRuns(
   const diagnosticStartedAt = now.toISOString();
   const finishDiagnostics = (outcome: "observed" | "observation-error"): void => {
     for (const { task, role, run } of stallCandidates) {
-      store.recordRoleRunDiagnostic?.({
+      store.recordRoleTurnDiagnostic?.({
         taskId: task.id,
         roleName: role.name,
-        runId: run.id,
+        turnId: run.id,
         startedAt: diagnosticStartedAt,
         outcome,
         now
@@ -763,7 +754,7 @@ export async function reconcileStalledRoleRuns(
     `${task.id}\0${role.name}`
   )));
   const observed = new Map<string, ObservedRun>();
-  // Recent active Runs are known healthy enough for Leader classification from
+  // Recent active Turns are known healthy enough for Leader classification from
   // their exact acceptance/creation boundary, but are deliberately not read
   // from tmux or Event history until the 30-minute diagnostic window.
   for (const candidate of candidates) {
@@ -772,7 +763,7 @@ export async function reconcileStalledRoleRuns(
     observed.set(key, {
       candidate,
       live: liveStatuses?.get(key) ?? "present",
-      progressAt: candidate.run.deliveredAt ?? candidate.run.createdAt,
+      progressAt: candidate.run.createdAt,
       idleMs: 0,
       stalled: false,
       resourceActivity: false,
@@ -788,22 +779,19 @@ export async function reconcileStalledRoleRuns(
       statuses = await delivery.inspectRoles(stallCandidates.map(({ task, role, run, session }) => ({
           taskId: task.id,
           roleName: role.name,
-          runId: run.id,
-          progressAt: run.deliveredAt ?? run.createdAt,
+          turnId: run.id,
+          progressAt: run.createdAt,
           agentId: session?.agentId ?? run.effective.agentId,
           adapterId: session?.adapterId ?? run.effective.adapterId,
           ...(session?.launchId === undefined ? {} : { launchId: session.launchId }),
           ...(session?.nativeSessionId === undefined
               ? {}
               : { nativeSessionId: session.nativeSessionId })
-        })), stallCandidates.flatMap(({ task, role, run, session }) => (
-          run.deliveredAt === undefined
-            ? []
-            : [{
+        })), stallCandidates.map(({ task, role, run, session }) => ({
                 taskId: task.id,
                 roleName: role.name,
-                runId: run.id,
-                progressAt: currentRoleRunProgressAt(
+                turnId: run.id,
+                progressAt: currentRoleTurnProgressAt(
                   store,
                   task.id,
                   role.name,
@@ -815,11 +803,10 @@ export async function reconcileStalledRoleRuns(
                 ...(session?.nativeSessionId === undefined
                   ? {}
                   : { nativeSessionId: session.nativeSessionId })
-              }]
-        )));
+              })));
     } catch {
       // Health inspection is advisory. Unknown host state must leave the exact
-      // Run/Session fence untouched. Closing this window schedules the next
+      // Turn/Session fence untouched. Closing this window schedules the next
       // bounded diagnostic thirty minutes later instead of hot-looping.
       finishDiagnostics("observation-error");
       return [];
@@ -836,7 +823,7 @@ export async function reconcileStalledRoleRuns(
       return [];
     }
   }
-  const raised: RoleRunStallResult[] = [];
+  const raised: RoleTurnStallResult[] = [];
   for (const [candidateIndex, candidate] of stallCandidates.entries()) {
     // A large Task's per-candidate reads are now bounded, but many candidates
     // in one pass still add up. Yield periodically so already-written control
@@ -863,7 +850,7 @@ export async function reconcileStalledRoleRuns(
           })
         : byRole.get(key)!;
     } catch {
-      // Without a complete live snapshot, especially for downstream Runs,
+      // Without a complete live snapshot, especially for downstream Turns,
       // Leader classification would be unsafe. Treat the whole advisory pass
       // as unknown instead of escalating a false stall.
       finishDiagnostics("observation-error");
@@ -884,22 +871,18 @@ export async function reconcileStalledRoleRuns(
       continue;
     }
 
-    // Fold-backed adapters expose an authoritative per-Run fact, so do not
-    // load the Task history just to satisfy currentRoleRunProgressAt or its
+    // Fold-backed adapters expose an authoritative per-Turn fact, so do not
+    // load the Task history just to satisfy currentRoleTurnProgressAt or its
     // fallback. Legacy ports retain one history read for these projections.
     const progressFacts = foldPortPresent
-      ? store.getRunProgressFacts?.(candidate.task.id, candidate.run.id)
+      ? store.getTurnProgressFacts?.(candidate.task.id, candidate.run.id)
       : undefined;
     const events = foldPortPresent
       ? undefined
       : store.listEvents?.(candidate.task.id);
-    // Before exact acceptance there is no execution progress clock. Keep the
-    // delivery watch anchored to the Run creation/transport boundary even if
-    // checkpoints, output, or related WorkItem/Review/Integration records are
-    // newer; those facts are useful evidence but cannot prove provider
-    // acceptance or reset delivery timeout. Once accepted, deliveredAt is the
-    // semantic baseline and the durable fold may advance it.
-    const progress = currentRoleRunProgressAt(
+    // The Turn creation boundary starts the execution clock; durable workflow
+    // facts may advance it independently of Provider transport observations.
+    const progress = currentRoleTurnProgressAt(
       store,
       candidate.task.id,
       candidate.role.name,
@@ -908,7 +891,7 @@ export async function reconcileStalledRoleRuns(
       progressFacts
     );
     const progressAt = progress.progressAt;
-    const evaluation = evaluateRoleRunStall({
+    const evaluation = evaluateRoleTurnStall({
       progressAt,
       now,
       windowMs,
@@ -930,7 +913,7 @@ export async function reconcileStalledRoleRuns(
       : {
           taskId: candidate.task.id,
           roleName: candidate.role.name,
-          runId: candidate.run.id,
+          turnId: candidate.run.id,
           agentId: runAgentId,
           adapterId: runAdapterId,
           ...(candidate.session.nativeSessionId === undefined
@@ -957,30 +940,23 @@ export async function reconcileStalledRoleRuns(
       )
       && resourceEvidenceIsFresh(resourceSnapshot, now, windowMs, diagnosticAfterMs);
     const resource = resourceIsCurrent ? resourceSnapshot : undefined;
-    const health = projectRoleRunHealth({
+    const health = projectRoleTurnHealth({
       progressAt,
       createdAt: candidate.run.createdAt,
-      ...(candidate.run.deliveredAt === undefined
-        ? {}
-        : { deliveredAt: candidate.run.deliveredAt }),
       now,
       windowMs,
       diagnosticAfterMs,
       hostLiveness: live,
       nativeSession: candidate.session,
-      providerAcceptance: candidate.run.deliveredAt === undefined
-        ? "ambiguous"
-        : "accepted",
+      providerAcceptance: candidate.session === null ? "ambiguous" : "accepted",
       resource,
       roleName: candidate.role.name
     });
-    // Delivery-stalled Runs retain the existing delivery clock and immediate
-    // provider-uncertainty path. Accepted execution Runs use the shared
+    // Delivery-stalled Turns retain the existing delivery clock and immediate
+    // Provider-uncertainty path. Accepted execution Turns use the shared
     // projection. Exact Session/host resource evidence remains diagnostic.
     const resourceActivity = health.resourceActivity;
-    const stalled = candidate.run.deliveredAt === undefined
-      ? evaluation.stalled && live === "present"
-      : health.stalled && sessionMatchesRun && sessionUsable;
+    const stalled = health.stalled && sessionMatchesRun && sessionUsable;
     observed.set(key, {
       candidate,
       live,
@@ -1002,7 +978,7 @@ export async function reconcileStalledRoleRuns(
     if (current.live !== "present" || !current.stalled || !current.stallCandidate) continue;
     const { candidate, progressAt } = current;
     const previous = foldPortPresent
-      ? store.getRunProgressFacts?.(candidate.task.id, candidate.run.id)?.latestStall
+      ? store.getTurnProgressFacts?.(candidate.task.id, candidate.run.id)?.latestStall
       : latestStallEvidenceKey(store.listEvents?.(candidate.task.id) ?? [], candidate.run.id);
     if (
       previous !== undefined
@@ -1010,17 +986,17 @@ export async function reconcileStalledRoleRuns(
     ) {
       // A new semantic progress point closes the previous episode first. It
       // may itself already be older than the window, in which case the same
-      // pass records the next Run+progressAt episode below.
-      store.recordRoleRunProgress?.({
+      // pass records the next Turn+progressAt episode below.
+      store.recordRoleTurnProgress?.({
         taskId: candidate.task.id,
         roleName: candidate.role.name,
-        runId: candidate.run.id,
+        turnId: candidate.run.id,
         progressAt,
         ...(current.evidence === undefined ? {} : { evidence: current.evidence }),
         now
       });
     }
-    const kind: RoleRunStallKind = candidate.run.deliveredAt === undefined
+    const kind: RoleTurnStallKind = candidate.session === null
       ? "delivery-stalled"
       : "workflow-not-progressing";
     const classification = candidate.role.name === "leader"
@@ -1038,14 +1014,14 @@ export async function reconcileStalledRoleRuns(
         : []),
       ...(current.evidence === undefined ? [] : [current.evidence])
     ].join(":");
-    // The final contract is one episode per Run + semantic progress point.
+    // The final contract is one episode per Turn + semantic progress point.
     // New role/session/provider evidence is retained in the Leader's next
     // diagnostic context, not duplicated as another Task-level alert.
     if (previous?.progressAt === progressAt) continue;
-    const persisted = store.recordRoleRunStall({
+    const persisted = store.recordRoleTurnStall({
       taskId: candidate.task.id,
       roleName: candidate.role.name,
-      runId: candidate.run.id,
+      turnId: candidate.run.id,
       agentId: candidate.run.effective.agentId,
       adapterId: candidate.run.effective.adapterId,
       session: candidate.session,
@@ -1060,7 +1036,7 @@ export async function reconcileStalledRoleRuns(
       raised.push({
         taskId: candidate.task.id,
         roleName: candidate.role.name,
-        runId: candidate.run.id,
+        turnId: candidate.run.id,
         status: persisted,
         kind,
         classification,
@@ -1070,22 +1046,22 @@ export async function reconcileStalledRoleRuns(
   }
 
   // A related WorkItem/Review/Integration fold may advance progress without
-  // carrying the Run id. Materialize it once so context/web can clear the
+  // carrying the Turn id. Materialize it once so context/web can clear the
   // attention projection and the event history records the recovery boundary.
   for (const current of observed.values()) {
     if (current.live !== "present" || current.stalled || !current.stallCandidate) continue;
     const { candidate, progressAt } = current;
     const previous = foldPortPresent
-      ? store.getRunProgressFacts?.(candidate.task.id, candidate.run.id)?.latestStall
+      ? store.getTurnProgressFacts?.(candidate.task.id, candidate.run.id)?.latestStall
       : latestStallEvidenceKey(store.listEvents?.(candidate.task.id) ?? [], candidate.run.id);
     if (
       previous !== undefined
       && Date.parse(progressAt) > Date.parse(previous.progressAt)
     ) {
-      store.recordRoleRunProgress?.({
+      store.recordRoleTurnProgress?.({
         taskId: candidate.task.id,
         roleName: candidate.role.name,
-        runId: candidate.run.id,
+        turnId: candidate.run.id,
         progressAt,
         ...(current.evidence === undefined ? {} : { evidence: current.evidence }),
         now
@@ -1097,14 +1073,13 @@ export async function reconcileStalledRoleRuns(
 }
 
 function isStallCandidate(
-  run: Readonly<{ createdAt: string; deliveredAt?: string }>,
+  run: Readonly<{ createdAt: string }>,
   now: Date,
   windowMs: number,
   lastDiagnosticFinishedAt?: string,
   latestProgressAt?: string
 ): boolean {
-  const startAt = run.deliveredAt ?? run.createdAt;
-  const baseline = [startAt, lastDiagnosticFinishedAt, latestProgressAt]
+  const baseline = [run.createdAt, lastDiagnosticFinishedAt, latestProgressAt]
     .filter((value): value is string => (
       value !== undefined && Number.isFinite(Date.parse(value))
     ))
@@ -1127,7 +1102,6 @@ type ObservedRun = Readonly<{
     run: Readonly<{
       id: string;
       createdAt: string;
-      deliveredAt?: string;
       effective: Readonly<{ agentId: string; adapterId: string }>;
     }>;
     session: Readonly<{
@@ -1153,12 +1127,12 @@ function classifyLeaderStall(
   observed: ReadonlyMap<string, ObservedRun>,
   now: Date,
   windowMs: number
-): RoleRunStallClassification {
+): RoleTurnStallClassification {
   if (store.hasOpenInputRequest(taskId)) return "waiting-user";
   const downstream = [...observed.values()].filter((entry) => (
     entry.candidate.task.id === taskId && entry.candidate.role.name !== "leader"
   ));
-  // A present downstream Run keeps recovery Leader-owned. If that Run is
+  // A present downstream Turn keeps recovery Leader-owned. If that Turn is
   // itself stalled, this pass has just routed its structured attention to the
   // Leader; escalating the Leader to the Operator in the same pass would skip
   // the intended recovery owner.
@@ -1169,16 +1143,16 @@ function classifyLeaderStall(
   const mailbox = store.getWorkMailbox({ kind: "role", taskId, roleName: "leader" });
   const pending = mailbox === null || mailbox === undefined ? null : nextPendingBatch(mailbox);
   const processing = mailbox?.processing;
-  const processingCurrent = processing?.executionRef?.type === "run"
+  const processingCurrent = processing?.executionRef?.type === "turn"
     && processing.executionRef.taskId === taskId
     && leader !== undefined
     && processing.executionRef.id === leader.candidate.run.id;
-  const currentRunId = leader?.candidate.run.id;
-  if (processingCurrent && currentRunId !== undefined && processing !== null) {
+  const currentTurnId = leader?.candidate.run.id;
+  if (processingCurrent && currentTurnId !== undefined && processing !== null) {
     const actionProgressAt = latestLeaderActionProgressAt(
       store,
       taskId,
-      currentRunId,
+      currentTurnId,
       processing.startedAt,
       processing.batch,
       now
@@ -1199,7 +1173,7 @@ function classifyLeaderStall(
 }
 
 const LEADER_ACTION_PROGRESS_TYPES = new Set([
-  RUN_PROGRESS_EVENT,
+  TURN_PROGRESS_EVENT,
   "input.answered",
   "input.auto-answered",
   "input.cancelled",
@@ -1219,7 +1193,7 @@ const LEADER_ACTION_PROGRESS_TYPES = new Set([
 function latestLeaderActionProgressAt(
   store: SchedulerStorePort,
   taskId: string,
-  runId: string,
+  turnId: string,
   startedAt: string,
   batch: Readonly<{
     refs: readonly Readonly<{ type: string; taskId?: string; id: string }>[];
@@ -1234,14 +1208,14 @@ function latestLeaderActionProgressAt(
   for (const event of store.listEvents?.(taskId) ?? []) {
     if (!LEADER_ACTION_PROGRESS_TYPES.has(event.type)) continue;
     if (event.payload.taskId !== undefined && event.payload.taskId !== taskId) continue;
-    if (!leaderActionEventMatches(event, taskId, runId, batch)) continue;
+    if (!leaderActionEventMatches(event, taskId, turnId, batch)) continue;
     const createdMs = Date.parse(event.createdAt);
     if (
       !Number.isFinite(createdMs)
       || createdMs < startedMs
       || createdMs > now.getTime()
     ) continue;
-    const value = event.type === RUN_PROGRESS_EVENT
+    const value = event.type === TURN_PROGRESS_EVENT
       && typeof event.payload.progressAt === "string"
       && Number.isFinite(Date.parse(event.payload.progressAt))
       ? event.payload.progressAt
@@ -1262,15 +1236,15 @@ function latestLeaderActionProgressAt(
 function leaderActionEventMatches(
   event: TaskEvent,
   taskId: string,
-  runId: string,
+  turnId: string,
   batch: Readonly<{
     refs: readonly Readonly<{ type: string; taskId?: string; id: string }>[];
     reasons: readonly string[];
   }>
 ): boolean {
   if (event.taskId !== taskId) return false;
-  if (event.payload.leaderRunId === runId) return true;
-  if (event.payload.runId === runId) return true;
+  if (event.payload.leaderTurnId === turnId) return true;
+  if (event.payload.turnId === turnId) return true;
   const refs = batch.refs ?? [];
   const refMatches = (type: string, payloadKey: string): boolean => {
     const id = event.payload[payloadKey];
@@ -1280,7 +1254,7 @@ function leaderActionEventMatches(
       && (ref.taskId === undefined || ref.taskId === taskId)
     ));
   };
-  if (refMatches("run", "runId")) return true;
+  if (refMatches("turn", "turnId")) return true;
   if (refMatches("work-item", "workItemId")) return true;
   const reason = event.type.replaceAll(".", "-");
   // Mailbox reasons are opaque exact coalescing keys. A prefix or suffix
@@ -1319,7 +1293,7 @@ function leaderStallEvidence(
   const leader = [...observed.values()].find((entry) => (
     entry.candidate.task.id === taskId && entry.candidate.role.name === "leader"
   ));
-  const processingCurrent = processing?.executionRef?.type === "run"
+  const processingCurrent = processing?.executionRef?.type === "turn"
     && processing.executionRef.taskId === taskId
     && leader !== undefined
     && processing.executionRef.id === leader.candidate.run.id;
@@ -1363,21 +1337,21 @@ function exactLiveStatuses(
 }
 
 function resourceForRun(
-  snapshot: RoleRunResourceEvidenceSnapshot | undefined,
+  snapshot: RoleTurnResourceEvidenceSnapshot | undefined,
   taskId: string,
   roleName: string,
-  runId: string
-): RoleRunResourceEvidence | undefined {
+  turnId: string
+): RoleTurnResourceEvidence | undefined {
   if (snapshot === undefined) return undefined;
-  return snapshot.get(`${taskId}\0${roleName}\0${runId}`);
+  return snapshot.get(`${taskId}\0${roleName}\0${turnId}`);
 }
 
 function resourceEvidenceMatchesCurrentRun(
-  resource: RoleRunResourceEvidence | undefined,
+  resource: RoleTurnResourceEvidence | undefined,
   expected: Readonly<{
     taskId: string;
     roleName: string;
-    runId: string;
+    turnId: string;
     agentId: string;
     adapterId: string;
     nativeSessionId?: string;
@@ -1392,7 +1366,7 @@ function resourceEvidenceMatchesCurrentRun(
     || resource.progressAt !== progressAt
     || identity.taskId !== expected.taskId
     || identity.roleName !== expected.roleName
-    || identity.runId !== expected.runId
+    || identity.turnId !== expected.turnId
     || identity.agentId !== expected.agentId
     || identity.adapterId !== expected.adapterId
     || identity.nativeSessionId !== expected.nativeSessionId
@@ -1407,7 +1381,7 @@ function hasResourceIdentityText(value: string | undefined): value is string {
 }
 
 function resourceEvidenceIsFresh(
-  evidence: RoleRunResourceEvidence | undefined,
+  evidence: RoleTurnResourceEvidence | undefined,
   now: Date,
   windowMs: number,
   diagnosticAfterMs = DEFAULT_WORKFLOW_STALL_CANDIDATE_AGE_MS

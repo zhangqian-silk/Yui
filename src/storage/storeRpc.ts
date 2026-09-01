@@ -16,10 +16,8 @@
  *     `transactionAsync` ships an ordered batch that the worker runs inside one
  *     `BEGIN IMMEDIATE … COMMIT` (§3.2).
  *
- * The file `TaskStore` remains the default for CLI tools and tests; the worker
- * backend is opt-in via `YUI_STORE_BACKEND=sqlite` + `YUI_STORE_WORKER=1`
- * ({@link resolveStoreWorkerEnabled}). Rollback to the file store is a config
- * flip (§6).
+ * SQLite is the only product Store. `YUI_STORE_WORKER` controls whether its
+ * connection lives in a Worker Thread; it does not select another authority.
  */
 import {
   BoundedRpcClient,
@@ -178,14 +176,13 @@ const READ_ONLY_STORE_METHODS: ReadonlySet<string> = new Set([
   "getRoleSession",
   "getWorkItem",
   "listWorkItems",
-  "getAgentRun",
-  "listAgentRuns",
+  "getTurn",
+  "listTurns",
   "listPendingProviderRetries",
-  "peekNextAgentRunId",
+  "peekNextTurnId",
   "getReviewRound",
-  "listReviewRuns",
-  "getActiveAgentRun",
-  "getActiveExecutionLaneRun",
+  "getActiveTurn",
+  "getActiveExecutionLaneTurn",
   "listMessages",
   "getInputRequest",
   "listInputRequests",
@@ -412,25 +409,7 @@ function isRpcCallOptions(value: unknown): value is RpcCallOptions {
   return "requestId" in record || "signal" in record;
 }
 
-/**
- * Resolve whether the persistence worker backend is enabled (design §6).
- * The worker requires the SQLite backend (`YUI_STORE_BACKEND=sqlite`) and is
- * opt-in via `YUI_STORE_WORKER=1`. The file store remains the default.
- */
-export function resolveStoreWorkerEnabled(env: NodeJS.ProcessEnv = process.env): boolean {
-  if (env.YUI_STORE_BACKEND?.toLowerCase() !== "sqlite") return false;
-  const flag = env.YUI_STORE_WORKER;
-  return flag === "1" || flag?.toLowerCase() === "true";
-}
-
-/**
- * Resolve whether the persistence worker is enabled, from the Home's verified
- * manifest (Issue 01). A Home-decided SQLite backend (layout 7, no explicit
- * `YUI_STORE_BACKEND`) runs the worker by default — that is the product
- * commitment layout 7 makes. An env-decided SQLite backend keeps the
- * historical opt-in (`YUI_STORE_WORKER=1`). `YUI_STORE_WORKER=0/false`
- * disables the worker in both cases (in-process SQLite still applies).
- */
+/** Resolve the optional persistence worker for the current SQLite store. */
 export function resolveStoreWorkerEnabledForHome(
   home: string,
   env: NodeJS.ProcessEnv = process.env
@@ -439,5 +418,5 @@ export function resolveStoreWorkerEnabledForHome(
   const flag = env.YUI_STORE_WORKER?.toLowerCase();
   if (flag === "1" || flag === "true") return true;
   if (flag === "0" || flag === "false") return false;
-  return env.YUI_STORE_BACKEND?.toLowerCase() !== "sqlite";
+  return true;
 }

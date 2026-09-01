@@ -99,7 +99,7 @@ export type DirectTaskMainSnapshot = Readonly<{
 }>;
 
 export type WorkItemCandidate = Readonly<{
-  schemaVersion: 2;
+  schemaVersion: 3;
   id: string;
   taskId: string;
   workItemId: string;
@@ -108,7 +108,7 @@ export type WorkItemCandidate = Readonly<{
   summary: string;
   source:
     | Readonly<{ type: "direct" }>
-    | Readonly<{ type: "run"; runId: string }>;
+    | Readonly<{ type: "turn"; turnId: string }>;
   executionGroupId?: string;
   executionLaneId?: string;
   reviewPolicy?: ReviewConfig;
@@ -122,8 +122,8 @@ export type WorkItemCandidate = Readonly<{
 }>;
 
 export type WorkItem = {
-  /** v12 lets new exploration stages freeze unified resource budgets and completion policy. */
-  schemaVersion: 12;
+  /** v13 names Provider execution lineage consistently as Turn. */
+  schemaVersion: 13;
   id: string;
   taskId: string;
   title: string;
@@ -173,7 +173,7 @@ export function createWorkItem(
 ): WorkItem {
   const timestamp = now.toISOString();
   return validateWorkItem({
-    schemaVersion: 12,
+    schemaVersion: 13,
     id: requireIdentity(id, "Work Item id"),
     taskId: requireIdentity(taskId, "Task id"),
     title: requireText(input.title, "Work item title"),
@@ -210,7 +210,7 @@ export function submitWorkItemCandidate(
     summary: string;
     source:
       | Readonly<{ type: "direct" }>
-      | Readonly<{ type: "run"; runId: string }>;
+      | Readonly<{ type: "turn"; turnId: string }>;
     reviewPolicy?: ReviewConfig;
     taskFinalReviewContract?: TaskFinalReviewContract;
     executionGroupId?: string;
@@ -230,7 +230,7 @@ export function submitWorkItemCandidate(
   const revision = workItem.revision + 1;
   const sequence = workItem.candidates.length + 1;
   const candidate = validateWorkItemCandidate({
-    schemaVersion: 2,
+    schemaVersion: 3,
     id: `candidate-${sequence}`,
     taskId: workItem.taskId,
     workItemId: workItem.id,
@@ -469,7 +469,7 @@ export function recordWorkItemWorkspaceDisposition(
 }
 
 export function validateWorkItem(workItem: WorkItem): WorkItem {
-  if (workItem.schemaVersion !== 12) throw new Error("WorkItem must use schemaVersion 12.");
+  if (workItem.schemaVersion !== 13) throw new Error("WorkItem must use schemaVersion 13.");
   validateTaskRecordReference({ taskId: workItem.taskId, localId: workItem.id }, "workItem");
   requireIdentity(workItem.taskId, "Task id");
   requireText(workItem.title, "Work item title");
@@ -757,7 +757,7 @@ export function workItemExecutionGroupById(
 }
 
 /**
- * True when a Run failure belongs to the WorkItem's current unresolved Lane.
+ * True when a Turn failure belongs to the WorkItem's current unresolved Lane.
  * Such a failure is Lane-bounded: the WorkItem remains running so the Leader
  * can reuse completed siblings and retry only this failed attempt.
  */
@@ -920,8 +920,8 @@ export function validateWorkItemCandidate(
   if (typeof candidate !== "object" || candidate === null) {
     throw new Error("Work Item candidate is required.");
   }
-  if (candidate.schemaVersion !== 2) {
-    throw new Error("Work Item candidate must use schemaVersion 2.");
+  if (candidate.schemaVersion !== 3) {
+    throw new Error("Work Item candidate must use schemaVersion 3.");
   }
   requireIdentity(candidate.taskId, "Work Item candidate Task id");
   validateTaskRecordReference({
@@ -942,14 +942,14 @@ export function validateWorkItemCandidate(
   if (typeof candidate.source !== "object" || candidate.source === null) {
     throw new Error("Work Item candidate source is required.");
   }
-  if (candidate.source.type !== "direct" && candidate.source.type !== "run") {
+  if (candidate.source.type !== "direct" && candidate.source.type !== "turn") {
     throw new Error("Work Item candidate source is invalid.");
   }
-  if (candidate.source.type === "run") {
+  if (candidate.source.type === "turn") {
     validateTaskRecordReference({
       taskId: candidate.taskId,
-      localId: candidate.source.runId
-    }, "agentRun");
+      localId: candidate.source.turnId
+    }, "turn");
   }
   if ((candidate.executionGroupId === undefined) !== (candidate.executionLaneId === undefined)) {
     throw new Error("Work Item candidate execution lineage is incomplete.");

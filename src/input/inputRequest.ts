@@ -2,7 +2,7 @@ import { validateTaskRecordReference } from "../task/taskRecordReference.js";
 
 export type InputChoice = Readonly<{ key: string; label: string }>;
 export type InputBlockedRef = Readonly<{
-  type: "work-item" | "run";
+  type: "work-item" | "turn";
   taskId: string;
   id: string;
 }>;
@@ -11,7 +11,7 @@ export type InputRequester = Readonly<{
   taskId: string;
   roleName: "leader";
   agentId: string;
-  runId: string;
+  turnId: string;
   nativeSessionId?: string;
 }>;
 
@@ -39,7 +39,7 @@ export type InputCancellation = Readonly<{
 }>;
 
 type InputRequestBase = Readonly<{
-  schemaVersion: 2;
+  schemaVersion: 3;
   id: string;
   taskId: string;
   requester: InputRequester;
@@ -84,7 +84,7 @@ export function createInputRequest(
   const timestamp = requireDate(now, "Input request creation time");
   const choices = normalizeChoices(input.choices);
   return validateInputRequest({
-    schemaVersion: 2,
+    schemaVersion: 3,
     id: requireIdentity(id, "Input request id"),
     taskId: requireIdentity(taskId, "Input request Task id"),
     requester: normalizeRequester(requester),
@@ -150,11 +150,11 @@ export function validateInputRequest(value: unknown): InputRequest {
     "schemaVersion", "id", "taskId", "requester", "question", "choices",
     "blockedRefs", "policy", "status", "createdAt", "updatedAt", ...terminalField
   ], "Input request");
-  if (request.schemaVersion !== 2) throw new Error("Input request must use schemaVersion 2.");
+  if (request.schemaVersion !== 3) throw new Error("Input request must use schemaVersion 3.");
   const choices = validateChoices(request.choices);
   const createdAt = requireTimestamp(request.createdAt, "Input request createdAt");
   const base: InputRequestBase = {
-    schemaVersion: 2,
+    schemaVersion: 3,
     id: requireIdentity(request.id, "Input request id"),
     taskId: requireIdentity(request.taskId, "Input request Task id"),
     requester: normalizeRequester(request.requester as InputRequester),
@@ -168,11 +168,11 @@ export function validateInputRequest(value: unknown): InputRequest {
   validateTaskRecordReference({ taskId: base.taskId, localId: base.id }, "inputRequest");
   validateTaskRecordReference({
     taskId: base.requester.taskId,
-    localId: base.requester.runId
-  }, "agentRun");
+    localId: base.requester.turnId
+  }, "turn");
   for (const reference of base.blockedRefs) {
     validateTaskRecordReference({ taskId: reference.taskId, localId: reference.id },
-      reference.type === "run" ? "agentRun" : "workItem");
+      reference.type === "turn" ? "turn" : "workItem");
   }
   if (base.requester.taskId !== base.taskId
     || base.blockedRefs.some(({ taskId }) => taskId !== base.taskId)) {
@@ -250,8 +250,8 @@ function normalizeBlockedRefs(value: readonly InputBlockedRef[]): InputBlockedRe
   const references: InputBlockedRef[] = value.map((reference): InputBlockedRef => {
     const item = record(reference, "Input blocked reference");
     exact(item, ["type", "taskId", "id"], "Input blocked reference");
-    if (item.type !== "work-item" && item.type !== "run") {
-      throw new Error("Input blocked reference type must be work-item or run.");
+    if (item.type !== "work-item" && item.type !== "turn") {
+      throw new Error("Input blocked reference type must be work-item or turn.");
     }
     return {
       type: item.type,
@@ -310,8 +310,8 @@ function normalizeRequester(value: InputRequester): InputRequester {
   exact(
     requester,
     requester.nativeSessionId === undefined
-      ? ["taskId", "roleName", "agentId", "runId"]
-      : ["taskId", "roleName", "agentId", "runId", "nativeSessionId"],
+      ? ["taskId", "roleName", "agentId", "turnId"]
+      : ["taskId", "roleName", "agentId", "turnId", "nativeSessionId"],
     "Input requester"
   );
   if (requester.roleName !== "leader") throw new Error("Input requester must be the Task Leader.");
@@ -319,7 +319,7 @@ function normalizeRequester(value: InputRequester): InputRequester {
     taskId: requireIdentity(requester.taskId, "Input requester Task id"),
     roleName: "leader",
     agentId: requireIdentity(requester.agentId, "Input requester Agent id"),
-    runId: requireIdentity(requester.runId, "Input requester Run id"),
+    turnId: requireIdentity(requester.turnId, "Input requester Turn id"),
     ...(requester.nativeSessionId === undefined
       ? {}
       : { nativeSessionId: requireIdentity(requester.nativeSessionId, "Input requester native session id") })

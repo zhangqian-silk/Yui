@@ -25,7 +25,7 @@ Leader 负责语义规划、动态修订和最终决议；Controller 负责确�
 | D-01 | 双层模型：Task DAG + WorkItem 多路探索状态机，无第二套图/运行时 |
 | D-02 | `WorkItem.dependsOn` 是 Task 级顺序的唯一权威；调度器是投影 |
 | D-03 | WorkItem 内固定阶段 `Plan→Generate→Compare→Synthesize→Verify→Resolve` + 轮次；禁止任意嵌套 DAG |
-| D-04 | Role / Agent / Execution Profile / Lane Spec / EffectiveLaunchSnapshot / AgentRun 分离；Lane 运行身份 = group/lane/attempt |
+| D-04 | Role / Agent / Execution Profile / Lane Spec / EffectiveLaunchSnapshot / Turn 分离；Lane 运行身份 = group/lane/attempt |
 | D-05 | ContextSnapshot 清单模型与上下文权威顺序；禁止完整 transcript 共享 |
 | D-06 | 统一 Resource Broker：跨 Task/WorkItem/Group/Provider/Agent/模型的并发与成本核算 |
 | D-07 | 健康状态四档；禁止仅凭静默判死 |
@@ -68,11 +68,11 @@ Leader 负责语义规划、动态修订和最终决议；Controller 负责确�
 | ExecutionGroup/Lane 表达单路/并行、固定/自适应、隔离工作区、结构化结果 | **全部存在**（`executionGroup.ts`）：strategy `fixed`/`adaptive`、Lane 禁共享可写根（强制）、`ExecutionLaneResult` 结构化结果（summary/report/checks/findings/evidence）、`ExecutionResolution` 以 `selectedLaneIds` 汇合。**无 stage/round 字段** |
 | EffectiveLaunchSnapshot 冻结最终启动配置 | **存在**（`effectiveLaunch.ts:33`，schemaVersion 2）：冻结 agent/adapter/model/effort/permission/profileAccess/writeProjectIds/workspace/context(RoleProfile)/sourceDesiredRevision 等；Dispatch 后不可变，运行中进程不被热变更 |
 | Candidate / ReviewRound / Task-final Review / Integration 主链 | **存在**：Candidate 单槽（仅最新为 current，只能从 running 提交）；ReviewRound 与 Candidate 1:1、冻结 reviewBaseCommit、独占隔离工作区；Task-final 按集成头变化自动排队；IntegrationAttempt 以 CAS 推进目标头，冲突产出报告且 ResolutionDecision 为 Leader 独占 |
-| AgentRun 审计记录 | **存在**（`agentRun.ts`）。AgentRun 是唯一调度权威；Provider 错误记录为标准化事实，由 Leader/Operator 决定在同 Session 提交新 Turn，或显式结束旧 Session 后创建新 Run/Session。WorkItem 级重试仍派发新 Group；Lane 重启使用新 Run id。 |
-| 运行健康监控 | **存在 Role/Run 级**（`roleRunStall.ts`）：30 分钟无持久进展窗口 + 语义事件进展钟（非文本输出），分类 working/waiting-user/waiting-on-workers/truly-stalled，恢复归 Leader、绝不自动终止——与 I-10 一致。**Lane 级健康是 T7 的扩展** |
-| Project Knowledge 权威 | **存在**（`project.ts`），但**仅 Operator CLI 可写**，无 Agent/Leader/Run 写路径——I-8 在实现层面成立（ARCHITECTURE.md 所称 Leader「promote」尚无代码路径，T3/T7 如需该路径须显式建设） |
-| 原生子 Agent 生命周期观测 | **部分存在**：subagent `operation.started/completed/failed` 持久事件 + `subagent-active` 展示状态；run-fence 匹配刻意不绑 nativeTurnId，使跨 turn 后台子 Agent 绑定同一持久 Run。**在途结果持久化不存在**（子 Agent 输出只有经父 Run yield/report 才耐久）——Task-25 缺口 #1 证实，T7 强制项 |
-| Resource Broker / 预算核算 | **不存在**：仅有 Group 内 Lane 上限、每 Role 一个活跃 Run、warning-only 语义进展预算；token 用量仅观测、明确排除在耐久进展钟外。D-06 为全新建设 |
+| Turn 审计记录 | **存在**（`turn.ts`）。Turn 是唯一调度权威；Provider 错误记录为标准化事实，由 Leader/Operator 决定在同 Session 提交新 Turn，或显式结束旧 Session 后创建新 Turn/Session。WorkItem 级重试仍派发新 Group；Lane 重启使用新 Turn id。 |
+| 运行健康监控 | **存在 Role/Turn 级**（`roleTurnStall.ts`）：30 分钟无持久进展窗口 + 语义事件进展钟（非文本输出），分类 working/waiting-user/waiting-on-workers/truly-stalled，恢复归 Leader、绝不自动终止——与 I-10 一致。**Lane 级健康是 T7 的扩展** |
+| Project Knowledge 权威 | **存在**（`project.ts`），但**仅 Operator CLI 可写**，无 Agent/Leader/Turn 写路径——I-8 在实现层面成立（ARCHITECTURE.md 所称 Leader「promote」尚无代码路径，T3/T7 如需该路径须显式建设） |
+| 原生子 Agent 生命周期观测 | **部分存在**：subagent `operation.started/completed/failed` 持久事件 + `subagent-active` 展示状态。父 Provider Turn 的原生终态自动持久化 Turn 结果；子 Agent 的独立在途输出仍需写入持久 Task/Workspace 记录。 |
+| Resource Broker / 预算核算 | **不存在**：仅有 Group 内 Lane 上限、每 Role 一个活跃 Turn、warning-only 语义进展预算；token 用量仅观测、明确排除在耐久进展钟外。D-06 为全新建设 |
 | ContextSnapshot 类型 | **不存在**；装配原语存在（`dispatchContext`、`roleSessionContext`、`task context` 合并恢复读），冻结上下文角色由 `EffectiveLaunchSnapshot.context` 与 Brief/Decision/Milestone/Knowledge 持久记录承担。T3 定义清单契约 |
 | WorkItem/Group 上的 stage/phase/round | **不存在**（grep 干净）。D-03 为全新建设；最接近的既有概念是 ReviewRound（仅评审生命周期）、Candidate.sequence（尝试编号）、WorkItem 上不可变的 executionGroups 历史（一次一个 current） |
 
@@ -91,7 +91,7 @@ Task-25「调研 multi agent wiki」已于 2026-08-21 完成（结论落盘于�
 
 **记录中另有基线未列的缺口**：选路理由不落盘、无事件驱动订阅原语、无量化成本模型（WikiLoop: Cost=0.6·token+0.2·搜索+0.2·阅读）、fan-out 缺背压（Hivebook 超额降级到队列而非硬拒）、元数据检索层（LLM-Wiki wiki_search 先查 name/alias/tag，每查询仅读 2.5–3.9 页）、变更差量视图。其归属：量化成本模型与背压 → T6/T10；元数据检索、Knowledge TTL、差量视图 → T3；事件订阅与选路理由落盘 → 超出 T1–T10 范围，记为 Yui Core 未来项（§14）。
 
-**一手故障证据（本架构分离持久权威与会话/文件证据的直接经验依据）**：Task-25 的 agent-run-2 在完成三路并行调研派发后 turn 未 yield 而失败，三个 explorer subagent 的在途证据因跨 Run 上下文压缩全部丢失；而 subagent 直接写入 workspace 的 `notes/01-03` 证据文件幸存。其结论原话：「凡外置的都活下来了，凡没外置的都丢了」。
+**一手故障证据（本架构分离持久权威与会话/文件证据的直接经验依据）**：Task-25 的 turn-2 在完成三路并行调研派发后异常结束，三个 explorer subagent 的在途证据因跨 Turn 上下文压缩全部丢失；而 subagent 直接写入 workspace 的 `notes/01-03` 证据文件幸存。其结论原话：「凡外置的都活下来了，凡没外置的都丢了」。
 
 当前 Project Knowledge 为空。本 RFC 在被接受前只是待接受设计，不冒充已接受知识；接受后按 §8 沉淀。
 
@@ -147,7 +147,7 @@ Task-25「调研 multi agent wiki」已于 2026-08-21 完成（结论落盘于�
 
 1. WorkItem 是严格 6 态机（pending/running/awaiting_acceptance/completed/failed/retired）；Candidate 只能从 `running` 提交，终态需要明确结果。
 2. 每个 WorkItem 同时至多一个未解决 ExecutionGroup；Group target 不可变、追加式 Lane、Resolution 一次性不可变。**新阶段或新探索目标 = 新 ExecutionGroup**——这是阶段状态机的物理形态（T4 据此设计，不引入新容器）。
-3. Lane 扇出受 strategy（fixed count / adaptive max）上限约束；每 Lane 一个 Role；每 Role 同时一个活跃 Run。并行路线消耗 Role 槽位而非通用预算；T6 的统一预算层在此之上建设，不另起运行时。
+3. Lane 扇出受 strategy（fixed count / adaptive max）上限约束；每 Lane 一个 Role；每 Role 同时一个活跃 Turn。并行路线消耗 Role 槽位而非通用预算；T6 的统一预算层在此之上建设，不另起运行时。
 4. `dependsOn` 门控是 all-`completed` 二元谓词；失败/退役依赖会使下游无限阻塞，无传播/取消/跳过。**T1 必须定义失败传播与跳过语义**，这是 D-02 的必备组成部分。
 5. Candidate 单槽：一个 WorkItem 同时只有最新 Candidate 是 current。多路线结果必须在 Resolve 归一为一个 Candidate 或一个显式多 ChangeSet 决议（D-08），不存在多 Candidate 并存。
 6. ReviewRound 与 Candidate 1:1、冻结基线、独占工作区；多路线评审 = 每个 Candidate/路线一个 Round，由 T8 衔接。
@@ -163,7 +163,7 @@ Task-25「调研 multi agent wiki」已于 2026-08-21 完成（结论落盘于�
 - **Execution Profile**：可复用执行配置——模型、effort、工具、权限、技能、搜索、Provider 高级参数。
 - **Lane Spec**：一次并行路线的期望配置 = Role + Agent/Profile 引用 + 局部覆盖 + 差异化探索指令。
 - **EffectiveLaunchSnapshot**：Dispatch 时解析并冻结的最终配置，Dispatch 后不可变。
-- **AgentRun**：某个 Lane 的一次实际启动、恢复或重试；重试创建新 AgentRun。
+- **Turn**：某个 Lane 的一次实际启动、恢复或重试；重试创建新 Turn。
 
 同一 Agent ID 可出现在多个 Lane 中使用不同模型/effort（如 `codex + gpt-5.6-sol + xhigh`、`codex + gpt-5.6-terra + high`、`claude + opus + max + critic`）。不同 EffectiveLaunchSnapshot 不共享原生 Session；**Lane 的运行身份由 group/lane/attempt 确定，不能由 Agent ID 确定**（I-3）。
 
@@ -172,9 +172,9 @@ Task-25「调研 multi agent wiki」已于 2026-08-21 完成（结论落盘于�
 - **I-1 图唯一**：`WorkItem.dependsOn` 是 Task 级顺序的唯一权威；不存在第二套图存储或并行运行时。
 - **I-2 状态机唯一**：一个 WorkItem 至多有一个活跃的探索状态机实例；阶段集合固定且可恢复。
 - **I-3 运行身份**：Lane 运行身份 = (group, lane, attempt)，永不由 Agent ID 确定；不同 EffectiveLaunchSnapshot 不共享原生 Session。
-- **I-4 快照不可变**：Dispatch 冻结 EffectiveLaunchSnapshot；运行中进程不被后续配置编辑热变更。重试分两级：瞬时 Provider 错误的传输级重试在同 Run+Session 内原地进行（不改变 Snapshot）；Lane/路线级重试以新 AgentRun 重启，WorkItem 级重试派发新 ExecutionGroup。
+- **I-4 快照不可变**：Dispatch 冻结 EffectiveLaunchSnapshot；运行中进程不被后续配置编辑热变更。重试分两级：瞬时 Provider 错误的传输级重试在同 Turn+Session 内原地进行（不改变 Snapshot）；Lane/路线级重试以新 Turn 重启，WorkItem 级重试派发新 ExecutionGroup。
 - **I-5 写隔离**：兄弟可写 Lane 不共享可写根目录或原生 Session。
-- **I-6 Lane 失败有界**：Lane 失败限于 Lane；已完成 Lane 的持久结果可复用；未完成 Lane 以新 AgentRun 重试。
+- **I-6 Lane 失败有界**：Lane 失败限于 Lane；已完成 Lane 的持久结果可复用；未完成 Lane 以新 Turn 重试。
 - **I-7 单一出口**：Resolve 只产出一个 Candidate 或一个显式多 ChangeSet 决议，进入既有 Review/Integration 主链。
 - **I-8 知识权威**：只有被接受/集成的结论才能进入 Project Knowledge；Worker 永不写 Knowledge。
 - **I-9 上下文清单化**：ContextSnapshot 是 ID/版本/digest/仓库 commit/验收条件/证据引用的清单，不复制全文；Compare 只收归一化结果与产物引用，Verify 只收选中结果、验收条件和证据。
@@ -188,7 +188,7 @@ Task-25「调研 multi agent wiki」已于 2026-08-21 完成（结论落盘于�
 
 | 层级 | 触发 | 语义 |
 |---|---|---|
-| Lane 失败 | 单路执行错误、模型/Provider 错误 | 瞬时错误走传输级原地重试（同 Run+Session）；持续失败以新 AgentRun 重启该 Lane 或终止该路线，其余 Lane 继续；已完成 Lane 的持久结果不重放 |
+| Lane 失败 | 单路执行错误、模型/Provider 错误 | 瞬时错误走传输级原地重试（同 Turn+Session）；持续失败以新 Turn 重启该 Lane 或终止该路线，其余 Lane 继续；已完成 Lane 的持久结果不重放 |
 | 阶段未达 | quorum 未满足、预算耗尽、连续无进展 | 阶段 blocked，Leader 决议：适配/扩展/放弃路线或升级 WorkItem blocked/input |
 | WorkItem 失败 | 验证失败、所有路线耗尽 | 进入 Layer 1 传播规则（T1 精确定义） |
 | Leader Session 丢失 | 进程/会话终止 | 从权威记录重新装配上下文续任，不依赖手写 handoff 文件 |
@@ -196,10 +196,10 @@ Task-25「调研 multi agent wiki」已于 2026-08-21 完成（结论落盘于�
 
 ### 6.2 恢复依据
 
-1. **持久状态权威**：Controller 恢复后根据持久化 Group/Lane/Run 状态重建执行；会话 transcript 仅用于审计与故障定位。
+1. **持久状态权威**：Controller 恢复后根据持久化 Group/Lane/Turn 状态重建执行；会话 transcript 仅用于审计与故障定位。
 2. **结果复用**：已完成 Lane 的持久结果必须可被后续轮次/恢复复用，不重复执行。Task-25 的一手经验（在途证据随上下文压缩丢失、直写文件幸存，§2.2）表明：在途结果持久化是 T7 的**强制项而非可选优化**，且持久化目标必须是 Yui 权威记录（WorkItem 证据链），不能依赖会话 transcript 或手写 handoff 文件——「凡外置的都活下来了，凡没外置的都丢了」。
-3. **Leader 续任**：新 Leader Run 从 Task Brief、Decision、Milestone、已接受 WorkItem 结果和 Project Knowledge 重新装配；Task Brief 的 focus/leader-summary 是续任契约的一部分。
-4. **健康判定**：`running-active / running-silent / suspected-stalled / confirmed-dead` 四档；`suspected-stalled` 触发诊断而非杀死；`confirmed-dead` 才允许 AgentRun 重试。
+3. **Leader 续任**：新 Leader Turn 从 Task Brief、Decision、Milestone、已接受 WorkItem 结果和 Project Knowledge 重新装配；Task Brief 的 focus/leader-summary 是续任契约的一部分。
+4. **健康判定**：`running-active / running-silent / suspected-stalled / confirmed-dead` 四档；`suspected-stalled` 触发诊断而非杀死；`confirmed-dead` 才允许 Turn 重试。
 
 ## 7. 成本模型依据
 
@@ -269,8 +269,8 @@ Task-25「调研 multi agent wiki」已于 2026-08-21 完成（结论落盘于�
 约束：T4 定义状态机语义；不得实现通用嵌套图引擎或无限自治循环；不得引入 ExecutionGroup 之外的新容器。
 
 ### D-04 对象分离与运行身份
-决议：Role/Agent/Execution Profile/Lane Spec/EffectiveLaunchSnapshot/AgentRun 六类对象分离；运行身份 = group/lane/attempt；Snapshot Dispatch 后不可变；重试 = 新 AgentRun。
-依据：§4；I-3/I-4；现有 AgentRun 不可变快照语义。
+决议：Role/Agent/Execution Profile/Lane Spec/EffectiveLaunchSnapshot/Turn 六类对象分离；运行身份 = group/lane/attempt；Snapshot Dispatch 后不可变；重试 = 新 Turn。
+依据：§4；I-3/I-4；现有 Turn 不可变快照语义。
 约束：T2 定义分离契约；不得通过复制 Role 表达模型差异，不得共享原生 Session。
 
 ### D-05 上下文清单与权威顺序
@@ -284,7 +284,7 @@ Task-25「调研 multi agent wiki」已于 2026-08-21 完成（结论落盘于�
 约束：T6 定义调度与预算；不得默认开满 Agent，不得绕过 Provider 限额。
 
 ### D-07 健康四档与静默非死亡
-决议：running-active/running-silent/suspected-stalled/confirmed-dead；confirmed-dead 需多维证据 + 宽限期。现状 Role/Run 级已有 30 分钟无持久进展的语义事件检测（`roleRunStall.ts`，恢复归 Leader、绝不自动终止），T7 在此基础上扩展 Lane 级健康与在途结果持久化。
+决议：running-active/running-silent/suspected-stalled/confirmed-dead；confirmed-dead 需多维证据 + 宽限期。现状 Role/Turn 级已有 30 分钟无持久进展的语义事件检测（`roleTurnStall.ts`，恢复归 Leader、绝不自动终止），T7 在此基础上扩展 Lane 级健康与在途结果持久化。
 依据：§6.2；I-10；Task-25 恢复经验与在途结果丢失证据。
 约束：T7 定义监控与恢复；不得仅凭无输出时长杀死 Session；在途结果持久化是强制项。
 
@@ -323,7 +323,7 @@ Task-25「调研 multi agent wiki」已于 2026-08-21 完成（结论落盘于�
 | T4 WorkItem 多路探索阶段状态机 | 六阶段、轮次、阶段 Group、重试、终止 | D-03, D-01, §3.5-1/2/5/10 | 通用嵌套图引擎；无限自治循环；引入新容器替代 ExecutionGroup；多 Candidate 并存 |
 | T5 候选比较、综合与验证策略 | 结构化结果、去重聚类、证据比较、按产物类型综合、独立验证 | D-03, I-9 | 简单多数投票；全任务 Elo/大规模 debate |
 | T6 自适应预算与资源调度 | 并行/顺序路由、配额、统一预算、背压、quorum、straggler、提前终止 | D-06, §7, §3.5-3/9 | 默认开满 Agent；绕过 Provider 限额；在证据不足时以成本为由提前终止 |
-| T7 Agent/Lane 状态监控与恢复 | 四档健康、Controller 恢复、AgentRun 重试、结果复用、Leader 续任 | D-07, §6, I-10, §3.5-10 | 仅凭无输出杀 Session；handoff 文件替代持久记录；把在途结果持久化做成可选项（现状不存在，是强制项） |
+| T7 Agent/Lane 状态监控与恢复 | 四档健康、Controller 恢复、Turn 重试、结果复用、Leader 续任 | D-07, §6, I-10, §3.5-10 | 仅凭无输出杀 Session；handoff 文件替代持久记录；把在途结果持久化做成可选项（现状不存在，是强制项） |
 | T8 多路结果接入 Review 与 Integration | Resolve 结果接入 Candidate/ReviewRound/Task-final Review/原子 Integration | D-08, §9 | 兄弟 Lane 共享可写工作区；未选产物直接集成 |
 | T9 可观测界面 | DAG + 探索 + 成本/上下文/证据/决议统一展示 | D-09, §10 | 界面侧状态权威；为展示改变领域语义 |
 | T10 评测、基线与分阶段启用 | 单 Agent 基线 + 多路策略评测、启用门槛 | D-11, D-12, §7 | 未经明确授权调用真实 Provider/付费资源 |

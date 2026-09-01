@@ -7,7 +7,7 @@ import type { DurableJob } from "../job/durableJob.js";
 import type { ChangeSet } from "../integration/changeSet.js";
 import type { IntegrationAttempt } from "../integration/integrationAttempt.js";
 import type { PublicationReference } from "../task/publicationReference.js";
-import type { AgentRun } from "../run/agentRun.js";
+import type { Turn } from "../turn/turn.js";
 import type { ReviewFinding } from "../review/reviewFinding.js";
 import { classifyReviewRoundOutcome } from "../review/reviewOutcomeClassifier.js";
 import type { ReviewRound } from "../review/reviewRound.js";
@@ -33,7 +33,7 @@ export type TaskOrchestrationMetrics = Readonly<{
   taskId: string;
   taskType: string | null;
   timeToFirstProjectCommitMs: number | null;
-  runs: Readonly<{
+  turns: Readonly<{
     total: number;
     byStatus: Readonly<Record<string, number>>;
     byRole: Readonly<Record<string, number>>;
@@ -61,7 +61,7 @@ export type TaskOrchestrationMetrics = Readonly<{
 
 export type TaskOrchestrationFacts = Readonly<{
   task: Task;
-  runs: readonly AgentRun[];
+  turns: readonly Turn[];
   roleSessionSets: readonly TaskRoleSessionSet[];
   workItems: readonly WorkItem[];
   changeSets: readonly ChangeSet[];
@@ -80,7 +80,7 @@ export function projectTaskOrchestration(
   facts: TaskOrchestrationFacts
 ): TaskOrchestrationMetrics {
   const evidence = {
-    listAgentRuns: () => facts.runs,
+    listTurns: () => facts.turns,
     listReviewFindings: () => facts.reviewFindings,
     listEvents: () => facts.events
   };
@@ -149,10 +149,10 @@ export function projectTaskOrchestration(
     timeToFirstProjectCommitMs: firstCommitAt === undefined
       ? null
       : Math.max(0, Date.parse(firstCommitAt) - Date.parse(facts.task.createdAt)),
-    runs: {
-      total: facts.runs.length,
-      byStatus: counts(facts.runs.map(({ status }) => status)),
-      byRole: counts(facts.runs.map(({ roleName }) => roleName))
+    turns: {
+      total: facts.turns.length,
+      byStatus: counts(facts.turns.map(({ status }) => status)),
+      byRole: counts(facts.turns.map(({ roleName }) => roleName))
     },
     workItems: facts.workItems.length,
     reviews: {

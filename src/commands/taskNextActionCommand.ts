@@ -22,7 +22,7 @@ import { operationalTaskRecords } from "../task/taskRecordRetirement.js";
 import {
   buildTaskExecutionProjection,
   type TaskExecutionProjection,
-  type TaskExecutionRun
+  type TaskExecutionTurn
 } from "../scheduler/taskExecutionProjection.js";
 import {
   projectReviewDecision,
@@ -32,7 +32,7 @@ import type { TaskReviewCandidate } from "../review/reviewRound.js";
 
 type NextActionExecutionView = Readonly<Pick<
   TaskExecutionProjection,
-  "status" | "owner" | "action" | "reason" | "summary" | "activeRuns"
+  "status" | "owner" | "action" | "reason" | "summary" | "activeTurns"
 >>;
 
 /**
@@ -99,24 +99,24 @@ export function runTaskNextActionCommand(
     }
     const events = reader.listEvents(taskId);
     const task = reader.getTask(taskId)!;
-    const operationalRuns = operationalTaskRecords(
-      reader.listAgentRuns(taskId),
+    const operationalTurns = operationalTaskRecords(
+      reader.listTurns(taskId),
       events,
-      "agent-run"
+      "turn"
     );
     const reviewRounds = reader.listReviewRounds(taskId);
     const reviewDecision = projectReviewDecision({
       store: reader,
       task,
       roles: reader.listRoles(taskId),
-      runs: operationalRuns,
+      turns: operationalTurns,
       rounds: reviewRounds,
       reviewConfig: reader.getReviewConfig(),
       currentCandidate: currentTaskReviewCandidate
     });
     const orchestration = projectTaskOrchestration({
       task,
-      runs: operationalRuns,
+      turns: operationalTurns,
       roleSessionSets: reader.listRoleSessionSets(taskId),
       workItems: reader.listWorkItems(taskId),
       changeSets: reader.listChangeSets(taskId),
@@ -198,10 +198,10 @@ function renderNextAction(
     `Next action: ${action.kind}`,
     `Reason: ${action.reason}`,
     `Execution view: ${execution.status}; owner/action=${execution.owner}/${execution.action}; reason=${execution.reason}; ${execution.summary}`,
-    `Active AgentRuns (${execution.activeRuns.length}):`,
-    ...(execution.activeRuns.length === 0
+    `Active Turns (${execution.activeTurns.length}):`,
+    ...(execution.activeTurns.length === 0
       ? ["  none"]
-      : execution.activeRuns.map((run) => `  ${renderActiveRun(run)}`)),
+      : execution.activeTurns.map((run) => `  ${renderActiveTurn(run)}`)),
     ...(action.refs.length === 0
       ? ["Refs: none"]
       : ["Refs:", ...action.refs.map((ref) => `  ${ref.kind}: ${ref.id}`)]),
@@ -298,7 +298,7 @@ function renderNextAction(
   return `${lines.join("\n")}\n`;
 }
 
-function renderActiveRun(run: TaskExecutionRun): string {
+function renderActiveTurn(run: TaskExecutionTurn): string {
   const subject = run.reviewRoundId === undefined
     ? run.workItemId === undefined ? "task" : `work-item=${run.workItemId}`
     : `review-round=${run.reviewRoundId}`;
@@ -308,7 +308,7 @@ function renderActiveRun(run: TaskExecutionRun): string {
       run.executionLaneId === undefined ? "" : `; lane=${run.executionLaneId}`
     }`;
   return `${run.id} [${run.purpose}/${run.status}; role=${run.roleName}; ${
-    run.delivered ? "accepted" : "delivery-pending"
+    `provider-${run.providerSession}`
   }; ${subject}${lane}]`;
 }
 
@@ -321,6 +321,6 @@ function nextActionExecutionView(
     action: execution.action,
     reason: execution.reason,
     summary: execution.summary,
-    activeRuns: execution.activeRuns
+    activeTurns: execution.activeTurns
   };
 }

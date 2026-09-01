@@ -78,7 +78,7 @@ export function candidateConvergenceDirective(stage: ExecutionStageContext): str
   const parentRefs = stage.parentResults.map(parentResultRef);
   const common = [
     "Candidate convergence contract v1 is active.",
-    "Yield one JSON object. Keep summary/checks/findings/evidence at the top level and add convergence={schemaVersion:1,stage,artifactType,parentResultRefs,...}.",
+    "Return one JSON object. Keep summary/checks/findings/evidence at the top level and add convergence={schemaVersion:1,stage,artifactType,parentResultRefs,...}.",
     `convergence.stage must be ${stage.stage}; parentResultRefs must equal ${JSON.stringify(parentRefs)} in this order.`,
     "artifactType is research, architecture, or code and must stay unchanged across the round.",
     "Use only frozen parent result references; never replay sibling transcripts. Direct sources, executable checks, and frozen artifacts outrank derived analysis or vote counts."
@@ -359,9 +359,7 @@ export function candidateConvergenceEvidenceSufficient(
   if (stage?.convergence === undefined
     || (stage.stage !== "verify" && stage.stage !== "resolve")
     || selectedLaneIds.length === 0) return false;
-  const usable = group.lanes.filter(({ status }) => (
-    status === "yielded" || status === "completed"
-  ));
+  const usable = group.lanes.filter(({ status }) => status === "completed");
   if (selectedLaneIds.some((laneId) => !usable.some(({ id }) => id === laneId))) return false;
   // Cost policy may never hide contradictory evidence that has already
   // arrived. Every usable output must independently clear the same acceptance
@@ -459,7 +457,7 @@ function usableCandidateConvergenceEnvelopes(
   const stage = group.stage;
   if (stage?.convergence === undefined) return [];
   const usable = group.lanes.filter(({ status, result }) => (
-    (status === "yielded" || status === "completed") && result !== undefined
+    status === "completed" && result !== undefined
   ));
   try {
     return usable.map(({ result }) => validateCandidateConvergenceReport(

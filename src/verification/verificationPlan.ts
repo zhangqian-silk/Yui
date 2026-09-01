@@ -82,7 +82,7 @@ export type VerificationPlan = Readonly<{
   l2: Readonly<{ steps: readonly VerificationStep[] }>;
   /** L3 package/release smoke steps (release-unique only). */
   l3?: Readonly<{ steps: readonly VerificationStep[] }>;
-  /** Real-resource checks this plan deliberately does not run. */
+  /** Real-resource checks this plan deliberately does not turn. */
   excludedRealResourceChecks?: readonly string[];
   /** Retention window for unreferenced successful artifacts, in days. */
   artifactTtlDays?: number;

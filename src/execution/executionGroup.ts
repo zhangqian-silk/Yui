@@ -23,7 +23,6 @@ export type ExecutionPurpose = "execution" | "review";
 export type ExecutionLaneStatus =
   | "pending"
   | "running"
-  | "yielded"
   | "completed"
   | "failed"
   | "skipped";
@@ -149,7 +148,7 @@ export type ExecutionFinding = Readonly<{
 }>;
 
 /**
- * The immutable Git output of one Lane at the moment it yields.  Resolution
+ * The immutable Git output of one Lane when the Leader resolves its result. Resolution
  * must consume these exact commits; a later branch advance is never silently
  * folded into the Candidate.
  */
@@ -170,7 +169,7 @@ export type ExecutionLaneResult = Readonly<{
   evidence?: readonly string[];
   /** Commit containing durable evidence produced by this Lane. */
   evidenceCommit?: string;
-  /** Managed workspace heads frozen automatically when this Lane yields. */
+  /** Managed workspace heads frozen when the Leader resolves this Lane. */
   gitSnapshot?: ExecutionLaneGitSnapshot;
 }>;
 
@@ -187,7 +186,7 @@ export type ExecutionLane = Readonly<{
   ordinal: number;
   roleName: string;
   effective?: EffectiveLaunchSnapshot;
-  runId?: string;
+  turnId?: string;
   sessionId?: string;
   reviewRoundId?: string;
   workspace?: ExecutionLaneWorkspace;
@@ -237,7 +236,7 @@ export type ExecutionGroupSummary = Readonly<{
     laneId: string;
     roleName: string;
     ordinal: number;
-    runId?: string;
+    turnId?: string;
     sessionId?: string;
     effective?: EffectiveLaunchSnapshot;
     directive?: string;
@@ -260,7 +259,7 @@ export type ExecutionLaneInput = Readonly<{
   ordinal?: number;
   roleName: string;
   effective?: EffectiveLaunchSnapshot;
-  runId?: string;
+  turnId?: string;
   sessionId?: string;
   reviewRoundId?: string;
   workspace?: ExecutionLaneWorkspace;
@@ -380,7 +379,7 @@ export function assertExecutionTargetUnchanged(
  * Enforce the only durable Group/Lane evolution accepted by both domain
  * helpers and storage. Identity, target, prior results, and a final Leader
  * resolution never move backwards. A terminal Lane may only reopen as an
- * explicit retry with a fresh Run identity, or reset to pending for a
+ * explicit retry with a fresh Turn identity, or reset to pending for a
  * Task-final Review execution retry.
  */
 export function assertExecutionGroupTransition(
@@ -435,7 +434,7 @@ export function updateExecutionLane(
   patch: Readonly<{
     status?: Exclude<ExecutionLaneStatus, "skipped">;
     effective?: EffectiveLaunchSnapshot;
-    runId?: string;
+    turnId?: string;
     sessionId?: string;
     reviewRoundId?: string;
     workspace?: ExecutionLaneWorkspace;
@@ -455,11 +454,11 @@ export function updateExecutionLane(
   }
   const status = patch.status ?? existing.status;
   const timestamp = now.toISOString();
-  const terminal = status === "completed" || status === "failed" || status === "yielded";
+  const terminal = status === "completed" || status === "failed";
   const next = {
     ...existing,
     ...(patch.effective === undefined ? {} : { effective: validateEffectiveLaunchSnapshot(patch.effective) }),
-    ...(patch.runId === undefined ? {} : { runId: requireIdentity(patch.runId, "Agent Run id") }),
+    ...(patch.turnId === undefined ? {} : { turnId: requireIdentity(patch.turnId, "Turn id") }),
     ...(patch.sessionId === undefined ? {} : { sessionId: requireIdentity(patch.sessionId, "Session id") }),
     ...(patch.reviewRoundId === undefined ? {} : { reviewRoundId: requireIdentity(patch.reviewRoundId, "ReviewRound id") }),
     ...(patch.workspace === undefined ? {} : { workspace: validateLaneWorkspace(patch.workspace) }),
@@ -476,8 +475,8 @@ export function updateExecutionLane(
 }
 
 /**
- * Reopens only a failed Lane for an explicit WorkItem retry. Completed and
- * yielded results are immutable reusable outputs; retrying them would erase
+ * Reopens only a failed Lane for an explicit WorkItem retry. Completed
+ * results are immutable reusable outputs; retrying them would erase
  * the Group's durable evidence instead of recovering unfinished work.
  */
 export function restartExecutionLane(
@@ -485,7 +484,7 @@ export function restartExecutionLane(
   laneId: string,
   patch: Readonly<{
     effective?: EffectiveLaunchSnapshot;
-    runId?: string;
+    turnId?: string;
     sessionId?: string;
     reviewRoundId?: string;
     workspace?: ExecutionLaneWorkspace;
@@ -502,7 +501,7 @@ export function restartExecutionLane(
   if (existing === undefined) throw new Error(`ExecutionLane not found: ${group.id}/${id}.`);
   if (existing.status !== "failed") {
     throw new Error(
-      `Only failed ExecutionLanes can start a new AgentRun: ${group.id}/${id}.`
+      `Only failed ExecutionLanes can start a new Turn: ${group.id}/${id}.`
     );
   }
   const timestamp = now.toISOString();
@@ -510,7 +509,7 @@ export function restartExecutionLane(
   const next: ExecutionLane = {
     ...base,
     ...(patch.effective === undefined ? {} : { effective: validateEffectiveLaunchSnapshot(patch.effective) }),
-    ...(patch.runId === undefined ? {} : { runId: requireIdentity(patch.runId, "Agent Run id") }),
+    ...(patch.turnId === undefined ? {} : { turnId: requireIdentity(patch.turnId, "Turn id") }),
     ...(patch.sessionId === undefined ? {} : { sessionId: requireIdentity(patch.sessionId, "Session id") }),
     ...(patch.reviewRoundId === undefined ? {} : { reviewRoundId: requireIdentity(patch.reviewRoundId, "ReviewRound id") }),
     ...(patch.workspace === undefined ? {} : { workspace: validateLaneWorkspace(patch.workspace) }),
@@ -526,8 +525,8 @@ export function restartExecutionLane(
 }
 
 /**
- * Reopen a failed execution Lane without starting its next Run when Resource
- * Broker capacity is unavailable. The failed attempt remains in AgentRun
+ * Reopen a failed execution Lane without starting its next Turn when Resource
+ * Broker capacity is unavailable. The failed attempt remains in Turn
  * history; the Lane freezes the next launch input until ordinary dispatch can
  * admit it.
  */
@@ -555,7 +554,7 @@ export function queueExecutionLaneRetry(
   }
   const timestamp = now.toISOString();
   const {
-    runId: _runId,
+    turnId: _turnId,
     sessionId: _sessionId,
     result: _result,
     endedAt: _endedAt,
@@ -578,7 +577,7 @@ export function queueExecutionLaneRetry(
 
 /**
  * Resets a terminal Reviewer Lane to pending without replacing its ExecutionGroup.
- * The old AgentRun remains the attempt trail; clearing the Lane's Run/session and
+ * The old Turn remains the attempt trail; clearing the Lane's Turn/Session and
  * result lets the same semantic ReviewRound be dispatched again.
  */
 export function resetReviewExecutionLane(
@@ -599,7 +598,7 @@ export function resetReviewExecutionLane(
   const timestamp = now.toISOString();
   const {
     effective: _effective,
-    runId: _runId,
+    turnId: _turnId,
     sessionId: _sessionId,
     result: _result,
     endedAt: _endedAt,
@@ -616,7 +615,7 @@ export function recordExecutionLaneResult(
   group: ExecutionGroup,
   laneId: string,
   result: ExecutionLaneResult,
-  status: "yielded" | "completed" | "failed",
+  status: "completed" | "failed",
   now: Date
 ): ExecutionGroup {
   const checked = validateLaneResult(result);
@@ -637,7 +636,7 @@ export function recordExecutionLaneResult(
 }
 
 /**
- * Stop only work that has never started. Running Lanes retain their exact Run
+ * Stop only work that has never started. Running Lanes retain their exact Turn
  * and Session; the Resource Broker never kills a straggler merely to save
  * budget. Skipped Lanes are terminal but never usable Candidate inputs.
  */
@@ -660,7 +659,7 @@ export function skipPendingExecutionLanes(
   for (const laneId of selected) {
     const lane = group.lanes.find(({ id }) => id === laneId);
     if (lane === undefined) throw new Error(`ExecutionLane not found: ${group.id}/${laneId}.`);
-    if (lane.status !== "pending" || lane.runId !== undefined) {
+    if (lane.status !== "pending" || lane.turnId !== undefined) {
       throw new Error(`Only an unstarted pending ExecutionLane can be skipped: ${group.id}/${laneId}.`);
     }
   }
@@ -699,7 +698,7 @@ export function resolveExecutionGroup(
   const summary = requireText(input.summary, "Execution resolution summary");
   const defaultSelectedLaneIds = input.decision === "accept"
     ? group.lanes
-      .filter((lane) => lane.status === "yielded" || lane.status === "completed")
+      .filter((lane) => lane.status === "completed")
       .map(({ id }) => id)
     : group.lanes.map(({ id }) => id);
   const selected = [...new Set((input.selectedLaneIds ?? defaultSelectedLaneIds)
@@ -709,14 +708,12 @@ export function resolveExecutionGroup(
   }
   if (input.decision === "accept" && selected.some((id) => {
     const lane = group.lanes.find((candidate) => candidate.id === id);
-    return lane?.status !== "yielded" && lane?.status !== "completed";
+    return lane?.status !== "completed";
   })) {
     throw new Error(`ExecutionGroup accept selects a Lane without usable terminal output: ${group.id}.`);
   }
   if (input.decision === "accept" && group.stage?.resources !== undefined) {
-    const usable = group.lanes.filter(({ status }) => (
-      status === "yielded" || status === "completed"
-    )).length;
+    const usable = group.lanes.filter(({ status }) => status === "completed").length;
     if (usable < group.stage.resources.quorum) {
       throw new Error(
         `ExecutionGroup quorum is not met: ${usable}/${group.stage.resources.quorum} usable Lanes.`
@@ -767,7 +764,7 @@ export function summarizeExecutionGroup(group: ExecutionGroup): ExecutionGroupSu
       laneId: lane.id,
       roleName: lane.roleName,
       ordinal: lane.ordinal,
-      ...(lane.runId === undefined ? {} : { runId: lane.runId }),
+      ...(lane.turnId === undefined ? {} : { turnId: lane.turnId }),
       ...(lane.sessionId === undefined ? {} : { sessionId: lane.sessionId }),
       ...(lane.effective === undefined ? {} : { effective: lane.effective }),
       ...(lane.directive === undefined ? {} : { directive: lane.directive }),
@@ -954,7 +951,7 @@ export function validateExecutionLane(
     if (lane.groupId !== group.id) throw new Error(`ExecutionLane belongs to another Group: ${lane.id}.`);
     if (group.purpose === "review" && lane.reviewRoundId === undefined) {
       // A review lane may be pending before its ReviewRound is dispatched, but
-      // it must acquire that identity before it can run.
+      // it must acquire that identity before it can turn.
       if (lane.status === "running"
         || lane.status === "completed"
         || lane.status === "failed"
@@ -966,19 +963,19 @@ export function validateExecutionLane(
   positiveInteger(lane.ordinal, "ExecutionLane ordinal");
   requireIdentity(lane.roleName, "ExecutionLane Role");
   if (lane.effective !== undefined) validateEffectiveLaunchSnapshot(lane.effective);
-  if (lane.runId !== undefined) requireIdentity(lane.runId, "Agent Run id");
+  if (lane.turnId !== undefined) requireIdentity(lane.turnId, "Turn id");
   if (lane.sessionId !== undefined) requireIdentity(lane.sessionId, "Session id");
   if (lane.reviewRoundId !== undefined) requireIdentity(lane.reviewRoundId, "ReviewRound id");
   if (lane.workspace !== undefined) validateLaneWorkspace(lane.workspace);
   if (lane.directive !== undefined) requireText(lane.directive, "ExecutionLane directive");
-  if (!( ["pending", "running", "yielded", "completed", "failed", "skipped"] as const).includes(lane.status)) {
+  if (!( ["pending", "running", "completed", "failed", "skipped"] as const).includes(lane.status)) {
     throw new Error(`ExecutionLane status is invalid: ${String(lane.status)}.`);
   }
   if (lane.status === "skipped") {
     if (group !== undefined && group.purpose !== "execution") {
       throw new Error(`Only WorkItem ExecutionLanes can be skipped: ${lane.id}.`);
     }
-    if (lane.runId !== undefined || lane.sessionId !== undefined) {
+    if (lane.turnId !== undefined || lane.sessionId !== undefined) {
       throw new Error(`Skipped ExecutionLane must never have started: ${lane.id}.`);
     }
   }
@@ -1008,7 +1005,7 @@ function createLane(
     ordinal: positiveInteger(input.ordinal ?? ordinal, "ExecutionLane ordinal"),
     roleName: requireIdentity(input.roleName, "ExecutionLane Role"),
     ...(input.effective === undefined ? {} : { effective: validateEffectiveLaunchSnapshot(input.effective) }),
-    ...(input.runId === undefined ? {} : { runId: requireIdentity(input.runId, "Agent Run id") }),
+    ...(input.turnId === undefined ? {} : { turnId: requireIdentity(input.turnId, "Turn id") }),
     ...(input.sessionId === undefined ? {} : { sessionId: requireIdentity(input.sessionId, "Session id") }),
     ...(input.reviewRoundId === undefined ? {} : { reviewRoundId: requireIdentity(input.reviewRoundId, "ReviewRound id") }),
     ...(input.workspace === undefined ? {} : { workspace: validateLaneWorkspace(input.workspace) }),
@@ -1113,7 +1110,7 @@ function validateResolution(resolution: ExecutionResolution, group: ExecutionGro
     && (resolution.selectedLaneIds.length === 0
       || resolution.selectedLaneIds.some((id) => {
         const lane = group.lanes.find((candidate) => candidate.id === id);
-        return lane?.status !== "yielded" && lane?.status !== "completed";
+        return lane?.status !== "completed";
       }))) {
     throw new Error("Execution accept resolution must select usable Lane output.");
   }
@@ -1156,7 +1153,7 @@ function assertExecutionLaneTransition(
     if (groupPurpose === "review"
       && candidate.status === "pending"
       && candidate.effective === undefined
-      && candidate.runId === undefined
+      && candidate.turnId === undefined
       && candidate.sessionId === undefined
       && candidate.result === undefined
       && candidate.endedAt === undefined
@@ -1167,7 +1164,7 @@ function assertExecutionLaneTransition(
       && existing.status === "failed"
       && candidate.status === "pending"
       && candidate.effective !== undefined
-      && candidate.runId === undefined
+      && candidate.turnId === undefined
       && candidate.sessionId === undefined
       && candidate.result === undefined
       && candidate.endedAt === undefined
@@ -1175,16 +1172,16 @@ function assertExecutionLaneTransition(
       return;
     }
     if (candidate.status !== "running"
-      || candidate.runId === undefined
-      || candidate.runId === existing.runId) {
-      throw new Error(`Terminal ExecutionLane is immutable without a fresh retry Run: ${existing.id}.`);
+      || candidate.turnId === undefined
+      || candidate.turnId === existing.turnId) {
+      throw new Error(`Terminal ExecutionLane is immutable without a fresh retry Turn: ${existing.id}.`);
     }
     return;
   }
   if (existing.status === "running" && candidate.status === "pending") {
     throw new Error(`Running ExecutionLane cannot return to pending: ${existing.id}.`);
   }
-  for (const key of ["effective", "runId", "sessionId", "workspace", "directive"] as const) {
+  for (const key of ["effective", "turnId", "sessionId", "workspace", "directive"] as const) {
     if (existing[key] !== undefined
       && !isDeepStrictEqual(existing[key], candidate[key])) {
       throw new Error(`ExecutionLane ${key} changed without retry: ${existing.id}.`);
@@ -1216,8 +1213,7 @@ function validatePurpose(purpose: ExecutionPurpose): ExecutionPurpose {
 }
 
 function isTerminalLane(status: ExecutionLaneStatus): boolean {
-  return status === "yielded"
-    || status === "completed"
+  return status === "completed"
     || status === "failed"
     || status === "skipped";
 }

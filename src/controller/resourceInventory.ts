@@ -88,7 +88,7 @@ export type RuntimeRoleFact = Readonly<{
   adapterId?: string;
   nativeSessionId?: string;
   launchId?: string;
-  runId?: string;
+  turnId?: string;
 }>;
 
 export type RuntimeArtifactFact = Readonly<{
@@ -141,7 +141,7 @@ export type RuntimeOwner =
       adapterId?: string;
       nativeSessionId?: string;
       launchId?: string;
-      runId?: string;
+      turnId?: string;
     }>
   | Readonly<{
       kind: "global-role";
@@ -150,7 +150,7 @@ export type RuntimeOwner =
       adapterId?: string;
       nativeSessionId?: string;
       launchId?: string;
-      runId?: string;
+      turnId?: string;
     }>
   | Readonly<{ kind: "none" }>;
 
@@ -181,7 +181,7 @@ export type RuntimeResource = Readonly<{
 export type RuntimeResourceSampleIdentity = Readonly<{
   taskId: string;
   roleName: string;
-  runId: string;
+  turnId: string;
   agentId: string;
   adapterId: string;
   nativeSessionId?: string;
@@ -234,7 +234,7 @@ export function createRuntimeResourceActivityTracker(): RuntimeResourceActivityT
       || roleKey === undefined
     ) return reject();
     const identityKey = JSON.stringify([
-      identity.runId,
+      identity.turnId,
       identity.agentId,
       identity.adapterId,
       identity.nativeSessionId ?? null,
@@ -548,7 +548,7 @@ function roleOwner(role: RuntimeRoleFact): RuntimeOwner {
       ...(role.adapterId === undefined ? {} : { adapterId: role.adapterId }),
       ...(role.nativeSessionId === undefined ? {} : { nativeSessionId: role.nativeSessionId }),
       ...(role.launchId === undefined ? {} : { launchId: role.launchId }),
-      ...(role.runId === undefined ? {} : { runId: role.runId })
+      ...(role.turnId === undefined ? {} : { turnId: role.turnId })
     };
   }
   return {
@@ -561,7 +561,7 @@ function roleOwner(role: RuntimeRoleFact): RuntimeOwner {
     ...(role.adapterId === undefined ? {} : { adapterId: role.adapterId }),
     ...(role.nativeSessionId === undefined ? {} : { nativeSessionId: role.nativeSessionId }),
     ...(role.launchId === undefined ? {} : { launchId: role.launchId }),
-    ...(role.runId === undefined ? {} : { runId: role.runId })
+    ...(role.turnId === undefined ? {} : { turnId: role.turnId })
   };
 }
 
@@ -774,8 +774,8 @@ function matchesResourceIdentity(
     || identity.taskId.length === 0
     || typeof identity.roleName !== "string"
     || identity.roleName.length === 0
-    || typeof identity.runId !== "string"
-    || identity.runId.length === 0
+    || typeof identity.turnId !== "string"
+    || identity.turnId.length === 0
     || typeof identity.agentId !== "string"
     || identity.agentId.length === 0
     || typeof identity.adapterId !== "string"
@@ -787,7 +787,7 @@ function matchesResourceIdentity(
     owner.kind !== "task-role"
     || owner.taskId !== identity.taskId
     || owner.roleName !== identity.roleName
-    || owner.runId !== identity.runId
+    || owner.turnId !== identity.turnId
     || owner.agentId !== identity.agentId
     || owner.adapterId !== identity.adapterId
   ) return false;

@@ -6,7 +6,7 @@ import {
   observedExecutionResourceUsage,
   type ExecutionStageResourceProjection
 } from "../execution/resourceBroker.js";
-import type { AgentRun } from "../run/agentRun.js";
+import type { Turn } from "../turn/turn.js";
 import type { SessionTokenMetrics } from "../runtime/sessionTokenMetrics.js";
 import type { WorkItem, WorkItemStatus } from "../workItem/workItem.js";
 import type { ExecutionGroupHealthSummary } from "../execution/executionHealth.js";
@@ -125,7 +125,7 @@ export type TaskObservabilityInput = Readonly<{
   workItems: readonly WorkItem[];
   executionGroups: readonly ExecutionGroup[];
   groupSummaries?: readonly ExecutionGroupHealthSummary[];
-  runs: readonly AgentRun[];
+  turns: readonly Turn[];
   events: readonly TaskEvent[];
   contextSnapshots?: readonly ContextSnapshot[];
   sessionTokens?: readonly TaskSessionTokenProjection[];
@@ -166,8 +166,8 @@ export function buildTaskObservabilityProjection(
         ...(summary?.resources === undefined ? {} : { resources: summary.resources })
       });
     });
-    const itemCost = projectCost(groups, input.runs, input.events, now);
-    const itemContext = projectContext(groups, input.runs, input.contextSnapshots);
+    const itemCost = projectCost(groups, input.turns, input.events, now);
+    const itemContext = projectContext(groups, input.turns, input.contextSnapshots);
     const evidence = groups.flatMap((group) => group.lanes.flatMap((lane) => (
       lane.result?.evidence ?? []
     )));
@@ -190,8 +190,8 @@ export function buildTaskObservabilityProjection(
       openFindingCount
     });
   });
-  const cost = projectCost(input.executionGroups, input.runs, input.events, now);
-  const context = projectContext(input.executionGroups, input.runs, input.contextSnapshots);
+  const cost = projectCost(input.executionGroups, input.turns, input.events, now);
+  const context = projectContext(input.executionGroups, input.turns, input.contextSnapshots);
   return Object.freeze({
     dag,
     workItems,
@@ -310,7 +310,7 @@ function resolveDependency(
 
 function projectCost(
   groups: readonly ExecutionGroup[],
-  runs: readonly AgentRun[],
+  turns: readonly Turn[],
   events: readonly TaskEvent[],
   now: Date
 ): TaskCostProjection {
@@ -324,7 +324,7 @@ function projectCost(
   let retryCount = 0;
   for (const group of stageGroups) {
     const lineage = groups.filter((candidate) => sameStage(candidate, group));
-    const usage = observedExecutionResourceUsage({ group, stageGroups: lineage, runs, events });
+    const usage = observedExecutionResourceUsage({ group, stageGroups: lineage, turns, events });
     tokens += usage.tokens;
     toolCalls += usage.toolCalls;
     tokensObservable = tokensObservable && (usage.tokensObservable ?? true);
@@ -349,7 +349,7 @@ function projectCost(
 
 function projectContext(
   groups: readonly ExecutionGroup[],
-  runs: readonly AgentRun[],
+  turns: readonly Turn[],
   snapshots?: readonly ContextSnapshot[]
 ): TaskContextProjection {
   const refs = new Map<string, {
@@ -362,8 +362,8 @@ function projectContext(
     const ref = group.stage?.contextSnapshotRef;
     if (ref !== undefined) refs.set(ref.id, ref);
   }
-  for (const run of runs) {
-    const ref = run.assignment.contextSnapshotRef;
+  for (const turn of turns) {
+    const ref = turn.inputs[0]!.input.contextSnapshotRef;
     if (ref !== undefined) refs.set(ref.id, ref);
   }
   const snapshotById = new Map((snapshots ?? []).map((snapshot) => [snapshot.id, snapshot]));
@@ -445,5 +445,5 @@ function stageDurationSeconds(groups: readonly ExecutionGroup[], now: Date): num
 }
 
 function isTerminalLane(status: ExecutionLaneStatus): boolean {
-  return status === "yielded" || status === "completed" || status === "failed" || status === "skipped";
+  return status === "completed" || status === "failed" || status === "skipped";
 }

@@ -53,7 +53,7 @@ export async function healCheckoutSwap(
  * leaving the registered path without a valid repository. The previous
  * checkout is moved to the backup path first; if the promotion fails it is
  * restored and the staging clone is removed. A crash between the two renames
- * is healed by {@link healCheckoutSwap} on the next run.
+ * is healed by {@link healCheckoutSwap} on the next turn.
  */
 export async function swapManagedCheckout(
   request: CheckoutSwapRequest,

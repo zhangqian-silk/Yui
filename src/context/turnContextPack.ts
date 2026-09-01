@@ -1,12 +1,8 @@
-import type { AgentRun } from "../run/agentRun.js";
-import {
-  rejectedYieldAttemptFromTaskEvent,
-  RUN_YIELD_REJECTED_EVENT
-} from "../run/rejectedYieldAttempt.js";
+import type { Turn } from "../turn/turn.js";
 import type { TaskStore } from "../storage/taskStore.js";
 import { operationalTaskRecords } from "../task/taskRecordRetirement.js";
 import { TASK_COMPLETION_PUBLISHED_TREE_AUTHORIZED_EVENT } from "../task/publicationReference.js";
-import { RUN_BOOTSTRAP_MAX_DELTAS } from "./runContextContract.js";
+import { TURN_INPUT_MAX_DELTAS } from "./turnInputContract.js";
 import {
   contextContentDigest,
   contextSnapshotRef,
@@ -18,60 +14,60 @@ import {
   type ContextSnapshotScope
 } from "./contextSnapshot.js";
 
-export const RUN_CONTEXT_PACK_SCHEMA_VERSION = 1 as const;
-export const RUN_CONTEXT_PACK_MAX_REFS = 256;
-export const RUN_CONTEXT_PACK_MAX_BYTES = 8 * 1024 * 1024;
-export const RUN_CONTEXT_EXPAND_MAX_BYTES = 4 * 1024 * 1024;
+export const TURN_CONTEXT_PACK_SCHEMA_VERSION = 1 as const;
+export const TURN_CONTEXT_PACK_MAX_REFS = 256;
+export const TURN_CONTEXT_PACK_MAX_BYTES = 8 * 1024 * 1024;
+export const TURN_CONTEXT_EXPAND_MAX_BYTES = 4 * 1024 * 1024;
 
-export type RunContextView = "operator" | "leader" | "worker" | "reviewer" | "global";
-export type RunContextSummary = Readonly<{
+export type TurnContextView = "operator" | "leader" | "worker" | "reviewer" | "global";
+export type TurnContextSummary = Readonly<{
   refId: string;
   store: string;
   summary: string;
   digest: string;
 }>;
-export type RunContextBudgetResult = Readonly<{
+export type TurnContextBudgetResult = Readonly<{
   maxRefs: number;
   returnedRefs: number;
   maxBytes: number;
   returnedBytes: number;
   truncated: false;
 }>;
-export type RunContextPack = Readonly<{
-  schemaVersion: typeof RUN_CONTEXT_PACK_SCHEMA_VERSION;
+export type TurnContextPack = Readonly<{
+  schemaVersion: typeof TURN_CONTEXT_PACK_SCHEMA_VERSION;
   identity: Readonly<{
     taskId: string;
-    runId: string;
+    turnId: string;
     roleName: string;
-    purpose: AgentRun["purpose"];
+    purpose: Turn["purpose"];
     agentId: string;
     adapterId: string;
     workspace: string;
   }>;
   snapshot?: ContextSnapshotRef;
-  assignment: AgentRun["assignment"];
+  input: Turn["inputs"][number]["input"];
   authority: Readonly<{
-    view: RunContextView;
+    view: TurnContextView;
     readableRefs: readonly ContextRef[];
     writableProjectIds: readonly string[];
   }>;
   pointers: readonly ContextRef[];
-  summaries: readonly RunContextSummary[];
+  summaries: readonly TurnContextSummary[];
   deltas: readonly ContextRef[];
   completion: Readonly<{
     allowedActions: readonly string[];
-    exactRunRef: string;
+    exactTurnRef: string;
   }>;
-  budget: RunContextBudgetResult;
+  budget: TurnContextBudgetResult;
   digest: string;
 }>;
 
 type MaterializedRef = Readonly<{ ref: ContextRef; value: unknown }>;
 
-export function freezeRunContextSnapshot(
+export function freezeTurnContextSnapshot(
   store: TaskStore,
   run: Readonly<Pick<
-    AgentRun,
+    Turn,
     "taskId" | "roleName" | "purpose" | "workItemId" | "reviewRoundId" | "workspace"
   >>,
   now: Date,
@@ -88,10 +84,10 @@ export function freezeRunContextSnapshot(
       || baseline.scope !== "stage"
       || baselineRef.scope !== baseline.scope
       || baseline.scopeRef !== baselineRef.scopeRef) {
-      throw new Error(`Run Context baseline is missing or drifted: ${baselineRef.id}.`);
+      throw new Error(`Turn Context baseline is missing or drifted: ${baselineRef.id}.`);
     }
     validateContextSnapshot(baseline);
-    const overlays = collectRunContextOverlays(store, run);
+    const overlays = collectTurnContextOverlays(store, run);
     const resources = [...new Map([...baseline.resources, ...overlays].map((entry) => [
       contextRefIdentity(entry.ref),
       entry
@@ -150,7 +146,7 @@ export function freezeRunContextSnapshot(
 
 /**
  * Freeze the shared, role-neutral ContextSnapshot anchored by one WorkItem
- * exploration stage Group. AgentRun snapshots remain role-specific; this
+ * exploration stage Group. Turn snapshots remain role-specific; this
  * record is the durable stage baseline and derives from a fresh WorkItem
  * snapshot so the Group never depends on ambient latest state.
  */
@@ -180,7 +176,7 @@ export function freezeExecutionStageContextSnapshot(
   }
   for (const binding of task.projectBindings) {
     const project = store.getProject(binding.projectId);
-    if (project === null) throw new Error(`Run Project not found: ${binding.projectId}.`);
+    if (project === null) throw new Error(`Turn Project not found: ${binding.projectId}.`);
     const { knowledge, ...projectPolicy } = project;
     materialized.push(materialize("L1", "project-policy", project.id, projectPolicy));
     for (const entry of knowledge.filter(({ status }) => status === "active")) {
@@ -319,27 +315,27 @@ export function contextSnapshotDeltaRefIds(
       || before.store !== ref.store
       || before.layer !== ref.layer;
   }).map(({ refId }) => refId);
-  return Object.freeze([...new Set(changed)].sort().slice(0, RUN_BOOTSTRAP_MAX_DELTAS));
+  return Object.freeze([...new Set(changed)].sort().slice(0, TURN_INPUT_MAX_DELTAS));
 }
 
-export function buildRunContextPack(store: TaskStore, taskId: string, runId: string): RunContextPack {
-  const run = requireExactRun(store, taskId, runId);
+export function buildTurnContextPack(store: TaskStore, taskId: string, turnId: string): TurnContextPack {
+  const run = requireExactTurn(store, taskId, turnId);
   const current = collectAuthorizedContext(store, run);
   let pointers: readonly ContextRef[] = current.map(({ ref }) => ref);
   let snapshotRef: ContextSnapshotRef | undefined;
-  if (run.assignment.contextSnapshotRef !== undefined) {
-    const expected = run.assignment.contextSnapshotRef;
+  if (run.inputs[0]!.input.contextSnapshotRef !== undefined) {
+    const expected = run.inputs[0]!.input.contextSnapshotRef;
     const snapshot = store.getContextSnapshot(taskId, expected.id);
-    if (snapshot === null) throw new Error(`Run Context Snapshot is missing: ${expected.id}.`);
+    if (snapshot === null) throw new Error(`Turn Context Snapshot is missing: ${expected.id}.`);
     validateContextSnapshot(snapshot);
     if (snapshot.digest !== expected.digest || snapshot.taskId !== taskId) {
-      throw new Error(`Run Context Snapshot identity drifted: ${expected.id}.`);
+      throw new Error(`Turn Context Snapshot identity drifted: ${expected.id}.`);
     }
     pointers = snapshot.refs;
     snapshotRef = contextSnapshotRef(snapshot);
   }
-  if (pointers.length > RUN_CONTEXT_PACK_MAX_REFS) {
-    throw new Error(`Run Context exceeds ${RUN_CONTEXT_PACK_MAX_REFS} authorized refs.`);
+  if (pointers.length > TURN_CONTEXT_PACK_MAX_REFS) {
+    throw new Error(`Turn Context exceeds ${TURN_CONTEXT_PACK_MAX_REFS} authorized refs.`);
   }
   const view = contextView(run);
   const writableProjectIds = writableProjects(store, run, view);
@@ -350,10 +346,10 @@ export function buildRunContextPack(store: TaskStore, taskId: string, runId: str
     digest: ref.digest
   }));
   const body = {
-    schemaVersion: RUN_CONTEXT_PACK_SCHEMA_VERSION,
+    schemaVersion: TURN_CONTEXT_PACK_SCHEMA_VERSION,
     identity: Object.freeze({
       taskId,
-      runId,
+      turnId: turnId,
       roleName: run.roleName,
       purpose: run.purpose,
       agentId: run.effective.agentId,
@@ -361,27 +357,27 @@ export function buildRunContextPack(store: TaskStore, taskId: string, runId: str
       workspace: run.effective.workspace.root
     }),
     ...(snapshotRef === undefined ? {} : { snapshot: snapshotRef }),
-    assignment: run.assignment,
+    input: run.inputs[0]!.input,
     authority: Object.freeze({ view, readableRefs: pointers, writableProjectIds }),
     pointers,
     summaries,
-    deltas: pointers.filter((ref) => run.assignment.deltaRefIds.includes(ref.refId)),
+    deltas: pointers.filter((ref) => run.inputs[0]!.input.deltaRefIds.includes(ref.refId)),
     completion: Object.freeze({
       allowedActions: completionActions(view),
-      exactRunRef: `${taskId}/${runId}`
+      exactTurnRef: `${taskId}/${turnId}`
     })
   };
   const digest = contextContentDigest(body);
   const preliminaryBytes = Buffer.byteLength(JSON.stringify({ ...body, digest }), "utf8");
-  if (preliminaryBytes > RUN_CONTEXT_PACK_MAX_BYTES) {
-    throw new Error(`Run Context Pack exceeds ${RUN_CONTEXT_PACK_MAX_BYTES} bytes.`);
+  if (preliminaryBytes > TURN_CONTEXT_PACK_MAX_BYTES) {
+    throw new Error(`Turn Context Pack exceeds ${TURN_CONTEXT_PACK_MAX_BYTES} bytes.`);
   }
   const pack = Object.freeze({
     ...body,
     budget: Object.freeze({
-      maxRefs: RUN_CONTEXT_PACK_MAX_REFS,
+      maxRefs: TURN_CONTEXT_PACK_MAX_REFS,
       returnedRefs: pointers.length,
-      maxBytes: RUN_CONTEXT_PACK_MAX_BYTES,
+      maxBytes: TURN_CONTEXT_PACK_MAX_BYTES,
       returnedBytes: preliminaryBytes,
       truncated: false as const
     }),
@@ -390,23 +386,23 @@ export function buildRunContextPack(store: TaskStore, taskId: string, runId: str
   return pack;
 }
 
-export function expandRunContextRef(
+export function expandTurnContextRef(
   store: TaskStore,
   taskId: string,
-  runId: string,
+  turnId: string,
   refId: string,
   refStore?: string
 ): Readonly<{ ref: ContextRef; value: unknown; digest: string }> {
-  const pack = buildRunContextPack(store, taskId, runId);
+  const pack = buildTurnContextPack(store, taskId, turnId);
   const authorized = pack.pointers.filter((ref) => (
     ref.refId === refId && (refStore === undefined || ref.store === refStore)
   ));
   const selector = refStore === undefined ? refId : `${refStore}/${refId}`;
   if (authorized.length !== 1) {
-    throw new Error(`Run Context ref is not uniquely authorized: ${selector}.`);
+    throw new Error(`Turn Context ref is not uniquely authorized: ${selector}.`);
   }
-  const run = requireExactRun(store, taskId, runId);
-  const snapshotRef = run.assignment.contextSnapshotRef;
+  const run = requireExactTurn(store, taskId, turnId);
+  const snapshotRef = run.inputs[0]!.input.contextSnapshotRef;
   const materialized = snapshotRef === undefined
     ? collectAuthorizedContext(store, run).find(({ ref }) => (
         contextRefIdentity(ref) === contextRefIdentity(authorized[0]!)
@@ -415,11 +411,11 @@ export function expandRunContextRef(
         contextRefIdentity(ref) === contextRefIdentity(authorized[0]!)
       ));
   if (materialized === undefined || materialized.ref.digest !== authorized[0]!.digest) {
-    throw new Error(`Run Context ref is unavailable or drifted: ${selector}.`);
+    throw new Error(`Turn Context ref is unavailable or drifted: ${selector}.`);
   }
   const bytes = Buffer.byteLength(JSON.stringify(materialized.value), "utf8");
-  if (bytes > RUN_CONTEXT_EXPAND_MAX_BYTES) {
-    throw new Error(`Run Context expansion exceeds ${RUN_CONTEXT_EXPAND_MAX_BYTES} bytes.`);
+  if (bytes > TURN_CONTEXT_EXPAND_MAX_BYTES) {
+    throw new Error(`Turn Context expansion exceeds ${TURN_CONTEXT_EXPAND_MAX_BYTES} bytes.`);
   }
   return Object.freeze({
     ref: materialized.ref,
@@ -428,26 +424,26 @@ export function expandRunContextRef(
   });
 }
 
-/** Fail-closed delta cursor resolution for one immutable Run lineage. */
-export function buildRunContextDelta(
+/** Fail-closed delta cursor resolution for one immutable Turn lineage. */
+export function buildTurnContextDelta(
   store: TaskStore,
   taskId: string,
-  runId: string,
+  turnId: string,
   after: string
 ): Readonly<{ schemaVersion: 1; after: string; cursor: string; refs: readonly ContextRef[] }> {
-  const pack = buildRunContextPack(store, taskId, runId);
+  const pack = buildTurnContextPack(store, taskId, turnId);
   if (after === pack.digest || after === pack.snapshot?.digest) {
     return Object.freeze({ schemaVersion: 1, after, cursor: pack.digest, refs: [] });
   }
-  const run = requireExactRun(store, taskId, runId);
-  const snapshotRef = run.assignment.contextSnapshotRef;
+  const run = requireExactTurn(store, taskId, turnId);
+  const snapshotRef = run.inputs[0]!.input.contextSnapshotRef;
   const snapshot = snapshotRef === undefined
     ? null
     : store.getContextSnapshot(taskId, snapshotRef.id);
   const parentDigest = snapshot?.parentRef?.digest;
   if (!((parentDigest !== undefined && after === parentDigest)
     || (parentDigest === undefined && after === "none"))) {
-    throw new Error("Run Context delta cursor is outside the frozen Snapshot lineage.");
+    throw new Error("Turn Context delta cursor is outside the frozen Snapshot lineage.");
   }
   return Object.freeze({
     schemaVersion: 1,
@@ -457,10 +453,10 @@ export function buildRunContextDelta(
   });
 }
 
-function requireExactRun(store: TaskStore, taskId: string, runId: string): AgentRun {
-  const run = store.getAgentRun(taskId, runId);
-  if (run === null || run.taskId !== taskId || run.id !== runId) {
-    throw new Error(`Agent Run not found: ${taskId}/${runId}.`);
+function requireExactTurn(store: TaskStore, taskId: string, turnId: string): Turn {
+  const run = store.getTurn(taskId, turnId);
+  if (run === null || run.taskId !== taskId || run.id !== turnId) {
+    throw new Error(`Turn not found: ${taskId}/${turnId}.`);
   }
   return run;
 }
@@ -468,7 +464,7 @@ function requireExactRun(store: TaskStore, taskId: string, runId: string): Agent
 function collectAuthorizedContext(
   store: TaskStore,
   run: Readonly<Pick<
-    AgentRun,
+    Turn,
     "taskId" | "roleName" | "purpose" | "workItemId" | "reviewRoundId" | "workspace"
   >>
 ): MaterializedRef[] {
@@ -480,17 +476,17 @@ function collectAuthorizedContext(
   if (brief !== null && view === "leader") {
     result.push(materialize("L2", "task-brief", task.id, brief));
   }
-  result.push(...collectRunContextOverlays(store, run));
+  result.push(...collectTurnContextOverlays(store, run));
   if (run.workItemId !== undefined) {
     const item = store.getWorkItem(task.id, run.workItemId);
-    if (item === null) throw new Error(`Run WorkItem not found: ${run.workItemId}.`);
+    if (item === null) throw new Error(`Turn WorkItem not found: ${run.workItemId}.`);
     result.push(materialize("L3", "work-item", item.id, item));
     if (view === "worker") {
       for (const dependencyId of item.dependsOn) {
         const dependency = store.getWorkItem(task.id, dependencyId);
         if (dependency === null
           || (dependency.status !== "completed" && dependency.status !== "retired")) {
-          throw new Error(`Run WorkItem dependency is not accepted: ${dependencyId}.`);
+          throw new Error(`Turn WorkItem dependency is not accepted: ${dependencyId}.`);
         }
         if (dependency.status === "retired") continue;
         result.push(materialize("L3", "accepted-work-item", dependency.id, dependency));
@@ -499,7 +495,7 @@ function collectAuthorizedContext(
   }
   if (run.reviewRoundId !== undefined) {
     const round = store.getReviewRound(task.id, run.reviewRoundId);
-    if (round === null) throw new Error(`Run ReviewRound not found: ${run.reviewRoundId}.`);
+    if (round === null) throw new Error(`Turn ReviewRound not found: ${run.reviewRoundId}.`);
     result.push(materialize("L3", "review-round", round.id, round));
     for (const finding of store.listReviewFindings(task.id).filter((candidate) => (
       candidate.firstReviewRoundId === round.id
@@ -511,7 +507,7 @@ function collectAuthorizedContext(
   }
   for (const binding of task.projectBindings) {
     const project = store.getProject(binding.projectId);
-    if (project === null) throw new Error(`Run Project not found: ${binding.projectId}.`);
+    if (project === null) throw new Error(`Turn Project not found: ${binding.projectId}.`);
     const { knowledge, ...projectPolicy } = project;
     result.push(materialize("L1", "project-policy", project.id, projectPolicy));
     for (const entry of knowledge.filter(({ status }) => status === "active")) {
@@ -540,12 +536,12 @@ function collectAuthorizedContext(
     for (const finding of store.listReviewFindings(task.id)) {
       result.push(materialize("L3", "review-finding", finding.id, finding));
     }
-    for (const agentRun of operationalTaskRecords(
-      store.listAgentRuns(task.id),
+    for (const turn of operationalTaskRecords(
+      store.listTurns(task.id),
       events,
-      "agent-run"
+      "turn"
     ).slice(-24)) {
-      result.push(materialize("L4", "agent-run", agentRun.id, agentRun));
+      result.push(materialize("L4", "turn", turn.id, turn));
     }
     for (const message of operationalTaskRecords(
       store.listMessages(task.id),
@@ -565,21 +561,6 @@ function collectAuthorizedContext(
     for (const event of publishedTreeAuthorizations.reverse().slice(-16)) {
       result.push(materialize("L4", "task-event", event.id, event));
     }
-    for (const event of events.filter(({ type }) => (
-      type === RUN_YIELD_REJECTED_EVENT
-    )).slice(-16)) {
-      result.push(materialize("L4", "task-event", event.id, event));
-      const attempt = rejectedYieldAttemptFromTaskEvent(event);
-      if (attempt === null) continue;
-      const rejectedRun = store.getAgentRun(task.id, attempt.runId);
-      if (rejectedRun !== null) {
-        result.push(materialize("L4", "agent-run", rejectedRun.id, rejectedRun));
-      }
-      const rejectedRound = store.getReviewRound(task.id, attempt.reviewRoundId);
-      if (rejectedRound !== null) {
-        result.push(materialize("L3", "review-round", rejectedRound.id, rejectedRound));
-      }
-    }
     for (const request of store.listOpenInputRequests([task.id])) {
       result.push(materialize("L4", "input-request", request.id, request));
     }
@@ -591,15 +572,15 @@ function collectAuthorizedContext(
 }
 
 /** Lane-specific context that may be layered over an immutable stage base. */
-function collectRunContextOverlays(
+function collectTurnContextOverlays(
   store: TaskStore,
   run: Readonly<Pick<
-    AgentRun,
+    Turn,
     "taskId" | "roleName" | "purpose" | "workItemId" | "reviewRoundId" | "workspace"
   >>
 ): MaterializedRef[] {
   const role = store.getRole(run.taskId, run.roleName);
-  if (role === null) throw new Error(`Run Role not found: ${run.taskId}/${run.roleName}.`);
+  if (role === null) throw new Error(`Turn Role not found: ${run.taskId}/${run.roleName}.`);
   return [
     materialize("L1", "role-profile", role.name, {
       name: role.name,
@@ -648,14 +629,14 @@ function contextRefIdentity(ref: ContextRef): string {
   return `${ref.store}\0${ref.refId}\0${ref.revision}`;
 }
 
-function contextView(run: Readonly<Pick<AgentRun, "roleName" | "purpose">>): RunContextView {
+function contextView(run: Readonly<Pick<Turn, "roleName" | "purpose">>): TurnContextView {
   if (run.purpose === "review") return "reviewer";
   if (run.roleName === "leader") return "leader";
   if (run.roleName === "operator") return "operator";
   return "worker";
 }
 
-function writableProjects(store: TaskStore, run: AgentRun, view: RunContextView): readonly string[] {
+function writableProjects(store: TaskStore, run: Turn, view: TurnContextView): readonly string[] {
   if (view === "leader") return Object.freeze(store.getTask(run.taskId)?.projectBindings.map(({ projectId }) => projectId) ?? []);
   if (view === "reviewer") {
     return Object.freeze(run.workspace?.entries.filter(({ access }) => access === "write").map(({ projectId }) => projectId) ?? []);
@@ -664,9 +645,9 @@ function writableProjects(store: TaskStore, run: AgentRun, view: RunContextView)
   return Object.freeze(store.getWorkItem(run.taskId, run.workItemId)?.writeProjectIds ?? []);
 }
 
-function completionActions(view: RunContextView): readonly string[] {
-  if (view === "leader") return Object.freeze(["yield", "complete-task", "request-input"]);
-  if (view === "reviewer") return Object.freeze(["checkpoint", "yield-review"]);
+function completionActions(view: TurnContextView): readonly string[] {
+  if (view === "leader") return Object.freeze(["finish-turn", "complete-task", "request-input"]);
+  if (view === "reviewer") return Object.freeze(["checkpoint", "finish-turn"]);
   if (view === "operator") return Object.freeze(["answer-input", "recover"]);
-  return Object.freeze(["checkpoint", "yield"]);
+  return Object.freeze(["checkpoint", "finish-turn"]);
 }

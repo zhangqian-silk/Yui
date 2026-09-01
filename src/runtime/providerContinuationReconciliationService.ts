@@ -141,7 +141,7 @@ function groupDetachedContinuations(
       && observation.fence.continuationGeneration === continuation.identity.generation
     ));
     // A projected continuation without its original durable fence cannot be
-    // safely attached to a live Run. Keep ownership conservative and let the
+    // safely attached to a live Turn. Keep ownership conservative and let the
     // malformed identity remain visible instead of synthesizing a receipt.
     if (source === undefined) continue;
     const group = groups.get(key) ?? [];
@@ -198,7 +198,7 @@ function reconciliationObservation(
       ...sourceFence,
       taskId: continuation.taskId,
       roleName: continuation.roleName,
-      runId: continuation.runId,
+      turnId: continuation.turnId,
       agentId: continuation.identity.accountScope,
       driverId: continuation.identity.providerNamespace,
       conversationId: continuation.identity.conversationId,

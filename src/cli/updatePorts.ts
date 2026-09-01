@@ -7,10 +7,10 @@
  * `npm install --global --prefix <tmp>`, so the live global install is never
  * touched until the binary-activation step. Preflight invokes the STAGED binary's
  * internal `yui upgrade --update-preflight` contract so the target version
- * classifies the Home, validates a compatible source in memory, or reads the
- * authoritative offline inventory as required by that path. After the parent
- * stops the exact old Controller, storage activation performs the full staged
- * validation/switch. Post-verify invokes the actually activated global binary.
+ * proves that the Home already implements the exact current contract. After
+ * the parent stops the exact old Controller, only the binary is promoted;
+ * update never rewrites or switches storage. Post-verify invokes the actually
+ * activated global binary.
  *
  * Two hardening guarantees this module enforces:
  *
@@ -23,11 +23,6 @@
  *    global `yui` (via `npm prefix -g`), runs its `--json doctor`, AND confirms
  *    the promoted binary's reported version matches the staged version. A
  *    mismatch fails closed.
- *
- * And the ambiguity guarantee (P1-2): `activateStorage` returns `ambiguous`
- * (never a false "unchanged") when the child leaves no parseable receipt, and
- * `probeStorage` reads the durable receipt + backup + schema so the orchestrator
- * can resolve the true state.
  */
 
 import { spawnSync, type SpawnSyncOptions, type SpawnSyncReturns } from "node:child_process";
@@ -36,28 +31,18 @@ import { tmpdir } from "node:os";
 import { delimiter, dirname, isAbsolute, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import Database from "better-sqlite3";
-
 import { runtimeError } from "../errors/cliError.js";
 import { isConcreteVersion } from "../domain/validation.js";
 import { STORAGE_DOCTOR_CHECK_NAMES } from "../doctor/doctor.js";
 import { acquireHandoverLock } from "../release/runtimeRelease.js";
-import { inspectStorageSchema } from "../storage/storageSchema.js";
-import { placeUpgradeFence } from "../storage/upgradeFence.js";
-import { correlateUpgradeReceipt } from "../storage/upgrade/upgradeOrchestrator.js";
-import { readSwitchProgress } from "../storage/upgrade/switchProgress.js";
 import type {
   StagedPackage,
   ControllerIdentity,
-  StorageActivation,
-  StorageStateProbe,
   UpdateControllerLifecycleStatus,
   UpdateControllerStopResult,
   UpdateBlockerIdentity,
   UpdatePorts,
-  UpdatePreflight,
-  UpdateSqliteLedgerHead,
-  UpdateSqliteMigrationBoundary
+  UpdatePreflight
 } from "./updateOrchestrator.js";
 
 const PACKAGE_NAME = "@zq-silk/yui";
@@ -120,28 +105,12 @@ export function createUpdatePorts(
   // deliberately not persisted as a retry or recovery protocol.
   let verifiedActivatedBinary: string | undefined;
   let verifiedActivatedVersion: string | undefined;
-  let storageFenceOwnerPid: number | undefined;
   const stopReplacementController = (home: string, pid: number): UpdateControllerStopResult => (
     stopReplacementControllerForUpdate(home, pid, environment, run)
   );
   return {
     beginControllerHandover(home: string): () => void {
       return acquireHandoverLock(home).release;
-    },
-    beginStorageWriteFence(home: string): () => void {
-      const release = placeUpgradeFence(home, {
-        reason: "update storage activation in progress",
-        createdAt: new Date().toISOString(),
-        ownerPid: process.pid
-      });
-      storageFenceOwnerPid = process.pid;
-      let released = false;
-      return () => {
-        if (released) return;
-        release();
-        released = true;
-        if (storageFenceOwnerPid === process.pid) storageFenceOwnerPid = undefined;
-      };
     },
     stage(version?: string): StagedPackage {
       // A caller that names a version (the release workflow, which freezes the
@@ -203,30 +172,6 @@ export function createUpdatePorts(
       return interpretPreflight(result);
     },
 
-    activateStorage(staged: StagedPackage, home: string): StorageActivation {
-      const result = run(
-        staged.binaryPath,
-        ["--json", "upgrade"],
-        {
-          cwd: process.cwd(),
-          // The parent update process captures/stops/drains the old Controller
-          // before invoking the staged child. Mark this internal call so the
-          // child performs storage migration only and never starts a Controller
-          // from the temporary staging installation.
-          env: {
-            ...environment,
-            YUI_HOME: home,
-            YUI_UPDATE_EXTERNALLY_QUIESCED: "1",
-            ...(storageFenceOwnerPid === undefined
-              ? {}
-              : { YUI_UPDATE_HANDOVER_OWNER_PID: String(storageFenceOwnerPid) })
-          },
-          shell: false
-        }
-      );
-      return interpretActivation(result);
-    },
-
     activateBinary(staged: StagedPackage): void {
       verifiedActivatedBinary = undefined;
       verifiedActivatedVersion = undefined;
@@ -250,7 +195,7 @@ export function createUpdatePorts(
           "Post-update health check failed: could not locate the activated global `yui` binary."
         );
       }
-      // 1) Health check the migrated Home through the activated binary's loader.
+      // 1) Health check the unchanged current Home through the activated binary.
       // POST-VERIFY PARSES THE MACHINE-READABLE RESULT FIRST, THEN THE EXIT STATUS
       // (R2-F2). `yui --json doctor` deliberately sets a non-zero exit when storage
       // is unhealthy, so interpreting the exit status before the envelope would
@@ -301,67 +246,6 @@ export function createUpdatePorts(
       verifiedActivatedVersion = activeVersion;
     },
 
-    probeStorage(home: string): StorageStateProbe {
-      // Resolve an ambiguous activation from durable on-disk evidence (P1-2),
-      // but only trust a receipt that CORRESPONDS to the current Home/backup
-      // (P2-6): a leftover receipt from a prior attempt, a different Home, or one
-      // whose backup was already restored/cleaned is NOT evidence that THIS
-      // attempt's switch committed. When it does not correspond, fall back to the
-      // on-disk schema and report `switched: false` so the caller re-probes the
-      // real state instead of giving a recovery instruction from a stale receipt.
-      const schema = inspectStorageSchema(home);
-      const sqliteSchemaHead = inspectSqliteSchemaHead(home);
-
-      // A crash mid-switch leaves a durable progress marker. A marker of ANY phase
-      // — `backing-up`, `promoting`, or `interrupted` — is only actionable as an
-      // interrupted switch when the FILESYSTEM still corroborates it: the backup
-      // exists AND the Home is not in place (missing/uninitialized), so the
-      // authoritative data lives only at the backup and the recovery is a precise
-      // restore. This gate now applies to `interrupted` too (R2-F3): a leftover
-      // `interrupted` marker after a manual recovery — Home already restored, or
-      // the backup already gone — must NOT be trusted to emit a restore path; we
-      // ignore the stale marker and re-probe the real state below.
-      const progress = readSwitchProgress(home);
-      if (progress !== null) {
-        const backupPresent = progress.backupPath !== undefined
-          && existsSync(progress.backupPath);
-        // The Home is "in place" only when storage is actually initialized there;
-        // a missing/uninitialized Home after a mid-switch crash means the data is
-        // at the backup.
-        const homeInitialized = schema.status !== "uninitialized";
-        if (backupPresent && !homeInitialized) {
-          // Original at the backup, Home missing/uninitialized: recover by restore.
-          // The Home is uninitialized here, so it is definitively not current.
-          return {
-            switched: false,
-            interrupted: true,
-            schemaCurrent: false,
-            ...(sqliteSchemaHead === undefined ? {} : { sqliteSchemaHead }),
-            ...(progress.backupPath === undefined ? {} : { backupPath: progress.backupPath })
-          };
-        }
-        // Otherwise the marker is stale relative to the current filesystem (Home
-        // intact, or no backup to restore). Do not emit a restore path from it —
-        // fall through and reconcile against the receipt/schema below.
-      }
-
-      const correlation = correlateUpgradeReceipt(home);
-      if (!correlation.corresponds) {
-        return {
-          switched: false,
-          schemaCurrent: schema.status === "current",
-          ...(sqliteSchemaHead === undefined ? {} : { sqliteSchemaHead })
-        };
-      }
-      const receipt = correlation.receipt;
-      return {
-        switched: true,
-        schemaCurrent: schema.status === "current",
-        ...(sqliteSchemaHead === undefined ? {} : { sqliteSchemaHead }),
-        ...(receipt.backupPath === undefined ? {} : { backupPath: receipt.backupPath })
-      };
-    },
-
     cleanup(staged: StagedPackage): void {
       if (staged.stagingPath !== undefined) {
         rmSync(staged.stagingPath, { recursive: true, force: true });
@@ -380,7 +264,6 @@ export function createUpdatePorts(
     stopController(home: string, expectedPid: number): UpdateControllerStopResult {
       return stopControllerForUpdate(home, expectedPid, environment, spawn);
     },
-    stopReplacementController,
     startController(home: string): void {
       if (verifiedActivatedBinary === undefined || verifiedActivatedVersion === undefined) {
         throw runtimeError(
@@ -401,39 +284,6 @@ export function createUpdatePorts(
       restoreControllerIdentity(home, identity, environment, spawn);
     }
   };
-}
-
-/**
- * Read the generic durable SQLite ledger without asking the old parent binary
- * to understand the staged release's migration registry. The staged preflight
- * supplies the validated source and target heads used to interpret this value.
- */
-function inspectSqliteSchemaHead(home: string): UpdateSqliteLedgerHead | undefined {
-  const path = join(home, "yui.db");
-  if (!existsSync(path)) return undefined;
-  const db = new Database(path, { readonly: true, fileMustExist: true });
-  try {
-    db.pragma("query_only = ON");
-    const rows = db.prepare(
-      "SELECT version, checksum FROM schema_migrations ORDER BY version"
-    ).all() as Array<{ version: unknown; checksum: unknown }>;
-    if (rows.length === 0) throw new Error("SQLite migration ledger is empty.");
-    for (let index = 0; index < rows.length; index += 1) {
-      const row = rows[index]!;
-      if (row.version !== index + 1
-        || typeof row.checksum !== "string"
-        || row.checksum.length === 0) {
-        throw new Error("SQLite migration ledger is not a contiguous checksummed prefix.");
-      }
-    }
-    const head = rows.at(-1)!;
-    return {
-      version: head.version as number,
-      checksum: head.checksum as string
-    };
-  } finally {
-    db.close();
-  }
 }
 
 const UPDATE_CLI_PATH = fileURLToPath(new URL("../cli.js", import.meta.url));
@@ -1202,98 +1052,19 @@ function interpretPreflight(result: SpawnSyncReturns<Buffer>): UpdatePreflight {
   };
 }
 
-/** Strictly parse the green states of the internal update preflight. */
+/** Only the exact current storage contract is a green update preflight. */
 function parseUpdatePreflightResult(data: Record<string, unknown>): UpdatePreflight | null {
-  const status = data.status;
-  const stepCount = data.stepCount;
-  if (
-    (status !== "already-current"
-      && status !== "compatible"
-      && status !== "in-place-migration"
-      && status !== "migration-required")
-    || !Number.isSafeInteger(stepCount)
-    || (stepCount as number) < 0
-  ) {
-    return null;
-  }
+  if (data.status !== "already-current" || data.stepCount !== 0) return null;
   const homeClassification = data.classification;
   if (!isRecord(homeClassification) || !isRecord(homeClassification.classification)) return null;
   const classification = homeClassification.classification;
-  const expected = status === "already-current"
-    ? { verdict: "USABLE", classificationStatus: "current" }
-    : status === "compatible"
-      ? { verdict: "COMPATIBLE", classificationStatus: "compatible-old" }
-      : { verdict: "MIGRATABLE", classificationStatus: "migration-required" };
   if (
-    classification.verdict !== expected.verdict
-    || classification.status !== expected.classificationStatus
-    || (status === "already-current"
-      ? stepCount !== 0
-      : classification.stepCount !== stepCount || (stepCount as number) < 1)
+    classification.verdict !== "USABLE"
+    || classification.status !== "current"
   ) {
     return null;
   }
-  if (status === "already-current") return { status };
-  const evidence = status === "compatible"
-    ? `${stepCount as number} compatible step(s) classified and the compatible source validated in memory`
-    : status === "in-place-migration"
-      ? `${stepCount as number} SQLite migration step(s) classified for one in-place transaction and the offline runtime inventory confirmed clear`
-      : `${stepCount as number} offline migration step(s) classified and the offline runtime inventory confirmed clear`;
-  const summary =
-    `${evidence}. `
-    + "No staged Home or staged-output loader validation was performed during update preflight.";
-  if (status === "in-place-migration") {
-    const sqliteMigration = parseSqliteMigrationBoundary(data.sqliteMigration, stepCount as number);
-    if (sqliteMigration === null) return null;
-    return {
-      status,
-      summary,
-      sqliteMigration
-    };
-  }
-  return {
-    status,
-    summary
-  };
-}
-
-function parseSqliteMigrationBoundary(
-  value: unknown,
-  stepCount: number
-): UpdateSqliteMigrationBoundary | null {
-  if (!isRecord(value)) return null;
-  const currentVersion = value.currentVersion;
-  const currentChecksum = value.currentChecksum;
-  const targetVersion = value.targetVersion;
-  const targetChecksum = value.targetChecksum;
-  const pendingVersions = value.pendingVersions;
-  if (
-    !Number.isSafeInteger(currentVersion)
-    || (currentVersion as number) < 1
-    || typeof currentChecksum !== "string"
-    || currentChecksum.length === 0
-    || !Number.isSafeInteger(targetVersion)
-    || (targetVersion as number) <= (currentVersion as number)
-    || typeof targetChecksum !== "string"
-    || targetChecksum.length === 0
-    || !Array.isArray(pendingVersions)
-    || pendingVersions.length !== stepCount
-    || targetVersion !== (currentVersion as number) + stepCount
-    || pendingVersions.some((version, index) =>
-      !Number.isSafeInteger(version) || version !== (currentVersion as number) + index + 1)
-  ) {
-    return null;
-  }
-  return {
-    current: {
-      version: currentVersion as number,
-      checksum: currentChecksum
-    },
-    target: {
-      version: targetVersion as number,
-      checksum: targetChecksum
-    }
-  };
+  return { status: "already-current" };
 }
 
 function parseUpdateBlockers(value: unknown): readonly UpdateBlockerIdentity[] | undefined {
@@ -1304,14 +1075,14 @@ function parseUpdateBlockers(value: unknown): readonly UpdateBlockerIdentity[] |
     if (!isRecord(item) || typeof item.reason !== "string" || item.reason.length === 0) {
       return undefined;
     }
-    const optional = ["taskId", "roleName", "runId", "nativeSessionId", "launchId"] as const;
+    const optional = ["taskId", "roleName", "turnId", "nativeSessionId", "launchId"] as const;
     if (optional.some((key) => item[key] !== undefined && typeof item[key] !== "string")) {
       return undefined;
     }
     parsed.push({
       ...(typeof item.taskId === "string" ? { taskId: item.taskId } : {}),
       ...(typeof item.roleName === "string" ? { roleName: item.roleName } : {}),
-      ...(typeof item.runId === "string" ? { runId: item.runId } : {}),
+      ...(typeof item.turnId === "string" ? { turnId: item.turnId } : {}),
       ...(typeof item.nativeSessionId === "string"
         ? { nativeSessionId: item.nativeSessionId }
         : {}),
@@ -1320,118 +1091,6 @@ function parseUpdateBlockers(value: unknown): readonly UpdateBlockerIdentity[] |
     });
   }
   return parsed;
-}
-
-function interpretActivation(result: SpawnSyncReturns<Buffer>): StorageActivation {
-  // A spawn transport error (could not even run) is a clean pre-switch failure.
-  if (result.error !== undefined) {
-    return {
-      status: "ambiguous",
-      detail: `the activation process could not be run: ${result.error.message}`
-    };
-  }
-  // Require a valid `{ ok:true, data }` success envelope (R3-F3). Killed by a
-  // signal, no parseable JSON, or an `ok:false`/malformed envelope: the child may
-  // have died after the atomic switch but before printing a valid result. This is
-  // AMBIGUOUS, never a false "recoverable/unchanged" (P1-2).
-  const data = parseSuccessEnvelopeData(result);
-  if (data === null) {
-    const how = result.signal !== null
-      ? `terminated by ${result.signal}`
-      : result.status === null
-        ? "terminated without an exit code"
-        : `exited with status ${result.status} and no valid success envelope`;
-    return {
-      status: "ambiguous",
-      detail: `the activation process ${how}`
-    };
-  }
-  const outcome = typeof data.outcome === "string" ? data.outcome : undefined;
-  // EXIT STATUS / OUTCOME CONSISTENCY (P1-2)
-  // A success-class outcome is only trustworthy when the child ALSO exited 0. A
-  // contradiction (e.g. stdout says `upgraded` but the process exited non-zero)
-  // means the child's own contract was violated mid-flight — the switch may or
-  // may not have committed — so it is AMBIGUOUS, never a false success. Blocker-
-  // class outcomes are exempt: `yui upgrade` deliberately exits non-zero (5) for
-  // a clean `blocked`, so a non-zero exit there is expected and consistent.
-  if ((outcome === "already-current" || outcome === "upgraded") && result.status !== 0) {
-    return {
-      status: "ambiguous",
-      detail:
-        `the activation process reported outcome=${outcome} but exited with status `
-        + `${result.status ?? "null"} (a success outcome must exit 0); the switch state is unknown`
-    };
-  }
-  if (outcome === "already-current") return { status: "already-current" };
-  if (outcome === "upgraded") {
-    if (data.migrationMode === "in-place" && data.backupPath === undefined) {
-      return { status: "migrated-in-place" };
-    }
-    const backupPath = data.backupPath;
-    if (
-      typeof backupPath !== "string"
-      || backupPath.length === 0
-      || backupPath.trim() !== backupPath
-      || backupPath.includes("\0")
-      || !isAbsolute(backupPath)
-    ) {
-      return {
-        status: "ambiguous",
-        detail:
-          "the activation process reported outcome=upgraded without a non-empty absolute backupPath"
-      };
-    }
-    return {
-      status: "migrated",
-      backupPath
-    };
-  }
-  if (outcome === "blocked") {
-    const stage = typeof data?.stage === "string" ? data.stage : "activate-storage";
-    // A `switch-ambiguous` blocker is NOT a clean, recoverable refusal (P1-4):
-    // the upgrade's atomic switch was left partially applied (original moved to
-    // backup, promotion + rollback both failed). Route it to AMBIGUOUS so the
-    // orchestrator probes the interrupted marker and reports a restore, never a
-    // false "the current install and Home remain usable".
-    if (stage === "switch-ambiguous") {
-      return {
-        status: "ambiguous",
-        detail: typeof data?.message === "string"
-          ? data.message
-          : "the storage switch was left partially applied"
-      };
-    }
-    // A post-verify blocker is emitted only after the atomic Home switch has
-    // committed. Treat it as AMBIGUOUS in the parent update flow so a stopped
-    // old Controller is never restored against the migrated Home; the receipt,
-    // backup, and switch-progress marker are the recovery evidence.
-    if (stage === "post-verify") {
-      return {
-        status: "ambiguous",
-        detail: typeof data?.message === "string"
-          ? data.message
-          : "storage switched but post-switch verification did not complete"
-      };
-    }
-    const blockers = parseUpdateBlockers(data.blockers);
-    return {
-      status: "blocked",
-      stage,
-      message: typeof data?.message === "string" ? data.message : "Storage activation was refused.",
-      action: typeof data?.action === "string"
-        ? data.action
-        : "Resolve the reported condition and retry.",
-      ...(blockers === undefined ? {} : { blockers }),
-      ...(typeof data.retryCommand === "string" ? { retryCommand: data.retryCommand } : {}),
-      ...(data.sceneUnchanged === true ? { sceneUnchanged: true } : {})
-    };
-  }
-  // Parseable JSON but an unrecognized outcome: we cannot classify it, so it is
-  // ambiguous rather than silently treated as a clean refusal.
-  return {
-    status: "ambiguous",
-    detail: `the activation process returned an unrecognized outcome (${String(outcome)})`
-  };
 }
 
 /**
@@ -1551,7 +1210,7 @@ function resolveGlobalBinary(
 }
 
 /**
- * Fail closed unless the doctor result PROVES the migrated Home's storage is
+ * Fail closed unless the doctor result proves the current Home's storage is
  * healthy (P1-3 / R2-F2). The envelope and storage checks are validated BEFORE
  * the exit status is interpreted, because `yui --json doctor` deliberately exits
  * non-zero on unhealthy storage — so keying off the exit first would reduce a
@@ -1669,7 +1328,7 @@ function assertDoctorStorageHealthy(result: SpawnSyncReturns<Buffer>): void {
       .map((c) => `${String(c.name)}=${String(c.status)} (${String(c.detail)})`)
       .join("; ");
     throw runtimeError(
-      "Post-update health check failed: the migrated Home is not healthy per the activated "
+      "Post-update health check failed: the current Home is not healthy per the activated "
         + `binary's doctor: ${detail || "(no detail)"}. The storage did not come up cleanly on `
         + "the new version. Restore the timestamped backup to recover the original Home before "
         + "resuming writes."
@@ -1689,7 +1348,7 @@ function assertDoctorStorageHealthy(result: SpawnSyncReturns<Buffer>): void {
 /** A fail-closed post-update health-check error for an unverifiable doctor result. */
 function doctorUnverifiable(reason: string): Error {
   return runtimeError(
-    `Post-update health check failed: ${reason}, so the migrated Home cannot be confirmed `
+    `Post-update health check failed: ${reason}, so the current Home cannot be confirmed `
       + "healthy. Investigate with `yui doctor` before resuming; if storage was migrated, restore "
       + "the timestamped backup to recover."
   );

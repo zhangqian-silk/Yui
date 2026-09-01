@@ -111,7 +111,7 @@ export type ProjectOwnership = "managed" | "external";
  * - `retired`: auditable soft deprecation. The catalog record, checkout, and
  *   every historical reference are retained, but the Project cannot be bound
  *   to new work or maintained. Hard removal goes through `project delete` and
- *   still preserves Task/Run/Review/Integration/Publication evidence.
+ *   still preserves Task/Turn/Review/Integration/Publication evidence.
  */
 export type ProjectStatus = "active" | "retired";
 
@@ -195,7 +195,7 @@ export function validateProjectName(value: string): string {
 
 /**
  * Soft-retire a Project: mark it retired and record the audit trail. The
- * catalog record, checkout, and every historical Task/Run/Review/Integration/
+ * catalog record, checkout, and every historical Task/Turn/Review/Integration/
  * Publication reference are retained. Retiring an already-retired Project
  * fails closed; a retired Project must be deleted (or kept) as-is.
  */
@@ -503,7 +503,7 @@ export function resolveProject(
  * Projection of every durable reference the Task ledger holds to a Project,
  * used by the lifecycle commands' fail-closed gates. `boundTaskIds` covers
  * historical (completed/retired/archived) bindings too, because their
- * Task/Run/Review/Integration/Publication evidence must stay resolvable;
+ * Task/Turn/Review/Integration/Publication evidence must stay resolvable;
  * `activeTaskIds` and the unresolved-delivery lists cover open work.
  */
 export type ProjectReferenceSummary = Readonly<{
@@ -514,8 +514,8 @@ export type ProjectReferenceSummary = Readonly<{
   activeTaskIds: readonly string[];
   /** Non-terminal Work Items (`task/work`) inside the active Tasks. */
   unresolvedWorkItemRefs: readonly string[];
-  /** Active Agent Runs (`task/run`) inside the active Tasks. */
-  activeRunRefs: readonly string[];
+  /** Active Turns (`task/run`) inside the active Tasks. */
+  activeTurnRefs: readonly string[];
   /** Running or blocked Integration Attempts inside the active Tasks. */
   unresolvedIntegrationRefs: readonly string[];
 }>;

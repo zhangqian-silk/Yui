@@ -174,11 +174,11 @@ an accepted-but-incorrect result.
 - **Recovery success rate**: attempted recoveries that reach a valid terminal
   outcome with the original acceptance contract intact.
 - **Time to recovery**: bounded time from the first confirmed failure signal to
-  the recovered Run/Lane or explicit Leader disposition.
+  the recovered Turn/Lane or explicit Leader disposition.
 - **Result reuse rate**: recoveries that reuse durable in-flight evidence
   instead of replaying an already completed result.
 
-Use structured Run/Lane recovery records and durable result references. A live
+Use structured Turn/Lane recovery records and durable result references. A live
 pane, silence timeout, or provider Turn completion is not recovery evidence.
 
 ### Marginal value

@@ -94,7 +94,7 @@ export type ResourceGcInput = Readonly<{
   /** Test seam for live-reference sources; production callers omit it. */
   liveReferencePorts?: LiveReferencePorts;
   /**
-   * Workspace paths claimed by active durable Jobs (AgentRuns). Production
+   * Workspace paths claimed by active durable Jobs (Turns). Production
    * callers compute these from the TaskStore; tests may omit them.
    */
   activeWorkspaceOwnerPaths?: readonly string[];
@@ -215,7 +215,7 @@ function classifyDiscoveredResources(
 
 /**
  * Collect active workspace owner path fragments from durable state.
- * These protect resources that an active Session, Job, or AgentRun still
+ * These protect resources that an active Session, Job, or Turn still
  * references even when the Task itself is terminal.
  */
 function collectActiveWorkspaceOwners(input: ResourceGcInput): readonly string[] {

@@ -52,7 +52,6 @@ kbd{background:var(--bg-3);border:1px solid var(--border);border-bottom-width:2p
 .filter-dot.active{background:var(--active);box-shadow:0 0 6px var(--active)}
 .filter-dot.draft{background:var(--warning);box-shadow:0 0 6px var(--warning)}
 .filter-dot.completed{background:var(--success);box-shadow:0 0 6px var(--success)}
-.filter-dot.yielded{background:var(--success);box-shadow:0 0 6px var(--success)}
 .filter-dot.failed{background:var(--danger);box-shadow:0 0 6px var(--danger)}
 .filter-dot.retired{background:var(--faint)}
 .filter-dot.archived{background:var(--muted)}
@@ -95,7 +94,7 @@ kbd{background:var(--bg-3);border:1px solid var(--border);border-bottom-width:2p
 /* Pills + dots + chips */
 .pill{display:inline-flex;align-items:center;font-family:var(--font-mono);font-size:9px;text-transform:uppercase;letter-spacing:.07em;padding:3px 10px;border-radius:var(--radius-pill);white-space:nowrap;color:var(--accent);background:var(--accent-soft);border:1px solid var(--accent-line)}
 .pill[data-status=failed],.pill[data-status=urgent],.pill[data-status=required]{color:var(--danger);background:var(--danger-soft);border-color:transparent}
-.pill[data-status=active],.pill[data-status=running],.pill[data-status=yielded],
+.pill[data-status=active],.pill[data-status=running],
 .pill[data-status=user],.pill[data-status=operator]{color:var(--active);background:var(--active-soft);border-color:transparent}
 .pill[data-status=completed],.pill[data-status=integrated],.pill[data-status=role-result]{color:var(--success);background:var(--success-soft);border-color:transparent}
 .pill[data-status=pending],.pill[data-status=draft],.pill[data-status=recommended],

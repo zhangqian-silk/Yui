@@ -35,8 +35,8 @@ import { activeLiveRoleAgentSession } from "../executor/agentExecutor.js";
  *
  * rr12: The identity is now bound to a durable, Controller-verified record
  * rather than trusted as a literal:
- * - A `task` caller must carry `runId`; the Controller looks up that Run,
- *   requires `run.roleName === role` and `run.status === "active"`, and verifies
+ * - A `task` caller must carry `turnId`; the Controller looks up that Turn,
+ *   requires `turn.roleName === role` and `turn.status === "active"`, and verifies
  *   the per-Session caller key. Role does not narrow authority within the Task.
  * - A `global` caller is verified against the current global Role, Agent,
  *   launch, and native Session and then has full Task control authority.
@@ -50,7 +50,7 @@ export type DurableJobCaller = Readonly<{
   adapterId?: string;
   launchId?: string;
   nativeSessionId?: string;
-  runId?: string;
+  turnId?: string;
   /**
    * rr13: task-scope caller — the per-Session job caller key injected at native
    * Session launch as `YUI_JOB_CALLER_KEY`. The Controller verifies its SHA-256
@@ -306,22 +306,22 @@ function validateStartParams(store: TaskStore, params: DurableJobStartParams): v
 /**
  * rr8/rr12: Bind the declared job owner to the caller's managed identity. The
  * Controller validates the declared owner/workspace and verifies the caller
- * against durable Run/Session state — a self-reported role or scope is never
+ * against durable Turn/Session state — a self-reported role or scope is never
  * authority on its own. The rules:
  *
  * - `user` (non-managed): rejected because it has no managed Session identity.
  * - `global`: full Task authority after current Role Session verification.
  * - `task` + mismatched taskId: rejected.
- * - `task` + missing `runId`: rejected (a managed caller must bind to a Run).
- * - `task` + Run not found / not active / `roleName !== role`: rejected — the
- *   claimed Role must be the real Role of an active Run.
- * - `task`: full authority inside the matching Task after active Run and
+ * - `task` + missing `turnId`: rejected (a managed caller must bind to a Turn).
+ * - `task` + Turn not found / not active / `roleName !== role`: rejected — the
+ *   claimed Role must be the real Role of an active Turn.
+ * - `task`: full authority inside the matching Task after active Turn and
  *   per-Session caller-key verification; Role does not narrow it.
  */
 /**
  * rr13: `job.start`/`job.cancel` caller authorization at the Controller
  * boundary. Every identity claim the Controller can verify from durable state
- * (role and runId) is replayable by any client in the
+ * (role and turnId) is replayable by any client in the
  * same Home that reads state.json. The channel itself is therefore not
  * authenticated by those claims alone. A non-replayable per-Session caller key
  * closes the gap:
@@ -335,13 +335,13 @@ function validateStartParams(store: TaskStore, params: DurableJobStartParams): v
  *   map for the caller's Role + Agent. No legacy fallback: an absent hash or a
  *   mismatched key is UNAUTHORIZED.
  *
- * The existing Run binding checks run after the key check, so a forged
+ * The existing Turn binding checks run after the key check, so a forged
  * identity that also lacks the key is rejected at the channel boundary.
  */
 function assertCallerAuthorized(
   store: Pick<
     TaskStore,
-    "getAgentRun" | "getActiveAgentRun" | "getTaskRoleSessionSet" | "getJobCallerKeyHash"
+    "getTurn" | "getActiveTurn" | "getTaskRoleSessionSet" | "getJobCallerKeyHash"
       | "getGlobalRole" | "getGlobalRoleSessionSet"
   >,
   caller: DurableJobCaller,
@@ -393,17 +393,17 @@ function assertCallerAuthorized(
       "A managed Task Session may not start or cancel Jobs for a different Task."
     );
   }
-  if (caller.runId === undefined) {
+  if (caller.turnId === undefined) {
     throw jobControlError(
       "UNAUTHORIZED",
-      "A managed Task Session must bind its request to a Run."
+      "A managed Task Session must bind its request to a Turn."
     );
   }
-  const run = store.getAgentRun(taskId, caller.runId);
+  const run = store.getTurn(taskId, caller.turnId);
   if (run === null || run.status !== "active" || run.roleName !== caller.role) {
     throw jobControlError(
       "UNAUTHORIZED",
-      "A managed Task Session's Role is not bound to an active Run."
+      "A managed Task Session's Role is not bound to an active Turn."
     );
   }
   // rr13: Verify the non-replayable per-Session caller key. The key is injected
@@ -678,7 +678,7 @@ function parseCaller(value: JsonValue | undefined): DurableJobCaller {
   const record = value as Readonly<Record<string, JsonValue>>;
   const allowed = new Set([
     "scope", "taskId", "role", "agentId", "adapterId", "launchId", "nativeSessionId",
-    "runId", "callerKey"
+    "turnId", "callerKey"
   ]);
   for (const key of Object.keys(record)) {
     if (!allowed.has(key)) {
@@ -689,7 +689,7 @@ function parseCaller(value: JsonValue | undefined): DurableJobCaller {
     throw jobControlError("INVALID_PARAMS", "job caller scope is invalid.");
   }
   const optionalId = (key: "taskId" | "role" | "agentId" | "adapterId" | "launchId"
-    | "nativeSessionId" | "runId"): string | undefined => {
+    | "nativeSessionId" | "turnId"): string | undefined => {
     const entry = record[key];
     if (entry === undefined) return undefined;
     return requiredId(entry, `job caller ${key}`);
@@ -700,7 +700,7 @@ function parseCaller(value: JsonValue | undefined): DurableJobCaller {
   const adapterId = optionalId("adapterId");
   const launchId = optionalId("launchId");
   const nativeSessionId = optionalId("nativeSessionId");
-  const runId = optionalId("runId");
+  const turnId = optionalId("turnId");
   const callerKey = record.callerKey === undefined
     ? undefined
     : requiredId(record.callerKey, "job caller callerKey");
@@ -712,7 +712,7 @@ function parseCaller(value: JsonValue | undefined): DurableJobCaller {
     ...(adapterId === undefined ? {} : { adapterId }),
     ...(launchId === undefined ? {} : { launchId }),
     ...(nativeSessionId === undefined ? {} : { nativeSessionId }),
-    ...(runId === undefined ? {} : { runId }),
+    ...(turnId === undefined ? {} : { turnId }),
     ...(callerKey === undefined ? {} : { callerKey })
   };
 }

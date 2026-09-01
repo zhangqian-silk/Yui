@@ -75,12 +75,12 @@ async function integrateUpstream(
     throw usageError(`Task must be active to integrate upstream: ${taskId}/${task.status}.`);
   }
   // RFC Phase 4: integrating upstream rewrites the Task worktree HEAD. Refuse
-  // while the Leader has an active Run so the merge never lands under a
+  // while the Leader has an active Turn so the merge never lands under a
   // running Session.
-  const activeLeaderRun = store.getActiveAgentRun(taskId, "leader");
+  const activeLeaderRun = store.getActiveTurn(taskId, "leader");
   if (activeLeaderRun !== null) {
     throw usageError(
-      `Task has an active Leader Run (${activeLeaderRun.id}); stop it before integrating upstream: ${taskId}.`
+      `Task has an active Leader Turn (${activeLeaderRun.id}); stop it before integrating upstream: ${taskId}.`
     );
   }
   const workspace = store.getTaskWorkspace(taskId);

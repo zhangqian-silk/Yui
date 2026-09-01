@@ -11,7 +11,10 @@ import WebSocket, { type RawData } from "ws";
 import {
   CodexAppServerRequestError,
   CodexAppServerRuntime,
-  codexAppServerErrorIsMissing
+  codexGoalNotification,
+  codexAppServerErrorIsMissing,
+  codexTurnInput,
+  codexTurnSummary
 } from "./codexAppServerRuntime.js";
 import type {
   AgentHostLaunchPayload,
@@ -37,6 +40,16 @@ export type StructuredProviderTurnInput = Readonly<{
   boundedText: string;
 }>;
 
+export type StructuredProviderTurnStarted = Readonly<{
+  conversationId: string;
+  nativeSessionId: string;
+  nativeTurnId: string;
+  clientOwned: boolean;
+  observedAt: string;
+  /** Provider-visible input when the start notification exposes it. */
+  input?: string;
+}>;
+
 export type StructuredProviderTurnTerminal = Readonly<{
   conversationId: string;
   nativeSessionId: string;
@@ -45,11 +58,22 @@ export type StructuredProviderTurnTerminal = Readonly<{
   clientOwned: boolean;
   status: "completed" | "failed" | "cancelled";
   observedAt: string;
+  /** Provider-visible input only; internal reasoning and tool items are excluded. */
+  input?: string;
   summary?: string;
   /** Human-readable Provider error message. */
   error?: string;
   /** Complete serialized Provider exception as received by this Driver. */
   rawError?: string;
+}>;
+
+export type StructuredProviderGoal = Readonly<{
+  conversationId: string;
+  status: "active" | "paused" | "blocked" | "usage-limited" | "budget-limited" | "complete";
+  objective: string;
+  updatedAt: string;
+  nativeTurnId?: string;
+  tokenBudget?: number;
 }>;
 
 export type StructuredProviderProcessExit = Readonly<{
@@ -65,6 +89,7 @@ export interface StructuredProviderSession {
   readonly processInstanceId: string;
   readonly activeTurnId: string | undefined;
   submitTurn(turn: StructuredProviderTurnInput): Promise<StructuredProviderTurnReceipt>;
+  steerTurn(turn: StructuredProviderTurnInput): Promise<StructuredProviderTurnReceipt>;
   waitForExit(): Promise<StructuredProviderProcessExit>;
   terminate(signal: NodeJS.Signals): void;
 }
@@ -115,12 +140,15 @@ export class ProviderConversationMissingError extends Error {
 export async function startStructuredProviderSession(
   payload: AgentHostLaunchPayload,
   input: Readonly<{
+    onStarted?: (started: StructuredProviderTurnStarted) => void;
     onTerminal?: (terminal: StructuredProviderTurnTerminal) => void;
+    onGoal?: (goal: StructuredProviderGoal | null) => void;
     mirrorOutput?: (stream: "stdout" | "stderr", text: string) => void;
   }> = {}
 ): Promise<Readonly<{
   session: StructuredProviderSession;
   recoveredTerminal?: StructuredProviderTurnTerminal;
+  goal?: StructuredProviderGoal | null;
 }>> {
   const control = payload.providerControl;
   if (control === undefined) {
@@ -145,14 +173,17 @@ export async function startStructuredProviderSession(
           processInstanceId,
           payload,
           control,
+          input.onStarted,
           input.onTerminal,
+          input.onGoal,
           mirror
         );
       return Object.freeze({
         session: opened.session,
         ...(opened.recoveredTerminal === undefined
           ? {}
-          : { recoveredTerminal: opened.recoveredTerminal })
+          : { recoveredTerminal: opened.recoveredTerminal }),
+        goal: opened.goal
       });
     }
     const session = await ClaudeStructuredProviderSession.open(
@@ -161,6 +192,7 @@ export async function startStructuredProviderSession(
           processInstanceId,
           control,
           input.onTerminal,
+          input.onGoal,
           mirror
         );
     return Object.freeze({ session });
@@ -451,6 +483,7 @@ class CodexStructuredProviderSession implements StructuredProviderSession {
   #activeTurnId: string | undefined;
   #clientOwnedTurnId: string | undefined;
   #submissionPending = false;
+  readonly #bufferedStarts: Array<Omit<StructuredProviderTurnStarted, "clientOwned">> = [];
   readonly #bufferedTerminals: Array<Omit<StructuredProviderTurnTerminal, "clientOwned">> = [];
 
   private constructor(
@@ -459,9 +492,13 @@ class CodexStructuredProviderSession implements StructuredProviderSession {
     readonly processInstanceId: string,
     readonly conversationId: string,
     private readonly runtime: CodexAppServerRuntime,
+    private readonly onStarted:
+      | ((started: StructuredProviderTurnStarted) => void)
+      | undefined,
     private readonly onTerminal:
       | ((terminal: StructuredProviderTurnTerminal) => void)
-      | undefined
+      | undefined,
+    private readonly onGoal: ((goal: StructuredProviderGoal | null) => void) | undefined
   ) {}
 
   static async open(
@@ -470,11 +507,14 @@ class CodexStructuredProviderSession implements StructuredProviderSession {
     processInstanceId: string,
     payload: AgentHostLaunchPayload,
     control: AgentHostProviderControl,
+    onStarted: ((started: StructuredProviderTurnStarted) => void) | undefined,
     onTerminal: ((terminal: StructuredProviderTurnTerminal) => void) | undefined,
+    onGoal: ((goal: StructuredProviderGoal | null) => void) | undefined,
     mirror: (stream: "stdout" | "stderr", text: string) => void
   ): Promise<Readonly<{
     session: CodexStructuredProviderSession;
     recoveredTerminal?: StructuredProviderTurnTerminal;
+    goal: StructuredProviderGoal | null;
   }>> {
     const channel = await CodexProxyWebSocketChannel.connect(child, mirror);
     const openingMessages: JsonObject[] = [];
@@ -527,7 +567,9 @@ class CodexStructuredProviderSession implements StructuredProviderSession {
       processInstanceId,
       conversationId,
       runtime,
-      onTerminal
+      onStarted,
+      onTerminal,
+      onGoal
     );
     session.#activeTurnId = resumedActiveTurnId;
     const ownedTurn = control.kind === "restore" ? control.ownedTurn : undefined;
@@ -556,6 +598,7 @@ class CodexStructuredProviderSession implements StructuredProviderSession {
             ? "failed"
             : recovered.status === "interrupted" ? "cancelled" : "completed",
           observedAt: new Date().toISOString(),
+          ...(recovered.summary === undefined ? {} : { summary: recovered.summary }),
           ...(recovered.status !== "failed"
             ? {}
             : {
@@ -571,9 +614,11 @@ class CodexStructuredProviderSession implements StructuredProviderSession {
         );
       }
     }
+    const goal = await runtime.readGoal(conversationId);
     return Object.freeze({
       session,
-      ...(recoveredTerminal === undefined ? {} : { recoveredTerminal })
+      ...(recoveredTerminal === undefined ? {} : { recoveredTerminal }),
+      goal
     });
   }
 
@@ -584,9 +629,27 @@ class CodexStructuredProviderSession implements StructuredProviderSession {
       const method = typeof message.method === "string" ? message.method : "";
       const params = object(message.params) ?? {};
       if (optionalId(params.threadId) !== this.conversationId) return undefined;
+      const goal = codexGoalNotification({ method, params });
+      if (goal !== undefined) {
+        if (emit) this.onGoal?.(goal);
+        return undefined;
+      }
       if (method === "turn/started") {
         const turnId = nestedId(params, "turn") ?? optionalId(params.turnId);
-        if (turnId !== undefined) this.#activeTurnId = turnId;
+        if (turnId !== undefined) {
+          this.#activeTurnId = turnId;
+          const turn = object(params.turn) ?? {};
+          const input = codexTurnInput(turn);
+          const started = {
+            conversationId: this.conversationId,
+            nativeSessionId: this.conversationId,
+            nativeTurnId: turnId,
+            observedAt: new Date().toISOString(),
+            ...(input === undefined ? {} : { input })
+          };
+          if (this.#submissionPending && emit) this.#bufferedStarts.push(started);
+          else if (emit) this.#emitStarted(started);
+        }
         return undefined;
       }
       if (method !== "turn/completed") return undefined;
@@ -599,12 +662,16 @@ class CodexStructuredProviderSession implements StructuredProviderSession {
       const failure = status === "failed"
         ? providerErrorEvidence(turn.error)
         : undefined;
+      const summary = codexTurnSummary(turn);
+      const input = codexTurnInput(turn);
       const terminal = {
         conversationId: this.conversationId,
         nativeSessionId: this.conversationId,
         nativeTurnId,
         status,
         observedAt: new Date().toISOString(),
+        ...(input === undefined ? {} : { input }),
+        ...(summary === undefined ? {} : { summary }),
         ...(failure === undefined ? {} : failure)
       } as const;
       if (this.#submissionPending && emit) {
@@ -664,13 +731,48 @@ class CodexStructuredProviderSession implements StructuredProviderSession {
       });
     } finally {
       this.#submissionPending = false;
+      const starts = this.#bufferedStarts.splice(0);
+      for (const started of starts) this.#emitStarted(started);
       const buffered = this.#bufferedTerminals.splice(0);
       for (const terminal of buffered) this.#emitTerminal(terminal);
     }
   }
 
+  async steerTurn(turn: StructuredProviderTurnInput): Promise<StructuredProviderTurnReceipt> {
+    const nativeTurnId = this.#activeTurnId;
+    if (nativeTurnId === undefined) {
+      throw new ProviderTurnRejectedError("Provider Conversation has no active Turn to steer.", turn.attemptId);
+    }
+    const acceptance = await this.runtime.steerTurn({
+      conversationId: this.conversationId,
+      expectedTurnId: nativeTurnId,
+      text: turn.boundedText,
+      clientUserMessageId: turn.attemptId
+    });
+    if (acceptance.status === "unknown") {
+      throw new ProviderDeliveryUnknownError(acceptance.reason, turn.attemptId);
+    }
+    if (acceptance.status !== "accepted") {
+      throw new ProviderTurnRejectedError(acceptance.reason, turn.attemptId);
+    }
+    return Object.freeze({
+      attemptId: turn.attemptId,
+      conversationId: this.conversationId,
+      nativeSessionId: this.conversationId,
+      nativeTurnId,
+      acceptedAt: new Date().toISOString()
+    });
+  }
+
   #emitTerminal(terminal: Omit<StructuredProviderTurnTerminal, "clientOwned">): void {
     this.#completeTerminal(terminal, true);
+  }
+
+  #emitStarted(started: Omit<StructuredProviderTurnStarted, "clientOwned">): void {
+    this.onStarted?.({
+      ...started,
+      clientOwned: started.nativeTurnId === this.#clientOwnedTurnId
+    });
   }
 
   #completeTerminal(
@@ -697,13 +799,15 @@ class CodexStructuredProviderSession implements StructuredProviderSession {
 class ClaudeStructuredProviderSession implements StructuredProviderSession {
   readonly adapterId = "claude" as const;
   #activeTurnId: string | undefined;
+  #lastGoalKey: string | undefined;
 
   private constructor(
     private readonly child: ChildProcessWithoutNullStreams,
     private readonly exit: Promise<StructuredProviderProcessExit>,
     readonly processInstanceId: string,
     readonly conversationId: string,
-    private readonly channel: JsonLineChannel
+    private readonly channel: JsonLineChannel,
+    private readonly onGoal: ((goal: StructuredProviderGoal | null) => void) | undefined
   ) {}
 
   static async open(
@@ -712,6 +816,7 @@ class ClaudeStructuredProviderSession implements StructuredProviderSession {
     processInstanceId: string,
     control: AgentHostProviderControl,
     onTerminal: ((terminal: StructuredProviderTurnTerminal) => void) | undefined,
+    onGoal: ((goal: StructuredProviderGoal | null) => void) | undefined,
     mirror: (stream: "stdout" | "stderr", text: string) => void
   ): Promise<ClaudeStructuredProviderSession> {
     const channel = new JsonLineChannel(child, mirror);
@@ -724,7 +829,8 @@ class ClaudeStructuredProviderSession implements StructuredProviderSession {
       exit,
       processInstanceId,
       nativeSessionId,
-      channel
+      channel,
+      onGoal
     );
     channel.onMessage((message) => session.#receive(message, onTerminal));
     return session;
@@ -779,6 +885,34 @@ class ClaudeStructuredProviderSession implements StructuredProviderSession {
     });
   }
 
+  async steerTurn(turn: StructuredProviderTurnInput): Promise<StructuredProviderTurnReceipt> {
+    const nativeTurnId = this.#activeTurnId;
+    if (nativeTurnId === undefined) {
+      throw new ProviderTurnRejectedError("Provider Conversation has no active Turn to steer.", turn.attemptId);
+    }
+    try {
+      await this.channel.send({
+        type: "user",
+        message: {
+          role: "user",
+          content: [{ type: "text", text: turn.boundedText }]
+        }
+      });
+    } catch (error) {
+      throw new ProviderDeliveryUnknownError(
+        `Claude steer write did not complete: ${error instanceof Error ? error.message : String(error)}`,
+        turn.attemptId
+      );
+    }
+    return Object.freeze({
+      attemptId: turn.attemptId,
+      conversationId: this.conversationId,
+      nativeSessionId: this.conversationId,
+      nativeTurnId,
+      acceptedAt: new Date().toISOString()
+    });
+  }
+
   waitForExit(): Promise<StructuredProviderProcessExit> {
     return this.exit;
   }
@@ -791,6 +925,18 @@ class ClaudeStructuredProviderSession implements StructuredProviderSession {
     message: JsonObject,
     onTerminal: ((terminal: StructuredProviderTurnTerminal) => void) | undefined
   ): void {
+    const goal = claudeActiveGoal(message, this.conversationId);
+    if (goal !== undefined) {
+      const key = JSON.stringify(goal === null ? null : {
+        status: goal.status,
+        objective: goal.objective,
+        tokenBudget: goal.tokenBudget
+      });
+      if (key !== this.#lastGoalKey) {
+        this.#lastGoalKey = key;
+        this.onGoal?.(goal);
+      }
+    }
     if (message.type === "user") return;
     if (message.type !== "result" || this.#activeTurnId === undefined
       || optionalId(message.session_id) !== this.conversationId) return;
@@ -814,6 +960,66 @@ class ClaudeStructuredProviderSession implements StructuredProviderSession {
           : {})
     });
   }
+}
+
+function claudeActiveGoal(
+  message: JsonObject,
+  conversationId: string
+): StructuredProviderGoal | null | undefined {
+  if (!Object.hasOwn(message, "active_goal")) return undefined;
+  if (message.active_goal === null) return null;
+  const raw = object(message.active_goal);
+  if (raw === null) return undefined;
+  const objective = typeof raw.objective === "string" ? raw.objective.trim() : "";
+  if (objective.length === 0) return undefined;
+  const status = providerGoalStatus(raw.status);
+  if (status === undefined) return undefined;
+  const tokenBudget = positiveOptionalInteger(raw.token_budget ?? raw.tokenBudget);
+  return Object.freeze({
+    conversationId,
+    status,
+    objective,
+    updatedAt: providerTimestamp(raw.updated_at ?? raw.updatedAt),
+    ...(optionalId(raw.turn_id ?? raw.turnId) === undefined
+      ? {}
+      : { nativeTurnId: optionalId(raw.turn_id ?? raw.turnId) }),
+    ...(tokenBudget === undefined ? {} : { tokenBudget })
+  });
+}
+
+function providerGoalStatus(value: unknown): StructuredProviderGoal["status"] | undefined {
+  switch (value) {
+    case "active":
+    case "paused":
+    case "blocked":
+    case "complete":
+      return value;
+    case "usageLimited":
+    case "usage_limited":
+    case "usage-limited":
+      return "usage-limited";
+    case "budgetLimited":
+    case "budget_limited":
+    case "budget-limited":
+      return "budget-limited";
+    default:
+      return undefined;
+  }
+}
+
+function providerTimestamp(value: unknown): string {
+  if (typeof value === "string" && Number.isFinite(Date.parse(value))) {
+    return new Date(value).toISOString();
+  }
+  if (Number.isSafeInteger(value) && (value as number) >= 0) {
+    const epoch = value as number;
+    return new Date(epoch < 1_000_000_000_000 ? epoch * 1_000 : epoch).toISOString();
+  }
+  return new Date().toISOString();
+}
+
+function positiveOptionalInteger(value: unknown): number | undefined {
+  return Number.isSafeInteger(value) && (value as number) > 0 ? value as number : undefined;
 }
 
 function childExit(

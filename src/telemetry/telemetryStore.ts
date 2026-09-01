@@ -8,7 +8,7 @@ import type { TelemetryMode } from "./telemetryConfig.js";
 export type TelemetryProgressEntry = Readonly<{
   taskId: string;
   roleName: string;
-  runId: string;
+  turnId: string;
   generation: string;
   progressId: string;
   sequence?: number;
@@ -17,14 +17,14 @@ export type TelemetryProgressEntry = Readonly<{
 }>;
 
 /**
- * Per-Run progress summary. `count` is the total number of progress
- * observations ever recorded for the Run (including rows pruned from the
+ * Per-Turn progress summary. `count` is the total number of progress
+ * observations ever recorded for the Turn (including rows pruned from the
  * retained window); the window and the aggregate are both bounded.
  */
 export type TelemetryAggregate = Readonly<{
   taskId: string;
   roleName: string;
-  runId: string;
+  turnId: string;
   generation: string;
   firstAt: string;
   lastAt: string;
@@ -55,7 +55,7 @@ export type TelemetryPage<T> = Readonly<{
 /**
  * Write side of the sidecar. `observe` is best-effort and MUST NOT throw:
  * telemetry is an observation fact, so a sidecar failure only increments
- * `dropped` and records a health warning. Semantic terminal/yield writes
+ * `dropped` and records a health warning. Semantic terminal writes
  * always take priority and are never blocked by this interface.
  */
 export interface TelemetrySink {
@@ -68,26 +68,26 @@ export interface TelemetrySink {
 /**
  * Read side of the sidecar. All reads are cold/bounded: default Task context
  * never loads full progress history — it uses aggregates and the latest row
- * per Run; full history is paged by Task ID.
+ * per Turn; full history is paged by Task ID.
  */
 export interface TelemetryReader {
-  count(taskId: string, runId?: string): number;
+  count(taskId: string, turnId?: string): number;
   list(
     taskId: string,
-    runId?: string,
+    turnId?: string,
     page?: Readonly<{ limit: number; offset: number }>
   ): TelemetryPage<TelemetryProgressEntry>;
-  /** Merged summary across all generations of one Run, or null when unknown. */
-  aggregate(taskId: string, runId: string): TelemetryAggregate | null;
-  /** Exact summary for one Run/generation, or null when unknown. */
+  /** Merged summary across all generations of one Turn, or null when unknown. */
+  aggregate(taskId: string, turnId: string): TelemetryAggregate | null;
+  /** Exact summary for one Turn/generation, or null when unknown. */
   aggregateGeneration(
     taskId: string,
     roleName: string,
-    runId: string,
+    turnId: string,
     generation: string
   ): TelemetryAggregate | null;
   /** All per-generation aggregates for one Task (retention/status reads). */
-  listRunAggregates(taskId: string): TelemetryAggregate[];
+  listTurnAggregates(taskId: string): TelemetryAggregate[];
   /**
    * Monotonic counter of applied writes. Consumers that cache projections
    * derived from telemetry (for example the scheduler stall fold) include it
@@ -99,21 +99,21 @@ export interface TelemetryReader {
 export interface TelemetryStore extends TelemetrySink, TelemetryReader {
   /**
    * Terminal retention: keep the newest `keep` rows per
-   * (task, role, run, generation) and delete older ones. The aggregate is
+   * (task, role, Turn, generation) and delete older ones. The aggregate is
    * preserved. Returns the number of rows deleted.
    */
   pruneGeneration(
     taskId: string,
     roleName: string,
-    runId: string,
+    turnId: string,
     generation: string,
     keep?: number
   ): number;
   /**
-   * Active-Run hard cap: trim oldest rows across the Run beyond `cap`.
+   * Active-Turn hard cap: trim oldest rows across the Turn beyond `cap`.
    * Returns the number of rows deleted.
    */
-  capRun(taskId: string, runId: string, cap?: number): number;
+  capTurn(taskId: string, turnId: string, cap?: number): number;
   /**
    * Bulk-import one generation's retained window and authoritative aggregate
    * (historical compaction). Synchronous and transactional; bypasses the

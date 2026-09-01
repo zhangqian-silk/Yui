@@ -55,7 +55,7 @@ const STRUCTURED_CLI_CAPABILITIES: AgentDriverCapabilities = Object.freeze({
   }),
   input: Object.freeze({
     startTurn: true,
-    steer: "unavailable" as const,
+    steer: "fenced" as const,
     inject: "unavailable" as const,
     acceptance: "exact" as const,
     idempotency: "unavailable" as const
@@ -72,6 +72,7 @@ const STRUCTURED_CLI_CAPABILITIES: AgentDriverCapabilities = Object.freeze({
     preInputReadiness: "unavailable",
     promptAcceptance: "exact",
     turnLifecycle: "exact",
+    goalLifecycle: "partial",
     // Transcript sources may emit an explicit activity identity separately
     // from usage snapshots. Numeric token values never decide runtime health.
     operations: Object.freeze(["tool", "subagent"] as const),
@@ -159,6 +160,7 @@ export const BUILTIN_AGENT_DRIVERS: readonly AgentDriver[] = Object.freeze([
         // to manufacture tool/wait/usage observations.
         operations: Object.freeze([] as const),
         waiting: Object.freeze([] as const),
+        goalLifecycle: "exact" as const,
         usage: "unavailable" as const
       })
     }),
@@ -203,6 +205,20 @@ export function builtinAgentDriverRegistry(): AgentDriverRegistry {
 type MappedHook = AgentDriverMappedHook;
 
 function mapClaudeHook(
+  name: string,
+  payload: Readonly<Record<string, unknown>>,
+  occurrenceId?: string
+): MappedHook | readonly MappedHook[] {
+  const lifecycle = mapClaudeLifecycleHook(name, payload, occurrenceId);
+  const goal = claudeGoalObservation(payload, occurrenceId);
+  if (goal === undefined) return lifecycle;
+  return Object.freeze([
+    ...(Array.isArray(lifecycle) ? lifecycle : [lifecycle]),
+    goal
+  ]);
+}
+
+function mapClaudeLifecycleHook(
   name: string,
   payload: Readonly<Record<string, unknown>>,
   occurrenceId?: string
@@ -293,6 +309,79 @@ function mapClaudeHook(
     default:
       throw new Error(`Claude Code Driver does not support Hook event: ${name}.`);
   }
+}
+
+function claudeGoalObservation(
+  payload: Readonly<Record<string, unknown>>,
+  occurrenceId?: string
+): MappedHook | undefined {
+  if (!Object.hasOwn(payload, "active_goal")) return undefined;
+  if (payload.active_goal === null) return mapped("goal.cleared");
+  const goal = objectValue(payload.active_goal);
+  if (goal === undefined) return undefined;
+  const objective = textValue(goal.objective);
+  const status = normalizedGoalStatus(goal.status);
+  const updatedAt = timestampValue(goal.updated_at ?? goal.updatedAt)
+    ?? timestampValue(payload.timestamp)
+    ?? occurrenceTimestamp(occurrenceId);
+  if (objective === undefined || status === undefined || updatedAt === undefined) return undefined;
+  const tokenBudget = positiveIntegerValue(goal.token_budget ?? goal.tokenBudget);
+  return mapped("goal.updated", {
+    goalStatus: status,
+    goalObjective: objective,
+    goalUpdatedAt: updatedAt,
+    ...(optionalIdentityFrom(goal, ["turn_id", "turnId"]) === undefined
+      ? {}
+      : { goalNativeTurnId: optionalIdentityFrom(goal, ["turn_id", "turnId"]) }),
+    ...(tokenBudget === undefined ? {} : { goalTokenBudget: tokenBudget })
+  });
+}
+
+function normalizedGoalStatus(
+  value: unknown
+): RuntimeObservationPayload["goalStatus"] | undefined {
+  if (value === "active" || value === "paused" || value === "blocked" || value === "complete") {
+    return value;
+  }
+  if (value === "usageLimited" || value === "usage_limited" || value === "usage-limited") {
+    return "usage-limited";
+  }
+  if (value === "budgetLimited" || value === "budget_limited" || value === "budget-limited") {
+    return "budget-limited";
+  }
+  return undefined;
+}
+
+function objectValue(value: unknown): Readonly<Record<string, unknown>> | undefined {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    ? value as Readonly<Record<string, unknown>>
+    : undefined;
+}
+
+function textValue(value: unknown): string | undefined {
+  return typeof value === "string" && value.trim().length > 0 ? value.trim() : undefined;
+}
+
+function positiveIntegerValue(value: unknown): number | undefined {
+  return Number.isSafeInteger(value) && (value as number) > 0 ? value as number : undefined;
+}
+
+function timestampValue(value: unknown): string | undefined {
+  if (typeof value === "string" && Number.isFinite(Date.parse(value))) {
+    return new Date(value).toISOString();
+  }
+  if (Number.isSafeInteger(value) && (value as number) >= 0) {
+    const epoch = value as number;
+    return new Date(epoch < 1_000_000_000_000 ? epoch * 1_000 : epoch).toISOString();
+  }
+  return undefined;
+}
+
+function occurrenceTimestamp(value: string | undefined): string | undefined {
+  const prefix = value?.slice(0, 24);
+  return prefix !== undefined && Number.isFinite(Date.parse(prefix))
+    ? new Date(prefix).toISOString()
+    : undefined;
 }
 
 function mapCodexHook(
@@ -492,7 +581,7 @@ function claudeFailure(
       }),
       ...(lastOutput === undefined ? {} : { lastOutput }),
       ...(payload.run_terminal === true || payload.unrecoverable === true
-        ? { runTerminal: true }
+        ? { turnTerminal: true }
         : {})
     },
     summary: [

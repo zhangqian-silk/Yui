@@ -1,7 +1,7 @@
 /*
  * CARDS — content-bearing surfaces.
  * Overview blocks, detail head / conclusion band, sections, record cards,
- * input cards, run cards, criteria lists. Widgets (pills, chips, metrics)
+ * input cards, Turn cards, criteria lists. Widgets (pills, chips, metrics)
  * live in widgets.ts; markdown typography lives in markdown.ts.
  */
 export const CARD_STYLES = `
@@ -109,13 +109,13 @@ details.work-item-card>summary.record-head~*{margin-top:0}
 .input-answer:hover{border-color:var(--accent-line);color:var(--accent);background:var(--accent-soft)}
 .input-form{display:flex;gap:8px;flex:1}
 .input-form input{min-width:0;flex:1;padding:8px 12px;color:var(--text);background:var(--bg-2);border:1px solid var(--border);border-radius:var(--radius);font-family:var(--font-body);font-size:12.5px}
-/* Execution runs */
-.run-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(min(320px,100%),1fr));gap:9px}
-.run-filter{margin-bottom:3px}
+/* Execution Turns */
+.turn-grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(min(320px,100%),1fr));gap:9px}
+.turn-filter{margin-bottom:3px}
 .execute-card{background:var(--bg-2);border:1px solid var(--border);border-left:2px solid var(--border);border-radius:var(--radius);padding:9px 12px;display:grid;gap:6px;box-shadow:var(--shadow-card);transition:border-color var(--motion-fast)}
 .execute-card:hover{border-left-color:var(--border-strong)}
 .execute-card[data-status=active]{border-left-color:var(--accent)}
-.execute-card[data-status=completed],.execute-card[data-status=yielded]{border-left-color:var(--success)}
+.execute-card[data-status=completed]{border-left-color:var(--success)}
 .execute-card[data-status=failed]{border-left-color:var(--danger)}
 .execute-id{display:flex;align-items:center;gap:8px;flex-wrap:wrap;color:var(--muted);font-family:var(--font-mono);font-size:10.5px;letter-spacing:.02em}
 .execute-id .status-dot{margin-top:0}

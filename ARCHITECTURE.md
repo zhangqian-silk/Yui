@@ -56,14 +56,14 @@ polling protocol is required to follow work.
 `WorkItem` means one substantial, independently acceptable requirement with a
 clear owner. Create multiple WorkItems only when multiple Workers can own and
 advance those requirements independently, normally in parallel. Internal
-implementation steps, test runs, review findings, and local fixes remain Run,
+implementation steps, test runs, review findings, and local fixes remain Turn,
 Event, report, or commit evidence under the existing Task or WorkItem; they are
 not new WorkItems.
 
 Each WorkItem may use a native subagent inside the Leader conversation or a
-Task Role AgentRun backed by a durable Worker Session. There is no Yui
-subagent launcher or child-session record. AgentRun is an execution attempt,
-not a requirement, and repeated Runs may continue the same compatible Role
+Task Role Turn backed by a durable Worker Session. There is no Yui
+subagent launcher or child-session record. Turn is an execution attempt,
+not a requirement, and repeated Turns may continue the same compatible Role
 Session.
 
 ## Profiles, Roles, and Agents
@@ -77,14 +77,14 @@ Session.
   the active Agent binding. Its versioned desired launch configuration is
   next-launch-only. The Role may bind multiple Agents; every binding retains
   independent runtime configuration.
-- `AgentRun` records one managed dispatch and an immutable effective snapshot:
+- `Turn` records one managed dispatch and an immutable effective snapshot:
   actual Agent, adapter, model, effort, Profile behavior intent, exact writable
   Projects, provider permission strategy and native options, workspace, Role
   context, and source desired revision. A native Role Session stores the same snapshot; running processes
   are never hot-mutated by later Role edits.
 - A `WorkItemCandidate` is the explicit result currently awaiting Leader
   acceptance. It snapshots the WorkItem revision, summary, and either a
-  yielded execution Run or a Leader-managed direct source.
+  completed execution Turn or a Leader-managed direct source.
 - `ReviewRound` records one semantic judgment. A WorkItem Review references
   that WorkItem's immutable Candidate. A Task-final Review references the
   frozen Task heads directly and has no synthetic WorkItem/Candidate anchor.
@@ -118,17 +118,19 @@ todo -> running -> awaiting Leader review
                       | reject -> failed -> redispatch -> running
 ```
 
-Worker yield ends the AgentRun and submits its result for review. It never
-accepts the WorkItem. The Leader checks semantics, evidence, and Git state,
-then accepts or rejects with bounded feedback. A rejected isolated WorkItem
-keeps its workspace so the next Run can repair the same result.
+The Provider's native Turn terminal ends its associated Turn and stores the
+final response as immutable Turn evidence. It never accepts the WorkItem. The
+Leader checks semantics, evidence, and Git state, then resolves the execution
+result and accepts or rejects it with bounded feedback. A rejected isolated
+WorkItem keeps its workspace so the next Turn can repair the same result.
 
 An optional global review rule names one existing Global Role and chooses
 `always`, `leader`, or `final`. Candidate rules remain live defaults; each
-WorkItem Candidate snapshots the effective legacy rule when submitted.
-Every result awaiting acceptance is stored as an explicit WorkItem candidate.
-`always` dispatches a review AgentRun for every candidate, whether it comes
-from a yielded execution Run or a Leader-managed direct result; `leader`
+WorkItem Candidate snapshots the effective review rule when submitted.
+Every result is stored first on its exact Turn/Lane. A Candidate is created only
+when the Leader resolves the execution output for acceptance.
+`always` dispatches a review Turn for every candidate, whether it comes
+from a completed execution Turn or a Leader-managed direct result; `leader`
 leaves every candidate for the Leader to accept directly or review explicitly.
 `final` keeps WorkItem acceptance and Integration independent and supplies the
 default Reviewer Role when the Leader decides the frozen Task result warrants
@@ -137,7 +139,7 @@ Review. A Leader-requested Round remains evidence without becoming policy: a
 later Task head does not require another Round unless the Leader requests one
 or an explicit Task contract requires it. This final Reviewer evaluates the whole
 Task, so normal delivery does not pay for a complete review of every WorkItem.
-Review Runs complete only their exact ReviewRound, leave the WorkItem awaiting
+Review Turns complete only their exact ReviewRound, leave the WorkItem awaiting
 acceptance, and never trigger another review or append a Candidate. Successful
 and failed review attempts both wake the Leader and remain evidence for
 judgment, not a machine verdict. The ReviewRound stores its frozen Candidate
@@ -147,16 +149,16 @@ never merges it automatically.
 
 Roles describe Agent capability, but they do not own repository workspaces. A
 `ManagedWorkspace` is keyed by its durable owner (`Task`, `WorkItem`,
-`ReviewRound`, or `IntegrationAttempt`); an AgentRun carries only a launch
+`ReviewRound`, or `IntegrationAttempt`); an Turn carries only a launch
 snapshot. Review workspaces are writable copies at the frozen commit, so
 diagnostics cannot redirect Develop or become a ChangeSet source. Task-final
 Rounds keep independent immutable records but may reassign one clean physical
 workspace to the next Round for the same Reviewer Role. This lets the native
-Reviewer Session continue while every Run remains bound to its exact Round and
+Reviewer Session continue while every Turn remains bound to its exact Round and
 head.
 
 Dependencies are enforced at dispatch. A Role cannot have overlapping active
-Runs, and terminal Task state fences new messages, dispatches, retries, and
+Turns, and terminal Task state fences new messages, dispatches, retries, and
 late results until explicitly reopened.
 
 ## Project workspaces and integration
@@ -206,7 +208,7 @@ WorkItem, or adds the Project to the Task.
 
 An isolated result is handled in this order:
 
-1. the Worker yields;
+1. the Worker Provider Turn ends and its Turn result is recorded;
 2. the Leader reviews semantics and evidence;
 3. Yui captures each writable Project HEAD as an immutable Project ChangeSet;
 4. each Project integration applies its latest reviewed ChangeSet in a candidate worktree;
@@ -223,7 +225,7 @@ project-specific engineering rules; and the Task Contract owns the requested
 outcome. Yui injects only its own generic Role Skills. It never scans or copies
 Project Skills into managed context; the selected Agent discovers them through
 its native project mechanism. Execution and review select their generic Skill
-by durable Run purpose. A Reviewer finding routes to the original Worker while
+by durable Turn purpose. A Reviewer finding routes to the original Worker while
 open, one consolidated Repair WorkItem when closed, Leader/Integration for
 merge or local fixes, and an architecture WorkItem only for a genuinely
 cross-cutting design change. Parallel repair is explicit and requires
@@ -254,10 +256,10 @@ and knowledge needed to resume and audit work:
 - Decisions: material choices and supersession;
 - Milestones: independently useful phase outcomes;
 - Project Knowledge: stable facts reusable across Tasks;
-- WorkItems, Roles, AgentRuns, Messages, InputRequests, Events, ChangeSets, and
+- WorkItems, Roles, Turns, Messages, InputRequests, Events, ChangeSets, and
   integration evidence.
 
-The Leader updates the Brief before every yield, records material choices as
+The Leader updates the Brief when durable Task context changes, records material choices as
 Decisions, records phase outcomes as Milestones, and promotes only cross-Task
 stable facts to Project Knowledge. `task context` is the consolidated recovery
 read; launches and wake messages carry record pointers rather than copied
@@ -270,30 +272,37 @@ Skill and Session Manifest pointer, then uses provider-native requests for
 durable Task delivery; it does not own or mirror the full transcript. The
 Controller owns mailbox delivery, wakeups, Role liveness, recovery decisions,
 and exact receipts. tmux keeps Yui's client attachment observable where the
-provider path needs one.
+provider path needs one. The Controller owns durable wake consumption and
+Provider submission; the Provider Runtime Binding owns the only Turn receipt.
 
-Run, Conversation, Activation, and Turn identities are independent. A
-Conversation can span Runs and client attachments; one Activation identifies
-Yui's current attachment, not exclusive ownership of the Provider thread. One
-Turn identifies one provider-native execution. Yui's authority epoch fences
-only Yui's own submissions and retries.
+Session, Activation, and Turn identities are independent. A Session can span
+Turns and client attachments; one Activation identifies Yui's current
+attachment, not exclusive ownership of the Provider thread. One Turn identifies
+one provider-native execution, whether its input arrived through Yui or directly
+through the Provider UI. Yui's authority epoch fences only Yui's own submissions
+and retries.
 
-`AgentRun` is the single durable scheduling authority for a Role. Provider
-runtime persistence has no independently writable current-Run field; a Turn's
-Run id is correlation evidence for receipts and terminal observations only.
+`Turn` is the single durable scheduling authority for a Role. It records the
+visible inputs, their source and channel, and the final Provider output; it does
+not copy reasoning or tool traffic. All input relayed or generated by Yui has
+source `yui`, while direct Provider input has source `user` and explicit Goal
+continuations have source `provider`.
 `TaskRole` likewise stores configuration and identity, not a writable runtime
-status. CLI and Web status views derive activity from the active AgentRun and
+status. CLI and Web status views derive activity from the active Turn and
 add Session/Driver facts only as lifecycle and diagnostic detail.
-`AgentHost` is the serialized consumer: while a native Turn is active, the next
-AgentRun and mailbox batch remain durable and unsubmitted. When that Turn ends,
-the Host makes the Conversation ready and the retained delivery continues.
-This remains true when the Agent declared the old Run's semantic outcome before
-the Provider emitted its terminal event.
+`AgentHost` is the serialized consumer: while a Provider Turn is active, the
+next mailbox wake remains durable and unsubmitted. When that Turn ends, Yui
+atomically stores the result. Worker and Reviewer completion enters the bounded
+Leader wake aggregation window; a later dispatch creates a new Turn while
+reusing the same live Session whenever its configuration remains compatible.
+Task and WorkItem completion remain Leader decisions and never follow merely
+from Provider termination.
 
-Codex Task threads remain ordinary native sessions and can be opened and used
-directly in Desktop. If a direct user Turn is active, Yui keeps its pending
-Run/message until that Turn settles. Global interactive entry remains a native
-session-lifecycle operation outside the Task delivery contract.
+Codex Task threads remain ordinary native Sessions and can be opened and used
+directly in Desktop. Direct user Turns are recorded in the same Turn history. If
+one is active, Yui keeps its pending message until that Turn settles. Global
+interactive entry remains a native Session-lifecycle operation outside the Task
+delivery contract.
 
 Codex establishes an App Server WebSocket through the byte-forwarding
 `app-server proxy` to create or resume a normal thread on the shared daemon.
@@ -309,15 +318,15 @@ transport with exact user-message replay acknowledgement. In both cases, Yui
 records Turn intent before writing, accepts only exact Provider evidence, and
 maps an uncertain write to `delivery-unknown` without automatic resubmission.
 
-Role desired revisions and Run/Session effective snapshots keep configuration
+Role desired revisions and Turn/Session effective snapshots keep configuration
 history explicit. Resume compares the complete effective snapshot and
 workspace compatibility rather than revision alone. Desired drift is expected
 while an old process is running and becomes effective only on a later launch;
 control-plane wakes continue through the live Session's actual snapshot, and
 fresh replacement archives the stopped snapshot instead of rewriting it.
-Mailbox generations, reservations, liveness, native Turn Hooks, and exact yield
-remain the control-plane authority; configuration snapshots do not replace any
-of those completion fences. Lifecycle code uses structured Hook data, persisted identities, tmux
+Mailbox generations, reservations, liveness, and native Turn terminals remain
+the control-plane authority; configuration snapshots do not replace those
+execution facts. Lifecycle code uses structured Hook data, persisted identities, tmux
 process state, receipts, and pane fences. It never parses Agent terminal glyphs,
 progress text, trust dialogs, or final prose to infer readiness or success.
 
@@ -328,386 +337,18 @@ cleanup revalidates ownership and fails safely when concurrent state changes;
 manual retry is the recovery boundary rather than another durable state
 machine.
 
-Storage compatibility is modeled on three independent, monotonic version axes:
-`layout` (on-disk `schema.json`, `state.json`, locks), `aggregate` (the
-authoritative document), and `record` — a `recordKind -> version` map so each
-record family versions on its own. A centralized compatibility framework
-(registry → planner → compatible loader or migration engine) is generic and
-domain-free: the engine is parameterized over an injected `MigrationTarget` and
-never hardcodes a Yui record list. Compatibility is decided **only** by explicit
-adjacent transition declarations, never by version magnitude or semver.
+Storage still records layout, aggregate, and record-family versions, but this
+release deliberately re-baselines all three axes at the current contract. The
+production migration registry is empty. Ordinary opening, Controller startup,
+doctor, update preflight, and the storage upgrade entry point therefore accept
+only an exact current manifest and current record shapes. An older Home is
+unsupported and must not be normalized, rewritten, or switched in place.
 
-The registry separates transition intent from executable transformation. A
-`compatible` declaration is legal only on a single `record` axis and carries
-three obligations: deterministic named defaults, `validateSource` for the exact
-old shape (including rejection of unknown fields), and a normalizer that returns
-a fresh value in the next/current domain model. Layout, aggregate, identity or
-reference meaning, record splits/merges, and transactional semantic changes must
-be declared `offline-migration`; that declaration is runnable only when the
-matching adjacent migration step is registered. A transform without a
-declaration is `missing-declaration`; an offline declaration without a step is
-`missing-step`. Both fail closed. The planner chooses `compatible` only if every
-hop on every changed axis is compatible; one offline hop selects the migration
-engine. Future versions and damaged structures remain unsupported. The
-production registry contains the explicit aggregate `16→17` offline transition;
-no historical record-family normalization is implicitly authorized. A frozen
-post-baseline descriptor snapshot (versions and locators) plus the shared planner
-form the delivery gate: any current-axis advance, locator drift, or new target
-family must have its full declared path before the registry can be constructed.
-
-`doctor`, staged `update` preflight, ordinary store opening, and `upgrade` share
-the same classification: **current** (`USABLE`), **compatible-old**
-(`COMPATIBLE`), **migration-required** (`MIGRATABLE`), or **unsupported**
-(`NEEDS_NEW_VERSION`/`CORRUPTED`). The legacy uppercase verdict remains an
-internal/result compatibility label; the product meaning is the four-state
-vocabulary above.
-
-The staged updater uses a dedicated internal preflight contract, not the user's
-`upgrade --dry-run`. It stops after four-state classification for current Homes,
-strict source/current-model validation for compatible-old Homes, or the
-authoritative offline inventory for migration-required Homes. It does not create
-a migration target, copy or back up the Home, place a fence, touch Controller
-lifecycle, or claim staged-output validation, so the exact old Controller may
-still be running. After this preflight is clear, the update parent captures and
-stops that exact Controller PID; only then does staged activation run the full
-stage, loader validation, and atomic switch. Machine results carry one explicit
-`update-preflight` outcome plus a consistent current/compatible/migration-required
-status; malformed or contradictory combinations fail closed.
-
-The three axes are genuinely independent, including the record axis. The
-durable `schema.json#/recordVersions` map is authoritative for each persisted
-family version; a family absent from that map is explicit pre-introduction
-version `0`, even when its `state.json` locator is empty. Raw `state.json` is
-traversed only to cross-check the manifest against persisted records, never to
-infer that a missing target family is current. The planner can advance version
-`0` only through an explicitly marked record-family `0->1` introduction; a
-missing declaration or offline transform fails closed. For compatible-old,
-`openCompatibleFileTaskStore` normalizes a fresh
-in-memory snapshot hop by hop, validates the resulting current state with the
-same strict graph gate, and exposes only the current domain model. Commits use
-the existing current `FileTaskStore` writer, so the first write emits only
-current records and advances the durable manifest to the same current versions;
-there is no dual write, no preservation of unknown old fields, and no old writer
-permitted against a newly written Home. For current Homes the
-ordinary strict loader remains the direct path. CORRUPTED is reserved for real
-structural JSON damage: an unparseable `state.json`, a container whose shape does
-not match its locator, a record with a missing/invalid `schemaVersion`, or a
-reference graph that fails the appropriate strict gate.
-
-`yui upgrade` is the transactional entry point only for
-**migration-required** Homes. Before constructing a migration target or touching
-the Controller, fence, binary, staging directory, or Home, both dry-run and
-execute re-read an authoritative offline inventory. The blocking facts are an
-active AgentRun, an in-flight Run, a live native Session, a native Session whose
-health cannot be determined, pending turn-completion ownership, a lifecycle
-mailbox, or a durable inbox event. Stopped/history-only Sessions, an idle Role
-with no native process, and an open Input alone are non-blocking. Every blocker
-returns the count plus the available Task/Role/Run/native-session/launch identity
-and reason, asserts the scene is unchanged, and names `yui update` as the user
-re-run boundary. The inspection never kills, resets, rebinds, retries, or drains
-anything. An unreadable inventory is unknown activity and fails closed.
-
-Once that inventory is clear (including on the user's later re-run after a
-block), execute mode places an **admission fence** honored at every authoritative
-write choke point, so baseline CLI writers and the Controller (which mutate
-through the same store) refuse to begin a new write while an upgrade owns the
-Home; the fencing process itself is exempt. Durable runtime-inbox `publish`
-participates in a separate,
-shared sibling coordination boundary: `<home>.upgrade-coordination.lock` lives
-outside the Home and serializes the complete inbox write with the final
-snapshot/copy/two-step switch. A publish acquires that lock, then checks the
-fence and any unresolved `<home>.upgrade-switch.json` marker before its
-temp/link/fsync sequence. Upgrade acquires the same lock after Controller drain,
-proves both runtime lanes, re-pins under `.state.lock`, stages the complete
-Home, and holds the coordination lock through `home -> backup` and
-`staging -> home`. A hook that passed admission before the fence therefore either
-finishes under the lock and is copied into promoted Home, or waits and receives a
-structured `UpgradeFenceError` that permits re-delivery; it cannot be silently
-dropped into backup-only storage. With no fence, normal hook behavior is unchanged
-apart from this shared serialization point. **Fence acquisition is a single atomic
-`O_CREAT|O_EXCL` create** — the kernel guarantees exactly one of any number of
-concurrent upgraders wins that create, so there is no check-then-write window in
-which two upgraders both believe they acquired; a loser either re-enters (it
-already owns the fence), reclaims a *provably-dead* owner's stale fence and
-retries, or fails closed for a live/undeterminable owner. **Stale-fence reclaim
-is itself atomic (compare-and-delete under a `mkdir` critical section):** the
-reclaim re-reads the fence bytes under the lock and deletes *only* the exact
-dead-owner bytes it observed, so a racer that slipped a fresh live fence into the
-same path between the observe and the delete is never clobbered — closing the
-reclaim TOCTOU that could otherwise let two entrants both acquire. **That
-critical-section lock is itself crash-recoverable** (mirroring the storage lock's
-dead-owner reclaim): it records its owner pid, and a lock left behind by a
-crashed holder is reclaimed by a later entrant once its owner is provably dead
-(or it is older than a small age bound), so a mid-reclaim crash can never
-permanently orphan the lock and strand admission (R2-F4). When a reclaim cannot
-be proven complete, `assertHomeWritable` re-verifies and refuses rather than
-falsely reporting the home writable, and a dead-owner fence is never left
-indefinitely stranding writers. There is no lease or multi-round negotiation.
-The coordination lock uses the same bounded crash-recovery rule as other Home
-locks: it records an owner PID, waits only a bounded interval, and atomically
-renames aside a lock whose owner is provably dead (or whose owner-less directory
-is older than the conservative acquisition window). A live or undeterminable
-holder fails closed; a switch-progress marker blocks hook admission when the
-Home is missing or uninitialized (including a malformed marker), while a stale
-marker beside an intact Home is ignored after filesystem corroboration. Lock
-ordering is one-way — coordination lock, then `.state.lock`; inbox writers
-never acquire `.state.lock` — so the cutover cannot deadlock on a reverse order.
-The fence is enforced by every writer built from this release forward (its check
-lives in the shared store-commit path); it cannot retroactively bind an
-already-installed older binary, so cross-release
-concurrency is instead handled by the quiesce step and the recommendation to
-stop all Yui activity for the home before upgrading. It then drains the
-Controller with the public `controller.stop`/shutdownAndDrain (never a broad
-kill, never a TTL or idle heuristic), fails closed if any foreign writer, live
-Controller, or held `.state.lock` remains, and proves BOTH durable runtime lanes
-empty — the aggregate `state.json` runtime-lifecycle mailboxes AND the durable
-runtime inbox `runtime/inbox/*` (authoritative not-yet-applied native-hook
-events; per task-1 / message-8 §3, either non-empty is a `drain-incomplete`
-blocker). The inbox is proven empty **read-only** (a plain directory scan for
-committed `*.json` events, in-progress `.tmp-*` writes, and quarantined
-`runtime/inbox-invalid` entries) — never via the inbox's own `list()`, which
-would quarantine as a side effect, so the check never mutates the source; an
-unreadable inbox directory fails closed. This matters because the no-Controller
-/ stale-event path reaches quiesce with inbox entries still on disk, and an
-atomic switch must never silently drop them. The read-only quiesce proof is
-performed only after acquiring the shared coordination lock; an admitted hook
-that was still completing cannot cross that lock, and a hook that waits sees the
-fence and fails explicitly. The cutover then re-pins the committed revision
-under the write lock after the drain (avoiding a
-check-then-migrate race), migrates the immutable source into a fresh staged home,
-validates it
-through the real `FileTaskStore` loader gate (record parse + reference graph),
-then atomically switches into place with a timestamped backup and a post-switch
-health check. Any blocked or failed step leaves the authoritative home
-byte-for-byte unchanged and reports the exact stage and recovery action;
-User-facing `--dry-run` runs through the validation gate and reports success only
-when the migration engine itself returns its exact `dry-run` evidence. A live
-runtime or any other earlier engine result remains a blocker; it is never wrapped
-as validated. Successful dry-run discards the staged output without switching.
-The aggregate `16→17` transition is the only production offline path in this
-release; compatible record-family normalization remains explicitly declaration-gated.
-
-**Uninitialized home is an actionable blocker, not a no-op.** An
-uninitialized home (never `yui setup`) has no storage to migrate. The classifier
-reports it as USABLE (nothing is *wrong* with it, so `doctor` may present it
-as-is), but the *upgrade* path would otherwise collapse that verdict into a
-silent no-op against a home that was never set up. Upgrade therefore returns a
-structured `uninitialized` blocker ("run `yui setup`") — never an unclassified
-runtime error and never a false success.
-
-**Complete home content preservation contract.** A migration only *transforms*
-`schema.json` + `state.json`, but the atomic switch replaces the **whole** home
-directory (`home -> backup`, `staging -> home`). Staging that held only those two
-files would silently drop everything else the real home persists — `runtime/`
-discovery, `runtime/inbox/*` (AUTHORITATIVE, not-yet-applied events), `cache/`,
-`artifacts/`. The chosen contract (implemented in `writeFreshOutput`) is that
-**staging carries a complete copy of the home**: every other entry (any depth:
-dirs, files, symlinks) is copied verbatim, and only `schema.json`/`state.json`
-are overwritten with their migrated bytes. So the switch preserves all
-authoritative and rebuildable content — and the timestamped backup retains the
-original of everything too. The transient `.state.lock` is the one exception: a
-lock is per-instance coordination state, never authoritative content, so it is
-not promoted into the migrated home. The staging directory is required to live
-*outside* the home (an in-home staging layout is refused at construction), so the
-copy never excludes a home entry merely because it shares the staging directory's
-name — a real home entry named `home.upgrade-staging` is preserved like any other.
-
-**Partial (two-step) switch is reported honestly, never as "unchanged".** The
-atomic switch is two renames — `home -> backup`, then `staging -> home` — with one
-non-atomic window between them, tracked by a durable sibling progress marker
-(`<home>.upgrade-switch.json`) whose phase distinguishes *not-started* /
-*backing-up* / *promoting* / *interrupted* / *complete*. The invariant that drives
-error handling: **before** the first rename commits the home is intact and any
-failure is a clean pre-switch error ("source unchanged", which is true);
-**after** it commits, *every* subsequent operation — the post-rename fsync, the
-`promoting` marker write, the promote rename, and the post-promote fsync/marker
-clear — is phase-aware, so an fsync or marker failure can never escape as a plain
-error that the engine would render as "source unchanged". On any pre-promotion
-failure the code attempts an automatic rollback (`backup -> home`); when that
-succeeds the original is restored and the failure is reported with the home
-genuinely unchanged. **Only if the rollback also fails** is the switch left
-partially applied: the marker records `interrupted`, the engine surfaces a
-distinct `switch-ambiguous` outcome, and the upgrade blocks at a dedicated
-`switch-ambiguous` stage that states the home is **not** intact and prints the
-exact `mv "<backup>" "<home>"` recovery. A failure of the *post-promotion*
-fsync/marker-clear, by contrast, does **not** fail the switch — the new home is
-already in place and correct, and those steps are best-effort durability, so a
-good migrated home is never rolled back. No completion receipt is written for an
-interrupted switch (it did not commit); the `interrupted` marker is the durable
-signal.
-
-**Crash-window recovery keys off the marker plus filesystem evidence.** A process
-that dies mid-switch leaves a durable marker (`backing-up`, `promoting`, or
-`interrupted`), with the original at the backup and the home path missing. `yui
-update`'s probe treats a marker of **any** phase as an interrupted switch **only
-when the filesystem still corroborates it** — the backup exists AND the home is
-missing/uninitialized — and then prints the exact backup-restore path, never a
-generic "most likely did not commit, retry/setup" that would send the operator to
-re-initialize a missing home. Crucially this evidence gate applies to the
-`interrupted` phase too (R2-F3): a stale `interrupted` marker left over after a
-manual recovery — the home already restored, or the backup already removed — is
-**not** trusted to emit a restore path; the probe ignores the stale marker and
-reconciles against the real on-disk state instead. A pre-start marker whose home
-is still intact (or that has no usable backup) is likewise not treated as
-interrupted: there is nothing to recover.
-
-**Quiesce fails closed on any undeterminable signal.** The `.state.lock` is
-acquired mkdir-first with its `owner` file written a moment later, so a lock
-directory that exists but whose owner is missing, empty, non-integer, or
-unreadable is *not* proof of "no writer" — it may be a writer mid-acquisition.
-Quiesce therefore treats such a lock as **unknown-active** and refuses to proceed
-(reporting an `active-runtime` blocker); only a lock whose owner is clearly
-readable *and* names a dead PID is reclaimable. A `runtime/controller.json` that
-exists but is malformed/unparseable is treated the same way — a live Controller
-cannot be ruled out, so it fails closed rather than being read as "no
-controller". A lock or discovery file that is provably absent is the only "no
-runtime" case.
-
-`yui update` stages the published package side by side (never replacing the live
-install first) and runs that staged binary's read-only classification against the
-Home. Current and compatible-old Homes take the **fast path**: no Home target is
-constructed, copied, backed up, renamed, or replayed, and no Provider Session is
-waited on. The parent captures the exact executable/argv/version identity of the
-old Controller, stops it once with authenticated lifecycle control, promotes the
-same staged artifact, validates the activated binary and compatible loader, then
-starts and authenticates the replacement Controller. Existing managed Sessions
-retain their frozen executable/CLI path, Home, control digest, and exact
-Task/Run/launch/native-Session fence; neither binary promotion nor Controller
-replacement retargets them through PATH. The managed continuity preflight treats
-package-version drift alone as expected for that in-place path, but keeps
-protocol, layout, aggregate, path, Home, digest, and runtime identity strict.
-This lets the old Session record progress and yield through the replacement
-Controller. It does not authorize migration-required storage: that path still
-requires the offline inventory to prove zero live Sessions. A compatible Home
-remains byte-for-byte old until an ordinary new-CLI commit; that first
-current-only write is also the no-auto-downgrade boundary.
-
-Migration-required Homes take the **offline path**. Staged preflight applies the
-offline inventory before the parent stops the Controller, and storage activation
-rechecks it before the child may fence, stage, or mutate the Home. Execute then
-closes pre-admitted writers through `.state.lock` while the fence is held and
-rechecks the same inventory once more before staging. A newly active Run or
-native Session therefore blocks the race window and the parent restores the exact
-captured Controller identity on a clean pre-switch refusal. Only a clear user
-invocation proceeds through the existing complete-Home migration, backup,
-validation, and switch. Neither path writes Task Messages as a heartbeat or
-performs background automatic upgrades.
-
-**Same-artifact promotion:** the version resolved at stage time is pinned, and
-binary activation installs that exact `@zq-silk/yui@<version>` — never a second
-bare `@latest` that could resolve to a different build than the one that passed
-preflight. **Only a CONCRETE version is accepted** (R3-F1): the resolver
-requires a semver-shaped `X.Y.Z` (optional pre-release/build suffix) — a dist-tag
-sentinel like `latest`, an empty/malformed value, or a version probe that does
-not come back in a valid `{ ok:true, data }` envelope at exit 0 all yield "no
-version", and the stage then FAILS closed (the live install is untouched, fully
-recoverable) rather than splicing a `latest` sentinel into an activation spec.
-**Verify the activated binary:** the post-update health check runs the
-*actually-activated* global binary (resolved via `npm prefix -g`), not the
-staging path, and **requires** its reported version to be concrete and equal to
-the staged version — a missing, unparseable, or mismatched version fails closed
-(never skipped), so a build whose identity cannot be positively confirmed is
-never trusted.
-
-**A success envelope is required before any outcome is trusted.** Every
-interpretation of a spawned staged-binary result first requires a valid
-`{ ok: true, data: <object> }` success envelope (R3-F3). The parser guards the
-top-level shape *before* reading any field: a body that parses to `null`, an
-array, or a primitive (`JSON.parse("null")`/`"[]"`/`"5"` all succeed) is rejected
-as no-envelope rather than crashing on a `.ok` access (R4-F1); likewise an
-`ok:false` error envelope, a non-object `data`, unparseable output, a kill, or a
-transport error is unresolved — preflight treats it as **blocked**, activation as
-**ambiguous**, and a version probe as "no version". The `runUpdate` orchestrator
-also wraps the preflight/activation port calls so an unexpected throw becomes a
-blocked preflight / ambiguous activation, never an uncaught error that could hide
-a committed switch. Only then does the outcome/exit consistency rule apply: a
-*success-class* outcome (`upgraded`, `compatible`, `already-current`, or a
-`dry-run` preflight) is trusted **only when the process also
-exited 0**. A contradiction — stdout says `upgraded` but the process exited
-non-zero — means the child's own contract was violated mid-flight, so it is
-treated as **ambiguous** (activation) or **blocked** (preflight), never a false
-success. Blocker-class outcomes are exempt: `yui upgrade` deliberately exits
-non-zero (5) for a clean `blocked`, so a non-zero exit there is expected and
-consistent. A parseable result with **no** recognized outcome is likewise never
-read as success.
-
-**Post-verify parses the doctor machine-readable result before the exit status.**
-The post-update health check validates the structured `yui --json doctor` verdict
-FIRST, then the exit status (R2-F2) — because `--json doctor` deliberately exits
-non-zero on unhealthy storage, so keying off the exit first would reduce a precise
-"storage unsupported/corrupted" verdict to a generic "exited with status N".
-Storage is healthy only when ALL hold: a valid `{ ok: true, data: { checks,
-storage } }` success envelope, **every expected storage check present exactly once
-and `ok`** (a missing, duplicated, or malformed check fails closed — the `healthy`
-flag is never trusted over the authoritative checks array, R3-F2), a
-`storage.blocking` that is **a well-formed array of check-shaped objects** (a
-missing field, a non-array value, or a malformed element fails closed rather than
-being silently coerced to an empty array, R4-F2), `storage.healthy === true` with
-no blocking checks, AND exit 0. A parseable-
-but-unhealthy result (typically exit 5) throws a precise, recovery-oriented
-blocker; an unparseable, non-success, or self-contradictory envelope (e.g.
-`healthy: true` alongside a non-`ok` storage check, or `ok: false`) fails closed —
-an unverifiable health check must never pass silently. The `--json` doctor path
-additionally exits non-zero when storage is unhealthy, so even a naive exit-code
-consumer fails closed; text-mode `doctor` keeps its existing presentation.
-
-**Activation ambiguity.** Storage activation runs in a spawned staged-binary
-child. If that child is killed (SIGTERM/OOM) or crashes *after* the atomic switch
-commits but *before* it prints its result JSON, the parent cannot tell "nothing
-happened" from "storage already switched". This is reported as a distinct
-**ambiguous** outcome — never a false "recoverable/unchanged". The switch writes
-a durable completion **receipt** at a sibling path (`<home>.upgrade-receipt.json`)
-the instant it commits, and clears it only on a clean, fully-verified return; so
-its presence proves the switch committed even when stdout was lost. On an
-ambiguous result the orchestrator probes the receipt + timestamped backup +
-current schema and prints precise manual-recovery steps (verify with `yui doctor`;
-restore the named backup with `mv` if needed), and the CLI exits non-zero with a
-dedicated code so the ambiguity is never mistaken for success.
-
-**A receipt is only trusted when it genuinely corresponds to the current home
-AND its backup.** A leftover receipt from a prior attempt is not unconditional
-proof that *this* attempt's switch committed, and existence alone is not
-correspondence (R3-F6). Before using a receipt for a recovery decision, the probe
-requires the current protocol's correlating fields and a real backup: it is
-rejected (the caller re-probes the real on-disk state instead) when it lacks a
-`homePath` (a legacy/degraded marker), names a **different home**, lacks a
-`backupPath`, names a backup that is **not this home's expected
-`<home>.backup-*` timestamped sibling** (unrelated/foreign evidence), or whose
-backup is **absent or not a real directory** (already restored or cleaned). A
-non-corresponding receipt reads as "not switched" so recovery advice is never
-derived from stale, legacy, or unrelated evidence.
-
-**Rollback boundary (narrowed):** the managed Session launcher is an in-place
-forwarder to the currently activated CLI, not a versioned package pointer, so
-this release still makes no binary+Home dual-resource atomicity claim. It
-guarantees isolated staging (a stage/preflight failure leaves binary and Home
-unchanged), a no-Home-mutation fast path, a recoverable atomic storage switch on
-the offline path (timestamped backup, restorable until the new version resumes
-writes), and no auto-downgrade after writes resume. The offline path's single
-non-atomic window — storage switched, binary promotion then failing — is surfaced
-with the exact backup-restore recovery, and the version-gated axes make the old
-binary fail-close on the new Home rather than misread it. This release exercises
-the contracts only against isolated synthetic Homes; the production registry
-contains the aggregate `16→17` offline transition, but this Task does not run a
-migration against any real Home.
-
-**Cross-Task schema scheduling.** Storage schema work is not globally serialized.
-Any module or Task may advance a storage version axis (`layout`, `aggregate`, or
-a `record` family) on its own isolated branch without waiting for another Task's
-schema change to land — branches do not block each other. The cost of that
-parallelism is assigned, by design, to whichever branch integrates later: the
-later-integrating branch is responsible for rebasing onto the latest project
-head, resolving all schema and code conflicts, re-advancing whatever schema
-versions and record-version-map entries the rebase requires, rebuilding and
-re-validating the real wiring, and fully re-running the isolated migration/upgrade
-E2E and its documentation. This rework-and-reconcile duty belongs to the later
-integrator; it is a deliberate scheduling trade-off (authorized by the user) that
-avoids cross-Task blocking rather than an accident to be repaired ad hoc.
-Concretely, the current manifest descriptor map is re-derived against the newest
-head, while the post-baseline descriptor snapshot remains frozen. If another
-Task lands a record-schema change, the integrating branch must reconcile both:
-existing-family advances need a complete adjacent path, and a new target family
-needs an explicit `0->1` introduction before re-testing to convergence.
+SQLite bootstrap DDL is an implementation detail for initializing a fresh Home.
+Its ledger must be complete on every later open; a partial or older ledger is
+rejected rather than advanced. This keeps one durable model for Turn,
+TaskRoleSessionSet, WorkMailbox, and Provider Runtime Binding and prevents an
+old writer or migration transform from recreating removed delivery state.
 
 The Web control room is loopback-only and never receives Controller socket
 credentials. It presents durable records and native terminal access without

@@ -19,7 +19,7 @@ import {
   type GlobalRole
 } from "../role/role.js";
 import { SYSTEM_LEADER_ROLE, SYSTEM_OPERATOR_ROLE } from "../role/systemRoles.js";
-import { initializeCompatibleTaskStore } from "../storage/compatibleTaskStore.js";
+import { initializeCurrentTaskStore } from "../storage/currentTaskStore.js";
 import {
   ensureYuiHome,
   resolveYuiHome,
@@ -77,7 +77,7 @@ export async function runSetupCommand(
     const question = createSetupQuestion(readline, io);
     const home = resolveYuiHome(env);
     ensureYuiHome(home);
-    const store = initializeCompatibleTaskStore(home);
+    const store = initializeCurrentTaskStore(home);
     const tmuxBin = resolveTmuxBin(store.getConfig().tmuxBin);
     assertTmuxAvailable(executor, tmuxBin);
     const choices = availableAgentChoices(store, env);

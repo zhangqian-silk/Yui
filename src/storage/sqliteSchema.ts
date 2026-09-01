@@ -24,16 +24,16 @@
 import { createHash } from "node:crypto";
 import type Database from "better-sqlite3";
 
-/** The SQLite layout version (state.json layout 6 -> SQLite layout 7, per §8.1). */
-export const SQLITE_LAYOUT_VERSION = 7;
+/** The current SQLite layout version. */
+export const SQLITE_LAYOUT_VERSION = 8;
 /** The aggregate version of the normalized SQLite schema. */
-export const SQLITE_AGGREGATE_VERSION = 1;
+export const SQLITE_AGGREGATE_VERSION = 2;
 /** The current schema migration version. */
-export const SQLITE_SCHEMA_VERSION = 18;
+export const SQLITE_SCHEMA_VERSION = 19;
 
 /** Telemetry retention bounds (§4.4). Open question 3 in §11; defaults from the design. */
 export const TELEMETRY_KEEP_PER_GENERATION = 200;
-export const TELEMETRY_RUN_CAP = 50_000;
+export const TELEMETRY_TURN_CAP = 50_000;
 
 /**
  * Version 1 migration: creates every table and index.
@@ -42,9 +42,8 @@ export const TELEMETRY_RUN_CAP = 50_000;
  * the store; `journal_mode=WAL` is a persistent database property set on open.
  * The migration itself only contains schema objects.
  *
- * This released SQL string, including its comments, is checksummed persistent
- * history and must remain byte-for-byte unchanged. The `operator-notification`
- * projection kind it creates is retained only for old layout-7 Homes.
+ * This is the direct current baseline for a new Home. Its checksum rejects any
+ * database initialized from a different physical contract.
  */
 const MIGRATION_1_SQL = `
 -- Global catalog and coordination (§4.1) -------------------------------------
@@ -236,22 +235,22 @@ CREATE TABLE IF NOT EXISTS work_item_candidates (
   PRIMARY KEY (task_id, candidate_id)
 );
 
-CREATE TABLE IF NOT EXISTS agent_runs (
+CREATE TABLE IF NOT EXISTS turns (
   task_id    TEXT NOT NULL,
-  run_id     TEXT NOT NULL,
+  turn_id    TEXT NOT NULL,
   role_name  TEXT NOT NULL,
   status     TEXT NOT NULL,
   payload    TEXT NOT NULL,
   updated_at TEXT NOT NULL,
-  PRIMARY KEY (task_id, run_id)
+  PRIMARY KEY (task_id, turn_id)
 );
-CREATE INDEX IF NOT EXISTS idx_agent_runs_role_status ON agent_runs(task_id, role_name, status);
+CREATE INDEX IF NOT EXISTS idx_turns_role_status ON turns(task_id, role_name, status);
 
--- Active-run pointers (getActiveAgentRun / execution-lane runs).
-CREATE TABLE IF NOT EXISTS active_runs (
+-- Active-Turn pointers (getActiveTurn / execution-lane Turns).
+CREATE TABLE IF NOT EXISTS active_turns (
   task_id    TEXT NOT NULL,
   pointer    TEXT NOT NULL,
-  run_id     TEXT NOT NULL,
+  turn_id    TEXT NOT NULL,
   payload    TEXT NOT NULL,
   updated_at TEXT NOT NULL,
   PRIMARY KEY (task_id, pointer)
@@ -348,15 +347,15 @@ CREATE TABLE IF NOT EXISTS task_projections (
 CREATE TABLE IF NOT EXISTS telemetry (
   task_id     TEXT NOT NULL,
   role_name   TEXT NOT NULL,
-  run_id      TEXT NOT NULL,
+  turn_id     TEXT NOT NULL,
   generation  TEXT NOT NULL,
   progress_id TEXT NOT NULL,
   sequence    INTEGER,
   payload     TEXT NOT NULL,
   received_at TEXT NOT NULL,
-  PRIMARY KEY (task_id, role_name, run_id, generation, progress_id)
+  PRIMARY KEY (task_id, role_name, turn_id, generation, progress_id)
 ) WITHOUT ROWID;
-CREATE INDEX IF NOT EXISTS idx_telemetry_run ON telemetry(task_id, run_id);
+CREATE INDEX IF NOT EXISTS idx_telemetry_turn ON telemetry(task_id, turn_id);
 `;
 
 /**
@@ -398,7 +397,7 @@ CREATE TABLE IF NOT EXISTS release_workflows (
 /**
  * Migration 3: Job caller key hashes (task-14, rr13). Durable SHA-256 hashes of
  * the caller key bound to each launched Session, used to fail-closed verify a
- * DurableJob's caller against durable Run state.
+ * DurableJob's caller against durable Turn state.
  */
 const MIGRATION_3_SQL = `
 CREATE TABLE IF NOT EXISTS job_caller_key_hashes (
@@ -416,8 +415,8 @@ CREATE TABLE IF NOT EXISTS job_caller_key_hashes (
  * job_id the global primary key, so two Tasks allocating their first `job-1`
  * could overwrite one another through the upsert path.  Rebuild the table with
  * the actual record identity `(task_id, job_id)` and restore its indexes.
- * Never edit migration 2's checksum: existing Homes reach this repair through
- * this adjacent schema migration.
+ * The adjacent rebuild keeps the direct baseline's final Task-local identity
+ * explicit while each physical step remains checksummed.
  */
 const MIGRATION_4_SQL = `
 CREATE TABLE durable_jobs_v4 (
@@ -445,7 +444,7 @@ CREATE UNIQUE INDEX idx_durable_jobs_idempotency
 /**
  * Migration 5: telemetry aggregate (Issue 09). The `telemetry` table (migration
  * 1, §4.4) stores the bounded latest-per-key progress window; this companion
- * table holds the authoritative per-Run/generation summary (count, first/last,
+ * table holds the authoritative per-Turn/generation summary (count, first/last,
  * max sequence, error count) so aggregates stay accurate after the window is
  * pruned. Triggers maintain it on telemetry INSERT/UPDATE; DELETE intentionally
  * leaves it untouched because pruned rows were still observed.
@@ -454,7 +453,7 @@ const MIGRATION_5_SQL = `
 CREATE TABLE IF NOT EXISTS telemetry_aggregate (
   task_id      TEXT NOT NULL,
   role_name    TEXT NOT NULL,
-  run_id       TEXT NOT NULL,
+  turn_id      TEXT NOT NULL,
   generation   TEXT NOT NULL,
   first_at     TEXT NOT NULL,
   last_at      TEXT NOT NULL,
@@ -462,21 +461,21 @@ CREATE TABLE IF NOT EXISTS telemetry_aggregate (
   max_sequence INTEGER,
   error_count  INTEGER NOT NULL DEFAULT 0,
   updated_at   TEXT NOT NULL,
-  PRIMARY KEY (task_id, role_name, run_id, generation)
+  PRIMARY KEY (task_id, role_name, turn_id, generation)
 ) WITHOUT ROWID;
 
 CREATE TRIGGER IF NOT EXISTS telemetry_ai AFTER INSERT ON telemetry
 BEGIN
   INSERT INTO telemetry_aggregate
-    (task_id, role_name, run_id, generation, first_at, last_at, count, max_sequence, error_count, updated_at)
+    (task_id, role_name, turn_id, generation, first_at, last_at, count, max_sequence, error_count, updated_at)
   VALUES
-    (NEW.task_id, NEW.role_name, NEW.run_id, NEW.generation, NEW.received_at, NEW.received_at, 1, NEW.sequence,
+    (NEW.task_id, NEW.role_name, NEW.turn_id, NEW.generation, NEW.received_at, NEW.received_at, 1, NEW.sequence,
      CASE WHEN json_valid(NEW.payload)
           AND (COALESCE(json_extract(NEW.payload, '$.error'), '') <> ''
                OR COALESCE(json_extract(NEW.payload, '$.errorKind'), '') <> '')
          THEN 1 ELSE 0 END,
      NEW.received_at)
-  ON CONFLICT(task_id, role_name, run_id, generation) DO UPDATE SET
+  ON CONFLICT(task_id, role_name, turn_id, generation) DO UPDATE SET
     first_at = MIN(telemetry_aggregate.first_at, excluded.first_at),
     last_at = MAX(telemetry_aggregate.last_at, excluded.last_at),
     count = telemetry_aggregate.count + 1,
@@ -497,7 +496,7 @@ BEGIN
       THEN NEW.sequence ELSE max_sequence END,
     updated_at = NEW.received_at
   WHERE task_id = NEW.task_id AND role_name = NEW.role_name
-    AND run_id = NEW.run_id AND generation = NEW.generation;
+    AND turn_id = NEW.turn_id AND generation = NEW.generation;
 END;
 `;
 
@@ -613,10 +612,10 @@ CREATE TABLE IF NOT EXISTS gate_artifact_logs (
 /**
  * Migration 10: bounded ready-mailbox lookup for the Controller hot path.
  *
- * Historical empty mailboxes remain durable, but only mailboxes with a
+ * Empty mailboxes remain durable, but only mailboxes with a
  * processing or pending batch require scheduling.  The partial index contains
  * exactly that unsettled set in target-key order, so the Controller's recovery
- * query is O(log H + ready) instead of scanning every historical mailbox.
+ * query is O(log H + ready) instead of scanning every settled mailbox.
  */
 const MIGRATION_10_SQL = `
 CREATE INDEX IF NOT EXISTS idx_mailboxes_ready
@@ -630,8 +629,8 @@ CREATE INDEX IF NOT EXISTS idx_mailboxes_ready
  * RoleSessionSet payloads remain authoritative. This table contains only the
  * current active Agent Session while it is non-stopped, so terminal Session
  * history cannot enlarge Controller cleanup discovery. Runtime writes maintain
- * it in the same transaction as the source payload; this migration performs
- * the one-time deterministic backfill for existing layout-7 Homes.
+ * it in the same transaction as the source payload; the initialization query
+ * projects any rows created by earlier baseline steps.
  */
 const MIGRATION_11_SQL = `
 CREATE TABLE IF NOT EXISTS runtime_session_candidates (
@@ -717,10 +716,8 @@ WHERE json_extract(active.value, '$.status') <> 'stopped';
 /**
  * Migration 12: bounded open-InputRequest lookup for Controller deadlines.
  *
- * The baseline index's historical predicate predates the current
- * open/answered/cancelled status contract and retains terminal rows. This
- * partial index contains only the live InputRequest set, so deadline arming and
- * targeted auto-resolution never scan terminal request history.
+ * This partial index contains only the live InputRequest set, so deadline
+ * arming and targeted auto-resolution never scan terminal request history.
  */
 const MIGRATION_12_SQL = `
 CREATE INDEX IF NOT EXISTS idx_input_requests_open_hot
@@ -728,152 +725,18 @@ CREATE INDEX IF NOT EXISTS idx_input_requests_open_hot
   WHERE status = 'open';
 `;
 
-/**
- * Migration 13: durable pending native Turn-completion hot projection.
- *
- * A Task Role may have an unsettled Turn completion after the native Session
- * has ended.  That completion is independent lifecycle state, so it cannot be
- * discovered through the current-Session projection (which intentionally
- * removes stopped Sessions).  Keep one typed row per Task Role and maintain it
- * in the same transaction as `role_session_sets`; deadline discovery can then
- * read this table without parsing a RoleSessionSet or its historical Sessions.
- */
-const MIGRATION_13_SQL = `
-CREATE TABLE IF NOT EXISTS pending_runtime_turn_completions (
-  task_id           TEXT NOT NULL,
-  role_name         TEXT NOT NULL,
-  schema_version    INTEGER NOT NULL CHECK (schema_version = 1),
-  agent_id          TEXT NOT NULL,
-  native_session_id TEXT NOT NULL,
-  turn_id           TEXT NOT NULL,
-  run_id            TEXT NOT NULL,
-  summary           TEXT NOT NULL,
-  observed_at       TEXT NOT NULL,
-  due_at            TEXT NOT NULL,
-  PRIMARY KEY (task_id, role_name),
-  CHECK (due_at >= observed_at),
-  FOREIGN KEY (task_id, role_name)
-    REFERENCES role_session_sets(task_id, role_name) ON DELETE CASCADE
-);
+/** Reserved bootstrap step retained only to keep the physical ledger contiguous. */
+const MIGRATION_13_SQL = `SELECT 1;`;
 
-CREATE INDEX IF NOT EXISTS idx_pending_runtime_turn_completions_due
-  ON pending_runtime_turn_completions(task_id, due_at, role_name);
-
-INSERT INTO pending_runtime_turn_completions (
-  task_id, role_name, schema_version, agent_id, native_session_id,
-  turn_id, run_id, summary, observed_at, due_at
-)
-SELECT
-  source.task_id,
-  source.role_name,
-  json_extract(source.payload, '$.pendingTurnCompletion.schemaVersion'),
-  json_extract(source.payload, '$.pendingTurnCompletion.agentId'),
-  json_extract(source.payload, '$.pendingTurnCompletion.nativeSessionId'),
-  json_extract(source.payload, '$.pendingTurnCompletion.turnId'),
-  json_extract(source.payload, '$.pendingTurnCompletion.runId'),
-  json_extract(source.payload, '$.pendingTurnCompletion.summary'),
-  json_extract(source.payload, '$.pendingTurnCompletion.observedAt'),
-  json_extract(source.payload, '$.pendingTurnCompletion.dueAt')
-FROM role_session_sets AS source
-WHERE json_type(source.payload, '$.pendingTurnCompletion') = 'object';
-`;
-
-/** Migration 14: WorkMailbox v2 lanes and the single durable model-input delivery. */
+/** Migration 14: WorkMailbox v4 is one coalesced wake hint. */
 const MIGRATION_14_SQL = `
-ALTER TABLE mailboxes ADD COLUMN input_delivery TEXT;
-
-UPDATE mailboxes
-SET processing = CASE
-  WHEN processing IS NULL THEN NULL
-  ELSE json_set(
-    processing,
-    '$.lane', 'normal',
-    '$.batch.sources', json_array('migration-v1'),
-    '$.batch.dedupeKeys', json_array(
-      'mailbox-v1:' || target_key || ':'
-      || json_extract(processing, '$.batch.fromSequence') || '-'
-      || json_extract(processing, '$.batch.toSequence')
-    ),
-    '$.batch.deliveryModes', json_array('followup')
-  )
-END;
-
-UPDATE mailboxes
-SET input_delivery = json_object(
-  'attemptId', json_extract(processing, '$.batchId'),
-  'lane', 'normal',
-  'mode', 'followup',
-  'batch', json(json_extract(processing, '$.batch')),
-  'owner', json_extract(processing, '$.owner'),
-  'status', 'delivery-unknown',
-  'startedAt', json_extract(processing, '$.startedAt'),
-  'pushedAt', json_extract(processing, '$.startedAt'),
-  'unknownReason', 'migrated-unconfirmed-provider-acceptance',
-  'executionRef', json(json_extract(processing, '$.executionRef')),
-  'providerFence', json_object(
-    'conversationId', (
-      SELECT json_extract(
-        json_extract(role_session_sets.payload, '$.sessions'),
-        '$.' || json_quote(json_extract(role_session_sets.payload, '$.activeAgentId'))
-          || '.nativeSessionId'
-      )
-      FROM role_session_sets
-      WHERE role_session_sets.task_id = mailboxes.task_id
-        AND role_session_sets.role_name = mailboxes.role_name
-    ),
-    'activationId', COALESCE((
-      SELECT json_extract(
-        json_extract(role_session_sets.payload, '$.sessions'),
-        '$.' || json_quote(json_extract(role_session_sets.payload, '$.activeAgentId'))
-          || '.launchId'
-      )
-      FROM role_session_sets
-      WHERE role_session_sets.task_id = mailboxes.task_id
-        AND role_session_sets.role_name = mailboxes.role_name
-    ), (
-      SELECT json_extract(role_session_sets.payload, '$.inFlight.receiptId')
-      FROM role_session_sets
-      WHERE role_session_sets.task_id = mailboxes.task_id
-        AND role_session_sets.role_name = mailboxes.role_name
-    ))
-  )
-)
-WHERE target_kind = 'role'
-  AND json_extract(processing, '$.batchId') LIKE 'agent-input:%';
-
-UPDATE mailboxes
-SET processing = NULL
-WHERE input_delivery IS NOT NULL;
-
-UPDATE mailboxes
-SET pending = json_object(
-  'normal', CASE
-    WHEN pending IS NULL THEN json('null')
-    ELSE json(json_set(
-      pending,
-      '$.sources', json_array('migration-v1'),
-      '$.dedupeKeys', json_array(
-        'mailbox-v1:' || target_key || ':'
-        || json_extract(pending, '$.fromSequence') || '-'
-        || json_extract(pending, '$.toSequence')
-      ),
-      '$.deliveryModes', json_array('followup')
-    ))
-  END,
-  'userCorrection', json('null'),
-  'cursors', json_object('normal', 0, 'userCorrection', 0),
-  'recentDedupeKeys', json_array()
-);
+ALTER TABLE mailboxes ADD COLUMN recent_dedupe_keys TEXT NOT NULL DEFAULT '[]';
 
 DROP INDEX idx_mailboxes_ready;
 CREATE INDEX idx_mailboxes_ready
   ON mailboxes(target_key)
-  WHERE processing IS NOT NULL
-     OR input_delivery IS NOT NULL
-     OR json_type(pending, '$.normal') <> 'null'
-     OR json_type(pending, '$.userCorrection') <> 'null';
+  WHERE processing IS NOT NULL OR json_type(pending) <> 'null';
 
-DROP TABLE pending_runtime_turn_completions;
 DROP TABLE IF EXISTS mailbox_signals;
 `;
 
@@ -923,7 +786,7 @@ CREATE TABLE IF NOT EXISTS task_wakes (
   wake_id     TEXT NOT NULL,
   seq         INTEGER NOT NULL,
   status      TEXT NOT NULL CHECK (status IN ('dispatched','consumed')),
-  run_id      TEXT,
+  turn_id     TEXT,
   from_cursor TEXT NOT NULL,
   to_cursor   TEXT NOT NULL,
   reasons     TEXT NOT NULL,
@@ -1007,6 +870,14 @@ CREATE INDEX idx_runtime_session_cleanup_required
   WHERE cleanup_required = 1;
 `;
 
+/**
+ * Migration 19 marks the direct Turn baseline. Earlier checksums are rejected;
+ * current Homes never create or rename a superseded run-shaped table or column.
+ */
+const MIGRATION_19_SQL = `
+SELECT 19;
+`;
+
 interface Migration {
   version: number;
   axis: "layout" | "aggregate" | "record";
@@ -1015,10 +886,8 @@ interface Migration {
 }
 
 /**
- * The single forward migration history for current SQLite Homes. New durable
- * layout, aggregate, and record changes belong here and must be expressible as
- * one atomic in-place transaction. The separate logical migration registry is
- * only the bridge from valid pre-SQLite Homes and is allowed to rebuild them.
+ * Ordered build steps for the direct current SQLite baseline. Their checksums
+ * validate current Homes; they do not admit earlier storage contracts.
  */
 const MIGRATIONS: readonly Migration[] = [
   { version: 1, axis: "layout", sql: MIGRATION_1_SQL },
@@ -1038,7 +907,8 @@ const MIGRATIONS: readonly Migration[] = [
   { version: 15, axis: "record", recordKind: "publicationReference", sql: MIGRATION_15_SQL },
   { version: 16, axis: "record", recordKind: "taskWake", sql: MIGRATION_16_SQL },
   { version: 17, axis: "record", recordKind: "contextSnapshot", sql: MIGRATION_17_SQL },
-  { version: 18, axis: "layout", sql: MIGRATION_18_SQL }
+  { version: 18, axis: "layout", sql: MIGRATION_18_SQL },
+  { version: 19, axis: "layout", sql: MIGRATION_19_SQL }
 ];
 
 /** Current hot-path indexes whose absence would invalidate a current Home. */
@@ -1056,7 +926,7 @@ function checksum(sql: string): string {
  * A SQLite Home is only safe to open when its migration ledger proves exactly
  * which schema definition was applied.  The ledger is durable metadata, not a
  * best-effort cache: a missing row, a changed checksum, or an unknown version
- * must stop startup before any pending migration is run.
+ * must stop startup before any pending schema step is applied.
  */
 export class SqliteSchemaMigrationError extends Error {
   constructor(detail: string, subject = "metadata") {
@@ -1215,92 +1085,10 @@ function validateSchemaObjects(db: Database.Database): void {
   }
 }
 
-/** Validate migration 13's source invariant before creating its hot table. */
-function validatePendingProjectionBackfillSources(db: Database.Database): void {
-  const existing = db.prepare(
-    `SELECT name
-     FROM sqlite_master
-     WHERE name IN (
-       'pending_runtime_turn_completions',
-       'idx_pending_runtime_turn_completions_due'
-     )
-     LIMIT 1`
-  ).get() as { name: string } | undefined;
-  if (existing !== undefined) {
-    throw new SqliteSchemaMigrationError(
-      `schema object '${existing.name}' exists before migration 13 is recorded`,
-      "backfill"
-    );
-  }
-  const mismatch = db.prepare(
-    `SELECT task_id, role_name
-     FROM role_session_sets
-     WHERE COALESCE(json_type(payload, '$.pendingTurnCompletion'), 'missing')
-             NOT IN ('null', 'object')
-        OR (
-          json_type(payload, '$.pendingTurnCompletion') = 'object'
-          AND (
-            json_extract(payload, '$.owner.scope') <> 'task'
-            OR json_extract(payload, '$.owner.taskId') IS NULL
-            OR json_extract(payload, '$.owner.taskId') <> task_id
-            OR json_extract(payload, '$.owner.roleName') IS NULL
-            OR json_extract(payload, '$.owner.roleName') <> role_name
-            OR json_extract(payload, '$.pendingTurnCompletion.taskId') IS NULL
-            OR json_extract(payload, '$.pendingTurnCompletion.taskId') <> task_id
-            OR json_extract(payload, '$.pendingTurnCompletion.roleName') IS NULL
-            OR json_extract(payload, '$.pendingTurnCompletion.roleName') <> role_name
-            OR json_extract(payload, '$.pendingTurnCompletion.schemaVersion') IS NOT 1
-            OR COALESCE(json_type(payload, '$.pendingTurnCompletion.agentId'), 'missing') <> 'text'
-            OR COALESCE(json_type(payload, '$.pendingTurnCompletion.nativeSessionId'), 'missing') <> 'text'
-            OR COALESCE(json_type(payload, '$.pendingTurnCompletion.turnId'), 'missing') <> 'text'
-            OR COALESCE(json_type(payload, '$.pendingTurnCompletion.runId'), 'missing') <> 'text'
-            OR COALESCE(json_type(payload, '$.pendingTurnCompletion.summary'), 'missing') <> 'text'
-            OR COALESCE(json_type(payload, '$.pendingTurnCompletion.observedAt'), 'missing') <> 'text'
-            OR COALESCE(json_type(payload, '$.pendingTurnCompletion.dueAt'), 'missing') <> 'text'
-            OR COALESCE(json_type(payload, '$.inFlight'), 'missing') <> 'object'
-            OR COALESCE(json_type(payload, '$.activeAgentId'), 'missing') <> 'text'
-            OR COALESCE(json_type(payload, '$.inFlight.agentId'), 'missing') <> 'text'
-            OR COALESCE(json_type(payload, '$.inFlight.runId'), 'missing') <> 'text'
-            OR json_extract(payload, '$.activeAgentId')
-                 <> json_extract(payload, '$.pendingTurnCompletion.agentId')
-            OR json_extract(payload, '$.inFlight.agentId')
-                 <> json_extract(payload, '$.pendingTurnCompletion.agentId')
-            OR json_extract(payload, '$.inFlight.runId')
-                 <> json_extract(payload, '$.pendingTurnCompletion.runId')
-            OR COALESCE(json_type(payload, '$.inFlight.pushedAt'), 'missing') <> 'text'
-            OR COALESCE(
-                 json_type(
-                   payload,
-                   '$.sessions.' || json_quote(
-                     json_extract(payload, '$.pendingTurnCompletion.agentId')
-                   ) || '.nativeSessionId'
-                 ),
-                 'missing'
-               ) <> 'text'
-            OR json_extract(
-                 payload,
-                 '$.sessions.' || json_quote(
-                   json_extract(payload, '$.pendingTurnCompletion.agentId')
-                 ) || '.nativeSessionId'
-               ) <> json_extract(payload, '$.pendingTurnCompletion.nativeSessionId')
-            OR json_extract(payload, '$.pendingTurnCompletion.dueAt')
-                 < json_extract(payload, '$.pendingTurnCompletion.observedAt')
-          )
-        )
-     LIMIT 1`
-  ).get() as { task_id: string; role_name: string } | undefined;
-  if (mismatch !== undefined) {
-    throw new SqliteSchemaMigrationError(
-      `pending Turn completion source is invalid for ${mismatch.task_id}/${mismatch.role_name}`,
-      "backfill"
-    );
-  }
-}
-
 export interface MigrationResult {
   /** Versions applied by this run (empty when the schema was already current). */
   readonly applied: readonly number[];
-  /** The schema version after the run. */
+  /** The schema version after the operation. */
   readonly version: number;
 }
 
@@ -1329,9 +1117,8 @@ export type SqliteSchemaMigrationOptions = Readonly<{
 }>;
 
 /**
- * Inspect a database's checksummed migration prefix without changing it.
- * Pending versions are a supported upgrade state; malformed, gapped, changed,
- * or future ledger entries remain explicit integrity failures.
+ * Inspect a current database without changing it. Any non-current ledger is an
+ * unsupported historical contract, not an upgrade candidate.
  */
 export function inspectSqliteSchemaMigrations(
   db: Database.Database
@@ -1341,7 +1128,13 @@ export function inspectSqliteSchemaMigrations(
   const pendingVersions = MIGRATIONS
     .filter((migration) => !applied.has(migration.version))
     .map((migration) => migration.version);
-  if (pendingVersions.length === 0) validateSchemaObjects(db);
+  if (pendingVersions.length > 0) {
+    throw new SqliteSchemaMigrationError(
+      `historical SQLite schema ${applied.size} is unsupported; initialize a new Home`,
+      "admission"
+    );
+  }
+  validateSchemaObjects(db);
   const current = MIGRATIONS[applied.size - 1];
   const target = MIGRATIONS.at(-1)!;
   if (current === undefined) {
@@ -1376,16 +1169,14 @@ export function migrateSqliteSchema(
     // skipping a later schema/data step.
     const applied = validateAppliedMigrations(db, ledgerWasCreated);
     const pending = MIGRATIONS.filter((migration) => !applied.has(migration.version));
-    if (options.mode === "validate" && pending.length > 0) {
+    if (!ledgerWasCreated && pending.length > 0) {
       throw new SqliteSchemaMigrationError(
-        `pending SQLite schema migration ${pending[0]!.version}; `
-          + "run the explicit storage upgrade before opening this database",
+        `historical SQLite schema ${applied.size} is unsupported; initialize a new Home`,
         "admission"
       );
     }
     const newlyApplied: number[] = [];
     for (const migration of pending) {
-      if (migration.version === 13) validatePendingProjectionBackfillSources(db);
       db.exec(migration.sql);
       db.prepare(
         `INSERT INTO schema_migrations (version, axis, record_kind, applied_at, checksum)
@@ -1428,8 +1219,8 @@ export const SQLITE_SCHEMA_TABLES: readonly string[] = [
   "work_items",
   "work_item_candidates",
   "context_snapshots",
-  "agent_runs",
-  "active_runs",
+  "turns",
+  "active_turns",
   "review_rounds",
   "review_findings",
   "change_sets",

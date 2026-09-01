@@ -4,7 +4,7 @@
  *
  * The `/proc` scanning in `resourceInventoryLinux` is blocking IO (hundreds of
  * `readFileSync` calls per pass, `spawnSync`, tmux inspection). When the worker
- * backend is active (`YUI_STORE_BACKEND=sqlite` + `YUI_STORE_WORKER=1`, the same
+ * persistence worker is active (`YUI_STORE_WORKER=1`, the same
  * flag as the persistence worker, §6), the Controller runtime and the ephemeral
  * reaper scan through this client instead: the scan runs in the inventory
  * worker (its own thread), the main event loop stays free, and the result is
@@ -17,8 +17,8 @@
  *   worker -> main: ready | result | error
  *
  * Only structured-cloneable scan options cross the port (the file-backed
- * `inspectStorage` / `openCompatibleStore` / `now` seams stay on the direct
- * path, which the file backend still uses). The inventory worker never touches
+ * `inspectStorage` / `openCurrentStore` / `now` seams stay on the direct
+ * path used without the worker). The inventory worker never touches
  * the persistence worker's database connection (§3.3): it is a separate worker
  * with a separate concern.
  */

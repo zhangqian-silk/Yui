@@ -8,7 +8,7 @@ export type RuntimeProcessExitObservation = Readonly<{
   providerProcessInstanceId?: string;
   taskId?: string;
   roleName: string;
-  runId?: string;
+  turnId?: string;
   launchId: string;
   nativeSessionId?: string;
   processKind: "agent-host" | "provider-child";
@@ -31,7 +31,7 @@ export function validateRuntimeProcessExitObservation(
   optionalIdentity(observation.providerProcessInstanceId, "providerProcessInstanceId");
   optionalIdentity(observation.taskId, "taskId");
   identity(observation.roleName, "roleName");
-  optionalIdentity(observation.runId, "runId");
+  optionalIdentity(observation.turnId, "turnId");
   identity(observation.launchId, "launchId");
   optionalIdentity(observation.nativeSessionId, "nativeSessionId");
   if (observation.processKind !== "agent-host" && observation.processKind !== "provider-child") {

@@ -52,7 +52,7 @@ import {
 } from "../worktree/managedWorkspace.js";
 import { FileRoleLaunchPlanner } from "../executor/fileRoleLaunchPlanner.js";
 import type { TaskStore } from "../storage/taskStore.js";
-import { openCompatibleFileTaskStore } from "../storage/compatibleTaskStore.js";
+import { openCurrentTaskStore } from "../storage/currentTaskStore.js";
 import { SqliteTaskStore } from "../storage/sqliteStore.js";
 import {
   AsyncTaskStoreClient,
@@ -164,18 +164,18 @@ export type RunningFileTaskControllerRuntime = RunningFileTaskController & Reado
 
 /** Refreshes only the exact Task runtime generation folded by the event transaction. */
 export function refreshAppliedTaskRuntimeDescriptor(
-  store: Pick<TaskStore, "getAgentRun" | "getTaskRoleSessionSet">,
+  store: Pick<TaskStore, "getTurn" | "getTaskRoleSessionSet">,
   planner: Pick<FileRoleLaunchPlanner, "refreshTaskRuntimeDescriptor">,
   input: TaskRuntimeAppliedInput
 ): void {
   if (input.launchId === undefined) return;
-  const run = input.runId === undefined
+  const run = input.turnId === undefined
     ? null
-    : store.getAgentRun(input.taskId, input.runId);
-  if (input.runId !== undefined && run === null) {
+    : store.getTurn(input.taskId, input.turnId);
+  if (input.turnId !== undefined && run === null) {
     throw new Error("Prepared Task runtime generation is not current.");
   }
-  // A terminal completion has already settled this exact Run and no later
+  // A terminal completion has already settled this exact Turn and no later
   // prompt can use its descriptor. Acknowledge the applied provider fact
   // without republishing a dead generation.
   if (run !== null && run.status !== "active") return;
@@ -204,28 +204,24 @@ export function refreshAppliedTaskRuntimeDescriptor(
   });
 }
 
-/** Production composition root for the lean FileTaskStore + tmux Controller. */
+/** Production composition root for the current SQLite TaskStore + tmux Controller. */
 export async function startFileTaskControllerRuntime(
   home: string,
   options: FileTaskControllerFactoryOptions = {}
 ): Promise<RunningFileTaskControllerRuntime> {
-  // The Home decides the backend (Issue 01): a layout-7 Home runs SQLite with
-  // the persistence worker on by default; YUI_STORE_WORKER=0/false forces the
-  // in-process SQLite connection. The non-worker path opens the Home-decided
-  // backend through the compatibility opener (SQLite for layout 7, file store
-  // with normalization for older layouts).
+  // The current Home always uses SQLite. The persistence worker is enabled by
+  // default; YUI_STORE_WORKER=0/false keeps the same database in-process.
   const useWorker = resolveStoreWorkerEnabledForHome(
     home,
     options.environment ?? process.env
   );
   const store = options.store
     ?? (useWorker
-      // Transitional: the scheduler/planner still use a sync store. The worker
-      // owns the event-processing hot path; the scheduler migration is the next
-      // step (see work-item-5 remaining call sites). Both connections point at
-      // the same WAL db and serialize via BEGIN IMMEDIATE + busy_timeout.
+      // The worker owns the event-processing hot path while the scheduler uses
+      // the synchronous connection. Both point at the same WAL database and
+      // serialize via BEGIN IMMEDIATE + busy_timeout.
       ? new SqliteTaskStore(home)
-      : openCompatibleFileTaskStore(home));
+      : openCurrentTaskStore(home));
   const homeId = store.getHomeIdentity().homeId;
   const durableConfig = store.getConfig();
   // When the worker backend is active, the db-touching observer folds run in
@@ -436,9 +432,8 @@ export async function startFileTaskControllerRuntime(
       runtimeIsolation
     }
   );
-  // One inventory scan per scheduler pass. When the worker backend is active
-  // the blocking /proc scan runs in the inventory worker; otherwise it runs on
-  // the main thread (file backend, unchanged).
+  // One inventory scan per scheduler pass. When the inventory worker is active
+  // the blocking /proc scan runs there; otherwise it runs on the main thread.
   const scanInventory = (panes: readonly RuntimePaneFact[]) => inventoryClient !== undefined
     ? inventoryClient.scan({
         currentHome: home,
@@ -477,7 +472,7 @@ export async function startFileTaskControllerRuntime(
             && candidate.roleName === owner.roleName
           ));
           if (input === undefined) return [];
-          const identity = owner.runId === undefined
+          const identity = owner.turnId === undefined
             || owner.adapterId === undefined
             || (owner.nativeSessionId === undefined && owner.launchId === undefined)
             || (owner.nativeSessionId !== undefined && owner.nativeSessionId.trim().length === 0)
@@ -486,7 +481,7 @@ export async function startFileTaskControllerRuntime(
             : {
                 taskId: owner.taskId,
                 roleName: owner.roleName,
-                runId: owner.runId,
+                turnId: owner.turnId,
                 agentId: owner.agentId,
                 adapterId: owner.adapterId,
                 ...(owner.nativeSessionId === undefined
@@ -494,12 +489,12 @@ export async function startFileTaskControllerRuntime(
                   : { nativeSessionId: owner.nativeSessionId }),
                 ...(owner.launchId === undefined ? {} : { launchId: owner.launchId })
               };
-          const changed = !active || input.runId === undefined
+          const changed = !active || input.turnId === undefined
             ? false
             : resourceActivity({
                 taskId: input.taskId,
                 roleName: input.roleName,
-                runId: input.runId,
+                turnId: input.turnId,
                 agentId: input.agentId,
                 adapterId: input.adapterId,
                 ...(input.nativeSessionId === undefined
@@ -796,7 +791,7 @@ export function createRuntimeLifecycleDispatcher(
         schedulerStore.beginAgentHostProviderTurn({
           taskId: value.taskId,
           roleName: value.roleName,
-          runId: value.runId,
+          ...(value.turnId === undefined ? {} : { turnId: value.turnId }),
           agentId: value.agentId,
           launchId: value.launchId,
           nativeSessionId: value.nativeSessionId,
@@ -827,7 +822,7 @@ export function createRuntimeLifecycleDispatcher(
       schedulerStore.resolveAgentHostProviderTurnSubmission({
         taskId: value.taskId,
         roleName: value.roleName,
-        runId: value.runId,
+        ...(value.turnId === undefined ? {} : { turnId: value.turnId }),
         attemptId: value.attemptId,
         status,
         reason,
@@ -838,9 +833,9 @@ export function createRuntimeLifecycleDispatcher(
     }
     if (method === "runtime.process-exit-observe") {
       const observation = validateRuntimeProcessExitObservation(params as never);
-      const run = observation.taskId === undefined || observation.runId === undefined
+      const run = observation.taskId === undefined || observation.turnId === undefined
         ? null
-        : store.getAgentRun(observation.taskId, observation.runId);
+        : store.getTurn(observation.taskId, observation.turnId);
       const globalRole = observation.taskId === undefined
         ? store.getGlobalRole(observation.roleName)
         : null;
@@ -850,20 +845,20 @@ export function createRuntimeLifecycleDispatcher(
         ? null
         : builtinAgentDriverRegistry().findByAdapterId(adapterId);
       const turnTerminalObserved = observation.taskId !== undefined
-        && observation.runId !== undefined
+        && observation.turnId !== undefined
         && store.listEvents(observation.taskId).some((event) => {
           const runtime = runtimeObservationFromTaskEvent(event);
           return runtime !== null
-            && runtime.fence.runId === observation.runId
+            && runtime.fence.turnId === observation.turnId
             && ["turn.completed", "turn.failed", "turn.cancelled"].includes(runtime.kind)
             && Date.parse(runtime.receivedAt) <= Date.parse(observation.observedAt);
         });
       const turnFailureObserved = observation.taskId !== undefined
-        && observation.runId !== undefined
+        && observation.turnId !== undefined
         && store.listEvents(observation.taskId).some((event) => {
           const runtime = runtimeObservationFromTaskEvent(event);
           return runtime !== null
-            && runtime.fence.runId === observation.runId
+            && runtime.fence.turnId === observation.turnId
             && runtime.fence.launchId === observation.launchId
             && runtime.kind === "turn.failed"
             && Date.parse(runtime.receivedAt) <= Date.parse(observation.observedAt);
@@ -1004,23 +999,23 @@ export function createRuntimeLifecycleDispatcher(
           : `Global Role not found: ${request.roleName}.`
       );
     }
-    const activeRun = request.scope === "task"
-      ? store.getActiveAgentRun(request.taskId, request.roleName)
+    const activeTurn = request.scope === "task"
+      ? store.getActiveTurn(request.taskId, request.roleName)
       : null;
-    if (request.scope === "task" && activeRun === null) {
+    if (request.scope === "task" && activeTurn === null) {
       throw applicationError(
         "INVALID_PARAMS",
-        "Task Role runtime attachment requires an admitted active Run; it cannot create an empty Provider Conversation."
+        "Task Role runtime attachment requires an admitted active Turn; it cannot create an empty Provider Conversation."
       );
     }
     const managedWorkspace = request.scope === "task"
-      ? activeRun?.workspace
+      ? activeTurn?.workspace
         ?? currentDesiredManagedWorkspace(store, request.taskId, request.roleName)
       : undefined;
     const sessions = request.scope === "task"
       ? store.getTaskRoleSessionSet(request.taskId, request.roleName)
       : store.getGlobalRoleSessionSet(request.roleName);
-    const effective = activeRun?.effective
+    const effective = activeTurn?.effective
       ?? activeLiveRoleAgentSession(sessions)?.effective
       ?? resolveRuntimeDesiredEffective(store, request, role);
     const binding = role.agentBindings[effective.agentId];
@@ -1039,16 +1034,12 @@ export function createRuntimeLifecycleDispatcher(
     }
     validateLifecycleEnvironment(request.environment, agent);
     const session = sessions?.sessions[effective.agentId];
-    const managedTurnDispatch = activeRun !== null && (
-      activeRun.pushedAt === undefined
-      || activeRun.controlRequest?.state === "dispatching"
-    );
-    // An ensure call may reattach the already-admitted Run to its existing
+    // An ensure call may reattach the already-admitted Turn to its existing
     // Conversation, but it may not manufacture a fresh Conversation without a
-    // pending managed Turn. Fresh replacement remains owned by Run dispatch.
-    const mode = activeRun === null
+    // pending managed Turn. Fresh replacement remains owned by Turn dispatch.
+    const mode = activeTurn === null
       ? roleAgentSessionResumeMode(sessions, effective.agentId, effective)
-      : managedTurnDispatch ? activeRun.mode : "resume";
+      : session?.nativeSessionId === undefined ? activeTurn.mode : "resume";
     if (request.scope === "task" && mode === "resume"
       && (session?.nativeSessionId === undefined
         || session.nativeSessionId.trim().length === 0)) {
@@ -1067,7 +1058,7 @@ export function createRuntimeLifecycleDispatcher(
       effective,
       workspace: effective.workspace.root,
       ...(managedWorkspace === undefined ? {} : { managedWorkspace }),
-      ...(activeRun === null ? {} : { runId: activeRun.id }),
+      ...(activeTurn === null ? {} : { turnId: activeTurn.id }),
       ...(request.environment === undefined
         ? {}
         : { environment: request.environment })
@@ -1134,7 +1125,7 @@ function assertRuntimeLaunchRequestCurrent(
   store: TaskStore,
   request: CoordinatedRuntimeLaunchRequest
 ): void {
-  let activeRun: ReturnType<TaskStore["getActiveAgentRun"]> = null;
+  let activeTurn: ReturnType<TaskStore["getActiveTurn"]> = null;
   if (request.owner.scope === "task") {
     const task = store.getTask(request.owner.taskId);
     if (task === null
@@ -1142,15 +1133,15 @@ function assertRuntimeLaunchRequestCurrent(
       || task.executionGate.state !== "enabled") {
       throw new Error(`Task is no longer active: ${request.owner.taskId}.`);
     }
-    activeRun = store.getActiveAgentRun(
+    activeTurn = store.getActiveTurn(
       request.owner.taskId,
       request.owner.roleName
     );
     if (
-      request.runId !== undefined
-      && activeRun?.id !== request.runId
+      request.turnId !== undefined
+      && activeTurn?.id !== request.turnId
     ) {
-      throw new Error(`Role Run is no longer current: ${request.runId}.`);
+      throw new Error(`Role Turn is no longer current: ${request.turnId}.`);
     }
   }
   const role = request.owner.scope === "task"
@@ -1162,8 +1153,8 @@ function assertRuntimeLaunchRequestCurrent(
   const sessions = request.owner.scope === "task"
     ? store.getTaskRoleSessionSet(request.owner.taskId, request.owner.roleName)
     : store.getGlobalRoleSessionSet(request.owner.roleName);
-  const expectedEffective = request.owner.scope === "task" && request.runId !== undefined
-    ? activeRun?.effective
+  const expectedEffective = request.owner.scope === "task" && request.turnId !== undefined
+    ? activeTurn?.effective
     : activeLiveRoleAgentSession(sessions)?.effective
       ?? currentDesiredEffective(store, request, role);
   if (
@@ -1176,7 +1167,7 @@ function assertRuntimeLaunchRequestCurrent(
     throw new Error(`Role launch state changed: ${request.owner.roleName}.`);
   }
   if (request.owner.scope === "task" && request.managedWorkspace !== undefined) {
-    const expectedWorkspace = activeRun?.workspace
+    const expectedWorkspace = activeTurn?.workspace
       ?? currentDesiredManagedWorkspace(
         store,
         request.owner.taskId,
@@ -1526,7 +1517,7 @@ function requiredParam(value: JsonValue | undefined): string {
 function providerTurnControlParams(params: JsonValue): Readonly<{
   taskId: string;
   roleName: string;
-  runId: string;
+  turnId?: string;
   agentId: string;
   launchId: string;
   nativeSessionId: string;
@@ -1551,7 +1542,7 @@ function providerTurnControlParams(params: JsonValue): Readonly<{
   return {
     taskId: requiredParam(value.taskId),
     roleName: requiredParam(value.roleName),
-    runId: requiredParam(value.runId),
+    ...(value.turnId === undefined ? {} : { turnId: requiredParam(value.turnId) }),
     agentId: requiredParam(value.agentId),
     launchId: requiredParam(value.launchId),
     nativeSessionId: requiredParam(value.nativeSessionId),

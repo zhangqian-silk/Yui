@@ -5,7 +5,7 @@
  * The layers are deliberately time-based and conservative: short silence is
  * normal for high-reasoning-effort turns, large reviews, and tool waits.
  * Time-based layers authorize display hints and coalesced read-only diagnosis
- * only. They never reset a Run or replace a Provider Conversation.
+ * only. They never reset a Turn or replace a Provider Session.
  */
 
 /** Runtime silence after which a live turn is surfaced as "quiet" (hint only). */

@@ -1,4 +1,4 @@
-import { accessSync, constants, existsSync, lstatSync, readFileSync } from "node:fs";
+import { accessSync, constants, existsSync, lstatSync } from "node:fs";
 import { isAbsolute, join } from "node:path";
 
 import Database from "better-sqlite3";
@@ -28,30 +28,17 @@ import { resolveEffectiveLaunch } from "../executor/effectiveLaunch.js";
 import { compileRoleSessionContext } from "../context/roleSessionContext.js";
 import { usageError } from "../errors/cliError.js";
 import { defaultTableWidth, renderTable } from "../output/table.js";
+import { resolveYuiHome } from "../storage/taskStore.js";
 import {
-  resolveYuiHome,
-  STORAGE_STATE_FILE
-} from "../storage/taskStore.js";
-import {
-  createProductionStorageRegistry,
-  openCompatibleFileTaskStore,
-  validateCompatibleFileTaskStore,
-  type OpenCompatibleFileTaskStoreOptions
-} from "../storage/compatibleTaskStore.js";
+  CURRENT_DATABASE_FILENAME,
+  openCurrentTaskStore
+} from "../storage/currentTaskStore.js";
 import {
   inspectStorageSchema,
   type StorageSchemaState
 } from "../storage/storageSchema.js";
-import { resolveTaskStoreBackendForHome } from "../storage/sqliteStore.js";
 import { resolveStoreWorkerEnabledForHome } from "../storage/storeRpc.js";
-import { classifyHome } from "../storage/upgrade/homeClassification.js";
 import { resolveTmuxBin } from "../config/yuiConfig.js";
-import {
-  readMigrationReceipt,
-  type PersistentMigrationReceipt
-} from "../storage/upgrade/migrationReceipt.js";
-import { latestStorageVersionState } from "../storage/upgrade/recordVersions.js";
-import { COMMITTED_DATABASE_FILENAME } from "../storage/upgrade/sqliteStateMigration.js";
 import {
   CommandExecutionError,
   type CommandExecutor
@@ -119,16 +106,14 @@ export type StorageDetails = Readonly<{
   /** The layout version the manifest declares (null when unreadable). */
   logicalLayout: number | null;
   /** The backend ordinary startup opens for this Home. */
-  authoritativeBackend: "sqlite" | "file";
+  authoritativeBackend: "sqlite";
   /** The absolute `yui.db` path when it exists, else null. */
   databasePath: string | null;
   /** The SQLite journal mode (null for the file store or an unreadable DB). */
   journalMode: string | null;
   /** Whether the persistence worker is enabled for this Home. */
   workerEnabled: boolean;
-  /** The persistent migration receipt, when one exists and is well-formed. */
-  migrationReceipt: PersistentMigrationReceipt | null;
-  /** The last committed revision (home_meta for SQLite, state.json for file). */
+  /** The last committed SQLite revision. */
   lastCommittedRevision: number | null;
 }>;
 
@@ -160,10 +145,9 @@ export function summarizeStorageHealth(
 /** Build the full machine-readable doctor report (checks + storage health). */
 export function buildDoctorReport(
   env: NodeJS.ProcessEnv,
-  executor: CommandExecutor,
-  storageOptions: OpenCompatibleFileTaskStoreOptions = {}
+  executor: CommandExecutor
 ): DoctorReport {
-  const inspection = inspectDoctor(env, executor, storageOptions);
+  const inspection = inspectDoctor(env, executor);
   const home = resolveYuiHome(env);
   return {
     checks: inspection.checks,
@@ -189,8 +173,8 @@ function inspectStorageDetails(
   const logicalLayout = schema.status === "current" || schema.status === "unsupported"
     ? schema.currentLayoutVersion
     : null;
-  const authoritativeBackend = resolveTaskStoreBackendForHome(home, env);
-  const dbPath = join(home, COMMITTED_DATABASE_FILENAME);
+  const authoritativeBackend = "sqlite" as const;
+  const dbPath = join(home, CURRENT_DATABASE_FILENAME);
   const databasePath = existsSync(dbPath) ? dbPath : null;
   let journalMode: string | null = null;
   let lastCommittedRevision: number | null = null;
@@ -210,15 +194,6 @@ function inspectStorageDetails(
     } catch {
       // Leave both null; the storage state check surfaces the corruption.
     }
-  } else {
-    try {
-      const state = JSON.parse(readFileSync(join(home, STORAGE_STATE_FILE), "utf8")) as {
-        revision?: unknown;
-      };
-      lastCommittedRevision = typeof state.revision === "number" ? state.revision : null;
-    } catch {
-      lastCommittedRevision = null;
-    }
   }
   return {
     logicalLayout,
@@ -226,7 +201,6 @@ function inspectStorageDetails(
     databasePath,
     journalMode,
     workerEnabled: resolveStoreWorkerEnabledForHome(home, env),
-    migrationReceipt: readMigrationReceipt(home),
     lastCommittedRevision
   };
 }
@@ -251,41 +225,29 @@ type SchemaInspection = StorageSchemaState | Readonly<{
   detail: string;
 }>;
 
-type StorageCompatibilityStatus =
-  | "current"
-  | "compatible-old"
-  | "migration-required"
-  | "needs-storage-repair"
-  | "unsupported";
-
-type ResolvedStorageOptions = Required<
-  Pick<OpenCompatibleFileTaskStoreOptions, "registry" | "latest">
->;
+type StorageCompatibilityStatus = "current" | "unsupported";
 
 type CompatibilityInspection = Readonly<{
   check: DoctorCheck;
   storageStatus?: StorageCompatibilityStatus;
-  storageOptions?: ResolvedStorageOptions;
 }>;
 
-/** Runs the read-only FileTaskStore diagnostics used by `yui doctor`. */
+/** Runs the read-only current-storage diagnostics used by `yui doctor`. */
 export function runDoctorCommand(
   args: readonly string[],
   env: NodeJS.ProcessEnv,
-  executor: CommandExecutor,
-  storageOptions: OpenCompatibleFileTaskStoreOptions = {}
+  executor: CommandExecutor
 ): string {
   if (args.length !== 0) throw usageError("Doctor usage: yui doctor");
-  const inspection = inspectDoctor(env, executor, storageOptions);
+  const inspection = inspectDoctor(env, executor);
   return renderDoctor(inspection.checks, inspection.review);
 }
 
 export function getDoctorChecks(
   env: NodeJS.ProcessEnv,
-  executor: CommandExecutor,
-  storageOptions: OpenCompatibleFileTaskStoreOptions = {}
+  executor: CommandExecutor
 ): DoctorCheck[] {
-  return inspectDoctor(env, executor, storageOptions).checks;
+  return inspectDoctor(env, executor).checks;
 }
 
 type DoctorInspection = Readonly<{
@@ -295,19 +257,13 @@ type DoctorInspection = Readonly<{
 
 function inspectDoctor(
   env: NodeJS.ProcessEnv,
-  executor: CommandExecutor,
-  storageOptions: OpenCompatibleFileTaskStoreOptions = {}
+  executor: CommandExecutor
 ): DoctorInspection {
   const home = resolveYuiHome(env);
   const homeCheck = checkHome(home);
   const schema = readSchema(home);
-  const compatibility = inspectCompatibility(
-    home,
-    homeCheck,
-    schema,
-    storageOptions
-  );
-  const schemaCheck = checkSchema(schema, compatibility);
+  const compatibility = inspectCompatibility(home, homeCheck, schema);
+  const schemaCheck = checkSchema(schema);
   const storage = inspectState(
     home,
     homeCheck,
@@ -315,7 +271,7 @@ function inspectDoctor(
     compatibility
   );
   const domain = checkEphemeralDomain(home);
-  const durableConfig = readDurableConfigSafely(home, compatibility.storageOptions);
+  const durableConfig = readDurableConfigSafely(home);
   const toolChecks = [
     checkExecutable("git", durableConfig.gitBin, ["--version"], executor),
     checkExecutable("tmux", durableConfig.tmuxBin, ["-V"], executor)
@@ -420,8 +376,7 @@ function readSchema(home: string): SchemaInspection {
 }
 
 function checkSchema(
-  state: SchemaInspection,
-  compatibility: CompatibilityInspection
+  state: SchemaInspection
 ): DoctorCheck {
   switch (state.status) {
     case "uninitialized":
@@ -433,19 +388,6 @@ function checkSchema(
         detail: `current=${state.currentVersion} latest=${state.latestVersion}`
       };
     case "unsupported":
-      if (
-        (compatibility.storageStatus === "compatible-old"
-          || compatibility.storageStatus === "needs-storage-repair")
-        && compatibility.check.status === "ok"
-      ) {
-        return {
-          name: "storage schema",
-          status: "ok",
-          detail:
-            `current=${state.currentVersion} latest=${state.latestVersion} `
-            + `direction=${state.direction}; ${compatibility.storageStatus} validated`
-        };
-      }
       return {
         name: "storage schema",
         status: "unsupported",
@@ -458,21 +400,11 @@ function checkSchema(
   }
 }
 
-/**
- * The four-state storage compatibility check: USABLE / MIGRATABLE /
- * NEEDS_NEW_VERSION / CORRUPTED. This complements the raw "storage schema" check
- * with the migration framework's verdict, so a user sees whether a Home can be
- * used as-is, upgraded with `yui upgrade`, needs a newer release, or is damaged.
- * Doctor uses the same explicit production registry as `yui upgrade`; tests
- * may inject a synthetic registry so the same classification and validation
- * path proves compatible-old behavior. Missing paths fail closed, and
- * CORRUPTED is reserved for structural or reference failure.
- */
+/** Diagnose admission to the exact current storage contract without repair. */
 function inspectCompatibility(
   home: string,
   homeCheck: DoctorCheck,
-  schema: SchemaInspection,
-  storageOptions: OpenCompatibleFileTaskStoreOptions
+  schema: SchemaInspection
 ): CompatibilityInspection {
   const name = "storage compatibility";
   if (homeCheck.status !== "ok") {
@@ -484,111 +416,32 @@ function inspectCompatibility(
   if (schema.status === "read-error") {
     return { check: { name, status: "invalid", detail: schema.detail } };
   }
-  let classification;
-  let resolvedStorageOptions: ResolvedStorageOptions;
-  try {
-    resolvedStorageOptions = {
-      registry: storageOptions.registry ?? createProductionStorageRegistry(),
-      latest: storageOptions.latest ?? latestStorageVersionState()
+  if (schema.status === "invalid") {
+    return { check: { name, status: "invalid", detail: schema.detail } };
+  }
+  if (schema.status === "unsupported") {
+    return {
+      storageStatus: "unsupported",
+      check: {
+        name,
+        status: "unsupported",
+        detail:
+          `unsupported contract: ${schema.incompatibleComponent} is ${schema.direction} `
+          + `(current=${schema.currentVersion}, required=${schema.latestVersion}). `
+          + "Preserve this Home and initialize a new Home."
+      }
     };
-    classification = classifyHome({
-      home,
-      registry: resolvedStorageOptions.registry,
-      latest: resolvedStorageOptions.latest
-    });
-  } catch (error) {
-    return { check: { name, status: "invalid", detail: errorMessage(error) } };
   }
-  const storageStatus = classification.classification.status;
-  // A pseudo-layout-7 Home (needs-storage-repair) opens through the same
-  // normalization path as compatible-old, so its records get the same eager
-  // validation before the schema check can treat a version mismatch as
-  // validated (Issue 01).
-  if (storageStatus === "compatible-old" || storageStatus === "needs-storage-repair") {
-    try {
-      validateCompatibleFileTaskStore(home, resolvedStorageOptions);
-    } catch (error) {
-      return {
-        storageStatus,
-        storageOptions: resolvedStorageOptions,
-        check: {
-          name,
-          status: "invalid",
-          detail: `unsupported ${storageStatus} shape: ${errorMessage(error)}`
-        }
-      };
+  return {
+    storageStatus: "current",
+    check: {
+      name,
+      status: "ok",
+      detail:
+        `current layout=${schema.currentLayoutVersion}/${schema.latestLayoutVersion} `
+        + `aggregate=${schema.currentAggregateSchemaVersion}/${schema.latestAggregateSchemaVersion}`
     }
-  }
-  const versions =
-    `layout=${classification.layoutVersion ?? "?"}/${classification.latestLayoutVersion}`
-    + ` aggregate=${classification.aggregateVersion ?? "?"}/${classification.latestAggregateVersion}`;
-  const incompatible = classification.incompatibleComponent === undefined
-    ? ""
-    : ` incompatibleComponent=${classification.incompatibleComponent}`;
-  switch (storageStatus) {
-    case "current":
-      return {
-        storageStatus,
-        storageOptions: resolvedStorageOptions,
-        check: { name, status: "ok", detail: `current (USABLE) ${versions}` }
-      };
-    case "compatible-old":
-      return {
-        storageStatus,
-        storageOptions: resolvedStorageOptions,
-        check: {
-          name,
-          status: "ok",
-          detail: `compatible-old (COMPATIBLE) ${versions}; ordinary commands are supported`
-        }
-      };
-    case "migration-required":
-      return {
-        storageStatus,
-        storageOptions: resolvedStorageOptions,
-        check: {
-          name,
-          status: "ok",
-          detail: `migration-required (MIGRATABLE) ${versions}; run yui update when Sessions are clear`
-        }
-      };
-    case "needs-storage-repair":
-      return {
-        storageStatus,
-        storageOptions: resolvedStorageOptions,
-        check: {
-          name,
-          // Diagnostic mode (Issue 01 rollout step 1): the Home is readable
-          // and usable, but the manifest claims layout 7 without a yui.db.
-          // Surface the repair need in the detail while keeping the Home
-          // healthy so ordinary commands keep working.
-          status: "ok",
-          detail:
-            `needs-storage-repair (NEEDS_STORAGE_REPAIR) ${versions}; `
-            + "the manifest claims layout 7 but yui.db is missing. Run `yui upgrade` to rebuild it from state.json."
-        }
-      };
-    case "unsupported": {
-      const unsupported = classification.classification;
-      return {
-        storageStatus,
-        storageOptions: resolvedStorageOptions,
-        check: unsupported.verdict === "CORRUPTED"
-          ? {
-              name,
-              status: "invalid",
-              detail: `unsupported (CORRUPTED): ${unsupported.detail}`
-            }
-          : {
-              name,
-              status: "unsupported",
-              detail:
-                `unsupported (NEEDS_NEW_VERSION) ${versions}${incompatible}; ` +
-                `${unsupported.blocker.reason}`
-            }
-      };
-    }
-  }
+  };
 }
 
 function inspectState(
@@ -605,48 +458,21 @@ function inspectState(
   }
   if (schema.status === "invalid") return blockedStorage("invalid", schema.detail);
   if (schema.status === "read-error") return blockedStorage("invalid", schema.detail);
-  // A pseudo-layout-7 Home (needs-storage-repair) has a readable state.json;
-  // the compatibility check surfaces the repair need, but the store itself is
-  // readable, so the state and review checks must still run (Issue 01).
-  if (
-    compatibility.check.status !== "ok"
-    && compatibility.storageStatus !== "needs-storage-repair"
-  ) {
+  if (compatibility.check.status !== "ok") {
     return blockedStorage(
       compatibility.check.status,
       storageBlockerDetail(compatibility.check)
     );
   }
-  if (
-    compatibility.storageStatus !== "current"
-    && compatibility.storageStatus !== "compatible-old"
-    && compatibility.storageStatus !== "needs-storage-repair"
-  ) {
+  if (compatibility.storageStatus !== "current") {
     return blockedStorage("unsupported", compatibility.check.detail);
   }
-  if (compatibility.storageOptions === undefined) {
-    return blockedStorage("invalid", "Storage compatibility options were not resolved.");
-  }
-
-  const statePath = join(home, STORAGE_STATE_FILE);
-  // A repaired layout-7 Home archived state.json; yui.db is the authoritative
-  // backend then, so the state.json gate is skipped (Issue 01).
-  const sqliteAuthoritative = !existsSync(statePath)
-    && existsSync(join(home, COMMITTED_DATABASE_FILENAME));
-  if (!sqliteAuthoritative) {
-    if (!existsSync(statePath)) return blockedStorage("missing", "run yui setup");
-    try {
-      const metadata = lstatSync(statePath);
-      if (!metadata.isFile() || metadata.isSymbolicLink()) {
-        return blockedStorage("invalid", `${STORAGE_STATE_FILE} must be a regular file.`);
-      }
-      accessSync(statePath, constants.R_OK);
-    } catch (error) {
-      return blockedStorage("invalid", errorMessage(error));
-    }
+  const databasePath = join(home, CURRENT_DATABASE_FILENAME);
+  if (!existsSync(databasePath)) {
+    return blockedStorage("invalid", "Current storage is incomplete: yui.db is missing.");
   }
   try {
-    const store = openCompatibleFileTaskStore(home, compatibility.storageOptions);
+    const store = openCurrentTaskStore(home);
     const config = store.getConfig();
     const agents = store.listConfiguredAgents();
     const tasks = store.listTasks();
@@ -659,12 +485,12 @@ function inspectState(
       check: {
         name: "storage state",
         status: "ok",
-        detail: `${sqliteAuthoritative ? "yui.db readable" : "readable"} agents=${agents.length} tasks=${tasks.length} roles=${roleCount} globalRoles=${globalRoles.length} defaultAgent=${config.defaultAgent ?? "none"}`
+        detail: `yui.db readable agents=${agents.length} tasks=${tasks.length} roles=${roleCount} globalRoles=${globalRoles.length} defaultAgent=${config.defaultAgent ?? "none"}`
       },
       agents,
       review: {
         storageReady: true,
-        storageDetail: sqliteAuthoritative ? "yui.db is readable" : "state.json is readable",
+        storageDetail: "yui.db is readable",
         ...(config.review === undefined ? {} : { policy: config.review }),
         ...(config.review === undefined
           ? {}
@@ -687,7 +513,7 @@ function inspectState(
 function storageBlockerDetail(check: DoctorCheck): string {
   const corruptionPrefix = "unsupported (CORRUPTED): ";
   return check.status === "invalid" && check.detail.startsWith(corruptionPrefix)
-    ? `Invalid state.json: ${check.detail.slice(corruptionPrefix.length)}`
+    ? `Invalid storage: ${check.detail.slice(corruptionPrefix.length)}`
     : check.detail;
 }
 
@@ -713,10 +539,6 @@ function inspectReview(
   environment: NodeJS.ProcessEnv
 ): ReviewInspection {
   if (!source.storageReady) {
-    const raw = source.home === undefined
-      ? null
-      : inspectRawReview(source.home, source.storageDetail);
-    if (raw !== null) return raw;
     return {
       report: {
         status: "misconfigured",
@@ -876,136 +698,6 @@ function inspectReview(
     },
     checks
   };
-}
-
-/**
- * Preserve a bounded Reviewer diagnosis when another malformed record prevents
- * FileTaskStore from opening. This is read-only evidence, never a compatibility
- * path: the storage check remains invalid and the review projection cannot be
- * reported as ready from unvalidated bytes.
- */
-function inspectRawReview(home: string, storageDetail: string): ReviewInspection | null {
-  try {
-    const parsed: unknown = JSON.parse(readFileSync(join(home, STORAGE_STATE_FILE), "utf8"));
-    if (!isRecord(parsed) || !isRecord(parsed.config)) return null;
-    const rawPolicy = parsed.config.review;
-    if (!isRecord(rawPolicy)
-      || typeof rawPolicy.roleName !== "string"
-      || typeof rawPolicy.trigger !== "string") {
-      return {
-        report: {
-          status: "misconfigured",
-          providerNative: "unverified",
-          detail: `Storage state is invalid; Review policy is unavailable: ${storageDetail}`
-        },
-        checks: [{
-          name: "review policy",
-          status: "invalid",
-          detail: `storage state invalid: ${storageDetail}`
-        }]
-      };
-    }
-    const policy = {
-      roleName: rawPolicy.roleName,
-      trigger: rawPolicy.trigger
-    } as ReviewConfig;
-    const roles = isRecord(parsed.globalRoles) ? parsed.globalRoles : {};
-    const roleValue = roles[policy.roleName];
-    if (!isRecord(roleValue)) {
-      return rawReviewMisconfigured(policy, storageDetail, [{
-        name: "review policy",
-        status: "ok",
-        detail: `role=${policy.roleName} trigger=${policy.trigger}`
-      }, {
-        name: "reviewer role",
-        status: "missing",
-        detail: `Global Role not found: ${policy.roleName}.`
-      }]);
-    }
-    const roleName = typeof roleValue.name === "string" ? roleValue.name : policy.roleName;
-    const activeAgentId = typeof roleValue.activeAgentId === "string"
-      ? roleValue.activeAgentId
-      : "";
-    const checks: DoctorCheck[] = [{
-      name: "review policy",
-      status: "ok",
-      detail: `role=${policy.roleName} trigger=${policy.trigger}`
-    }, {
-      name: "reviewer role",
-      status: "ok",
-      detail: `name=${roleName} activeAgent=${activeAgentId || "missing"}`
-    }];
-    const bindings = isRecord(roleValue.agentBindings) ? roleValue.agentBindings : {};
-    const bindingValue = activeAgentId.length === 0 ? undefined : bindings[activeAgentId];
-    if (!isRecord(bindingValue)) {
-      checks.push({
-        name: "reviewer binding",
-        status: "missing",
-        detail: `active Agent binding is missing: ${activeAgentId || "unknown"}.`
-      });
-      return rawReviewMisconfigured(policy, storageDetail, checks, roleName, activeAgentId || undefined);
-    }
-    const bindingAgentId = typeof bindingValue.agentId === "string"
-      ? bindingValue.agentId
-      : activeAgentId;
-    const adapterId = typeof bindingValue.adapterId === "string"
-      ? bindingValue.adapterId
-      : "unknown";
-    checks.push({
-      name: "reviewer binding",
-      status: "ok",
-      detail: `agent=${bindingAgentId} adapter=${adapterId}`
-    });
-    const configuredAgents = isRecord(parsed.configuredAgents)
-      ? parsed.configuredAgents
-      : {};
-    const agentValue = configuredAgents[bindingAgentId];
-    if (!isRecord(agentValue)) {
-      checks.push({
-        name: "reviewer agent",
-        status: "missing",
-        detail: `Configured Agent not found: ${bindingAgentId}.`
-      });
-      return rawReviewMisconfigured(policy, storageDetail, checks, roleName, bindingAgentId, adapterId);
-    }
-    checks.push({
-      name: "reviewer agent",
-      status: "invalid",
-      detail: `Storage state is invalid; configured Agent ${bindingAgentId} cannot be validated.`
-    });
-    return rawReviewMisconfigured(policy, storageDetail, checks, roleName, bindingAgentId, adapterId,
-      typeof agentValue.command === "string" ? agentValue.command : undefined);
-  } catch {
-    return null;
-  }
-}
-
-function rawReviewMisconfigured(
-  policy: ReviewConfig,
-  storageDetail: string,
-  checks: readonly DoctorCheck[],
-  roleName?: string,
-  activeAgentId?: string,
-  adapterId?: string,
-  command?: string
-): ReviewInspection {
-  return {
-    report: {
-      status: "misconfigured",
-      policy,
-      ...(roleName === undefined ? {} : { roleName }),
-      ...(activeAgentId === undefined ? {} : { activeAgentId }),
-      ...(adapterId === undefined ? {} : { adapterId }),
-      ...(command === undefined ? {} : { command }),
-      providerNative: "unverified",
-      detail: `Storage state is invalid; ${checks.at(-1)?.detail ?? storageDetail}`
-    },
-    checks
-  };
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return value !== null && typeof value === "object" && !Array.isArray(value);
 }
 
 function reviewMisconfigured(
@@ -1302,12 +994,9 @@ function errorMessage(error: unknown): string {
  * Read the durable config for executable paths. Falls back to defaults when
  * the Home store cannot be opened (the doctor must still run on broken Homes).
  */
-function readDurableConfigSafely(
-  home: string,
-  storageOptions: Readonly<{ registry?: OpenCompatibleFileTaskStoreOptions["registry"]; latest?: OpenCompatibleFileTaskStoreOptions["latest"] }> | undefined
-): { tmuxBin: string; gitBin: string } {
+function readDurableConfigSafely(home: string): { tmuxBin: string; gitBin: string } {
   try {
-    const store = openCompatibleFileTaskStore(home, storageOptions ?? {});
+    const store = openCurrentTaskStore(home);
     const config = store.getConfig();
     return {
       tmuxBin: resolveTmuxBin(config.tmuxBin),

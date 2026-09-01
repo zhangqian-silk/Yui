@@ -1,11 +1,18 @@
 import { enqueueWork, type WorkMailboxQueueStore } from "../coordination/workMailboxQueue.js";
 import { createTaskEvent, type TaskEvent, type TaskEventPayload } from "../event/taskEvent.js";
+import type { PendingWakeup } from "./pendingWakeup.js";
+import { queueLeaderWakeup } from "./wakeupQueue.js";
 
 export const LEADER_ATTENTION_REQUIRED_EVENT = "leader.attention-required";
 
 type OperatorEventStore = WorkMailboxQueueStore & Readonly<{
   nextEventId(taskId: string): string;
   saveEvent(taskId: string, event: TaskEvent): void;
+}>;
+
+type RoleEventStore = WorkMailboxQueueStore & Readonly<{
+  getPendingWakeup(taskId: string): PendingWakeup | null;
+  savePendingWakeup(wakeup: PendingWakeup): void;
 }>;
 
 /** The sole Task-event boundary into the global Operator mailbox. */
@@ -19,15 +26,13 @@ export function enqueueOperatorEvent(
     { type: "event", taskId: event.taskId, id: event.id }
   ], {
     source: "task-event",
-    dedupeKey: `operator-event:${event.taskId}:${event.id}`,
-    deliveryMode: "followup",
-    lane: "normal"
+    dedupeKey: `operator-event:${event.taskId}:${event.id}`
   });
 }
 
 /** Routes one Role fact to its supervisor without exposing Provider details to Operator code. */
 export function routeRoleEvent(
-  store: WorkMailboxQueueStore,
+  store: RoleEventStore,
   event: TaskEvent,
   roleName: string,
   reason: string,
@@ -45,11 +50,10 @@ export function routeRoleEvent(
     [{ type: "event", taskId: event.taskId, id: event.id }],
     {
       source: "task-event",
-      dedupeKey: `leader-event:${event.taskId}:${event.id}`,
-      deliveryMode: "followup",
-      lane: "normal"
+      dedupeKey: `leader-event:${event.taskId}:${event.id}`
     }
   );
+  queueLeaderWakeup(store, event.taskId, reason, now);
 }
 
 /** Records the semantic boundary used when a Leader can no longer continue. */

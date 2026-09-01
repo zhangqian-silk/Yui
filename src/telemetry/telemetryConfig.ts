@@ -9,7 +9,7 @@
 
 import {
   TELEMETRY_KEEP_PER_GENERATION,
-  TELEMETRY_RUN_CAP
+  TELEMETRY_TURN_CAP
 } from "../storage/sqliteSchema.js";
 
 /**
@@ -21,21 +21,21 @@ export type TelemetryMode = "off" | "on";
 
 export const DEFAULT_TELEMETRY_MODE: TelemetryMode = "off";
 
-/** Terminal Run/generation progress rows retained after prune. */
+/** Terminal Turn/generation progress rows retained after prune. */
 export const DEFAULT_TERMINAL_KEEP = TELEMETRY_KEEP_PER_GENERATION;
 
-/** Hard cap of progress rows per Run while it is still active. */
-export const DEFAULT_RUN_CAP = TELEMETRY_RUN_CAP;
+/** Hard cap of progress rows per Turn while it is still active. */
+export const DEFAULT_TURN_CAP = TELEMETRY_TURN_CAP;
 
 /**
- * Absolute ceiling for the configurable Run cap. Retention can be tuned but
+ * Absolute ceiling for the configurable Turn cap. Retention can be tuned but
  * never disabled: every Home keeps a computable upper bound on telemetry
- * rows (Tasks × Runs × cap).
+ * rows (Tasks × Turns × cap).
  */
-export const MAX_RUN_CAP = 10_000_000;
+export const MAX_TURN_CAP = 10_000_000;
 
 /**
- * Resolve the terminal-Run retention window from the durable config value
+ * Resolve the terminal-Turn retention window from the durable config value
  * (default 200). Must be a positive integer.
  */
 export function resolveTerminalKeep(value?: unknown): number {
@@ -43,15 +43,15 @@ export function resolveTerminalKeep(value?: unknown): number {
 }
 
 /**
- * Resolve the active-Run hard cap from the durable config value (default
- * 50,000). Must be a positive integer not exceeding {@link MAX_RUN_CAP};
+ * Resolve the active-Turn hard cap from the durable config value (default
+ * 50,000). Must be a positive integer not exceeding {@link MAX_TURN_CAP};
  * the cap cannot be disabled.
  */
-export function resolveRunCap(value?: unknown): number {
-  const cap = resolvePositiveInteger(value, DEFAULT_RUN_CAP, "telemetryRunCap");
-  if (cap > MAX_RUN_CAP) {
+export function resolveTurnCap(value?: unknown): number {
+  const cap = resolvePositiveInteger(value, DEFAULT_TURN_CAP, "telemetryTurnCap");
+  if (cap > MAX_TURN_CAP) {
     throw new TypeError(
-      `telemetryRunCap must not exceed ${MAX_RUN_CAP.toLocaleString("en-US")} (retention cannot be disabled).`
+      `telemetryTurnCap must not exceed ${MAX_TURN_CAP.toLocaleString("en-US")} (retention cannot be disabled).`
     );
   }
   return cap;

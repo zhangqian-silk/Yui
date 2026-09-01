@@ -24,7 +24,7 @@ import {
   resolveResourcesQuarantineTtlHours,
   resolveRuntimeHealth,
   resolveTelemetryEnabled,
-  resolveTelemetryRunCap,
+  resolveTelemetryTurnCap,
   resolveTelemetryTerminalKeep,
   resolveTmuxBin,
   resolveTmuxHistoryLimit,
@@ -176,7 +176,7 @@ export function effectiveConfigData(
     tmuxHistoryLimit: resolveTmuxHistoryLimit(config.tmuxHistoryLimit),
     telemetryEnabled: resolveTelemetryEnabled(config.telemetryEnabled),
     telemetryTerminalKeep: resolveTelemetryTerminalKeep(config.telemetryTerminalKeep),
-    telemetryRunCap: resolveTelemetryRunCap(config.telemetryRunCap),
+    telemetryTurnCap: resolveTelemetryTurnCap(config.telemetryTurnCap),
     review: config.review === undefined
       ? null
       : {
@@ -705,24 +705,24 @@ const CONFIG_KEY_HANDLERS: readonly ConfigKeyHandler[] = [
     }
   },
   {
-    key: "telemetry-run-cap",
-    showLabel: "Telemetry run cap",
-    showValue: (config) => String(resolveTelemetryRunCap(config.telemetryRunCap)),
+    key: "telemetry-turn-cap",
+    showLabel: "Telemetry Turn cap",
+    showValue: (config) => String(resolveTelemetryTurnCap(config.telemetryTurnCap)),
     set(args, store) {
-      if (args.length !== 1) throw usageError("Tools config set usage: yui config tools set telemetry-run-cap <n>.");
-      const telemetryRunCap = validatedConfigValue(
-        () => resolveTelemetryRunCap(Number(args[0])),
-        "Tools config set usage: yui config tools set telemetry-run-cap <n>."
+      if (args.length !== 1) throw usageError("Tools config set usage: yui config tools set telemetry-turn-cap <n>.");
+      const telemetryTurnCap = validatedConfigValue(
+        () => resolveTelemetryTurnCap(Number(args[0])),
+        "Tools config set usage: yui config tools set telemetry-turn-cap <n>."
       );
-      saveConfigKey(store, (config) => ({ ...config, telemetryRunCap }));
-      return `Telemetry run cap set to ${telemetryRunCap}\n`;
+      saveConfigKey(store, (config) => ({ ...config, telemetryTurnCap }));
+      return `Telemetry Turn cap set to ${telemetryTurnCap}\n`;
     },
     clear(store) {
       saveConfigKey(store, (config) => {
-        const { telemetryRunCap: _removed, ...rest } = config;
+        const { telemetryTurnCap: _removed, ...rest } = config;
         return rest;
       });
-      return "Telemetry run cap reset to default\n";
+      return "Telemetry Turn cap reset to default\n";
     }
   },
   {

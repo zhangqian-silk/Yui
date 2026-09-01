@@ -1,5 +1,6 @@
 import type { PromptEnvelope } from "./promptEnvelope.js";
 import type { RuntimeBinding } from "./runtimeBinding.js";
+import type { ProviderAuthorityFence } from "./providerAuthorityFence.js";
 import type { RuntimeOwner } from "./runtimeOwner.js";
 import type { EffectiveLaunchSnapshot } from "../executor/effectiveLaunch.js";
 import type { ManagedWorkspace } from "../worktree/managedWorkspace.js";
@@ -64,7 +65,7 @@ export type RuntimeLaunchPreparationRequest = Readonly<{
   nativeSessionId?: string;
   /** Current Host activation for exact same-Session restore, when known. */
   hostActivationId?: string;
-  runId?: string;
+  turnId?: string;
 }>;
 
 export type RuntimeLaunchPersistence = "deferred" | "immediate";
@@ -76,7 +77,7 @@ export type RuntimeLaunchPersistence = "deferred" | "immediate";
 export type RuntimeLaunchPreflight = Readonly<{
   owner: RuntimeOwner;
   launchId: string;
-  runId?: string;
+  turnId?: string;
   agentId: string;
   adapterId: string;
   effective: EffectiveLaunchSnapshot;
@@ -90,7 +91,7 @@ export type RuntimeLaunchPreStart = (preflight: RuntimeLaunchPreflight) => void;
 export interface RuntimeLaunchPreparationPort {
   /**
    * When supplied, the host must invoke `beforeHostStart` before creating any
-   * external Provider process; callers use it to persist the exact Run fence.
+   * external Provider process; callers use it to persist the exact Turn fence.
    */
   prepare(
     request: RuntimeLaunchPreparationRequest,
@@ -156,6 +157,18 @@ export type ActivePromptPushRequest = Readonly<{
   envelope: PromptEnvelope;
 }>;
 
+export type ActivePromptSteerRequest = Readonly<{
+  owner: Extract<RuntimeOwner, { scope: "task" }>;
+  launchId: string;
+  agentId: string;
+  adapterId: string;
+  nativeSessionId: string;
+  nativeTurnId: string;
+  providerAuthority: ProviderAuthorityFence;
+  envelope: PromptEnvelope;
+}>;
+
 export interface ActivePromptPushPort {
   tryPush(request: ActivePromptPushRequest): Promise<PromptPushResult>;
+  trySteer(request: ActivePromptSteerRequest): Promise<PromptPushResult>;
 }

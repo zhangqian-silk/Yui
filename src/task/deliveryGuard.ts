@@ -260,36 +260,36 @@ export type SemanticBudget = Readonly<{
 }>;
 
 /**
- * Default number of consecutive yielded Leader turns that must produce no
+ * Default number of consecutive completed Leader turns that must produce no
  * durable delivery change before the budget is exhausted.
  */
 export const DEFAULT_SEMANTIC_BUDGET_TURNS = 3;
 
 /**
  * Evaluate the semantic-progress budget from existing records only. The
- * budget is exhausted when the last `turns` Leader Runs all yielded and no
+ * budget is exhausted when the last `turns` Leader Turns all completed and no
  * WorkItem/ChangeSet/Integration/Review record changed at or after the first
- * of those Runs. Active execution (any Run) never exhausts the budget: a
+ * of those Turns. Active execution (any Turn) never exhausts the budget: a
  * slow but progressing Worker or Leader is never interrupted.
  */
 export function evaluateSemanticBudget(
   facts: NextActionFacts,
   turns = DEFAULT_SEMANTIC_BUDGET_TURNS
 ): SemanticBudget {
-  if (facts.activeRuns.length > 0) {
+  if (facts.activeTurns.length > 0) {
     return {
       exhausted: false,
-      reason: "Active execution is in flight; the budget never interrupts a progressing Run.",
-      evidence: facts.activeRuns.map((run) => run.id)
+      reason: "Active execution is in flight; the budget never interrupts a progressing Turn.",
+      evidence: facts.activeTurns.map((run) => run.id)
     };
   }
-  const recentLeaderRuns = facts.leaderRuns
-    .filter((run) => run.status === "yielded")
+  const recentLeaderRuns = facts.leaderTurns
+    .filter((run) => run.status === "completed")
     .slice(-turns);
   if (recentLeaderRuns.length < turns) {
     return {
       exhausted: false,
-      reason: `Fewer than ${turns} consecutive yielded Leader turns.`,
+      reason: `Fewer than ${turns} consecutive completed Leader turns.`,
       evidence: recentLeaderRuns.map((run) => run.id)
     };
   }
@@ -306,7 +306,7 @@ export function evaluateSemanticBudget(
   }
   return {
     exhausted: true,
-    reason: `${turns} consecutive Leader turns produced no durable delivery change; record a diagnosis/yield and wait for new facts instead of creating more records.`,
+    reason: `${turns} consecutive Leader turns produced no durable delivery change; record a diagnosis and wait for new facts instead of creating more records.`,
     evidence: recentLeaderRuns.map((run) => run.id)
   };
 }

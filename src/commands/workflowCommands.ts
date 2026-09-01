@@ -109,7 +109,7 @@ export async function runWorkflowCommandAsync(
   // mutation or effect evidence without an audit record saying the run was
   // attempted. FileTaskStore transactions are synchronous, so the async
   // engine run cannot join this transaction; committing the intent first is
-  // what makes the trail crash-safe across the whole run.
+  // what makes the trail crash-safe across the whole turn.
   const intentNow = clock(options);
   store.transaction((tx) => {
     recordTaskEvent(tx, taskId, "release-workflow.run-started", {

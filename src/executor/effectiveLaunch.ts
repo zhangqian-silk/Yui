@@ -193,7 +193,7 @@ export function effectiveLaunchSnapshotsCompatible(
 }
 
 /**
- * Task Role Sessions keep one physical workspace while Run-scoped facts move.
+ * Task Role Sessions keep one physical workspace while Turn-scoped facts move.
  * Candidate commits, ReviewRound identity and desired-revision bookkeeping do
  * not define a native Session. Agent, adapter, permission, model, sandbox,
  * manifest, Role context and physical workspace identity still do.
@@ -222,7 +222,7 @@ export function effectiveLaunchWithTaskMainWorkspace(
   validateEffectiveLaunchSnapshot(existing);
   validateManagedWorkspace(workspace);
   if (workspace.owner.type !== "task") {
-    throw new Error("Only a Task-owned main workspace may refresh fixed Session Run evidence.");
+    throw new Error("Only a Task-owned main workspace may refresh fixed Session Turn evidence.");
   }
   return validateEffectiveLaunchSnapshot({
     ...existing,

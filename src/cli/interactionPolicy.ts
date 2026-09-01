@@ -9,7 +9,7 @@ export type CandidateProviderName =
   | "integration-attempts"
   | "jobs"
   | "projects"
-  | "runs"
+  | "turns"
   | "task-decisions"
   | "task-events"
   | "task-milestones"
@@ -26,7 +26,7 @@ export type SelectableEntity =
   | "integration-attempt"
   | "job"
   | "project"
-  | "run"
+  | "turn"
   | "task"
   | "decision"
   | "event"
@@ -488,21 +488,18 @@ export const INTERACTION_POLICIES: readonly InteractionPolicy[] = Object.freeze(
     confirmation: { action: "Retire Work Item", targetArgumentIndex: 3 }
   },
   {
-    commandPath: ["task", "run", "list"],
+    commandPath: ["task", "turn", "list"],
     selectors: [{ argumentIndex: 3, entity: "work-item", provider: "work-items", actionTarget: true }],
   },
-  ...["retry", "yield"].map((command): InteractionPolicy => ({
-    commandPath: ["task", "run", command],
+  {
+    commandPath: ["task", "turn", "retry"],
     selectors: [{
       argumentIndex: 3,
-      entity: "run",
-      provider: "runs",
+      entity: "turn",
+      provider: "turns",
       actionTarget: true
-    }],
-    ...(command === "yield"
-      ? { trailingOptions: { "--summary": "value" as const } }
-      : {})
-  })),
+    }]
+  },
   {
     commandPath: ["task", "work", "group", "resolve"],
     selectors: [{

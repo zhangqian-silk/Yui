@@ -1,5 +1,7 @@
 import { reconciliationIntervalMilliseconds } from "../config/yuiConfig.js";
 import {
+  LEADER_WAKE_AGGREGATION_MS,
+  LEADER_WAKE_FORCE_MS,
   processLeaderWakeups,
   type LeaderWakeupProcessingResult
 } from "../scheduler/leaderWakeupProcessor.js";
@@ -8,30 +10,26 @@ import {
   type PendingWakeup
 } from "../scheduler/pendingWakeup.js";
 import {
-  processActiveRoleRunDeliveries,
-  type ActiveRoleRunDeliveryResult
-} from "../scheduler/activeRoleRunDelivery.js";
+  processActiveRoleTurnDeliveries,
+  type ActiveRoleTurnDeliveryResult
+} from "../scheduler/activeRoleTurnDelivery.js";
 import {
-  selectedActiveSchedulerTasks,
-  selectedSchedulerRoles,
-  selectedSchedulerTasks
+  selectedActiveSchedulerTasks
 } from "../scheduler/ports.js";
 import type {
   AutoResolvedInput,
-  RoleRunDeliveryFailurePersistence,
+  RoleTurnDeliveryFailurePersistence,
   SchedulerReconcileSelection,
-  SchedulerRoleSession,
   SchedulerStorePort,
   TmuxDeliveryPort
 } from "../scheduler/ports.js";
-import { reconcileExitedRoleRuns } from "../scheduler/roleRunLiveness.js";
+import { reconcileExitedRoleTurns } from "../scheduler/roleTurnLiveness.js";
 import {
   DEFAULT_STALL_WINDOW_MS,
   DEFAULT_WORKFLOW_STALL_CANDIDATE_AGE_MS,
-  reconcileStalledRoleRuns,
-  type RoleRunResourceEvidence
-} from "../scheduler/roleRunStall.js";
-import { repairOrphanedActiveTasks } from "../scheduler/activeTaskProgress.js";
+  reconcileStalledRoleTurns,
+  type RoleTurnResourceEvidence
+} from "../scheduler/roleTurnStall.js";
 import {
   processOperatorInputNotifications,
   type OperatorInputNotificationResult
@@ -109,14 +107,14 @@ type RuntimeLifecycleHost = Pick<
   "inspectOwner" | "inspectOwners" | "stopOwner"
 > & Partial<TaskRuntimeLifecycleCleanupPort>;
 
-type RoleRunDeliveryFailureIdentity = Omit<
-  RoleRunDeliveryFailurePersistence,
+type RoleTurnDeliveryFailureIdentity = Omit<
+  RoleTurnDeliveryFailurePersistence,
   "now"
 >;
 
 export type ControllerSchedulerResult = Readonly<{
-  activeRunDeliveries: readonly ActiveRoleRunDeliveryResult[];
-  failedRunRefs: readonly string[];
+  activeTurnDeliveries: readonly ActiveRoleTurnDeliveryResult[];
+  failedTurnRefs: readonly string[];
   wakeups: readonly LeaderWakeupProcessingResult[];
   inputNotifications: readonly OperatorInputNotificationResult[];
   autoResolvedInputs: readonly AutoResolvedInput[];
@@ -285,7 +283,6 @@ export async function runControllerSchedulerPass(
   maintenanceFence?: (projectId: string) => boolean,
   onMaintenanceFenceDefer?: ControllerRuntimeOptions["onMaintenanceFenceDefer"],
   blockedTaskIds: ReadonlySet<string> = new Set(),
-  inputDeliveryRecoveryCutoff?: Date,
   diagnosticAfterMs = DEFAULT_WORKFLOW_STALL_CANDIDATE_AGE_MS,
   leaderWakeFence?: () => boolean
 ): Promise<ControllerSchedulerResult> {
@@ -293,14 +290,13 @@ export async function runControllerSchedulerPass(
   const selection = includeOperator
     ? { ...compiledSelection, blockedTaskIds }
     : { ...compiledSelection, operator: false, blockedTaskIds };
-  queueSelectedCompletedTaskRuntimeCleanups(store, selection, now);
   // A full-state Task projection can be individually bounded yet still starve
   // control sockets when several scheduler phases repeat it in one native
   // event-loop turn. Give already-written requests a poll boundary before the
   // next durable phase; later phases retain their existing CAS fences.
   await controlEventLoopTurn();
   // A dormant Session may still name a Host that disappeared after its last
-  // Provider Turn. Detach that disposable Host before claiming the next Run,
+  // Provider Turn. Detach that disposable Host before claiming the next Turn,
   // so retained Agent intent restores the same Session instead of first
   // connecting to a known-dead control socket.
   await reconcileDormantRuntimeOwners(
@@ -334,7 +330,6 @@ export async function runControllerSchedulerPass(
           failedCleanupRoles
         )
   );
-  if (selection.full) repairOrphanedActiveTasks(store, now, selection);
   const claimedTaskMailboxes = claimSelectedTaskMailboxes(store, selection, now);
   try {
     // Durable Leader work that already has a ready Task workspace belongs to
@@ -358,16 +353,13 @@ export async function runControllerSchedulerPass(
       onMaintenanceFenceDefer
     );
     await controlEventLoopTurn();
-    // Issue 04: reopen due in-place Provider retries on their original
-    // Sessions before delivery, so the existing delivery path re-pushes the
-    // exact same input in this same pass.
-    const activeRunDeliveries = await processActiveRoleRunDeliveries(
-      store, delivery, now, roleSelection, inputDeliveryRecoveryCutoff
+    const activeTurnDeliveries = await processActiveRoleTurnDeliveries(
+      store, delivery, now, roleSelection
     );
     await controlEventLoopTurn();
-    const unsettledRunRefs = new Set(activeRunDeliveries.flatMap((result) => (
-      result.reason === "delivery-uncertain" || result.terminalFailure !== undefined
-        ? [formatTaskRecordReference(result.taskId, result.runId, "agentRun")]
+    const unsettledTurnRefs = new Set(activeTurnDeliveries.flatMap((result) => (
+      result.reason === "delivery-uncertain"
+        ? [formatTaskRecordReference(result.taskId, result.turnId, "turn")]
         : []
     )));
     // Every successful Task has completed the targeted phases owned by its
@@ -381,20 +373,20 @@ export async function runControllerSchedulerPass(
     }
     const newlyIdleBusyTaskIds = new Set(initialWakeupResults.flatMap((result) => (
       result.reason === "busy"
-        && store.getActiveAgentRun(result.taskId, "leader") === null
+        && store.getActiveTurn(result.taskId, "leader") === null
         ? [result.taskId]
         : []
     )));
-    // Phase-one Leader Runs did not exist at the pass's liveness boundary.
-    // Keep every newly claimed Run outside destructive absence decisions until
+    // Phase-one Leader Turns did not exist at the pass's liveness boundary.
+    // Keep every newly claimed Turn outside destructive absence decisions until
     // a later pass can observe its stable provider/session generation.
     for (const result of initialWakeupResults) {
       if (
-        result.runId !== undefined
-        && store.getActiveAgentRun(result.taskId, "leader")?.id === result.runId
+        result.turnId !== undefined
+        && store.getActiveTurn(result.taskId, "leader")?.id === result.turnId
       ) {
-        unsettledRunRefs.add(
-          formatTaskRecordReference(result.taskId, result.runId, "agentRun")
+        unsettledTurnRefs.add(
+          formatTaskRecordReference(result.taskId, result.turnId, "turn")
         );
       }
     }
@@ -402,19 +394,19 @@ export async function runControllerSchedulerPass(
     // before starting a potentially large liveness inventory.
     await controlEventLoopTurn();
     const liveStatuses = new Map<string, "present" | "absent">();
-    const resourceEvidence = new Map<string, RoleRunResourceEvidence>();
-    const failedRunRefs = await reconcileExitedRoleRuns(
+    const resourceEvidence = new Map<string, RoleTurnResourceEvidence>();
+    const failedTurnRefs = await reconcileExitedRoleTurns(
       store,
       delivery,
       now,
       roleSelection,
-      unsettledRunRefs,
+      unsettledTurnRefs,
       liveStatuses,
       resourceEvidence,
       scope.kind === "dirty"
     );
     await controlEventLoopTurn();
-    await reconcileStalledRoleRuns(
+    await reconcileStalledRoleTurns(
       store,
       delivery,
       now,
@@ -478,8 +470,8 @@ export async function runControllerSchedulerPass(
       ? await processOperatorInputNotifications(store, delivery, selection, now)
       : [];
     return {
-      activeRunDeliveries,
-      failedRunRefs,
+      activeTurnDeliveries,
+      failedTurnRefs,
       wakeups: mergeWakeupPhaseResults(initialWakeupResults, laterWakeups),
       inputNotifications,
       autoResolvedInputs
@@ -551,62 +543,6 @@ type RuntimeCleanupOutcome = Readonly<{
   status: "completed" | "failed";
   error?: unknown;
 }>;
-
-function queueSelectedCompletedTaskRuntimeCleanups(
-  store: SchedulerStorePort,
-  selection: ReconcileSelection,
-  now: Date
-): void {
-  if (store.enqueueRuntimeCleanup === undefined) return;
-  if (selection.full && store.listRuntimeSessionCandidates !== undefined) {
-    for (const candidate of store.listRuntimeSessionCandidates({
-      cleanupRequiredOnly: true
-    })) {
-      if (
-        candidate.owner.scope !== "task"
-        || !candidate.cleanupRequired
-        || selection.blockedTaskIds?.has(candidate.owner.taskId)
-      ) {
-        continue;
-      }
-      const { taskId, roleName } = candidate.owner;
-      if (store.getTask(taskId)?.status !== "completed") continue;
-      if (store.getActiveAgentRun(taskId, roleName) !== null) continue;
-      const target = runtimeLifecycleTarget(candidate.owner);
-      if (hasRuntimeCleanupObligation(store.getWorkMailbox(target))) continue;
-      store.enqueueRuntimeCleanup(candidate.owner, now);
-    }
-    return;
-  }
-  for (const task of selectedSchedulerTasks(store, selection)) {
-    if (task.status !== "completed") continue;
-    for (const role of selectedSchedulerRoles(store, task.id, selection)) {
-      if (store.getActiveAgentRun(task.id, role.name) !== null) continue;
-      const session = store.getRoleSession(task.id, role.name);
-      if (!schedulerSessionRequiresRuntimeCleanup(session)) continue;
-      const target = runtimeLifecycleTarget({
-        scope: "task",
-        taskId: task.id,
-        roleName: role.name
-      });
-      if (hasRuntimeCleanupObligation(store.getWorkMailbox(target))) continue;
-      store.enqueueRuntimeCleanup({
-        scope: "task",
-        taskId: task.id,
-        roleName: role.name
-      }, now);
-    }
-  }
-}
-
-function schedulerSessionRequiresRuntimeCleanup(
-  session: SchedulerRoleSession | null
-): boolean {
-  if (session === null || session.status === "ended") {
-    return false;
-  }
-  return session.launchId !== undefined;
-}
 
 async function processSelectedRoleRuntimeCleanups(
   store: SchedulerStorePort,
@@ -1180,8 +1116,8 @@ function partitionDirtyScope(keys: readonly MailboxKey[]): DirtyScopePartition {
 
 function emptyControllerSchedulerResult(): ControllerSchedulerResult {
   return {
-    activeRunDeliveries: [],
-    failedRunRefs: [],
+    activeTurnDeliveries: [],
+    failedTurnRefs: [],
     wakeups: [],
     inputNotifications: [],
     autoResolvedInputs: []
@@ -1205,8 +1141,8 @@ function mergeControllerSchedulerResults(
   results: readonly ControllerSchedulerResult[]
 ): ControllerSchedulerResult {
   return {
-    activeRunDeliveries: results.flatMap((result) => result.activeRunDeliveries),
-    failedRunRefs: results.flatMap((result) => result.failedRunRefs),
+    activeTurnDeliveries: results.flatMap((result) => result.activeTurnDeliveries),
+    failedTurnRefs: results.flatMap((result) => result.failedTurnRefs),
     wakeups: results.flatMap((result) => result.wakeups),
     inputNotifications: results.flatMap((result) => result.inputNotifications),
     autoResolvedInputs: results.flatMap((result) => result.autoResolvedInputs)
@@ -1214,7 +1150,7 @@ function mergeControllerSchedulerResults(
 }
 
 /**
- * Single-owner periodic runtime for FileTaskStore-backed scheduling. Full pump
+ * Single-owner periodic runtime for TaskStore-backed scheduling. Full pump
  * requests remain exclusive, while dirty work is serialized per Task and may
  * progress concurrently across different Tasks up to the configured bound.
  */
@@ -1244,7 +1180,7 @@ export class FileTaskController {
     identity: string;
     attempts: number;
     startedAtMs: number;
-    terminalFailure?: RoleRunDeliveryFailureIdentity;
+    terminalFailure?: RoleTurnDeliveryFailureIdentity;
   }>>();
   readonly #deliveryRetryTimers = new Map<MailboxKey, NodeJS.Timeout>();
   readonly #taskPassRetryAttempts = new Map<string, Readonly<{
@@ -1257,6 +1193,7 @@ export class FileTaskController {
   #passRetryAttempt = 0;
   #timer: NodeJS.Timeout | undefined;
   #deadlineTimer: NodeJS.Timeout | undefined;
+  #leaderWakeDeadlineTimer: NodeJS.Timeout | undefined;
   #runtimeObserverTimer: NodeJS.Timeout | undefined;
   readonly #signalScheduler: MailboxScheduler<MailboxKey>;
   readonly #operatorSignalScheduler: MailboxScheduler<MailboxKey>;
@@ -1343,12 +1280,12 @@ export class FileTaskController {
     this.#stallWindowMs = positiveInteger(
       options.stallWindowMs,
       DEFAULT_STALL_WINDOW_MS,
-      "Controller Run stall window"
+      "Controller Turn stall window"
     );
     this.#diagnosticAfterMs = positiveInteger(
       options.diagnosticAfterMs,
       DEFAULT_WORKFLOW_STALL_CANDIDATE_AGE_MS,
-      "Controller Run diagnostic threshold"
+      "Controller Turn diagnostic threshold"
     );
     this.#runtimeEventProcessor = options.runtimeEventProcessor;
     this.#runtimeObserver = options.runtimeObserver;
@@ -1481,6 +1418,10 @@ export class FileTaskController {
     if (this.#deadlineTimer !== undefined) {
       clearTimeout(this.#deadlineTimer);
       this.#deadlineTimer = undefined;
+    }
+    if (this.#leaderWakeDeadlineTimer !== undefined) {
+      clearTimeout(this.#leaderWakeDeadlineTimer);
+      this.#leaderWakeDeadlineTimer = undefined;
     }
     if (this.#timer !== undefined) {
       clearInterval(this.#timer);
@@ -1639,7 +1580,6 @@ export class FileTaskController {
               this.#maintenanceFence,
               this.#onMaintenanceFenceDefer,
               runtimeFailedTaskIds,
-              this.#startedAt,
               this.#diagnosticAfterMs,
               this.#leaderWakeFence
             );
@@ -1746,6 +1686,7 @@ export class FileTaskController {
       return result;
     } finally {
       this.#scheduleNextInputDeadline();
+      this.#scheduleNextLeaderWakeDeadline();
     }
   }
 
@@ -1773,7 +1714,6 @@ export class FileTaskController {
         this.#maintenanceFence,
         this.#onMaintenanceFenceDefer,
         blockedTaskIds,
-        this.#startedAt,
         this.#diagnosticAfterMs,
         this.#leaderWakeFence
       ));
@@ -1828,7 +1768,6 @@ export class FileTaskController {
               this.#maintenanceFence,
               this.#onMaintenanceFenceDefer,
               blockedTaskIds,
-              this.#startedAt,
               this.#diagnosticAfterMs,
               this.#leaderWakeFence
             );
@@ -1895,6 +1834,7 @@ export class FileTaskController {
     this.#scheduleDeliveryRetries(result);
     this.#clearEmptyOperatorRetry();
     this.#scheduleNextInputDeadline();
+    this.#scheduleNextLeaderWakeDeadline();
   }
 
   #signalOperatorMailbox(retryReady = false): void {
@@ -1917,7 +1857,7 @@ export class FileTaskController {
   async #drainRuntimeEvents(): Promise<RuntimeEventDrainResult | undefined> {
     const processor = this.#runtimeEventProcessor;
     if (processor === undefined) return undefined;
-    // The worker backend exposes drainAsync; the file backend stays sync.
+    // The persistence worker exposes drainAsync; the in-process store stays sync.
     const result = "drainAsync" in processor
       ? await processor.drainAsync(this.#now())
       : processor.drain(this.#now());
@@ -2067,15 +2007,51 @@ export class FileTaskController {
     this.#deadlineTimer.unref();
   }
 
+  #scheduleNextLeaderWakeDeadline(): void {
+    if (this.#leaderWakeDeadlineTimer !== undefined) {
+      clearTimeout(this.#leaderWakeDeadlineTimer);
+      this.#leaderWakeDeadlineTimer = undefined;
+    }
+    if (this.#stopped) return;
+    const now = this.#now().getTime();
+    const deadlines = this.store.listPendingWakeups().flatMap((wakeup) => {
+      const firstRequestedAt = Date.parse(wakeup.firstRequestedAt);
+      if (!Number.isFinite(firstRequestedAt)) return [];
+      const aggregationAt = firstRequestedAt + LEADER_WAKE_AGGREGATION_MS;
+      if (aggregationAt > now) {
+        return [{
+          key: `role:${encodeURIComponent(wakeup.taskId)}/leader` as MailboxKey,
+          at: aggregationAt
+        }];
+      }
+      const forceAt = firstRequestedAt + LEADER_WAKE_FORCE_MS;
+      return forceAt > now && this.store.getActiveTurn(wakeup.taskId, "leader") !== null
+        ? [{
+            key: `role:${encodeURIComponent(wakeup.taskId)}/leader` as MailboxKey,
+            at: forceAt
+          }]
+        : [];
+    });
+    const nearest = nearestDeadlineBatch(deadlines);
+    if (nearest === null) return;
+    const delayMs = Math.min(MAX_TIMER_DELAY_MS, Math.max(0, nearest.at - now));
+    this.#leaderWakeDeadlineTimer = setTimeout(() => {
+      this.#leaderWakeDeadlineTimer = undefined;
+      for (const key of nearest.keys) this.#signalScheduler.signal(key);
+      void this.#signalScheduler.drain().catch(this.#onError);
+    }, delayMs);
+    this.#leaderWakeDeadlineTimer.unref();
+  }
+
   #scheduleDeliveryRetries(result: ControllerSchedulerResult): void {
     const retry = new Map<MailboxKey, Readonly<{
       identity: string;
-      terminalFailure?: RoleRunDeliveryFailureIdentity;
+      terminalFailure?: RoleTurnDeliveryFailureIdentity;
     }>>();
     const settled = new Set<MailboxKey>();
     const writerBlocked = new Set<MailboxKey>();
     const resignal = new Set<MailboxKey>();
-    for (const delivery of result.activeRunDeliveries) {
+    for (const delivery of result.activeTurnDeliveries) {
       const key = `role:${encodeURIComponent(delivery.taskId)}/${encodeURIComponent(delivery.roleName)}` as const;
       if (delivery.terminalized === true) {
         settled.add(key);
@@ -2084,31 +2060,17 @@ export class FileTaskController {
       else if (delivery.reason === "writer-attached") writerBlocked.add(key);
       else if (delivery.reason === "not-ready"
         || delivery.reason === "runtime-unavailable") {
-        retry.set(key, {
-          identity: delivery.runId,
-          ...(delivery.terminalFailure === undefined
-            ? {}
-            : { terminalFailure: delivery.terminalFailure })
-        });
+        retry.set(key, { identity: delivery.turnId });
       }
       else if (delivery.status === "delivered" || delivery.status === "already-delivered") settled.add(key);
     }
     for (const wakeup of result.wakeups) {
       const key = `role:${encodeURIComponent(wakeup.taskId)}/leader` as const;
-      if (wakeup.terminalized === true) {
-        settled.add(key);
-        resignal.add(key);
-      }
-      else if (
-        wakeup.reason === "writer-attached"
-      ) {
-        writerBlocked.add(key);
-      }
-      else if (
+      if (
         wakeup.reason === "not-ready"
-        || (wakeup.reason === "busy" && wakeup.runId !== undefined)
+        || (wakeup.reason === "busy" && wakeup.turnId !== undefined)
       ) {
-        retry.set(key, { identity: wakeup.runId ?? key });
+        retry.set(key, { identity: wakeup.turnId ?? key });
       }
       else if (wakeup.status === "dispatched") settled.add(key);
     }
@@ -2189,7 +2151,7 @@ export class FileTaskController {
   #scheduleDeliveryRetry(
     key: MailboxKey,
     identity: string,
-    terminalFailure?: RoleRunDeliveryFailureIdentity
+    terminalFailure?: RoleTurnDeliveryFailureIdentity
   ): void {
     let previous = this.#deliveryRetryAttempts.get(key);
     if (previous !== undefined && previous.identity !== identity) {
@@ -2244,12 +2206,12 @@ export class FileTaskController {
 
   #terminalizePreparedAfterRetryExhaustion(
     key: MailboxKey,
-    runId: string,
-    failure: RoleRunDeliveryFailureIdentity | undefined
+    turnId: string,
+    failure: RoleTurnDeliveryFailureIdentity | undefined
   ): void {
     if (
       !key.startsWith("role:")
-      || runId.startsWith("runtime-cleanup:")
+      || turnId.startsWith("runtime-cleanup:")
       || failure === undefined
     ) {
       return;
@@ -2259,11 +2221,11 @@ export class FileTaskController {
     if (
       target.taskId !== failure.taskId
       || target.roleName !== failure.roleName
-      || runId !== failure.runId
+      || turnId !== failure.turnId
     ) {
-      throw new Error(`Role delivery retry identity changed: ${key}/${runId}.`);
+      throw new Error(`Role delivery retry identity changed: ${key}/${turnId}.`);
     }
-    const result = this.store.saveRoleRunDeliveryFailure({
+    const result = this.store.saveRoleTurnDeliveryFailure({
       ...failure,
       now: this.#now()
     });
@@ -2272,7 +2234,7 @@ export class FileTaskController {
     this.delivery.forgetPrepared?.({
       taskId: failure.taskId,
       roleName: failure.roleName,
-      runId: failure.runId,
+      turnId: failure.turnId,
       ...(failure.launchId === undefined
         ? {}
         : { launchId: failure.launchId })

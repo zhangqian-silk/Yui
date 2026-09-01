@@ -13,9 +13,9 @@ export const RUNTIME_HOST_DETACH_REQUIRED_REASON = "runtime-host-detach-required
 /**
  * A Role runtime lifecycle lane already holds an in-flight operation (a
  * launch reservation or a cleanup obligation). This is scheduler
- * backpressure: the equivalent wake/Run must be retried after the lane
- * settles. It is never grounds to terminalize a Run, because the contention
- * happens before (or outside) any semantic Run launch.
+ * backpressure: the equivalent wake/Turn must be retried after the lane
+ * settles. It is never grounds to terminalize a Turn, because the contention
+ * happens before (or outside) any semantic Turn launch.
  */
 export class RuntimeLifecycleBusyError extends Error {
   readonly name = "RuntimeLifecycleBusyError";
@@ -89,7 +89,7 @@ export function runtimeCleanupDisposition(
   mailbox: WorkMailbox | null
 ): "end-session" | "detach-host" | null {
   const reasons = [
-    ...(mailbox?.pending.normal?.reasons ?? []),
+    ...(mailbox?.pending?.reasons ?? []),
     ...(!isRuntimeLaunchReservation(mailbox?.processing)
       ? mailbox?.processing?.batch.reasons ?? []
       : [])

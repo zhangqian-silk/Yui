@@ -60,9 +60,9 @@ export function completeWorkExecution(
 /**
  * Completes a mailbox execution or fails the surrounding transaction.
  *
- * A terminal Run and its processing mailbox batch are one consistency
+ * A terminal Turn and its processing mailbox batch are one consistency
  * boundary. Silently accepting a missing or mismatched batch would leave
- * durable work stuck in `processing` after the Run has already ended.
+ * durable work stuck in `processing` after the Turn has already ended.
  */
 export function requireCompleteWorkExecution(
   store: WorkMailboxQueueStore,
@@ -91,7 +91,7 @@ export function requireCompleteWorkExecution(
 }
 
 /**
- * Settles the exact Run delivery boundary, including the short window before
+ * Settles the exact Turn delivery boundary, including the short window before
  * the scheduler has claimed its single pending dispatch. A merged pending
  * batch is never discarded because its signal-to-ref mapping is no longer
  * recoverable.
@@ -115,12 +115,8 @@ export function settleExactWorkExecution(
     );
   }
   const pending = matching[0]!;
-  const pendingKey = mailbox.pending.normal === pending ? "normal" : "userCorrection";
-  if (mailbox.pending[pendingKey] !== pending) return "absent";
-  store.saveWorkMailbox(consumePendingBatch(
-    mailbox,
-    pendingKey === "normal" ? "normal" : "user-correction"
-  ));
+  if (mailbox.pending !== pending) return "absent";
+  store.saveWorkMailbox(consumePendingBatch(mailbox));
   return "pending";
 }
 

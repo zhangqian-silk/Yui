@@ -438,16 +438,9 @@ export function createReleaseActivatePorts(
             + `${messageOf(error)} ${result.stderr.trim()}`
         );
       }
-      // The handover preflight is a compatibility check: the new release must
-      // understand the Home's storage schema and layout. The four-state
-      // `storage compatibility` verdict is authoritative: it is `ok` for
-      // current, compatible-old, and migration-required (MIGRATABLE) Homes,
-      // and non-ok for needs-new-version or corrupted Homes. The strict
-      // `storage schema` check reads `unsupported` for a MIGRATABLE Home even
-      // though the Controller opens it through the compatible migration path,
-      // so gating on it would reject every older-but-upgradable Home. A
-      // missing `storage state` (a Home that never ran `yui setup`) is not a
-      // compatibility blocker — the new Controller initializes it.
+      // The handover preflight must prove the exact current Home contract.
+      // Older, newer, malformed, or incomplete Homes all fail closed and are
+      // never normalized by release activation.
       const checks = (report as { checks?: readonly { name?: unknown; status?: unknown }[] } | undefined)?.checks;
       if (!Array.isArray(checks)) {
         throw new Error("Release preflight report has no storage checks.");

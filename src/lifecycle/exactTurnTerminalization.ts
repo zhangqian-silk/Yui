@@ -1,12 +1,7 @@
 import { isDeepStrictEqual } from "node:util";
 
 import { completeProcessing } from "../coordination/workMailbox.js";
-import { enqueueWork } from "../coordination/workMailboxQueue.js";
-import { settleExactWorkExecution } from "../coordination/workMailboxQueue.js";
-import {
-  terminalizeTaskRoleRunSession,
-  type TaskRoleSessionSet
-} from "../executor/agentExecutor.js";
+import type { TaskRoleSessionSet } from "../executor/agentExecutor.js";
 import { createTaskEvent } from "../event/taskEvent.js";
 import {
   finishReviewRound,
@@ -17,13 +12,11 @@ import {
 } from "../review/reviewRound.js";
 import { reconcileReviewFindingsAfterReview } from "../review/reviewFindingLedger.js";
 import {
-  agentRunDeliveryReceiptId,
-  failAgentRun,
-  withYieldReceipt,
-  yieldAgentRun,
-  type AgentRun
-} from "../run/agentRun.js";
-import { createYieldReceipt } from "../run/yieldReceipt.js";
+  completeTurn,
+  failTurn,
+  type Turn,
+  type TurnProviderResult
+} from "../turn/turn.js";
 import {
   recordExecutionLaneResult,
   resolveExecutionGroup,
@@ -33,10 +26,10 @@ import {
   isRuntimeLaunchReservation,
   runtimeLifecycleTarget
 } from "../runtime/lifecycleReservation.js";
-import { runOwnsBlockingProviderContinuation } from "../runtime/runtimeContinuationProjection.js";
+import { managedProviderTurnId } from "../runtime/providerRuntimeIdentity.js";
 import {
-  latestRunDurableProgressAt
-} from "../scheduler/roleRunStall.js";
+  latestTurnDurableProgressAt
+} from "../scheduler/roleTurnStall.js";
 import { markTaskWakeConsumed } from "../scheduler/taskWake.js";
 import type { TaskStore } from "../storage/taskStore.js";
 import {
@@ -51,20 +44,20 @@ export type ExactReviewRoundTerminalizationResult = Readonly<{
 
 /**
  * Validate every immutable identity and frozen Project head needed before a
- * review Run can settle any mailbox or Round state.  This is deliberately
+ * review Turn can settle any mailbox or Round state. This is deliberately
  * read-only: callers use it as the compare-and-swap fence immediately before
  * their aggregate mutation.
  */
-export function validateExactRunReviewRound(
+export function validateExactTurnReviewRound(
   store: TaskStore,
-  run: AgentRun,
+  turn: Turn,
   options: Readonly<{ allowTerminal?: boolean }> = {}
 ): ExactReviewRoundTerminalizationResult {
-  if (run.purpose !== "review") return { disposition: "applied", round: null };
-  if (run.reviewRoundId === undefined) {
+  if (turn.purpose !== "review") return { disposition: "applied", round: null };
+  if (turn.reviewRoundId === undefined) {
     return { disposition: "obsolete", round: null, reason: "review-round-missing" };
   }
-  const round = store.getReviewRound(run.taskId, run.reviewRoundId);
+  const round = store.getReviewRound(turn.taskId, turn.reviewRoundId);
   if (round === null) {
     return { disposition: "obsolete", round: null, reason: "review-round-missing" };
   }
@@ -72,62 +65,62 @@ export function validateExactRunReviewRound(
     && round.status !== "pending" && round.status !== "running") {
     return { disposition: "obsolete", round, reason: "review-round-terminal" };
   }
-  const lane = round.executionGroup?.lanes.find(({ id }) => id === run.executionLaneId);
-  const exactReviewerRun = round.reviewerRunId === run.id || lane?.runId === run.id;
-  const exactReviewerRole = round.reviewerRoleName === run.roleName || lane?.roleName === run.roleName;
-  if (!exactReviewerRun
+  const lane = round.executionGroup?.lanes.find(({ id }) => id === turn.executionLaneId);
+  const exactReviewerTurn = round.reviewerTurnId === turn.id || lane?.turnId === turn.id;
+  const exactReviewerRole = round.reviewerRoleName === turn.roleName || lane?.roleName === turn.roleName;
+  if (!exactReviewerTurn
     || !exactReviewerRole
-    || round.workItemId !== run.workItemId
-    || round.reviewBaseCommit !== run.effective.reviewBaseCommit) {
+    || round.workItemId !== turn.workItemId
+    || round.reviewBaseCommit !== turn.effective.reviewBaseCommit) {
     return { disposition: "obsolete", round, reason: "review-round-mismatch" };
   }
   const laneWorkspaceRoot = lane?.workspace?.root;
-  if (run.workspace === undefined || round.workspace === undefined
-    || (laneWorkspaceRoot === undefined && !isDeepStrictEqual(run.workspace, round.workspace))
-    || (laneWorkspaceRoot !== undefined && run.workspace.root !== laneWorkspaceRoot)) {
+  if (turn.workspace === undefined || round.workspace === undefined
+    || (laneWorkspaceRoot === undefined && !isDeepStrictEqual(turn.workspace, round.workspace))
+    || (laneWorkspaceRoot !== undefined && turn.workspace.root !== laneWorkspaceRoot)) {
     return { disposition: "obsolete", round, reason: "review-workspace-mismatch" };
   }
-  const storedWorkspace = run.workspace.owner.type === "execution-lane"
-    ? store.getManagedWorkspace(run.workspace.owner)
-    : store.getReviewRoundWorkspace(run.taskId, round.id);
+  const storedWorkspace = turn.workspace.owner.type === "execution-lane"
+    ? store.getManagedWorkspace(turn.workspace.owner)
+    : store.getReviewRoundWorkspace(turn.taskId, round.id);
   if (storedWorkspace === null
-    || (run.workspace.owner.type !== "execution-lane"
+    || (turn.workspace.owner.type !== "execution-lane"
       && !isDeepStrictEqual(storedWorkspace, round.workspace))
-    || !isDeepStrictEqual(storedWorkspace, run.workspace)) {
+    || !isDeepStrictEqual(storedWorkspace, turn.workspace)) {
     return { disposition: "obsolete", round, reason: "review-workspace-drift" };
   }
-  if (run.workspace.owner.type !== "execution-lane") {
+  if (turn.workspace.owner.type !== "execution-lane") {
     if (storedWorkspace.owner.type !== "review-round"
-      || storedWorkspace.owner.taskId !== run.taskId
+      || storedWorkspace.owner.taskId !== turn.taskId
       || storedWorkspace.owner.reviewRoundId !== round.id) {
       return { disposition: "obsolete", round, reason: "review-workspace-owner-mismatch" };
     }
   }
-  if (run.workspace.owner.type === "execution-lane"
-    && (run.workspace.owner.purpose !== "review"
-      || run.workspace.owner.executionGroupId !== run.executionGroupId
-      || run.workspace.owner.executionLaneId !== run.executionLaneId
-      || run.workspace.owner.reviewRoundId !== round.id)) {
+  if (turn.workspace.owner.type === "execution-lane"
+    && (turn.workspace.owner.purpose !== "review"
+      || turn.workspace.owner.executionGroupId !== turn.executionGroupId
+      || turn.workspace.owner.executionLaneId !== turn.executionLaneId
+      || turn.workspace.owner.reviewRoundId !== round.id)) {
     return { disposition: "obsolete", round, reason: "review-lane-workspace-owner-mismatch" };
   }
-  if (run.workspace.owner.type === "execution-lane") {
+  if (turn.workspace.owner.type === "execution-lane") {
     if (lane === undefined
-      || lane.runId !== run.id
-      || lane.roleName !== run.roleName
-      || lane.workspace?.root !== run.workspace.root
-      || lane.workspace.writableProjectIds.length !== run.workspace.entries.length
-      || run.workspace.entries.some((entry) => (
+      || lane.turnId !== turn.id
+      || lane.roleName !== turn.roleName
+      || lane.workspace?.root !== turn.workspace.root
+      || lane.workspace.writableProjectIds.length !== turn.workspace.entries.length
+      || turn.workspace.entries.some((entry) => (
         entry.access !== "write"
         || !lane.workspace!.writableProjectIds.includes(entry.projectId)
       ))) {
       return { disposition: "obsolete", round, reason: "review-lane-workspace-lineage-mismatch" };
     }
   }
-  const task = store.getTask(run.taskId);
+  const task = store.getTask(turn.taskId);
   const taskScope = (round.scope ?? "work-item") === "task";
   const item = taskScope || round.workItemId === undefined
     ? null
-    : store.getWorkItem(run.taskId, round.workItemId);
+    : store.getWorkItem(turn.taskId, round.workItemId);
   if (!taskScope && item === null) {
     return { disposition: "obsolete", round, reason: "review-work-item-missing" };
   }
@@ -177,18 +170,18 @@ export function validateExactRunReviewRound(
 }
 
 /**
- * Atomically terminalizes the exact ReviewRound bound to a review AgentRun.
+ * Atomically terminalizes the exact ReviewRound bound to a review Turn.
  * The round must still be pending/running and its reviewer identity must match
- * the Run exactly. This is the sole review-round convergence primitive shared
- * by the exact Run terminalization path and the pre-delivery launch-failure
- * path: a failed review Run must never leave its Round stranded.
+ * the Turn exactly. This is the sole review-round convergence primitive shared
+ * by the exact Turn terminalization path and the pre-delivery launch-failure
+ * path: a failed review Turn must never leave its Round stranded.
  */
-export function terminalizeExactRunReviewRound(
+export function terminalizeExactTurnReviewRound(
   store: TaskStore,
   input: Readonly<{
     taskId: string;
-    run: AgentRun;
-    outcome: Readonly<{ status: "yielded" | "failed"; summary: string }>;
+    turn: Turn;
+    outcome: Readonly<{ status: "completed" | "failed"; summary: string }>;
     reviewResult?: Readonly<{
       report?: string;
       checks?: readonly ReviewCheck[];
@@ -204,19 +197,19 @@ export function terminalizeExactRunReviewRound(
   }>,
   now: Date
 ): ExactReviewRoundTerminalizationResult {
-  const validation = validateExactRunReviewRound(store, input.run);
+  const validation = validateExactTurnReviewRound(store, input.turn);
   if (validation.disposition !== "applied" || validation.round === null) {
     return validation;
   }
   const reviewRound = validation.round;
-  let groupedRound = input.run.executionGroupId !== undefined
-    && input.run.executionLaneId !== undefined
+  let groupedRound = input.turn.executionGroupId !== undefined
+    && input.turn.executionLaneId !== undefined
     && reviewRound.executionGroup !== undefined
     ? updateReviewExecutionGroup(
         reviewRound,
         recordExecutionLaneResult(
           reviewRound.executionGroup,
-          input.run.executionLaneId,
+          input.turn.executionLaneId,
           {
             summary: input.outcome.summary,
             ...(input.reviewResult?.report === undefined ? {} : { report: input.reviewResult.report }),
@@ -242,7 +235,7 @@ export function terminalizeExactRunReviewRound(
               ? {}
               : { gitSnapshot: input.reviewResult.gitSnapshot })
           },
-          input.outcome.status === "yielded" ? "completed" : "failed",
+          input.outcome.status,
           now
         )
       )
@@ -252,8 +245,7 @@ export function terminalizeExactRunReviewRound(
     && groupedRound.executionGroup !== undefined
     && groupedRound.executionGroup.resolution === undefined
     && groupedRound.executionGroup.lanes.every((lane) => (
-      lane.status === "yielded"
-      || lane.status === "completed"
+      lane.status === "completed"
       || lane.status === "failed"
       || lane.status === "skipped"
     ))) {
@@ -279,7 +271,7 @@ export function terminalizeExactRunReviewRound(
   }
   const terminal = finishReviewRound(
     groupedRound,
-    input.outcome.status === "yielded" ? "completed" : "failed",
+    input.outcome.status,
     input.outcome.summary,
     now,
     input.reviewResult
@@ -293,21 +285,22 @@ export function terminalizeExactRunReviewRound(
   return { disposition: "applied", round: terminal };
 }
 
-export type ExactRunTerminalizationInput = Readonly<{
+export type ExactTurnTerminalizationInput = Readonly<{
   taskId: string;
   roleName: string;
   agentId: string;
-  runId: string;
-  receiptId: string;
+  turnId: string;
   nativeSessionId?: string;
   launchId?: string;
-  /** Aggregate retirement owns every queued Role signal, not only this Run. */
+  /** Aggregate retirement owns every queued Role signal, not only this Turn. */
   mailboxDisposition?: "exact" | "discard";
   /** Explicit retirement closes a fully terminal failed Group instead of leaving a retry path. */
   settleFailedExecutionGroup?: boolean;
   outcome: Readonly<{
-    status: "yielded" | "failed";
+    status: "completed" | "failed";
     summary: string;
+    failureReason?: import("../turn/turn.js").TurnFailureReason;
+    provider?: TurnProviderResult;
   }>;
   reviewResult?: Readonly<{
     report?: string;
@@ -321,16 +314,16 @@ export type ExactRunTerminalizationInput = Readonly<{
   }>;
 }>;
 
-export type ExactRunTerminalizationResult = Readonly<{
+export type ExactTurnTerminalizationResult = Readonly<{
   disposition: "applied" | "obsolete";
-  run: AgentRun | null;
+  turn: Turn | null;
   reason?: string;
 }>;
 
-export type ExactAgentRunRetirementInput = Readonly<{
+export type ExactTurnRetirementInput = Readonly<{
   taskId: string;
   roleName: string;
-  runId: string;
+  turnId: string;
   agentId: string;
   adapterId: string;
   nativeSessionId?: string;
@@ -340,86 +333,81 @@ export type ExactAgentRunRetirementInput = Readonly<{
   reason: string;
 }>;
 
-export type ExactAgentRunRetirementResult = Readonly<{
+export type ExactTurnRetirementResult = Readonly<{
   disposition: "applied" | "state-changed" | "blocked";
-  run: AgentRun | null;
+  turn: Turn | null;
   progressAt?: string;
   reason?: string;
 }>;
 
 /**
- * Retire one stranded active Run only after its exact Provider Turn is
+ * Retire one stranded active Turn only after its exact Provider Turn is
  * terminal and every durable execution fence is quiet. The caller owns the
- * surrounding aggregate transaction so the Run, ReviewRound/Lane, mailbox,
+ * surrounding aggregate transaction so the Turn, ReviewRound/Lane, mailbox,
  * Session, and append-only retirement record commit together.
  */
-export function retireExactActiveAgentRun(
+export function retireExactActiveTurn(
   store: TaskStore,
-  input: ExactAgentRunRetirementInput,
+  input: ExactTurnRetirementInput,
   now: Date
-): ExactAgentRunRetirementResult {
-  const current = store.getAgentRun(input.taskId, input.runId);
-  const stateChanged = (reason: string): ExactAgentRunRetirementResult => ({
+): ExactTurnRetirementResult {
+  const current = store.getTurn(input.taskId, input.turnId);
+  const stateChanged = (reason: string): ExactTurnRetirementResult => ({
     disposition: "state-changed",
-    run: current,
-    ...(current === null ? {} : { progressAt: latestRunDurableProgressAt(
+    turn: current,
+    ...(current === null ? {} : { progressAt: latestTurnDurableProgressAt(
       store,
       input.taskId,
       input.roleName,
-      input.runId
+      input.turnId
     )?.progressAt }),
     reason
   });
   const task = store.getTask(input.taskId);
   if (task === null) return stateChanged("task-missing");
   if (task.status !== "active") return stateChanged("task-terminal");
-  if (current === null) return stateChanged("run-missing");
-  if (current.status !== "active") return stateChanged("run-terminal");
+  if (current === null) return stateChanged("turn-missing");
+  if (current.status !== "active") return stateChanged("turn-terminal");
   if (current.taskId !== input.taskId || current.roleName !== input.roleName) {
-    return stateChanged("run-owner-mismatch");
+    return stateChanged("turn-owner-mismatch");
   }
   if (current.effective.agentId !== input.agentId
     || current.effective.adapterId !== input.adapterId) {
-    return stateChanged("run-launch-identity-mismatch");
+    return stateChanged("turn-launch-identity-mismatch");
   }
   const active = current.executionGroupId !== undefined && current.executionLaneId !== undefined
-    ? store.getActiveExecutionLaneRun(
+    ? store.getActiveExecutionLaneTurn(
       input.taskId,
       current.executionGroupId,
       current.executionLaneId
     )
-    : store.getActiveAgentRun(input.taskId, input.roleName);
-  if (active?.id !== current.id) return stateChanged("active-run-mismatch");
-  const progress = latestRunDurableProgressAt(
+    : store.getActiveTurn(input.taskId, input.roleName);
+  if (active?.id !== current.id) return stateChanged("active-turn-mismatch");
+  const progress = latestTurnDurableProgressAt(
     store,
     input.taskId,
     input.roleName,
-    input.runId
+    input.turnId
   );
   if (progress === null) return stateChanged("progress-unavailable");
   if (progress.progressAt !== input.expectedProgressAt) {
     return { ...stateChanged("progress-fence-mismatch"), progressAt: progress.progressAt };
   }
   const sessions = store.getTaskRoleSessionSet(input.taskId, input.roleName);
-  const terminalInput: ExactRunTerminalizationInput = {
+  const terminalInput: ExactTurnTerminalizationInput = {
     taskId: input.taskId,
     roleName: input.roleName,
     agentId: input.agentId,
-    runId: input.runId,
-    receiptId: agentRunDeliveryReceiptId(current),
+    turnId: input.turnId,
     ...(input.nativeSessionId === undefined ? {} : { nativeSessionId: input.nativeSessionId }),
     ...(input.launchId === undefined ? {} : { launchId: input.launchId }),
     settleFailedExecutionGroup: true,
-    outcome: { status: "failed", summary: input.reason }
+    outcome: { status: "failed", summary: input.reason, failureReason: "missing-result" }
   };
-  if (!matchesSessionFence(sessions, terminalInput)
-    || !matchesLaunchFence(store, sessions, terminalInput)) {
-    return stateChanged("session-or-launch-fence-mismatch");
-  }
   const session = sessions?.sessions[input.agentId];
   const providerBinding = sessions?.providerBinding;
   const providerTurn = providerBinding?.turn;
-  const providerSettled = providerTurn?.runId === current.id
+  const providerSettled = managedProviderTurnId(providerTurn) === current.id
     && (providerTurn?.status === "completed"
       || providerTurn?.status === "failed"
       || providerTurn?.status === "cancelled"
@@ -427,120 +415,66 @@ export function retireExactActiveAgentRun(
   if (session?.status === "active" && !providerSettled) {
     return {
       disposition: "blocked",
-      run: current,
+      turn: current,
       progressAt: progress.progressAt,
       reason: "runtime-not-terminal"
     };
   }
-  const terminal = terminalizeExactTaskRun(store, terminalInput, now);
-  if (terminal.disposition !== "applied" || terminal.run === null) {
+  const terminal = terminalizeExactTaskTurn(store, terminalInput, now);
+  if (terminal.disposition !== "applied" || terminal.turn === null) {
     return stateChanged(terminal.reason ?? "terminalization-fence-mismatch");
   }
   return {
     disposition: "applied",
-    run: terminal.run,
+    turn: terminal.turn,
     progressAt: progress.progressAt
   };
 }
 
 /**
  * Applies one exact application-level terminal fact inside the caller's
- * FileTaskStore transaction. All caller-owned outcome records can therefore
+ * TaskStore transaction. All caller-owned outcome records can therefore
  * be saved in the same aggregate commit.
  */
-export function terminalizeExactTaskRun(
+export function terminalizeExactTaskTurn(
   store: TaskStore,
-  input: ExactRunTerminalizationInput,
+  input: ExactTurnTerminalizationInput,
   now: Date
-): ExactRunTerminalizationResult {
-  const run = store.getAgentRun(input.taskId, input.runId);
-  if (run === null) return obsolete(null, "run-missing");
-  if (run.status !== "active") return obsolete(run, "run-terminal");
-  if (run.taskId !== input.taskId || run.roleName !== input.roleName) {
-    return obsolete(run, "run-owner-mismatch");
+): ExactTurnTerminalizationResult {
+  const turn = store.getTurn(input.taskId, input.turnId);
+  if (turn === null) return obsolete(null, "turn-missing");
+  if (turn.status !== "active") return obsolete(turn, "turn-terminal");
+  if (turn.taskId !== input.taskId || turn.roleName !== input.roleName) {
+    return obsolete(turn, "turn-owner-mismatch");
   }
-  if (run.effective.agentId !== input.agentId) {
-    return obsolete(run, "run-agent-mismatch");
+  if (turn.effective.agentId !== input.agentId) {
+    return obsolete(turn, "turn-agent-mismatch");
   }
   const role = store.getRole(input.taskId, input.roleName);
-  if (role === null) return obsolete(run, "role-missing");
-  const active = run.executionGroupId !== undefined && run.executionLaneId !== undefined
-    ? store.getActiveExecutionLaneRun(
+  if (role === null) return obsolete(turn, "role-missing");
+  const active = turn.executionGroupId !== undefined && turn.executionLaneId !== undefined
+    ? store.getActiveExecutionLaneTurn(
       input.taskId,
-      run.executionGroupId,
-      run.executionLaneId
+      turn.executionGroupId,
+      turn.executionLaneId
     )
-    : store.getActiveAgentRun(input.taskId, input.roleName);
-  if (active?.id !== run.id) return obsolete(run, "active-run-mismatch");
+    : store.getActiveTurn(input.taskId, input.roleName);
+  if (active?.id !== turn.id) return obsolete(turn, "active-turn-mismatch");
 
   const sessions = store.getTaskRoleSessionSet(input.taskId, input.roleName);
-  if (!matchesSessionFence(sessions, input)) {
-    return obsolete(run, "session-fence-mismatch");
-  }
-  if (!matchesLaunchFence(store, sessions, input)) {
-    return obsolete(run, "launch-fence-mismatch");
-  }
-  if (input.settleFailedExecutionGroup !== true
-    && runOwnsBlockingProviderContinuation(store.listEvents(input.taskId), {
-    taskId: run.taskId,
-    roleName: run.roleName,
-    runId: run.id,
-    agentId: run.effective.agentId
-  })) {
-    return obsolete(run, "provider-continuation-writer-owned");
-  }
-
   // Validate the exact ReviewRound, Candidate, stored workspace, and frozen
   // Project heads before any mailbox or Round write.
-  const reviewValidation = validateExactRunReviewRound(store, run);
+  const reviewValidation = validateExactTurnReviewRound(store, turn);
   if (reviewValidation.disposition !== "applied") {
-    return obsolete(run, reviewValidation.reason ?? "review-round-mismatch");
+    return obsolete(turn, reviewValidation.reason ?? "review-round-mismatch");
   }
 
-  const roleTarget = {
-    kind: "role" as const,
+  // All Turn, active-pointer, Session, launch, and mailbox fences have passed.
+  // Only now may the exact ReviewRound be terminalized alongside the Turn so a
+  // stale fence never leaves a Round written while the Turn stays active.
+  const reviewRoundTerminalization = terminalizeExactTurnReviewRound(store, {
     taskId: input.taskId,
-    roleName: input.roleName
-  };
-  if (input.mailboxDisposition === "discard") {
-    store.removeWorkMailbox(roleTarget);
-  } else {
-    // For review Runs the mailbox must carry an exact pending or processing
-    // entry for this Run: an absent or unrelated mailbox means the review
-    // dispatch was never recorded and the terminalization must fail closed.
-    // Execution/Leader Runs keep the historical absent-is-clean behavior so
-    // direct Leader completion and normal execution are unaffected.
-    const isReview = run.purpose === "review";
-    const mailbox = store.getWorkMailbox(roleTarget);
-    const processing = mailbox?.processing;
-    if (mailbox !== null && processing !== null && processing !== undefined) {
-      if (
-        processing.executionRef === undefined
-        || processing.executionRef.type !== "run"
-        || processing.executionRef.taskId !== run.taskId
-        || processing.executionRef.id !== run.id
-      ) {
-        return obsolete(run, "mailbox-busy");
-      }
-      store.saveWorkMailbox(completeProcessing(mailbox, processing.batchId));
-    } else {
-      const mailboxSettlement = settleExactWorkExecution(
-        store,
-        roleTarget,
-        { type: "run", taskId: run.taskId, id: run.id }
-      );
-      if (mailboxSettlement === "absent" && isReview && run.deliveredAt === undefined) {
-        return obsolete(run, "review-mailbox-missing");
-      }
-    }
-  }
-
-  // All Run, active-pointer, Session, launch, and mailbox fences have passed.
-  // Only now may the exact ReviewRound be terminalized alongside the Run so a
-  // stale fence never leaves a Round written while the Run stays active.
-  const reviewRoundTerminalization = terminalizeExactRunReviewRound(store, {
-    taskId: input.taskId,
-    run,
+    turn,
     outcome: input.outcome,
     reviewResult: input.reviewResult,
     ...(input.settleFailedExecutionGroup === undefined
@@ -548,44 +482,30 @@ export function terminalizeExactTaskRun(
       : { settleFailedExecutionGroup: input.settleFailedExecutionGroup })
   }, now);
   if (reviewRoundTerminalization.disposition !== "applied") {
-    return obsolete(run, reviewRoundTerminalization.reason ?? "review-round-mismatch");
+    return obsolete(turn, reviewRoundTerminalization.reason ?? "review-round-mismatch");
   }
 
-  const terminal = input.outcome.status === "yielded"
-    ? withYieldReceipt(
-        yieldAgentRun(run, input.outcome.summary, now),
-        createYieldReceipt(input.taskId, input.runId, {
-          status: "yielded",
-          summary: input.outcome.summary,
-          ...(input.reviewResult === undefined
-            ? {}
-            : {
-                reviewResult: {
-                  ...(input.reviewResult.report === undefined ? {} : { report: input.reviewResult.report }),
-                  ...(input.reviewResult.checks === undefined ? {} : { checks: input.reviewResult.checks }),
-                  ...(input.reviewResult.findings === undefined ? {} : { findings: input.reviewResult.findings }),
-                  ...(input.reviewResult.evidence === undefined ? {} : { evidence: input.reviewResult.evidence }),
-                  ...(input.reviewResult.evidenceCommit === undefined ? {} : { evidenceCommit: input.reviewResult.evidenceCommit }),
-                  ...(input.reviewResult.gitSnapshot === undefined ? {} : { gitSnapshot: input.reviewResult.gitSnapshot }),
-                  ...(input.reviewResult.deltaDisposition === undefined ? {} : { deltaDisposition: input.reviewResult.deltaDisposition }),
-                  ...(input.reviewResult.deltaReasoning === undefined ? {} : { deltaReasoning: input.reviewResult.deltaReasoning })
-                }
-              })
-        }, now)
-      )
-    : failAgentRun(run, input.outcome.summary, now);
-  if (run.executionGroupId !== undefined
-    && run.executionLaneId !== undefined
-    && run.purpose === "execution"
-    && run.workItemId !== undefined) {
-    const item = store.getWorkItem(input.taskId, run.workItemId);
+  const terminal = input.outcome.status === "completed"
+    ? completeTurn(turn, input.outcome.summary, now, input.outcome.provider)
+    : failTurn(
+        turn,
+        input.outcome.failureReason ?? "runtime-failed",
+        input.outcome.summary,
+        now,
+        input.outcome.provider
+      );
+  if (turn.executionGroupId !== undefined
+    && turn.executionLaneId !== undefined
+    && turn.purpose === "execution"
+    && turn.workItemId !== undefined) {
+    const item = store.getWorkItem(input.taskId, turn.workItemId);
     const group = item === null
       ? undefined
-      : workItemExecutionGroupById(item, run.executionGroupId);
+      : workItemExecutionGroupById(item, turn.executionGroupId);
     if (item !== null && group !== undefined) {
       let grouped = recordExecutionLaneResult(
         group,
-        run.executionLaneId,
+        turn.executionLaneId,
       {
         summary: input.outcome.summary,
         ...(input.reviewResult?.report === undefined ? {} : { report: input.reviewResult.report }),
@@ -595,15 +515,14 @@ export function terminalizeExactTaskRun(
         ...(input.reviewResult?.evidenceCommit === undefined ? {} : { evidenceCommit: input.reviewResult.evidenceCommit }),
         ...(input.reviewResult?.gitSnapshot === undefined ? {} : { gitSnapshot: input.reviewResult.gitSnapshot })
       },
-        input.outcome.status === "yielded" ? "completed" : "failed",
+        input.outcome.status,
         now
       );
       if (input.settleFailedExecutionGroup === true
         && input.outcome.status === "failed"
         && grouped.resolution === undefined
         && grouped.lanes.every((lane) => (
-          lane.status === "yielded"
-          || lane.status === "completed"
+          lane.status === "completed"
           || lane.status === "failed"
           || lane.status === "skipped"
         ))) {
@@ -615,79 +534,31 @@ export function terminalizeExactTaskRun(
       store.saveWorkItem(input.taskId, updateWorkItemExecutionGroup(item, grouped, now));
     }
   }
-  store.saveAgentRun(terminal);
+  store.saveTurn(terminal);
   if (terminal.roleName === "leader") {
     const wake = store.listTaskWakes(input.taskId)
-      .find((candidate) => candidate.runId === terminal.id && candidate.status === "dispatched");
+      .find((candidate) => candidate.turnId === terminal.id && candidate.status === "dispatched");
     if (wake !== undefined) {
       store.saveTaskWake(input.taskId, markTaskWakeConsumed(wake, now));
     }
   }
   if (terminal.executionGroupId !== undefined && terminal.executionLaneId !== undefined) {
-    store.clearActiveExecutionLaneRun(
+    store.clearActiveExecutionLaneTurn(
       input.taskId,
       terminal.executionGroupId,
       terminal.executionLaneId
     );
   } else {
-    store.clearActiveAgentRun(input.taskId, input.roleName);
-  }
-  if (sessions !== null) {
-    store.saveTaskRoleSessionSet(terminalizeTaskRoleRunSession(sessions, {
-      agentId: input.agentId,
-      runId: input.runId,
-      receiptId: input.receiptId
-    }, now));
+    store.clearActiveTurn(input.taskId, input.roleName);
   }
   settleLaunchReservation(store, sessions, input);
-  return { disposition: "applied", run: terminal };
-}
-
-function matchesSessionFence(
-  sessions: TaskRoleSessionSet | null,
-  input: ExactRunTerminalizationInput
-): boolean {
-  if (sessions === null) return input.nativeSessionId === undefined;
-  if (sessions.activeAgentId !== input.agentId) return false;
-  const session = sessions.sessions[input.agentId];
-  if (input.nativeSessionId !== undefined) {
-    if (session?.nativeSessionId !== input.nativeSessionId) return false;
-  }
-  const inFlight = sessions.inFlight;
-  return inFlight === null || (
-    inFlight.agentId === input.agentId
-    && inFlight.runId === input.runId
-    && inFlight.receiptId === input.receiptId
-  );
-}
-
-function matchesLaunchFence(
-  store: TaskStore,
-  sessions: TaskRoleSessionSet | null,
-  input: ExactRunTerminalizationInput
-): boolean {
-  // A resumed Run shares the native Provider Session whose process environment
-  // was created for an earlier Run. Once that exact native Session has passed
-  // matchesSessionFence, its immutable per-launch environment is not a second
-  // Run identity. Opaque hosts still require the launch fence below.
-  if (input.nativeSessionId !== undefined) return true;
-  if (input.launchId === undefined) return true;
-  const session = sessions?.sessions[input.agentId] as
-    | (TaskRoleSessionSet["sessions"][string] & { launchId?: string })
-    | undefined;
-  if (session?.launchId === input.launchId) return true;
-  const mailbox = store.getWorkMailbox(runtimeLifecycleTarget({
-    scope: "task",
-    taskId: input.taskId,
-    roleName: input.roleName
-  }));
-  return isRuntimeLaunchReservation(mailbox?.processing, input.launchId);
+  return { disposition: "applied", turn: terminal };
 }
 
 function settleLaunchReservation(
   store: TaskStore,
   sessions: TaskRoleSessionSet | null,
-  input: ExactRunTerminalizationInput
+  input: ExactTurnTerminalizationInput
 ): void {
   const target = runtimeLifecycleTarget({
     scope: "task",
@@ -712,8 +583,8 @@ function settleLaunchReservation(
 }
 
 function obsolete(
-  run: AgentRun | null,
+  turn: Turn | null,
   reason: string
-): ExactRunTerminalizationResult {
-  return { disposition: "obsolete", run, reason };
+): ExactTurnTerminalizationResult {
+  return { disposition: "obsolete", turn, reason };
 }

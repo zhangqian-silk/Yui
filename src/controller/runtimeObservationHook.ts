@@ -12,16 +12,16 @@ import {
 } from "../runtime/agentDriverObservation.js";
 import { runtimeLifecycleSignalKey } from "../runtime/lifecycleReservation.js";
 import type { RuntimeObservation } from "../runtime/runtimeObservation.js";
-import { formatAgentRunReceiptId } from "../task/taskRecordReference.js";
+import { formatTurnReceiptId } from "../task/taskRecordReference.js";
 import {
   FileRuntimeEventInbox,
   MAX_RUNTIME_EVENT_FILE_BYTES
 } from "./runtimeEventInbox.js";
-import { resolveRuntimeHookRunFence } from "./runtimeHookRunFence.js";
+import { resolveRuntimeHookTurnFence } from "./runtimeHookTurnFence.js";
 import type {
-  RuntimeHookRunFence,
-  RuntimeHookRunFenceOptions
-} from "./runtimeHookRunFence.js";
+  RuntimeHookTurnFence,
+  RuntimeHookTurnFenceOptions
+} from "./runtimeHookTurnFence.js";
 
 type ControllerCall = (
   home: string,
@@ -37,23 +37,23 @@ export type ParsedRuntimeObservationHook = Readonly<{
   observations: readonly RuntimeObservation[];
 }>;
 
-type ResolveRunFence = (
+type ResolveTurnFence = (
   environment: NodeJS.ProcessEnv,
   adapterId: string,
   nativeSessionId: string,
-  options: RuntimeHookRunFenceOptions
-) => RuntimeHookRunFence;
+  options: RuntimeHookTurnFenceOptions
+) => RuntimeHookTurnFence;
 
 export type RuntimeObservationHookDependencies = Readonly<{
   drivers?: AgentDriverRegistry;
-  resolveRunFence?: ResolveRunFence;
+  resolveTurnFence?: ResolveTurnFence;
   sequence?: () => number;
 }>;
 
 /**
  * Single hidden ingress for every structured CLI Driver Hook. Native event
  * names and payload shapes terminate here; the durable inbox contains only a
- * provider-independent RuntimeObservation with an exact generation/Run fence.
+ * provider-independent RuntimeObservation with an exact generation/Turn fence.
  */
 export async function runRuntimeObservationHookCommand(
   stdinJson: string | undefined,
@@ -122,7 +122,7 @@ async function runGlobalRuntimeTurnHook(
     adapterId: "claude",
     launchId: requireIdentity(environment.YUI_LAUNCH_ID, "Launch id"),
     nativeSessionId,
-    turnId: optionalIdentity(driver.runtime.nativeTurnId(nativeHook)) ?? occurrenceId,
+    nativeTurnId: optionalIdentity(driver.runtime.nativeTurnId(nativeHook)) ?? occurrenceId,
     ...(environment.YUI_SESSION_TITLE === undefined
       ? {}
       : { title: requireIdentity(environment.YUI_SESSION_TITLE, "Session title") }),
@@ -170,7 +170,7 @@ export function parseRuntimeObservationHook(
   const classification = normalizeAgentDriverHookClassification(
     driver.runtime.classifyHook(nativeHook)
   );
-  const fence = (dependencies.resolveRunFence ?? resolveRuntimeHookRunFence)(
+  const fence = (dependencies.resolveTurnFence ?? resolveRuntimeHookTurnFence)(
     environment,
     driver.adapterId,
     nativeSessionId,
@@ -186,6 +186,9 @@ export function parseRuntimeObservationHook(
       ...(nativeTurnId === undefined ? {} : { nativeTurnId })
     }
   );
+  if (fence.turnId === undefined) {
+    throw new Error("Agent Driver Hook requires a managed Turn.");
+  }
   const driverInput = {
     driver,
     hookEventName,
@@ -198,7 +201,7 @@ export function parseRuntimeObservationHook(
     fence: {
       taskId: fence.taskId,
       roleName: fence.roleName,
-      runId: fence.runId,
+      turnId: fence.turnId,
       agentId: fence.agentId,
       driverId,
       launchId: fence.launchId,
@@ -206,8 +209,8 @@ export function parseRuntimeObservationHook(
       conversationId: fence.nativeSessionId,
       activationId: fence.launchId,
       nativeSessionId: fence.nativeSessionId,
-      nativeTurnId: nativeTurnId ?? fence.runId,
-      receiptId: fence.receiptId ?? formatAgentRunReceiptId(fence.taskId, fence.runId)
+      nativeTurnId: nativeTurnId ?? fence.turnId,
+      receiptId: fence.receiptId ?? formatTurnReceiptId(fence.taskId, fence.turnId)
     },
     payload
   } as const;

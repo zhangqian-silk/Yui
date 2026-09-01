@@ -53,8 +53,6 @@ export type Task = {
   dueAt?: string;
   projectBindings: readonly TaskProjectBinding[];
   cwd?: string;
-  /** Historical v4 delivery selection retained only as migrated audit context. */
-  legacyDeliveryPath?: "direct" | "integrated";
   /**
    * Durable cross-Home-unique workspace identity, minted once on first workspace
    * preparation and reused forever. Absent only for Tasks that never had a
@@ -360,10 +358,8 @@ export function validateTask(task: Task): Task {
   if (task.dueAt !== undefined) requireTimestamp(task.dueAt, "Task dueAt");
   normalizeProjectBindings(task.projectBindings);
   if (task.cwd !== undefined) requireText(task.cwd, "Task workspace");
-  if (task.legacyDeliveryPath !== undefined
-    && task.legacyDeliveryPath !== "direct"
-    && task.legacyDeliveryPath !== "integrated") {
-    throw new Error("Task legacy delivery path is invalid.");
+  if (Object.hasOwn(task, "legacyDeliveryPath")) {
+    throw new Error("Task contains the removed delivery-path field.");
   }
   const completionFields = [task.completedAt, task.completedBy, task.completionSummary];
   const hasAnyCompletion = completionFields.some((value) => value !== undefined);

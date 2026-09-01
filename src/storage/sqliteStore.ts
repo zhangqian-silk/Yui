@@ -18,7 +18,6 @@
  *   - Crash recovery .............. WAL rollback of uncommitted transactions;
  *                                    outbox replay of committed-but-unacked effects.
  *   - Record family versioning .... full record (incl. schemaVersion) in payload.
- *   - Upgrade fence ............... assertHomeWritable at the write boundary.
  *   - Evidence retention .......... events/review_rounds/change_sets/
  *                                    integration_attempts are never pruned.
  *
@@ -44,7 +43,6 @@ import type { MailboxTarget, WorkMailbox } from "../coordination/workMailbox.js"
 import {
   consumePendingBatch,
   mailboxTargetKey,
-  pendingLane,
   validateWorkMailbox
 } from "../coordination/workMailbox.js";
 import type { Decision } from "../decision/decision.js";
@@ -53,12 +51,11 @@ import {
   type ContextSnapshot
 } from "../context/contextSnapshot.js";
 import type { TaskEvent } from "../event/taskEvent.js";
-import { TASK_FINAL_REVIEW_CONTRACT_REBOUND_EVENT } from "../review/taskFinalReviewContractEvent.js";
 import type { InputRequest } from "../input/inputRequest.js";
 import type { GlobalRoleSessionSet, RoleAgentSession, TaskRoleSessionSet } from "../executor/agentExecutor.js";
 import type { TaskMessage } from "../message/message.js";
 import type { Milestone } from "../milestone/milestone.js";
-import type { AgentRun } from "../run/agentRun.js";
+import type { Turn } from "../turn/turn.js";
 import type { RuntimeOwner } from "../runtime/runtimeOwner.js";
 import {
   compareRuntimeSessionCandidates,
@@ -107,22 +104,21 @@ import {
 import { TASK_RECORD_ID_PREFIXES, type TaskRecordKind } from "../task/taskRecordReference.js";
 import type { WorkItem } from "../workItem/workItem.js";
 import { managedWorkspaceKey, type ManagedWorkspace, type ManagedWorkspaceOwner } from "../worktree/managedWorkspace.js";
-import { assertHomeWritable } from "./upgradeFence.js";
 import {
   CURRENT_CONFIG_SCHEMA_VERSION,
   CURRENT_PENDING_WAKEUP_SCHEMA_VERSION,
   CURRENT_WORK_MAILBOX_SCHEMA_VERSION,
-  executionLaneActiveRunKey,
-  executionLaneActiveRunKeyParts,
+  executionLaneActiveTurnKey,
+  executionLaneActiveTurnKeyParts,
   StorageConflictError,
   StorageCancelledError,
   StorageRecordError,
-  FileTaskStore,
   storedCapabilityGrant,
   storedPublicationReference,
   storedReleaseWorkflow,
   isValidCapabilityGrantTransition,
   isValidReleaseWorkflowTransition,
+  pendingWakeupProjection,
   type ConfiguredAgentPatch,
   type ConfiguredAgentUpdateResult,
   type TaskStore,
@@ -148,7 +144,7 @@ import {
   SQLITE_AGGREGATE_VERSION,
   SQLITE_LAYOUT_VERSION,
   TELEMETRY_KEEP_PER_GENERATION,
-  TELEMETRY_RUN_CAP
+  TELEMETRY_TURN_CAP
 } from "./sqliteSchema.js";
 import { inspectStorageSchema } from "./storageSchema.js";
 
@@ -156,12 +152,6 @@ import { inspectStorageSchema } from "./storageSchema.js";
 export type SqliteTaskStoreOptions = Readonly<{
   /** Override the database filename (defaults to "yui.db"). */
   databaseFilename?: string;
-  /**
-   * Migration mode for a disposable sidecar database. It may create a fresh
-   * stage or advance an existing snapshot copy while the offline upgrade fence
-   * is active. The authoritative `yui.db` is never legal in this mode.
-   */
-  migration?: boolean;
 }>;
 
 /** Options for {@link SqliteTaskStore.transaction}. */
@@ -208,7 +198,7 @@ export function readSqliteHomeIdentity(
 export type TelemetryProgress = Readonly<{
   taskId: string;
   roleName: string;
-  runId: string;
+  turnId: string;
   generation: string;
   progressId: string;
   sequence?: number;
@@ -261,44 +251,19 @@ function isUniqueConstraint(error: unknown): boolean {
     || (error as { code?: string })?.code === "SQLITE_CONSTRAINT_UNIQUE";
 }
 
-/** Project a leader-role work mailbox's pending batch to a PendingWakeup (mirrors taskStore.ts). */
-function pendingWakeupProjection(mailbox: WorkMailbox | null): PendingWakeup | null {
-  const pending = mailbox === null ? null : pendingLane(mailbox, "normal");
-  if (mailbox === null || mailbox.target.kind !== "role" || mailbox.target.roleName !== "leader"
-    || pending === null) {
-    return null;
-  }
-  return {
-    schemaVersion: CURRENT_PENDING_WAKEUP_SCHEMA_VERSION,
-    taskId: mailbox.target.taskId,
-    reasons: [...pending.reasons],
-    requestCount: pending.requestCount,
-    firstRequestedAt: pending.firstQueuedAt,
-    lastRequestedAt: pending.lastQueuedAt
-  };
-}
-
 export class SqliteTaskStore implements TaskStore {
   readonly #db: Database.Database;
   readonly #rootDir: string;
-  readonly #migration: boolean;
   readonly #openedSchemaHead: Readonly<{ version: number; checksum: string }>;
   #inTransaction = false;
   #dirty = false;
 
   constructor(rootDir: string, _options: SqliteTaskStoreOptions = {}) {
     this.#rootDir = rootDir;
-    this.#migration = _options.migration ?? false;
     mkdirSync(rootDir, { recursive: true, mode: 0o700 });
     const filename = _options.databaseFilename ?? "yui.db";
     const databasePath = join(rootDir, filename);
     const databaseExisted = existsSync(databasePath);
-    if (this.#migration && filename === "yui.db") {
-      throw new SqliteSchemaMigrationError(
-        "offline migration mode cannot open the authoritative yui.db",
-        "admission"
-      );
-    }
     this.#db = new Database(databasePath);
     try {
       // §4.1 / §9: WAL, no fsync weakening, FKs on, busy timeout for CLI contention.
@@ -308,7 +273,7 @@ export class SqliteTaskStore implements TaskStore {
       this.#db.pragma("busy_timeout = 5000");
       this.#db.pragma("wal_autocheckpoint = 1000");
       migrateSqliteSchema(this.#db, {
-        mode: this.#migration || !databaseExisted ? "apply" : "validate"
+        mode: !databaseExisted ? "apply" : "validate"
       });
       const schema = inspectSqliteSchemaMigrations(this.#db);
       this.#openedSchemaHead = {
@@ -374,13 +339,8 @@ export class SqliteTaskStore implements TaskStore {
     this.#dirty = false;
   }
 
-  /** The upgrade-admission fence, honored at the single write moment (§9). */
+  /** Verify the SQLite schema head at the single write boundary. */
   #prepareWrite(): void {
-    // The staged migration populates the sidecar database while the upgrade
-    // fence is active (the migration IS the upgrade), so it bypasses the
-    // per-write admission check. Production stores never set migration mode.
-    if (this.#migration) return;
-    assertHomeWritable(this.#rootDir);
     const current = this.#db.prepare(
       "SELECT version, checksum FROM schema_migrations ORDER BY version DESC LIMIT 1"
     ).get() as { version?: unknown; checksum?: unknown } | undefined;
@@ -414,14 +374,9 @@ export class SqliteTaskStore implements TaskStore {
     }
     this.#begin();
     try {
-      // Acquire SQLite's write reservation before checking the upgrade fence.
-      // A writer that started first commits before the upgrader's final
-      // transactional inventory; a writer that starts later sees the fence.
       this.#prepareWrite();
       const result = fn();
-      if (!this.#migration) {
-        this.#bumpRevision();
-      }
+      this.#bumpRevision();
       this.#commit();
       return result;
     } catch (error) {
@@ -446,19 +401,15 @@ export class SqliteTaskStore implements TaskStore {
     this.#begin();
     try {
       // Pin the Store's validated schema generation before user code runs.
-      // This prevents a long-lived pre-upgrade Store from executing old SQL
-      // after an in-place migration has committed.
+      // This prevents a long-lived Store from executing SQL after the database
+      // schema head has changed underneath it.
       this.#prepareWrite();
       const result = run(this);
       if (this.#dirty) {
         if (options?.requestId !== undefined) {
           this.#insertOutbox(options.requestId, options.outboxCommand ?? null);
         }
-        // The staged migration sets the revision explicitly via
-        // migrationSetHomeMeta; the commit must not bump it.
-        if (!this.#migration) {
-          this.#bumpRevision();
-        }
+        this.#bumpRevision();
       }
       this.#commit();
       return result;
@@ -513,11 +464,7 @@ export class SqliteTaskStore implements TaskStore {
         if (options?.requestId !== undefined) {
           this.#insertOutbox(options.requestId, options.outboxCommand ?? null);
         }
-        // The staged migration sets the revision explicitly via
-        // migrationSetHomeMeta; the commit must not bump it.
-        if (!this.#migration) {
-          this.#bumpRevision();
-        }
+        this.#bumpRevision();
       }
       this.#commit();
       return result;
@@ -594,9 +541,7 @@ export class SqliteTaskStore implements TaskStore {
         if (options.requestId !== undefined) {
           this.#insertOutbox(options.requestId, options.outboxCommand ?? commands);
         }
-        if (!this.#migration) {
-          this.#bumpRevision();
-        }
+        this.#bumpRevision();
       }
       this.#commit();
       return results;
@@ -723,68 +668,6 @@ export class SqliteTaskStore implements TaskStore {
   #requireTask(taskId: string): void {
     const row = this.#db.prepare("SELECT 1 FROM task_records WHERE task_id = ?").get(taskId);
     if (row === undefined) throw new StorageRecordError(`Task not found: ${taskId}`);
-  }
-
-  // -- migration bulk-load helpers (state.json -> SQLite, task-21 §8) ----------
-  // These are used only by the staged offline migration, which runs with the
-  // `migration` option (fence bypass). They seed infrastructure tables that the
-  // document owns (home identity/revision, global and per-task ID high-water
-  // marks) so the opened store continues from the same counters.
-
-  /** Preserve the document's Home identity and revision in `home_meta`. */
-  migrationSetHomeMeta(identity: HomeIdentity, revision: number): void {
-    this.#mutate(() => {
-      this.#db.prepare(
-        `UPDATE home_meta SET home_identity = ?, revision = ?, updated_at = ? WHERE id = 1`
-      ).run(this.#json(identity), revision, this.#now());
-    });
-  }
-
-  /** Seed a global ID high-water mark (task/project) at least `highWater`. */
-  migrationSeedGlobalSequence(name: string, highWater: number): void {
-    this.#mutate(() => {
-      this.#db.prepare(
-        `INSERT INTO global_sequences (name, high_water) VALUES (?, ?)
-         ON CONFLICT(name) DO UPDATE SET high_water = MAX(high_water, ?)`
-      ).run(name, highWater, highWater);
-    });
-  }
-
-  /** Seed a per-task ID high-water mark at least `highWater`. */
-  migrationSeedIdSequence(taskId: string, kind: string, highWater: number): void {
-    this.#mutate(() => {
-      this.#db.prepare(
-        `INSERT INTO id_sequences (task_id, kind, high_water) VALUES (?, ?, ?)
-         ON CONFLICT(task_id, kind) DO UPDATE SET high_water = MAX(high_water, ?)`
-      ).run(taskId, kind, highWater, highWater);
-    });
-  }
-
-  /** Restore one validated historical grant into a disposable migration output. */
-  migrationRestoreCapabilityGrant(taskId: string, grant: CapabilityGrant): void {
-    if (!this.#migration) {
-      throw new StorageRecordError(
-        "Historical capability grants may only be restored into a migration sidecar."
-      );
-    }
-    const stored = storedCapabilityGrant(grant);
-    if (stored.taskId !== taskId) {
-      throw new StorageRecordError(`Capability grant belongs to another Task: ${stored.taskId}`);
-    }
-    this.#requireTask(taskId);
-    this.#mutate(() => {
-      const existing = this.#getPayload<CapabilityGrant>(
-        "capability_grants", "task_id = ? AND grant_id = ?", [taskId, stored.id]
-      );
-      if (existing !== null) {
-        throw new StorageRecordError(
-          `Migration cannot overwrite capability grant: ${taskId}/${stored.id}`
-        );
-      }
-      this.#db.prepare(
-        "INSERT INTO capability_grants (task_id, grant_id, payload, updated_at) VALUES (?, ?, ?, ?)"
-      ).run(taskId, stored.id, this.#json(stored), this.#now());
-    });
   }
 
   // -- generic payload helpers ------------------------------------------------
@@ -926,7 +809,7 @@ export class SqliteTaskStore implements TaskStore {
     );
     const activeTasks = boundTasks.filter((task) => task.status === "active");
     const unresolvedWorkItemRefs: string[] = [];
-    const activeRunRefs: string[] = [];
+    const activeTurnRefs: string[] = [];
     const unresolvedIntegrationRefs: string[] = [];
     for (const task of activeTasks) {
       for (const workItem of this.listWorkItems(task.id)) {
@@ -934,8 +817,8 @@ export class SqliteTaskStore implements TaskStore {
           unresolvedWorkItemRefs.push(`${task.id}/${workItem.id}`);
         }
       }
-      for (const run of this.listAgentRuns(task.id)) {
-        if (run.status === "active") activeRunRefs.push(`${task.id}/${run.id}`);
+      for (const run of this.listTurns(task.id)) {
+        if (run.status === "active") activeTurnRefs.push(`${task.id}/${run.id}`);
       }
       for (const attempt of this.listIntegrationAttempts(task.id)) {
         if (attempt.status === "running" || attempt.status === "blocked") {
@@ -948,7 +831,7 @@ export class SqliteTaskStore implements TaskStore {
       boundTaskIds: boundTasks.map(({ id }) => id),
       activeTaskIds: activeTasks.map(({ id }) => id),
       unresolvedWorkItemRefs,
-      activeRunRefs,
+      activeTurnRefs,
       unresolvedIntegrationRefs
     };
   }
@@ -1101,15 +984,14 @@ export class SqliteTaskStore implements TaskStore {
   readNextActionFacts(taskId: string): NextActionFacts | null {
     const task = this.#getPayload<Task>("task_records", "task_id = ?", [taskId]);
     if (task === null) return null;
-    // One indexed query (idx_agent_runs_role_status) covers both the active
-    // Runs the projection waits on and the Leader Runs the budget consumes.
+    // One indexed query (idx_turns_role_status) covers both the active
+    // Turns the projection waits on and the Leader Turns the budget consumes.
     const events = this.#sortById(
       this.#listPayload<TaskEvent>(
         "events",
-        "task_id = ? AND type IN (?, ?, ?)",
+        "task_id = ? AND type IN (?, ?)",
         [
           taskId,
-          TASK_FINAL_REVIEW_CONTRACT_REBOUND_EVENT,
           TASK_RECORD_RETIRED_EVENT,
           "review.completed"
         ]
@@ -1117,13 +999,13 @@ export class SqliteTaskStore implements TaskStore {
       (event) => event.id
     );
     const runs = operationalTaskRecords(this.#sortById(
-      this.#listPayload<AgentRun>(
-        "agent_runs",
+      this.#listPayload<Turn>(
+        "turns",
         "task_id = ? AND (status = 'active' OR role_name = 'leader')",
         [taskId]
       ),
       (run) => run.id
-    ), events, "agent-run");
+    ), events, "turn");
     return {
       task: {
         id: task.id,
@@ -1156,8 +1038,6 @@ export class SqliteTaskStore implements TaskStore {
         this.#listPayload<ReviewRound>("review_rounds", "task_id = ?", [taskId]),
         (round) => round.id
       ),
-      taskFinalReviewContractEvents: events
-        .filter((event) => event.type === TASK_FINAL_REVIEW_CONTRACT_REBOUND_EVENT),
       reviewConfig: this.getReviewConfig(),
       openInputRequests: this.#sortById(
         this.#listPayload<InputRequest>(
@@ -1167,12 +1047,12 @@ export class SqliteTaskStore implements TaskStore {
         ),
         (request) => request.id
       ),
-      activeRuns: runs.filter((run) => run.status === "active"),
-      leaderRuns: runs.filter((run) => run.roleName === "leader"),
+      activeTurns: runs.filter((run) => run.status === "active"),
+      leaderTurns: runs.filter((run) => run.roleName === "leader"),
       reviewOutcomeEvidence: {
-        agentRuns: this.#sortById(
-          this.#listPayload<AgentRun>(
-            "agent_runs",
+        turns: this.#sortById(
+          this.#listPayload<Turn>(
+            "turns",
             "task_id = ?",
             [taskId]
           ).filter((run) => run.purpose === "review"),
@@ -1189,10 +1069,10 @@ export class SqliteTaskStore implements TaskStore {
     if (base === null) return null;
     return {
       ...base,
-      agentRuns: operationalTaskRecords(
-        this.listAgentRuns(taskId),
+      turns: operationalTaskRecords(
+        this.listTurns(taskId),
         this.listEvents(taskId),
-        "agent-run"
+        "turn"
       ),
       managedWorkspaces: this.#sortById(
         this.#listPayload<ManagedWorkspace>("managed_workspaces", "task_id = ?", [taskId]),
@@ -2321,43 +2201,43 @@ export class SqliteTaskStore implements TaskStore {
     });
   }
 
-  // -- agent runs -------------------------------------------------------------
+  // -- turns -----------------------------------------------------------------
 
-  nextAgentRunId(taskId: string): string { return this.#nextTaskRecordId(taskId, "agentRun"); }
-  peekNextAgentRunId(taskId: string): string { return this.#peekTaskRecordId(taskId, "agentRun"); }
+  nextTurnId(taskId: string): string { return this.#nextTaskRecordId(taskId, "turn"); }
+  peekNextTurnId(taskId: string): string { return this.#peekTaskRecordId(taskId, "turn"); }
 
-  getAgentRun(taskId: string, runId: string): AgentRun | null {
-    return this.#getPayload<AgentRun>("agent_runs", "task_id = ? AND run_id = ?", [taskId, runId]);
+  getTurn(taskId: string, turnId: string): Turn | null {
+    return this.#getPayload<Turn>("turns", "task_id = ? AND turn_id = ?", [taskId, turnId]);
   }
 
-  listAgentRuns(taskId: string): AgentRun[] {
+  listTurns(taskId: string): Turn[] {
     return this.#sortById(
-      this.#listPayload<AgentRun>("agent_runs", "task_id = ?", [taskId]),
-      (run) => run.id
+      this.#listPayload<Turn>("turns", "task_id = ?", [taskId]),
+      (turn) => turn.id
     );
   }
 
-  saveAgentRun(run: AgentRun): void {
-    if (run.taskId !== undefined) this.#requireTask(run.taskId);
-    if (run.reviewRoundId !== undefined) {
-      const round = this.getReviewRound(run.taskId, run.reviewRoundId);
+  saveTurn(turn: Turn): void {
+    if (turn.taskId !== undefined) this.#requireTask(turn.taskId);
+    if (turn.reviewRoundId !== undefined) {
+      const round = this.getReviewRound(turn.taskId, turn.reviewRoundId);
       if (round === null) {
-        throw new StorageRecordError(`Agent run ReviewRound not found: ${run.reviewRoundId}.`);
+        throw new StorageRecordError(`Turn ReviewRound not found: ${turn.reviewRoundId}.`);
       }
-      const roundWorkItemId = round.workItemId ?? round.legacyAnchor?.workItemId;
+      const roundWorkItemId = round.workItemId;
       const laneRole = round.executionGroup?.lanes
-        .find(({ id }) => id === run.executionLaneId)?.roleName;
-      if (roundWorkItemId !== run.workItemId
-        || (round.reviewerRoleName !== run.roleName && laneRole !== run.roleName)) {
-        throw new StorageRecordError(`Agent run does not match ReviewRound: ${run.id}.`);
+        .find(({ id }) => id === turn.executionLaneId)?.roleName;
+      if (roundWorkItemId !== turn.workItemId
+        || (round.reviewerRoleName !== turn.roleName && laneRole !== turn.roleName)) {
+        throw new StorageRecordError(`Turn does not match ReviewRound: ${turn.id}.`);
       }
     }
     this.#mutate(() => {
       this.#db.prepare(
-        `INSERT INTO agent_runs (task_id, run_id, role_name, status, payload, updated_at) VALUES (?, ?, ?, ?, ?, ?)
-         ON CONFLICT(task_id, run_id) DO UPDATE SET role_name = excluded.role_name, status = excluded.status,
+        `INSERT INTO turns (task_id, turn_id, role_name, status, payload, updated_at) VALUES (?, ?, ?, ?, ?, ?)
+         ON CONFLICT(task_id, turn_id) DO UPDATE SET role_name = excluded.role_name, status = excluded.status,
            payload = excluded.payload, updated_at = excluded.updated_at`
-      ).run(run.taskId, run.id, run.roleName, run.status, this.#json(run), this.#now());
+      ).run(turn.taskId, turn.id, turn.roleName, turn.status, this.#json(turn), this.#now());
     });
   }
 
@@ -2419,221 +2299,208 @@ export class SqliteTaskStore implements TaskStore {
     });
   }
 
-  // -- active runs ------------------------------------------------------------
+  // -- active turns ----------------------------------------------------------
 
-  #saveActiveRun(taskId: string, pointer: string, runId: string): void {
+  #saveActiveTurn(taskId: string, pointer: string, turnId: string): void {
     this.#mutate(() => {
-      const payload = this.#json({ schemaVersion: 3, runId });
+      const payload = this.#json({ schemaVersion: 3, turnId });
       this.#db.prepare(
-        `INSERT INTO active_runs (task_id, pointer, run_id, payload, updated_at) VALUES (?, ?, ?, ?, ?)
-         ON CONFLICT(task_id, pointer) DO UPDATE SET run_id = excluded.run_id, payload = excluded.payload, updated_at = excluded.updated_at`
-      ).run(taskId, pointer, runId, payload, this.#now());
+        `INSERT INTO active_turns (task_id, pointer, turn_id, payload, updated_at) VALUES (?, ?, ?, ?, ?)
+         ON CONFLICT(task_id, pointer) DO UPDATE SET turn_id = excluded.turn_id, payload = excluded.payload, updated_at = excluded.updated_at`
+      ).run(taskId, pointer, turnId, payload, this.#now());
     });
   }
 
-  #readActiveRunPointer(taskId: string, pointer: string): {
-    runId: string;
-    run: AgentRun | null;
+  #readActiveTurnPointer(taskId: string, pointer: string): {
+    turnId: string;
+    turn: Turn | null;
   } | null {
     const row = this.#db.prepare(
-      "SELECT run_id FROM active_runs WHERE task_id = ? AND pointer = ?"
-    ).get(taskId, pointer) as { run_id: string } | undefined;
+      "SELECT turn_id FROM active_turns WHERE task_id = ? AND pointer = ?"
+    ).get(taskId, pointer) as { turn_id: string } | undefined;
     if (row === undefined) return null;
     return {
-      runId: row.run_id,
-      run: this.getAgentRun(taskId, row.run_id)
+      turnId: row.turn_id,
+      turn: this.getTurn(taskId, row.turn_id)
     };
   }
 
-  #assertActiveRunForWrite(
-    run: AgentRun,
+  #assertActiveTurnForWrite(
+    turn: Turn,
     lane?: Readonly<{ executionGroupId: string; executionLaneId: string }>
   ): void {
-    if (run.status !== "active") {
-      throw new StorageRecordError(`Active Agent run must have active status: ${run.id}`);
+    if (turn.status !== "active") {
+      throw new StorageRecordError(`Active Turn must have active status: ${turn.id}`);
     }
-    const hasGroup = run.executionGroupId !== undefined;
-    const hasLane = run.executionLaneId !== undefined;
+    const hasGroup = turn.executionGroupId !== undefined;
+    const hasLane = turn.executionLaneId !== undefined;
     if (hasGroup !== hasLane) {
-      throw new StorageRecordError(`Agent Run execution lineage is incomplete: ${run.id}.`);
+      throw new StorageRecordError(`Turn execution lineage is incomplete: ${turn.id}.`);
     }
     if (lane !== undefined
-      && (run.executionGroupId !== lane.executionGroupId
-        || run.executionLaneId !== lane.executionLaneId)) {
+      && (turn.executionGroupId !== lane.executionGroupId
+        || turn.executionLaneId !== lane.executionLaneId)) {
       throw new StorageRecordError(
-        `Active Agent run execution lineage does not match its Lane: ${run.id}`
+        `Active Turn execution lineage does not match its Lane: ${turn.id}`
       );
     }
   }
 
-  #getActiveRoleRun(taskId: string, roleName: string): AgentRun | null {
-    const pointer = this.#readActiveRunPointer(taskId, roleName);
+  #getActiveRoleTurn(taskId: string, roleName: string): Turn | null {
+    const pointer = this.#readActiveTurnPointer(taskId, roleName);
     if (pointer === null) return null;
     const task = this.getTask(taskId);
     if (task === null) {
-      throw new StorageRecordError(`Active Agent run Task is missing: ${taskId}/${roleName}`);
+      throw new StorageRecordError(`Active Turn Task is missing: ${taskId}/${roleName}`);
     }
-    if (pointer.run === null) {
+    if (pointer.turn === null) {
       // Retired Tasks are an explicit historical isolation boundary. Their
-      // retained pointer rows may intentionally reference a missing Run.
+      // retained pointer rows may intentionally reference a missing Turn.
       if (task.status === "retired") return null;
-      throw new StorageRecordError(`Active Agent run pointer is dangling: ${taskId}/${roleName}`);
+      throw new StorageRecordError(`Active Turn pointer is dangling: ${taskId}/${roleName}`);
     }
-    const run = pointer.run;
-    if (task.status === "retired") return run;
-    if (run.id !== pointer.runId
-      || run.taskId !== taskId
-      || run.roleName !== roleName
-      || run.status !== "active"
-      || (run.executionGroupId === undefined) !== (run.executionLaneId === undefined)) {
-      throw new StorageRecordError(`Active Agent run pointer is invalid: ${taskId}/${roleName}`);
+    const turn = pointer.turn;
+    if (task.status === "retired") return turn;
+    if (turn.id !== pointer.turnId
+      || turn.taskId !== taskId
+      || turn.roleName !== roleName
+      || turn.status !== "active"
+      || (turn.executionGroupId === undefined) !== (turn.executionLaneId === undefined)) {
+      throw new StorageRecordError(`Active Turn pointer is invalid: ${taskId}/${roleName}`);
     }
-    return run;
+    return turn;
   }
 
-  #getActiveLaneRun(
+  #getActiveLaneTurn(
     taskId: string,
     executionGroupId: string,
     executionLaneId: string
-  ): AgentRun | null {
-    const pointerKey = executionLaneActiveRunKey(executionGroupId, executionLaneId);
-    const pointer = this.#readActiveRunPointer(taskId, pointerKey);
+  ): Turn | null {
+    const pointerKey = executionLaneActiveTurnKey(executionGroupId, executionLaneId);
+    const pointer = this.#readActiveTurnPointer(taskId, pointerKey);
     if (pointer === null) return null;
     const task = this.getTask(taskId);
     if (task === null) {
-      throw new StorageRecordError(`Active Agent run Task is missing: ${taskId}/${pointerKey}`);
+      throw new StorageRecordError(`Active Turn Task is missing: ${taskId}/${pointerKey}`);
     }
-    if (pointer.run === null) {
+    if (pointer.turn === null) {
       if (task.status === "retired") return null;
-      throw new StorageRecordError(`Active Agent run pointer is dangling: ${taskId}/${pointerKey}`);
+      throw new StorageRecordError(`Active Turn pointer is dangling: ${taskId}/${pointerKey}`);
     }
-    const run = pointer.run;
-    if (task.status === "retired") return run;
-    if (run.id !== pointer.runId
-      || run.taskId !== taskId
-      || run.status !== "active"
-      || run.executionGroupId !== executionGroupId
-      || run.executionLaneId !== executionLaneId) {
-      throw new StorageRecordError(`Active Agent run pointer is invalid: ${taskId}/${pointerKey}`);
+    const turn = pointer.turn;
+    if (task.status === "retired") return turn;
+    if (turn.id !== pointer.turnId
+      || turn.taskId !== taskId
+      || turn.status !== "active"
+      || turn.executionGroupId !== executionGroupId
+      || turn.executionLaneId !== executionLaneId) {
+      throw new StorageRecordError(`Active Turn pointer is invalid: ${taskId}/${pointerKey}`);
     }
-    return run;
+    return turn;
   }
 
-  #clearActiveRun(taskId: string, pointer: string): void {
+  #clearActiveTurn(taskId: string, pointer: string): void {
     this.#mutate(() => {
-      this.#db.prepare("DELETE FROM active_runs WHERE task_id = ? AND pointer = ?").run(taskId, pointer);
+      this.#db.prepare("DELETE FROM active_turns WHERE task_id = ? AND pointer = ?").run(taskId, pointer);
     });
   }
 
-  getActiveAgentRun(taskId: string, roleName: string): AgentRun | null {
-    return this.#getActiveRoleRun(taskId, roleName);
+  getActiveTurn(taskId: string, roleName: string): Turn | null {
+    return this.#getActiveRoleTurn(taskId, roleName);
   }
 
-  saveActiveAgentRun(run: AgentRun): void {
-    if (run.executionGroupId !== undefined || run.executionLaneId !== undefined) {
-      this.saveActiveExecutionLaneRun(run);
+  saveActiveTurn(turn: Turn): void {
+    if (turn.executionGroupId !== undefined || turn.executionLaneId !== undefined) {
+      this.saveActiveExecutionLaneTurn(turn);
       return;
     }
     this.transaction((store) => {
-      const task = store.getTask(run.taskId);
+      const task = store.getTask(turn.taskId);
       if (task === null || task.status !== "active" || task.executionGate.state !== "enabled") {
-        throw new StorageRecordError(`Task execution is not enabled: ${run.taskId}.`);
+        throw new StorageRecordError(`Task execution is not enabled: ${turn.taskId}.`);
       }
-      this.#assertActiveRunForWrite(run);
-      const current = store.getActiveAgentRun(run.taskId, run.roleName);
-      if (current !== null && current.id !== run.id) {
-        throw new StorageRecordError(`Role already has an active Agent run: ${run.taskId}/${run.roleName}`);
+      this.#assertActiveTurnForWrite(turn);
+      const current = store.getActiveTurn(turn.taskId, turn.roleName);
+      if (current !== null && current.id !== turn.id) {
+        throw new StorageRecordError(`Role already has an active Turn: ${turn.taskId}/${turn.roleName}`);
       }
-      const sessions = store.getTaskRoleSessionSet(run.taskId, run.roleName);
-      if (sessions !== null && sessions.inFlight !== null && sessions.inFlight.runId !== run.id) {
-        throw new StorageRecordError(
-          `Role still has an in-flight Turn: ${run.taskId}/${run.roleName}/${sessions.inFlight.runId}`
-        );
-      }
-      // Keep the Run row and its active pointer in the same transaction. The
+      // Keep the Turn row and its active pointer in the same transaction. The
       // adapter may have already written the row; this upsert remains
       // intentionally idempotent for that backend-neutral path.
-      store.saveAgentRun(run);
-      this.#saveActiveRun(run.taskId, run.roleName, run.id);
+      store.saveTurn(turn);
+      this.#saveActiveTurn(turn.taskId, turn.roleName, turn.id);
     });
   }
 
-  clearActiveAgentRun(taskId: string, roleName: string): void {
-    // Older Controller paths only know the Role key.  When that key points
-    // at a lane-backed Run, remove the matching lane pointer too; preserve
-    // every other lane for the same Role in a multi-lane group.
+  clearActiveTurn(taskId: string, roleName: string): void {
+    // A Role key can point at a lane-backed Turn. Remove the matching lane
+    // pointer too while preserving every other lane for the same Role.
     this.transaction(() => {
-      const rolePointer = this.#readActiveRunPointer(taskId, roleName);
-      this.#clearActiveRun(taskId, roleName);
+      const rolePointer = this.#readActiveTurnPointer(taskId, roleName);
+      this.#clearActiveTurn(taskId, roleName);
       if (rolePointer === null) return;
       const laneRows = this.#db.prepare(
-        "SELECT pointer, run_id FROM active_runs WHERE task_id = ?"
-      ).all(taskId) as Array<{ pointer: string; run_id: string }>;
+        "SELECT pointer, turn_id FROM active_turns WHERE task_id = ?"
+      ).all(taskId) as Array<{ pointer: string; turn_id: string }>;
       for (const row of laneRows) {
-        if (executionLaneActiveRunKeyParts(row.pointer) !== null
-          && row.run_id === rolePointer.runId) {
-          this.#clearActiveRun(taskId, row.pointer);
+        if (executionLaneActiveTurnKeyParts(row.pointer) !== null
+          && row.turn_id === rolePointer.turnId) {
+          this.#clearActiveTurn(taskId, row.pointer);
         }
       }
     });
   }
 
-  getActiveExecutionLaneRun(taskId: string, executionGroupId: string, executionLaneId: string): AgentRun | null {
-    return this.#getActiveLaneRun(taskId, executionGroupId, executionLaneId);
+  getActiveExecutionLaneTurn(taskId: string, executionGroupId: string, executionLaneId: string): Turn | null {
+    return this.#getActiveLaneTurn(taskId, executionGroupId, executionLaneId);
   }
 
-  saveActiveExecutionLaneRun(run: AgentRun): void {
-    if (run.executionGroupId === undefined || run.executionLaneId === undefined) {
-      throw new StorageRecordError(`Active execution-lane run requires group and lane ids: ${run.id}`);
+  saveActiveExecutionLaneTurn(turn: Turn): void {
+    if (turn.executionGroupId === undefined || turn.executionLaneId === undefined) {
+      throw new StorageRecordError(`Active execution-lane Turn requires group and lane ids: ${turn.id}`);
     }
     this.transaction((store) => {
-      const task = store.getTask(run.taskId);
+      const task = store.getTask(turn.taskId);
       if (task === null || task.status !== "active" || task.executionGate.state !== "enabled") {
-        throw new StorageRecordError(`Task execution is not enabled: ${run.taskId}.`);
+        throw new StorageRecordError(`Task execution is not enabled: ${turn.taskId}.`);
       }
-      const key = executionLaneActiveRunKey(run.executionGroupId!, run.executionLaneId!);
-      this.#assertActiveRunForWrite(run, {
-        executionGroupId: run.executionGroupId!,
-        executionLaneId: run.executionLaneId!
+      const key = executionLaneActiveTurnKey(turn.executionGroupId!, turn.executionLaneId!);
+      this.#assertActiveTurnForWrite(turn, {
+        executionGroupId: turn.executionGroupId!,
+        executionLaneId: turn.executionLaneId!
       });
-      const current = store.getActiveExecutionLaneRun(
-        run.taskId,
-        run.executionGroupId!,
-        run.executionLaneId!
+      const current = store.getActiveExecutionLaneTurn(
+        turn.taskId,
+        turn.executionGroupId!,
+        turn.executionLaneId!
       );
-      if (current !== null && current.id !== run.id) {
-        throw new StorageRecordError(`Execution Lane already has an active Agent run: ${run.taskId}/${key}`);
+      if (current !== null && current.id !== turn.id) {
+        throw new StorageRecordError(`Execution Lane already has an active Turn: ${turn.taskId}/${key}`);
       }
-      const sessions = store.getTaskRoleSessionSet(run.taskId, run.roleName);
-      if (sessions !== null && sessions.inFlight !== null && sessions.inFlight.runId !== run.id) {
-        throw new StorageRecordError(
-          `Role still has an in-flight Turn: ${run.taskId}/${run.roleName}/${sessions.inFlight.runId}`
-        );
-      }
-      const rolePointer = this.#readActiveRunPointer(run.taskId, run.roleName);
-      store.saveAgentRun(run);
-      this.#saveActiveRun(run.taskId, key, run.id);
-      // Keep the legacy role pointer for the single-lane delivery path, but
-      // never replace it when another Lane already owns that Role.
+      const rolePointer = this.#readActiveTurnPointer(turn.taskId, turn.roleName);
+      store.saveTurn(turn);
+      this.#saveActiveTurn(turn.taskId, key, turn.id);
+      // Keep the Role pointer for the single-lane delivery path, but never
+      // replace it when another Lane already owns that Role.
       if (rolePointer === null) {
-        this.#saveActiveRun(run.taskId, run.roleName, run.id);
+        this.#saveActiveTurn(turn.taskId, turn.roleName, turn.id);
       }
     });
   }
 
-  clearActiveExecutionLaneRun(taskId: string, executionGroupId: string, executionLaneId: string): void {
+  clearActiveExecutionLaneTurn(taskId: string, executionGroupId: string, executionLaneId: string): void {
     this.transaction(() => {
-      const key = executionLaneActiveRunKey(executionGroupId, executionLaneId);
-      const lanePointer = this.#readActiveRunPointer(taskId, key);
-      this.#clearActiveRun(taskId, key);
+      const key = executionLaneActiveTurnKey(executionGroupId, executionLaneId);
+      const lanePointer = this.#readActiveTurnPointer(taskId, key);
+      this.#clearActiveTurn(taskId, key);
       if (lanePointer === null) return;
       const roleRows = this.#db.prepare(
-        "SELECT pointer, run_id FROM active_runs WHERE task_id = ?"
-      ).all(taskId) as Array<{ pointer: string; run_id: string }>;
+        "SELECT pointer, turn_id FROM active_turns WHERE task_id = ?"
+      ).all(taskId) as Array<{ pointer: string; turn_id: string }>;
       for (const row of roleRows) {
-        if (executionLaneActiveRunKeyParts(row.pointer) === null
-          && row.run_id === lanePointer.runId) {
-          this.#clearActiveRun(taskId, row.pointer);
+        if (executionLaneActiveTurnKeyParts(row.pointer) === null
+          && row.turn_id === lanePointer.turnId) {
+          this.#clearActiveTurn(taskId, row.pointer);
         }
       }
     });
@@ -2815,11 +2682,11 @@ export class SqliteTaskStore implements TaskStore {
       const seq = this.#idSequence(wake.id, "taskWake");
       this.#db.prepare(
         `INSERT INTO task_wakes
-          (task_id, wake_id, seq, status, run_id, from_cursor, to_cursor, reasons, payload, created_at, consumed_at)
+          (task_id, wake_id, seq, status, turn_id, from_cursor, to_cursor, reasons, payload, created_at, consumed_at)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
        + ` ON CONFLICT(task_id, wake_id) DO UPDATE SET
            status = excluded.status,
-           run_id = excluded.run_id,
+           turn_id = excluded.turn_id,
            reasons = excluded.reasons,
            payload = excluded.payload,
            consumed_at = excluded.consumed_at`
@@ -2828,7 +2695,7 @@ export class SqliteTaskStore implements TaskStore {
         wake.id,
         wake.seq,
         wake.status,
-        wake.runId ?? null,
+        wake.turnId ?? null,
         wake.fromCursor,
         wake.toCursor,
         this.#json([...wake.reasons]),
@@ -2885,7 +2752,7 @@ export class SqliteTaskStore implements TaskStore {
     };
   }
 
-  #rowToMailbox(row: { target_kind: string; task_id: string | null; role_name: string | null; next_sequence: number; processing: string | null; pending: string; input_delivery: string | null }): WorkMailbox {
+  #rowToMailbox(row: { target_kind: string; task_id: string | null; role_name: string | null; next_sequence: number; processing: string | null; pending: string; recent_dedupe_keys: string }): WorkMailbox {
     const target = this.#targetFromCols(row.target_kind, row.task_id, row.role_name);
     return validateWorkMailbox({
       schemaVersion: CURRENT_WORK_MAILBOX_SCHEMA_VERSION,
@@ -2893,7 +2760,7 @@ export class SqliteTaskStore implements TaskStore {
       nextSequence: row.next_sequence,
       processing: row.processing === null ? null : this.#parse(row.processing),
       pending: this.#parse(row.pending),
-      inputDelivery: row.input_delivery === null ? null : this.#parse(row.input_delivery)
+      recentDedupeKeys: this.#parse(row.recent_dedupe_keys)
     });
   }
 
@@ -2911,28 +2778,26 @@ export class SqliteTaskStore implements TaskStore {
   getWorkMailbox(target: MailboxTarget): WorkMailbox | null {
     const cols = this.#mailboxCols(target);
     const row = this.#db.prepare(
-      "SELECT target_kind, task_id, role_name, next_sequence, processing, pending, input_delivery FROM mailboxes WHERE target_key = ?"
-    ).get(cols.targetKey) as { target_kind: string; task_id: string | null; role_name: string | null; next_sequence: number; processing: string | null; pending: string; input_delivery: string | null } | undefined;
+      "SELECT target_kind, task_id, role_name, next_sequence, processing, pending, recent_dedupe_keys FROM mailboxes WHERE target_key = ?"
+    ).get(cols.targetKey) as { target_kind: string; task_id: string | null; role_name: string | null; next_sequence: number; processing: string | null; pending: string; recent_dedupe_keys: string } | undefined;
     return row === undefined ? null : this.#rowToMailbox(row);
   }
 
   listWorkMailboxes(): WorkMailbox[] {
     const rows = this.#db.prepare(
-      "SELECT target_kind, task_id, role_name, next_sequence, processing, pending, input_delivery FROM mailboxes ORDER BY target_key"
-    ).all() as Array<{ target_kind: string; task_id: string | null; role_name: string | null; next_sequence: number; processing: string | null; pending: string; input_delivery: string | null }>;
+      "SELECT target_kind, task_id, role_name, next_sequence, processing, pending, recent_dedupe_keys FROM mailboxes ORDER BY target_key"
+    ).all() as Array<{ target_kind: string; task_id: string | null; role_name: string | null; next_sequence: number; processing: string | null; pending: string; recent_dedupe_keys: string }>;
     return rows.map((row) => this.#rowToMailbox(row));
   }
 
   listReadyWorkMailboxes(): WorkMailbox[] {
     const rows = this.#db.prepare(
-      `SELECT target_kind, task_id, role_name, next_sequence, processing, pending, input_delivery
+      `SELECT target_kind, task_id, role_name, next_sequence, processing, pending, recent_dedupe_keys
        FROM mailboxes
        WHERE processing IS NOT NULL
-          OR input_delivery IS NOT NULL
-          OR json_type(pending, '$.normal') <> 'null'
-          OR json_type(pending, '$.userCorrection') <> 'null'
+          OR json_type(pending) <> 'null'
        ORDER BY target_key`
-    ).all() as Array<{ target_kind: string; task_id: string | null; role_name: string | null; next_sequence: number; processing: string | null; pending: string; input_delivery: string | null }>;
+    ).all() as Array<{ target_kind: string; task_id: string | null; role_name: string | null; next_sequence: number; processing: string | null; pending: string; recent_dedupe_keys: string }>;
     return rows.map((row) => this.#rowToMailbox(row));
   }
 
@@ -2946,17 +2811,17 @@ export class SqliteTaskStore implements TaskStore {
     const cols = this.#mailboxCols(validated.target);
     this.#mutate(() => {
       this.#db.prepare(
-        `INSERT INTO mailboxes (target_kind, task_id, role_name, target_key, next_sequence, processing, pending, input_delivery)
+        `INSERT INTO mailboxes (target_kind, task_id, role_name, target_key, next_sequence, processing, pending, recent_dedupe_keys)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(target_key) DO UPDATE SET next_sequence = excluded.next_sequence,
            processing = excluded.processing, pending = excluded.pending,
-           input_delivery = excluded.input_delivery`
+           recent_dedupe_keys = excluded.recent_dedupe_keys`
       ).run(
         cols.targetKind, cols.taskId, cols.roleName, cols.targetKey,
         validated.nextSequence,
         validated.processing === null ? null : this.#json(validated.processing),
         this.#json(validated.pending),
-        validated.inputDelivery === null ? null : this.#json(validated.inputDelivery)
+        this.#json(validated.recentDedupeKeys)
       );
     });
   }
@@ -3033,7 +2898,7 @@ export class SqliteTaskStore implements TaskStore {
     const target: MailboxTarget = { kind: "role", taskId: value.taskId, roleName: "leader" };
     this.transaction((store) => {
       const existing = store.getWorkMailbox(target);
-      const existingPending = existing === null ? null : pendingLane(existing, "normal");
+      const existingPending = existing?.pending ?? null;
       if (existingPending !== null
         && value.requestCount <= existingPending.requestCount) {
         throw new StorageRecordError(`Pending wakeup is stale: ${value.taskId}`);
@@ -3045,26 +2910,20 @@ export class SqliteTaskStore implements TaskStore {
         target,
         nextSequence: Math.max(existing?.nextSequence ?? 1, toSequence + 1),
         processing: existing?.processing ?? null,
-        inputDelivery: existing?.inputDelivery ?? null,
         pending: {
-          normal: {
-            fromSequence,
-            toSequence,
-            reasons: [...value.reasons],
-            refs: existingPending?.refs ?? [],
-            requestCount: value.requestCount,
-            firstQueuedAt: value.firstRequestedAt,
-            lastQueuedAt: value.lastRequestedAt,
-            sources: existingPending?.sources ?? ["pending-wakeup-projection"],
-            dedupeKeys: existingPending?.dedupeKeys ?? [
-              `pending-wakeup:${value.taskId}:${fromSequence}-${toSequence}`
-            ],
-            deliveryModes: existingPending?.deliveryModes ?? ["followup"]
-          },
-          userCorrection: existing?.pending.userCorrection ?? null,
-          cursors: existing?.pending.cursors ?? { normal: 0, userCorrection: 0 },
-          recentDedupeKeys: existing?.pending.recentDedupeKeys ?? []
-        }
+          fromSequence,
+          toSequence,
+          reasons: [...value.reasons],
+          refs: existingPending?.refs ?? [],
+          requestCount: value.requestCount,
+          firstQueuedAt: value.firstRequestedAt,
+          lastQueuedAt: value.lastRequestedAt,
+          sources: existingPending?.sources ?? ["pending-wakeup-projection"],
+          dedupeKeys: existingPending?.dedupeKeys ?? [
+            `pending-wakeup:${value.taskId}:${fromSequence}-${toSequence}`
+          ]
+        },
+        recentDedupeKeys: existing?.recentDedupeKeys ?? []
       });
     });
   }
@@ -3072,14 +2931,14 @@ export class SqliteTaskStore implements TaskStore {
   clearPendingWakeup(taskId: string): void {
     const target = { kind: "role" as const, taskId, roleName: "leader" };
     const mailbox = this.getWorkMailbox(target);
-    if (mailbox === null || mailbox.pending.normal === null) return;
-    this.saveWorkMailbox(consumePendingBatch(mailbox, "normal"));
+    if (mailbox === null || mailbox.pending === null) return;
+    this.saveWorkMailbox(consumePendingBatch(mailbox));
   }
 
   // -- telemetry (§4.4) -----------------------------------------------------------
 
   /**
-   * Upsert one progress row. The PK is (task_id, role_name, run_id, generation,
+   * Upsert one progress row. The PK is (task_id, role_name, turn_id, generation,
    * progress_id): a repeated progress id updates in place, so a high-frequency
    * runtime telemetry observation is a single-row write that never
    * rewrites global state or another Task's rows.
@@ -3087,30 +2946,30 @@ export class SqliteTaskStore implements TaskStore {
   upsertTelemetryProgress(entry: TelemetryProgress): void {
     this.#mutate(() => {
       this.#db.prepare(
-        `INSERT INTO telemetry (task_id, role_name, run_id, generation, progress_id, sequence, payload, received_at)
+        `INSERT INTO telemetry (task_id, role_name, turn_id, generation, progress_id, sequence, payload, received_at)
          VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-         ON CONFLICT(task_id, role_name, run_id, generation, progress_id)
+         ON CONFLICT(task_id, role_name, turn_id, generation, progress_id)
          DO UPDATE SET sequence = excluded.sequence, payload = excluded.payload, received_at = excluded.received_at`
       ).run(
-        entry.taskId, entry.roleName, entry.runId, entry.generation, entry.progressId,
+        entry.taskId, entry.roleName, entry.turnId, entry.generation, entry.progressId,
         entry.sequence ?? null, this.#json(entry.payload), entry.receivedAt
       );
     });
   }
 
-  listTelemetry(taskId: string, runId?: string): TelemetryProgress[] {
-    const rows = runId === undefined
+  listTelemetry(taskId: string, turnId?: string): TelemetryProgress[] {
+    const rows = turnId === undefined
       ? this.#db.prepare(
-          "SELECT task_id, role_name, run_id, generation, progress_id, sequence, payload, received_at FROM telemetry WHERE task_id = ? ORDER BY received_at"
+          "SELECT task_id, role_name, turn_id, generation, progress_id, sequence, payload, received_at FROM telemetry WHERE task_id = ? ORDER BY received_at"
         ).all(taskId)
       : this.#db.prepare(
-          "SELECT task_id, role_name, run_id, generation, progress_id, sequence, payload, received_at FROM telemetry WHERE task_id = ? AND run_id = ? ORDER BY received_at"
-        ).all(taskId, runId);
-    return (rows as Array<{ task_id: string; role_name: string; run_id: string; generation: string; progress_id: string; sequence: number | null; payload: string; received_at: string }>)
+          "SELECT task_id, role_name, turn_id, generation, progress_id, sequence, payload, received_at FROM telemetry WHERE task_id = ? AND turn_id = ? ORDER BY received_at"
+        ).all(taskId, turnId);
+    return (rows as Array<{ task_id: string; role_name: string; turn_id: string; generation: string; progress_id: string; sequence: number | null; payload: string; received_at: string }>)
       .map((row) => ({
         taskId: row.task_id,
         roleName: row.role_name,
-        runId: row.run_id,
+        turnId: row.turn_id,
         generation: row.generation,
         progressId: row.progress_id,
         sequence: row.sequence ?? undefined,
@@ -3119,10 +2978,10 @@ export class SqliteTaskStore implements TaskStore {
       }));
   }
 
-  countTelemetry(taskId: string, runId?: string): number {
-    const row = runId === undefined
+  countTelemetry(taskId: string, turnId?: string): number {
+    const row = turnId === undefined
       ? this.#db.prepare("SELECT COUNT(*) AS n FROM telemetry WHERE task_id = ?").get(taskId)
-      : this.#db.prepare("SELECT COUNT(*) AS n FROM telemetry WHERE task_id = ? AND run_id = ?").get(taskId, runId);
+      : this.#db.prepare("SELECT COUNT(*) AS n FROM telemetry WHERE task_id = ? AND turn_id = ?").get(taskId, turnId);
     return (row as { n: number }).n;
   }
 
@@ -3132,40 +2991,40 @@ export class SqliteTaskStore implements TaskStore {
    * by task_id; it never rewrites global rows or other Tasks. Returns the number
    * of rows deleted. Terminal/semantic events go to `events` and are never pruned.
    */
-  pruneTelemetry(taskId: string, roleName: string, runId: string, generation: string, keep: number = TELEMETRY_KEEP_PER_GENERATION): number {
+  pruneTelemetry(taskId: string, roleName: string, turnId: string, generation: string, keep: number = TELEMETRY_KEEP_PER_GENERATION): number {
     return this.#mutate(() => {
       const result = this.#db.prepare(
         `DELETE FROM telemetry
-         WHERE task_id = ? AND role_name = ? AND run_id = ? AND generation = ?
-           AND (task_id, role_name, run_id, generation, progress_id) NOT IN (
-             SELECT task_id, role_name, run_id, generation, progress_id
+         WHERE task_id = ? AND role_name = ? AND turn_id = ? AND generation = ?
+           AND (task_id, role_name, turn_id, generation, progress_id) NOT IN (
+             SELECT task_id, role_name, turn_id, generation, progress_id
              FROM telemetry
-             WHERE task_id = ? AND role_name = ? AND run_id = ? AND generation = ?
+             WHERE task_id = ? AND role_name = ? AND turn_id = ? AND generation = ?
              ORDER BY COALESCE(sequence, -1) DESC, received_at DESC, progress_id ASC
              LIMIT ?
            )`
-      ).run(taskId, roleName, runId, generation, taskId, roleName, runId, generation, keep);
+      ).run(taskId, roleName, turnId, generation, taskId, roleName, turnId, generation, keep);
       return result.changes;
     });
   }
 
   /**
-   * Hard cap for an active run (§4.4): trim oldest rows across the run beyond
+   * Hard cap for an active Turn (§4.4): trim oldest rows across the Turn beyond
    * `cap` (default 50k). Returns the number of rows deleted.
    */
-  capTelemetryRun(taskId: string, runId: string, cap: number = TELEMETRY_RUN_CAP): number {
+  capTelemetryTurn(taskId: string, turnId: string, cap: number = TELEMETRY_TURN_CAP): number {
     return this.#mutate(() => {
       const result = this.#db.prepare(
         `DELETE FROM telemetry
-         WHERE task_id = ? AND run_id = ?
-           AND (task_id, role_name, run_id, generation, progress_id) NOT IN (
-             SELECT task_id, role_name, run_id, generation, progress_id
+         WHERE task_id = ? AND turn_id = ?
+           AND (task_id, role_name, turn_id, generation, progress_id) NOT IN (
+             SELECT task_id, role_name, turn_id, generation, progress_id
              FROM telemetry
-             WHERE task_id = ? AND run_id = ?
+             WHERE task_id = ? AND turn_id = ?
              ORDER BY COALESCE(sequence, -1) DESC, received_at DESC, progress_id ASC
              LIMIT ?
            )`
-      ).run(taskId, runId, taskId, runId, cap);
+      ).run(taskId, turnId, taskId, turnId, cap);
       return result.changes;
     });
   }
@@ -3197,78 +3056,44 @@ function validIntegrationQueueTransition(
 }
 
 
-// -- §6 replaceable-Store seam ----------------------------------------------
+// -- current Store composition ----------------------------------------------
 
-/** The selectable storage backends (design §6). */
-export type TaskStoreBackend = "file" | "sqlite";
+/** The product has one storage backend. */
+export type TaskStoreBackend = "sqlite";
 
 /** Options for {@link openTaskStore}. */
 export type TaskStoreOptions = SqliteTaskStoreOptions;
 
 /**
- * Open a {@link TaskStore} for the given backend. `file` returns the existing
- * {@link FileTaskStore}; `sqlite` returns the in-process {@link SqliteTaskStore}.
- * Backend selection is explicit (design §6); the environment switch lives in
- * {@link resolveTaskStoreBackend}. The file store is not removed — rollback is
- * a config flip.
+ * Open the current SQLite Task store. The backend remains explicit at
+ * composition seams but has only one legal value.
  */
 export function openTaskStore(
   home: string,
-  backend: TaskStoreBackend,
+  _backend: TaskStoreBackend,
   options?: TaskStoreOptions
 ): TaskStore {
-  if (backend === "sqlite") {
-    return new SqliteTaskStore(home, options);
-  }
-  return new FileTaskStore(home);
+  return new SqliteTaskStore(home, options);
 }
 
 /**
- * Resolve the storage backend from `YUI_STORE_BACKEND` (default `file`,
- * design §6). Only the exact value `sqlite` selects the SQLite store; any
- * other value (including unset) keeps the file store.
+ * Resolve the one current storage backend. Historical environment overrides
+ * are intentionally ignored.
  */
-export function resolveTaskStoreBackend(env: NodeJS.ProcessEnv = process.env): TaskStoreBackend {
-  return env.YUI_STORE_BACKEND?.toLowerCase() === "sqlite" ? "sqlite" : "file";
+export function resolveTaskStoreBackend(_env: NodeJS.ProcessEnv = process.env): TaskStoreBackend {
+  return "sqlite";
 }
 
-/**
- * Resolve the storage backend from the Home's verified manifest (Issue 01).
- *
- * The Home decides: a layout-7 Home's authoritative backend is SQLite WAL, so
- * ordinary CLI/Controller startup opens SQLite without requiring
- * `YUI_STORE_BACKEND=sqlite`. An explicit `YUI_STORE_BACKEND` env value still
- * wins — it is reserved for tests and explicit recovery commands — and any
- * other value (including unset) defers to the Home. A Home whose manifest
- * cannot be read falls back to the file store; the classifier/doctor surfaces
- * the manifest problem separately.
- */
+/** The product storage backend is one current SQLite contract. */
 export function resolveTaskStoreBackendForHome(
-  home: string,
-  env: NodeJS.ProcessEnv = process.env
+  _home: string,
+  _env: NodeJS.ProcessEnv = process.env
 ): TaskStoreBackend {
-  const explicit = env.YUI_STORE_BACKEND?.toLowerCase();
-  if (explicit === "sqlite" || explicit === "file") return explicit;
-  const schema = inspectStorageSchema(home);
-  const layout = schema.status === "current" || schema.status === "unsupported"
-    ? schema.currentLayoutVersion
-    : 0;
-  if (layout < 7) return "file";
-  // Issue 01: a layout-7 Home's authoritative backend is SQLite WAL, but only
-  // when yui.db actually exists. A pseudo-layout-7 Home (manifest 7, no
-  // yui.db) is classified NEEDS_STORAGE_REPAIR; until repair runs, the file
-  // store remains the readable fallback. This keeps the Controller's backend
-  // resolution consistent with openCompatibleFileTaskStore's physical check.
-  // Uses the literal "yui.db" (not COMMITTED_DATABASE_FILENAME) to avoid a
-  // circular import: sqliteStateMigration.ts imports SqliteTaskStore from here.
-  return existsSync(join(home, "yui.db")) ? "sqlite" : "file";
+  return "sqlite";
 }
 
 /**
- * Convenience: open the store for the backend resolved from the environment
- * and the Home's verified manifest (see {@link resolveTaskStoreBackendForHome}).
- * CLI/controller entry points call this instead of {@link openTaskStore}
- * directly so a layout-7 Home opens SQLite without an env opt-in.
+ * Convenience for seams which cannot receive an already-open current store.
  */
 export function openConfiguredTaskStore(
   home: string,

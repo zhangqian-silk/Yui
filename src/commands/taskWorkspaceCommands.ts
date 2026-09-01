@@ -1,10 +1,6 @@
 import { usageError } from "../errors/cliError.js";
 import { createMilestone } from "../milestone/milestone.js";
-import { defaultTableWidth, renderTable } from "../output/table.js";
-import type {
-  FileTaskWorkspacePreparer,
-  LegacyTaskRef
-} from "../repository/taskWorkspacePreparer.js";
+import type { FileTaskWorkspacePreparer } from "../repository/taskWorkspacePreparer.js";
 import type { TaskStore } from "../storage/taskStore.js";
 import type { Task } from "../task/task.js";
 import { runTaskCommand } from "./taskCommands.js";
@@ -15,10 +11,9 @@ export type TaskWorkspaceCommandResult = Readonly<{
 }>;
 
 /**
- * Task workspace lifecycle commands that sit outside the sync task command
- * surface because they drive Git: controlled rebuild of a legacy Task
- * workspace, legacy ref history inspection/archival, and the
- * replacement-creating path for terminal Tasks.
+ * Task workspace lifecycle command that sits outside the sync task command
+ * surface because replacement preserves the terminal Task and creates a new
+ * current-contract Task.
  */
 export async function runTaskWorkspaceCommand(
   args: readonly string[],
@@ -27,89 +22,9 @@ export async function runTaskWorkspaceCommand(
   options: { now?: () => Date } = {}
 ): Promise<TaskWorkspaceCommandResult> {
   const [command, ...rest] = args;
-  if (command === "rebuild") return rebuildTaskCommand(rest, preparer);
-  if (command === "history") return historyCommand(rest, preparer);
+  void preparer;
   if (command === "replace") return replaceTaskCommand(rest, store, options);
-  throw usageError(
-    "Unknown task workspace command. Available: yui task rebuild <task>, "
-      + "yui task history list|archive [task], yui task replace <task>."
-  );
-}
-
-async function rebuildTaskCommand(
-  args: readonly string[],
-  preparer: FileTaskWorkspacePreparer
-): Promise<TaskWorkspaceCommandResult> {
-  const usage = "Task rebuild usage: yui task rebuild <task> [--latest].";
-  const taskId = args[0];
-  const options = new Set(args.slice(1));
-  if (taskId === undefined
-    || options.size !== args.length - 1
-    || [...options].some((option) => option !== "--latest")) {
-    throw usageError(usage);
-  }
-  const result = await preparer.rebuildTaskWorkspace(taskId, {
-    latestRemote: options.has("--latest")
-  });
-  const archived = result.archived.length === 0
-    ? "no legacy refs"
-    : `${result.archived.length} legacy ref(s) archived`;
-  const resumed = result.resumed ? " (resumed pending cleanup)" : "";
-  return {
-    output: `Rebuilt Task workspace ${result.task.id} at ${result.task.cwd ?? "its configured workspace"}: `
-      + `${archived}${resumed}.`,
-    data: {
-      taskId: result.task.id,
-      archived: result.archived,
-      resumed: result.resumed,
-      latestRemote: options.has("--latest")
-    }
-  };
-}
-
-async function historyCommand(
-  args: readonly string[],
-  preparer: FileTaskWorkspacePreparer
-): Promise<TaskWorkspaceCommandResult> {
-  const usage = "Task history usage: yui task history list|archive [task].";
-  const action = args[0];
-  if (action !== "list" && action !== "archive") throw usageError(usage);
-  const taskId = args[1];
-  if (args.length > 2) throw usageError(usage);
-  if (action === "list") {
-    const refs = await preparer.listLegacyTaskRefs(taskId);
-    if (refs.length === 0) {
-      return { output: "No legacy Task refs.", data: { refs: [] } };
-    }
-    return {
-      output: renderTable(
-        "Legacy Task refs",
-        [
-          { header: "Project", minWidth: 8, maxWidth: 24 },
-          { header: "Task", minWidth: 8, maxWidth: 16 },
-          { header: "Legacy ref", minWidth: 16, maxWidth: 64 }
-        ],
-        refs.map((entry: LegacyTaskRef) => [entry.projectId, entry.taskId, entry.ref]),
-        defaultTableWidth()
-      ),
-      data: { refs }
-    };
-  }
-  const result = await preparer.archiveLegacyTaskRefs(taskId);
-  const lines: string[] = [];
-  if (result.archived.length > 0) {
-    lines.push(`Archived ${result.archived.length} legacy ref(s):`);
-    lines.push(...result.archived.map((entry) => `  ${entry}`));
-  }
-  if (result.refused.length > 0) {
-    lines.push(`Refused ${result.refused.length} live ref(s) owned by an open Task:`);
-    lines.push(...result.refused.map((entry) => `  ${entry}`));
-  }
-  if (lines.length === 0) lines.push("No legacy Task refs to archive.");
-  return {
-    output: lines.join("\n"),
-    data: { archived: result.archived, refused: result.refused }
-  };
+  throw usageError("Unknown task workspace command. Available: yui task replace <task>.");
 }
 
 /**
@@ -130,11 +45,11 @@ function replaceTaskCommand(
   if (old === null) throw usageError(`Task not found: ${oldId}.`);
   if (old.status === "draft") {
     throw usageError(
-      `Draft Task ${old.id} owns no workspace to replace or rebuild; activate it or retire it and create a new Draft.`
+      `Draft Task ${old.id} owns no completed history to replace; activate it or retire it and create a new Draft.`
     );
   }
   if (old.status === "active") {
-    throw usageError(`Active Task can be rebuilt instead of replaced: ${old.id}.`);
+    throw usageError(`Active Task cannot be replaced: ${old.id}.`);
   }
   let title = `Replaces ${old.id}: ${old.title}`;
   for (let index = 1; index < args.length; index += 1) {

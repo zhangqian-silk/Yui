@@ -46,7 +46,7 @@ export type ContextSnapshotResource = Readonly<{
 
 export type ContextSnapshot = ContextSnapshotRef & Readonly<{
   refs: readonly ContextRef[];
-  /** Immutable authorized values; mutable stores are never re-read for a frozen Run. */
+  /** Immutable authorized values; mutable stores are never re-read for a frozen Turn. */
   resources: readonly ContextSnapshotResource[];
   repoCommit?: string;
   acceptRefs: readonly string[];

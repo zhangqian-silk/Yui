@@ -1,7 +1,7 @@
 import {
-  DEFAULT_RUN_CAP,
+  DEFAULT_TURN_CAP,
   DEFAULT_TERMINAL_KEEP,
-  MAX_RUN_CAP
+  MAX_TURN_CAP
 } from "../telemetry/telemetryConfig.js";
 import {
   DEFAULT_RUNTIME_HEALTH_POLICY,
@@ -122,14 +122,14 @@ export function resolveTelemetryTerminalKeep(value?: unknown): number {
   return value;
 }
 
-export function resolveTelemetryRunCap(value?: unknown): number {
-  if (value === undefined || value === null) return DEFAULT_RUN_CAP;
+export function resolveTelemetryTurnCap(value?: unknown): number {
+  if (value === undefined || value === null) return DEFAULT_TURN_CAP;
   if (typeof value !== "number" || !Number.isSafeInteger(value) || value < 1) {
-    throw new TypeError("telemetryRunCap must be a positive integer.");
+    throw new TypeError("telemetryTurnCap must be a positive integer.");
   }
-  if (value > MAX_RUN_CAP) {
+  if (value > MAX_TURN_CAP) {
     throw new TypeError(
-      `telemetryRunCap must not exceed ${MAX_RUN_CAP.toLocaleString("en-US")} (retention cannot be disabled).`
+      `telemetryTurnCap must not exceed ${MAX_TURN_CAP.toLocaleString("en-US")} (retention cannot be disabled).`
     );
   }
   return value;

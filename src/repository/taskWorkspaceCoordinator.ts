@@ -64,10 +64,10 @@ export class TaskWorkspaceCoordinator {
     const item = this.store.getWorkItem(taskId, workItemId);
     if (item === null) throw new Error(`Work item not found: ${taskId}/${workItemId}.`);
     const assignee = this.#workItemIsolationAssignee(item);
-    const activeDevelopRun = this.store.listAgentRuns(item.taskId)
+    const activeDevelopTurn = this.store.listTurns(item.taskId)
       .find((run) => run.status === "active" && run.workItemId === item.id);
-    if (activeDevelopRun !== undefined) {
-      throw new Error(`Work Item already has an active Develop Run: ${activeDevelopRun.id}.`);
+    if (activeDevelopTurn !== undefined) {
+      throw new Error(`Work Item already has an active Develop Turn: ${activeDevelopTurn.id}.`);
     }
     const task = this.store.getTask(item.taskId)!;
     const taskProjectIds = task.projectBindings.map(({ projectId }) => projectId);
@@ -115,8 +115,8 @@ export class TaskWorkspaceCoordinator {
       );
     }
     if (item.workspaceDisposition === disposition) return "missing";
-    // Hold the per-Project maintenance fence so a concurrent migrate/rebuild/
-    // archive cannot interleave with worktree removal.
+    // Hold the per-Project maintenance fence so concurrent Project maintenance
+    // or Task archive cannot interleave with worktree removal.
     const workspace = this.store.getWorkItemWorkspace(item.taskId, item.id);
     const projectIds = workspace === null
       ? []
@@ -176,8 +176,8 @@ export class TaskWorkspaceCoordinator {
       throw new Error(`ReviewRound must be terminal before cleanup: ${round.id}.`);
     }
     if (round.workspaceDisposition?.kind === "reassigned") return "missing";
-    // Hold the per-Project maintenance fence so a concurrent migrate/rebuild/
-    // archive cannot interleave with worktree removal.
+    // Hold the per-Project maintenance fence so concurrent Project maintenance
+    // or Task archive cannot interleave with worktree removal.
     const workspace = this.store.getReviewRoundWorkspace(taskId, reviewRoundId);
     const projectIds = workspace === null
       ? []
@@ -218,7 +218,7 @@ export class TaskWorkspaceCoordinator {
           .localeCompare(managedWorkspaceKey(right.owner)));
       // Archive cleanup removes worktrees from every Project the Task uses:
       // hold each Project's maintenance fence so the Controller defers
-      // preparation and no migrate/rebuild/archive interleaves.
+      // preparation and no Project maintenance or Task archive interleaves.
       const projectIds = new Set(task.projectBindings.map(({ projectId }) => projectId));
       for (const workspace of managedWorkspaces) {
         for (const entry of workspace.entries) projectIds.add(entry.projectId);
@@ -311,13 +311,13 @@ export class TaskWorkspaceCoordinator {
         };
       }
       const activeRole = this.store.listRoles(taskId)
-        .find((role) => this.store.getActiveAgentRun(taskId, role.name) !== null);
+        .find((role) => this.store.getActiveTurn(taskId, role.name) !== null);
       if (activeRole !== undefined) {
         throw new WorkspaceCleanupBlockedError(
-          "active-run",
+          "active-turn",
           `role:${task.id}/${activeRole.name}`,
           true,
-          `Task Role still has an active Run: ${task.id}/${activeRole.name}.`
+          `Task Role still has an active Turn: ${task.id}/${activeRole.name}.`
         );
       }
       const roleNames = this.store.listRoles(taskId).map(({ name }) => name);
@@ -408,14 +408,14 @@ export class TaskWorkspaceCoordinator {
   }
 
   #assertWorkItemRuntimeQuiescent(item: WorkItem): void {
-    const activeRun = this.store.listAgentRuns(item.taskId)
+    const activeTurn = this.store.listTurns(item.taskId)
       .find((run) => run.status === "active" && run.workItemId === item.id);
-    if (activeRun !== undefined) {
+    if (activeTurn !== undefined) {
       throw new WorkspaceCleanupBlockedError(
-        "active-run",
+        "active-turn",
         `work-item:${item.taskId}/${item.id}`,
         true,
-        `Work item still has an active Run: ${item.taskId}/${item.id}.`
+        `Work item still has an active Turn: ${item.taskId}/${item.id}.`
       );
     }
   }
@@ -467,14 +467,10 @@ export class TaskWorkspaceCoordinator {
 
   async #stopLiveRoles(taskId: string, roleNames: readonly string[]): Promise<void> {
     const targets = [...new Set(roleNames)];
-    const getActiveRun = this.store.getActiveAgentRun?.bind(this.store);
+    const getActiveTurn = this.store.getActiveTurn?.bind(this.store);
     for (const roleName of targets) {
-      if (getActiveRun !== undefined && getActiveRun(taskId, roleName) !== null) {
-        throw new Error(`Role has an active Run: ${taskId}/${roleName}.`);
-      }
-      const sessions = this.store.getTaskRoleSessionSet(taskId, roleName);
-      if (sessions?.inFlight !== null && sessions?.inFlight !== undefined) {
-        throw new Error(`Role has unsettled Run state: ${taskId}/${roleName}.`);
+      if (getActiveTurn !== undefined && getActiveTurn(taskId, roleName) !== null) {
+        throw new Error(`Role has an active Turn: ${taskId}/${roleName}.`);
       }
       if (this.store.getWorkMailbox !== undefined && hasRuntimeLifecycleWork(
         this.store.getWorkMailbox(
@@ -502,7 +498,7 @@ export class TaskWorkspaceCoordinator {
     // The aggregate-16 dormant Claude placeholder is the sole exception to
     // strict workspace-session retirement. The synchronous pane inspection is
     // performed while holding the Task store transaction so a normal launch
-    // cannot reserve a Run/Session between absence proof and terminalization.
+    // cannot reserve a Turn/Session between absence proof and terminalization.
     if (inspect === undefined || this.store.transaction === undefined) return;
     this.store.transaction((tx) => {
       const panes = inspect(taskId);
@@ -510,8 +506,8 @@ export class TaskWorkspaceCoordinator {
         if (panes.some((pane) => pane.roleName === roleName && !pane.dead)) {
           throw new Error(`Task Role native pane must stop before workspace migration: ${roleName}.`);
         }
-        if (tx.getActiveAgentRun(taskId, roleName) !== null) {
-          throw new Error(`Role has an active Run: ${taskId}/${roleName}.`);
+        if (tx.getActiveTurn(taskId, roleName) !== null) {
+          throw new Error(`Role has an active Turn: ${taskId}/${roleName}.`);
         }
         if (tx.getWorkMailbox !== undefined && hasRuntimeLifecycleWork(
           tx.getWorkMailbox(
@@ -544,8 +540,8 @@ export class TaskWorkspaceCoordinator {
     if (isTerminalWorkItem(item)) {
       throw new Error(`Work item is already terminal: ${item.id}.`);
     }
-    if (item.assignee !== undefined && this.store.getActiveAgentRun(task.id, item.assignee) !== null) {
-      throw new Error(`Role has an active Run: ${task.id}/${item.assignee}.`);
+    if (item.assignee !== undefined && this.store.getActiveTurn(task.id, item.assignee) !== null) {
+      throw new Error(`Role has an active Turn: ${task.id}/${item.assignee}.`);
     }
     if (item.assignee !== undefined && this.store.getRole(task.id, item.assignee) === null) {
       throw new Error(`Role not found: ${task.id}/${item.assignee}.`);
