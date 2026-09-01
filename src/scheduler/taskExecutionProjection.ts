@@ -7,7 +7,7 @@ import type { Task, TaskStatus } from "../task/task.js";
 import type { TaskBrief } from "../brief/taskBrief.js";
 import type { PendingWakeup } from "./pendingWakeup.js";
 import type { LeaderFailure } from "./leaderFailure.js";
-import { currentWorkItemExecutionGroup, type WorkItem } from "../workItem/workItem.js";
+import type { WorkItem } from "../workItem/workItem.js";
 import type { ReviewRound } from "../review/reviewRound.js";
 import type { IntegrationAttempt } from "../integration/integrationAttempt.js";
 import type { ChangeSet } from "../integration/changeSet.js";
@@ -304,12 +304,8 @@ export function projectTaskExecution(
   } = facts;
   const now = facts.now ?? new Date();
   const groupSummaries = executionGroups.map((group) => {
-    const stageGroups = workItems.find((item) => (
-      item.executionGroups.some(({ id }) => id === group.id)
-    ))?.executionGroups;
     return summarizeExecutionGroupHealth({
       group,
-      ...(stageGroups === undefined ? {} : { stageGroups }),
       turns,
       sessions: roleSessions,
       events,
@@ -317,10 +313,7 @@ export function projectTaskExecution(
       policy: facts.runtimeHealthPolicy
     });
   });
-  const observabilityGroups = uniqueExecutionGroups([
-    ...executionGroups,
-    ...workItems.flatMap((item) => item.executionGroups)
-  ]);
+  const observabilityGroups = uniqueExecutionGroups(executionGroups);
   const sessionTokens = roleSessions.map((session) => {
     const identity = resolveSessionTokenIdentity({ taskId: task.id, ...session });
     return Object.freeze({
@@ -753,10 +746,6 @@ function collectExecutionGroups(
     ...[...latestWorkItemRounds.values()].map(({ id }) => id)
   ]);
   const groups = [
-    ...workItems.filter(({ status }) => status !== "retired").flatMap((item) => {
-      const group = currentWorkItemExecutionGroup(item);
-      return group === undefined ? [] : [group];
-    }),
     ...reviewRounds.flatMap((round) => (
       !operationalReviewRoundIds.has(round.id) || round.executionGroup === undefined
         ? []

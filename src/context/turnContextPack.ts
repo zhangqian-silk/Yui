@@ -146,16 +146,15 @@ export function freezeTurnContextSnapshot(
 
 /**
  * Freeze the shared, role-neutral ContextSnapshot anchored by one WorkItem
- * exploration stage Group. Turn snapshots remain role-specific; this
- * record is the durable stage baseline and derives from a fresh WorkItem
- * snapshot so the Group never depends on ambient latest state.
+ * ExecutionAssignment. Turn snapshots remain role-specific; this record is
+ * the durable Assignment baseline and derives from a fresh WorkItem snapshot
+ * so the Group never depends on ambient latest state.
  */
-export function freezeExecutionStageContextSnapshot(
+export function freezeWorkItemExecutionAssignmentContextSnapshot(
   store: TaskStore,
   input: Readonly<{
     taskId: string;
     workItemId: string;
-    executionGroupId: string;
   }>,
   now: Date
 ): ContextSnapshot {
@@ -170,7 +169,7 @@ export function freezeExecutionStageContextSnapshot(
   for (const dependencyId of workItem.dependsOn) {
     const dependency = store.getWorkItem(task.id, dependencyId);
     if (dependency === null || dependency.status !== "completed") {
-      throw new Error(`Exploration stage dependency is not accepted: ${dependencyId}.`);
+      throw new Error(`ExecutionAssignment dependency is not accepted: ${dependencyId}.`);
     }
     materialized.push(materialize("L3", "accepted-work-item", dependency.id, dependency));
   }
@@ -215,21 +214,7 @@ export function freezeExecutionStageContextSnapshot(
     frozenBy: "controller"
   });
   store.saveContextSnapshot(workItemSnapshot);
-  const stageSnapshot = createContextSnapshot({
-    id: store.nextContextSnapshotId(task.id),
-    taskId: task.id,
-    scope: "stage",
-    scopeRef: input.executionGroupId,
-    sequence: workItemSnapshot.sequence + 1,
-    refs: resources.map(({ ref }) => ref),
-    resources,
-    acceptRefs: [`work-item:${workItem.id}:acceptance`],
-    parentRef: contextSnapshotRef(workItemSnapshot),
-    frozenAt: now,
-    frozenBy: "controller"
-  });
-  store.saveContextSnapshot(stageSnapshot);
-  return stageSnapshot;
+  return workItemSnapshot;
 }
 
 /**

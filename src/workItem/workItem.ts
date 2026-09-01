@@ -2,15 +2,9 @@ import {
   normalizedUniqueIdentities,
   normalizedUniqueText,
   requireIdentity,
-  requirePositiveInteger,
   requireText,
   requireTimestamp
 } from "../domain/validation.js";
-import {
-  contextContentDigest,
-  validateContextSnapshotRef,
-  type ContextSnapshotRef
-} from "../context/contextSnapshot.js";
 import { validateReviewConfig, type ReviewConfig } from "../review/reviewConfig.js";
 import {
   taskFinalReviewConfig,
@@ -23,19 +17,11 @@ import {
 } from "../worktree/managedWorkspace.js";
 import { validateTaskRecordReference } from "../task/taskRecordReference.js";
 import {
-  assertExecutionGroupTransition,
-  validateExecutionGroup,
-  WORK_ITEM_EXPLORATION_STAGES,
-  type CandidateConvergencePolicy,
-  type ExecutionGroup,
-  type ExecutionParentResultRef,
-  type ExecutionStageBudget,
-  type ExecutionStageContext,
-  type ExecutionStageResourcePolicy,
-  type ExecutionStrategy,
-  type WorkItemExplorationMode,
-  type WorkItemExplorationStage
-} from "../execution/executionGroup.js";
+  assertWorkItemExecutionGroupTransition,
+  validateWorkItemExecutionGroup as validateExecutionGroupRecord,
+  workItemExecutionGroupSettled,
+  type WorkItemExecutionGroup
+} from "../execution/workItemExecution.js";
 
 export type WorkItemStatus =
   | "pending"
@@ -122,8 +108,8 @@ export type WorkItemCandidate = Readonly<{
 }>;
 
 export type WorkItem = {
-  /** v13 names Provider execution lineage consistently as Turn. */
-  schemaVersion: 13;
+  /** v14 replaces configurable WorkItem panels with fixed replicated Groups. */
+  schemaVersion: 14;
   id: string;
   taskId: string;
   title: string;
@@ -132,7 +118,7 @@ export type WorkItem = {
   dependsOn: readonly string[];
   writeProjectIds: readonly string[];
   /** Immutable execution history for this WorkItem. */
-  executionGroups: readonly ExecutionGroup[];
+  executionGroups: readonly WorkItemExecutionGroup[];
   /** Current iteration Group; historical Groups remain addressable by id. */
   currentExecutionGroupId?: string;
   /** Explicit Git refs for the initial writable WorkItem worktree. */
@@ -166,14 +152,14 @@ export function createWorkItem(
     assignee?: string;
     writeProjectIds?: readonly string[];
     baseRefs?: readonly WorkItemProjectBaseRef[];
-    executionGroups?: readonly ExecutionGroup[];
+    executionGroups?: readonly WorkItemExecutionGroup[];
     currentExecutionGroupId?: string;
   }>,
   now: Date
 ): WorkItem {
   const timestamp = now.toISOString();
   return validateWorkItem({
-    schemaVersion: 13,
+    schemaVersion: 14,
     id: requireIdentity(id, "Work Item id"),
     taskId: requireIdentity(taskId, "Task id"),
     title: requireText(input.title, "Work item title"),
@@ -320,7 +306,7 @@ export function updateWorkItemStatus(
 /** Attach the common execution Group without changing the WorkItem identity. */
 export function attachWorkItemExecutionGroup(
   workItem: WorkItem,
-  executionGroup: ExecutionGroup,
+  executionGroup: WorkItemExecutionGroup,
   now: Date
 ): WorkItem {
   validateWorkItem(workItem);
@@ -337,8 +323,8 @@ export function attachWorkItemExecutionGroup(
     throw new Error(`Work Item historical ExecutionGroup is immutable: ${workItem.id}/${checked.id}.`);
   }
   const current = currentWorkItemExecutionGroup(workItem);
-  if (current !== undefined && current.resolution === undefined) {
-    throw new Error(`Work Item already has an unresolved ExecutionGroup: ${workItem.id}/${current.id}.`);
+  if (current !== undefined && !workItemExecutionGroupSettled(current)) {
+    throw new Error(`Work Item already has an open ExecutionGroup: ${workItem.id}/${current.id}.`);
   }
   return validateWorkItem({
     ...workItem,
@@ -352,7 +338,7 @@ export function attachWorkItemExecutionGroup(
 /** Advance a Group's lane state while keeping its frozen target immutable. */
 export function updateWorkItemExecutionGroup(
   workItem: WorkItem,
-  executionGroup: ExecutionGroup,
+  executionGroup: WorkItemExecutionGroup,
   now: Date
 ): WorkItem {
   validateWorkItem(workItem);
@@ -364,11 +350,11 @@ export function updateWorkItemExecutionGroup(
   if (workItem.currentExecutionGroupId !== checked.id) {
     throw new Error(`Work Item historical ExecutionGroup is immutable: ${workItem.id}/${checked.id}.`);
   }
-  if (JSON.stringify(existing.target) !== JSON.stringify(checked.target)) {
-    throw new Error(`Work Item ExecutionGroup target is immutable: ${workItem.id}/${checked.id}.`);
+  if (JSON.stringify(existing.assignment) !== JSON.stringify(checked.assignment)) {
+    throw new Error(`Work Item ExecutionGroup Assignment is immutable: ${workItem.id}/${checked.id}.`);
   }
   if (JSON.stringify(existing) === JSON.stringify(checked)) return workItem;
-  assertExecutionGroupTransition(existing, checked);
+  assertWorkItemExecutionGroupTransition(existing, checked);
   return validateWorkItem({
     ...workItem,
     executionGroups: workItem.executionGroups.map((group) =>
@@ -429,10 +415,10 @@ export function retryFailedWorkItem(workItem: WorkItem, now: Date): WorkItem {
     throw new Error(`Work item workspace is already settled: ${workItem.id}.`);
   }
   const { outcome: _outcome, endedAt: _endedAt, ...base } = workItem;
-  // Keep every historical Group. A resolved current Group is cleared only as
-  // the current pointer; dispatch appends a fresh immutable Group.
+  // Keep every historical Group. A settled current Group is cleared only as
+  // the current pointer; redispatch appends a fresh immutable Group.
   const current = currentWorkItemExecutionGroup(workItem);
-  const retryBase = current?.resolution === undefined
+  const retryBase = current === undefined || !workItemExecutionGroupSettled(current)
     ? base
     : (({ currentExecutionGroupId: _currentExecutionGroupId, ...history }) => history)(base);
   return validateWorkItem({
@@ -469,7 +455,7 @@ export function recordWorkItemWorkspaceDisposition(
 }
 
 export function validateWorkItem(workItem: WorkItem): WorkItem {
-  if (workItem.schemaVersion !== 13) throw new Error("WorkItem must use schemaVersion 13.");
+  if (workItem.schemaVersion !== 14) throw new Error("WorkItem must use schemaVersion 14.");
   validateTaskRecordReference({ taskId: workItem.taskId, localId: workItem.id }, "workItem");
   requireIdentity(workItem.taskId, "Task id");
   requireText(workItem.title, "Work item title");
@@ -504,7 +490,6 @@ export function validateWorkItem(workItem: WorkItem): WorkItem {
     }
     groupIds.add(group.id);
   }
-  validateWorkItemExplorationHistory(workItem.executionGroups);
   if (workItem.currentExecutionGroupId !== undefined) {
     requireIdentity(workItem.currentExecutionGroupId, "ExecutionGroup id");
     if (!groupIds.has(workItem.currentExecutionGroupId)) {
@@ -530,16 +515,6 @@ export function validateWorkItem(workItem: WorkItem): WorkItem {
     candidateIds.add(candidate.id);
     if (candidate.workItemRevision > workItem.revision) {
       throw new Error("Work Item candidate revision cannot exceed the Work Item revision.");
-    }
-    if (candidate.executionGroupId !== undefined) {
-      const group = workItem.executionGroups.find(({ id }) => id === candidate.executionGroupId);
-      if (group?.stage !== undefined) {
-        if (group.stage.stage !== "resolve"
-          || group.resolution?.decision !== "accept"
-          || !group.resolution.selectedLaneIds.includes(candidate.executionLaneId!)) {
-          throw new Error("An exploration Candidate must come from the accepted Resolve stage.");
-        }
-      }
     }
   });
   const currentCandidate = currentWorkItemCandidate(workItem);
@@ -582,167 +557,10 @@ export function validateWorkItem(workItem: WorkItem): WorkItem {
   return workItem;
 }
 
-export type PlanWorkItemExplorationStageInput = Readonly<{
-  /** Required only when the first exploration Group is planned. */
-  mode?: WorkItemExplorationMode;
-  /** Required only when the first exploration Group is planned. */
-  maxRounds?: number;
-  /** Required for a new stage; retries inherit the frozen stage budget. */
-  maxAttempts?: number;
-  /** Required for a new T6 stage; valid migrated pre-T6 retries may omit it. */
-  resourceBudget?: Pick<
-    ExecutionStageBudget,
-    "maxTokens" | "maxToolCalls" | "maxWallClockSeconds"
-  >;
-  /** Required for a new T6 stage; retries inherit the exact frozen policy. */
-  resources?: ExecutionStageResourcePolicy;
-  strategy: ExecutionStrategy;
-  contextSnapshotRef: ContextSnapshotRef;
-  /** Set only on the first stage; every successor inherits the frozen policy. */
-  convergence?: CandidateConvergencePolicy;
-}>;
-
-/**
- * Project the next legal exploration stage from immutable WorkItem Group
- * history. Retry repeats the current stage; retry at Resolve begins the next
- * round. Reject has no continuation, while blocked follows the same bounded
- * retry path after the Leader settles any required InputRequest.
- */
-export function planWorkItemExplorationStage(
-  workItem: WorkItem,
-  input: PlanWorkItemExplorationStageInput
-): ExecutionStageContext {
-  validateWorkItem(workItem);
-  const snapshot = validateContextSnapshotRef(input.contextSnapshotRef);
-  const capacity = executionStrategyCapacity(input.strategy);
-  const current = currentWorkItemExecutionGroup(workItem);
-  if (workItem.executionGroups.length === 0) {
-    if (workItem.status !== "pending" && workItem.status !== "running") {
-      throw new Error(`Work Item cannot begin exploration from ${workItem.status}: ${workItem.id}.`);
-    }
-    if (input.mode === undefined) {
-      throw new Error("The first exploration stage requires a mode.");
-    }
-    if (input.convergence === undefined) {
-      throw new Error("The first exploration stage requires a candidate convergence policy.");
-    }
-    const resourceBudget = requireNewStageResourceBudget(input.resourceBudget);
-    const resources = requireNewStageResources(input.resources);
-    return {
-      schemaVersion: 1,
-      mode: input.mode,
-      stage: "plan",
-      round: 1,
-      stageAttempt: 1,
-      maxRounds: requirePositiveInteger(input.maxRounds ?? 1, "Exploration max rounds"),
-      budget: {
-        maxLanes: capacity,
-        maxAttempts: requirePositiveInteger(
-          input.maxAttempts ?? 1,
-          "Exploration stage max attempts"
-        ),
-        ...resourceBudget
-      },
-      resources,
-      contextSnapshotRef: snapshot,
-      parentResults: [],
-      ...(input.convergence === undefined ? {} : { convergence: input.convergence })
-    };
-  }
-  if (current === undefined || current.stage === undefined) {
-    throw new Error("A Work Item cannot mix single and exploration ExecutionGroups.");
-  }
-  if (current.resolution === undefined) {
-    throw new Error(`Execution stage is still active: ${current.id}.`);
-  }
-  if (input.mode !== undefined && input.mode !== current.stage.mode) {
-    throw new Error("Work Item exploration mode is immutable.");
-  }
-  if (input.maxRounds !== undefined && input.maxRounds !== current.stage.maxRounds) {
-    throw new Error("Work Item exploration maxRounds is immutable.");
-  }
-  const parentResults = selectedParentResults(current);
-  const base = {
-    schemaVersion: 1 as const,
-    mode: current.stage.mode,
-    maxRounds: current.stage.maxRounds,
-    contextSnapshotRef: snapshot,
-    parentResults,
-    ...(current.stage.convergence === undefined
-      ? {}
-      : { convergence: current.stage.convergence })
-  };
-  if (current.resolution.decision === "reject") {
-    throw new Error(`Rejected exploration has no continuation: ${current.id}.`);
-  }
-  if (current.resolution.decision === "accept") {
-    if (current.stage.stage === "resolve") {
-      throw new Error(`Accepted Resolve stage already completed exploration: ${current.id}.`);
-    }
-    const resourceBudget = requireNewStageResourceBudget(input.resourceBudget);
-    const resources = requireNewStageResources(input.resources);
-    return {
-      ...base,
-      stage: nextExplorationStage(current.stage.stage),
-      round: current.stage.round,
-      stageAttempt: 1,
-      budget: {
-        maxLanes: capacity,
-        maxAttempts: requirePositiveInteger(
-          input.maxAttempts ?? 1,
-          "Exploration stage max attempts"
-        ),
-        ...resourceBudget
-      },
-      resources
-    };
-  }
-  if (current.stage.stage === "resolve" && current.resolution.decision === "retry") {
-    if (current.stage.round >= current.stage.maxRounds) {
-      throw new Error(`Work Item exploration round budget is exhausted: ${workItem.id}.`);
-    }
-    const resourceBudget = requireNewStageResourceBudget(input.resourceBudget);
-    const resources = requireNewStageResources(input.resources);
-    return {
-      ...base,
-      stage: "plan",
-      round: current.stage.round + 1,
-      stageAttempt: 1,
-      budget: {
-        maxLanes: capacity,
-        maxAttempts: requirePositiveInteger(
-          input.maxAttempts ?? 1,
-          "Exploration stage max attempts"
-        ),
-        ...resourceBudget
-      },
-      resources
-    };
-  }
-  if (current.stage.stageAttempt >= current.stage.budget.maxAttempts) {
-    throw new Error(`Work Item exploration stage attempt budget is exhausted: ${workItem.id}.`);
-  }
-  if (capacity !== current.stage.budget.maxLanes) {
-    throw new Error("A retried exploration stage must keep its frozen Lane budget.");
-  }
-  if (input.maxAttempts !== undefined
-    && input.maxAttempts !== current.stage.budget.maxAttempts) {
-    throw new Error("A retried exploration stage must keep its frozen attempt budget.");
-  }
-  return {
-    ...base,
-    stage: current.stage.stage,
-    round: current.stage.round,
-    stageAttempt: current.stage.stageAttempt + 1,
-    budget: current.stage.budget,
-    ...(current.stage.resources === undefined ? {} : { resources: current.stage.resources })
-  };
-}
-
 /** Resolve the WorkItem's current execution iteration. */
 export function currentWorkItemExecutionGroup(
   workItem: WorkItem
-): ExecutionGroup | undefined {
+): WorkItemExecutionGroup | undefined {
   return workItem.currentExecutionGroupId === undefined
     ? undefined
     : workItemExecutionGroupById(workItem, workItem.currentExecutionGroupId);
@@ -752,7 +570,7 @@ export function currentWorkItemExecutionGroup(
 export function workItemExecutionGroupById(
   workItem: WorkItem,
   executionGroupId: string
-): ExecutionGroup | undefined {
+): WorkItemExecutionGroup | undefined {
   return workItem.executionGroups.find(({ id }) => id === executionGroupId);
 }
 
@@ -771,145 +589,24 @@ export function workItemOwnsUnresolvedExecutionLane(
     || workItem.currentExecutionGroupId !== executionGroupId) return false;
   const group = workItem.executionGroups.find(({ id }) => id === executionGroupId);
   return group !== undefined
-    && group.resolution === undefined
-    && group.lanes.some(({ id, status }) => (
-      id === executionLaneId && status === "failed"
+    && !workItemExecutionGroupSettled(group)
+    && group.lanes.some(({ id, disposition, currentTurnId }) => (
+      id === executionLaneId && disposition === "open" && currentTurnId !== undefined
     ));
 }
 
-function validateWorkItemExplorationHistory(groups: readonly ExecutionGroup[]): void {
-  const staged = groups.filter(({ stage }) => stage !== undefined);
-  if (staged.length === 0) return;
-  if (staged.length !== groups.length) {
-    throw new Error("A Work Item cannot mix single and exploration ExecutionGroups.");
-  }
-  const first = groups[0]!.stage!;
-  if (first.stage !== "plan"
-    || first.round !== 1
-    || first.stageAttempt !== 1
-    || first.parentResults.length !== 0) {
-    throw new Error("Work Item exploration must begin at Plan round 1 attempt 1.");
-  }
-  for (let index = 1; index < groups.length; index += 1) {
-    const previous = groups[index - 1]!;
-    const current = groups[index]!;
-    const before = previous.stage!;
-    const after = current.stage!;
-    if (previous.resolution === undefined) {
-      throw new Error(`Exploration stage must resolve before its successor: ${previous.id}.`);
-    }
-    if (previous.resolution.decision === "reject") {
-      throw new Error(`Rejected exploration cannot have a successor: ${previous.id}.`);
-    }
-    if (after.mode !== before.mode
-      || after.maxRounds !== before.maxRounds
-      || JSON.stringify(after.convergence) !== JSON.stringify(before.convergence)) {
-      throw new Error("Work Item exploration mode, maxRounds and convergence policy are immutable.");
-    }
-    const parents = selectedParentResults(previous);
-    if (JSON.stringify(after.parentResults) !== JSON.stringify(parents)) {
-      throw new Error(`Exploration parentResults do not match ${previous.id}.`);
-    }
-    if (previous.resolution.decision === "accept") {
-      if (before.stage === "resolve"
-        || after.stage !== nextExplorationStage(before.stage)
-        || after.round !== before.round
-        || after.stageAttempt !== 1) {
-        throw new Error(`Exploration stage transition is invalid: ${previous.id}/${current.id}.`);
-      }
-      continue;
-    }
-    if (before.stage === "resolve" && previous.resolution.decision === "retry") {
-      if (before.round >= before.maxRounds
-        || after.stage !== "plan"
-        || after.round !== before.round + 1
-        || after.stageAttempt !== 1) {
-        throw new Error(`Exploration round transition is invalid: ${previous.id}/${current.id}.`);
-      }
-      continue;
-    }
-    if (after.stage !== before.stage
-      || after.round !== before.round
-      || after.stageAttempt !== before.stageAttempt + 1
-      || after.stageAttempt > before.budget.maxAttempts
-      || JSON.stringify(after.budget) !== JSON.stringify(before.budget)
-      || JSON.stringify(after.resources) !== JSON.stringify(before.resources)) {
-      throw new Error(`Exploration retry transition is invalid: ${previous.id}/${current.id}.`);
-    }
-  }
-}
-
-function requireNewStageResourceBudget(
-  value: PlanWorkItemExplorationStageInput["resourceBudget"]
-): Required<NonNullable<PlanWorkItemExplorationStageInput["resourceBudget"]>> {
-  if (value?.maxTokens === undefined
-    || value.maxToolCalls === undefined
-    || value.maxWallClockSeconds === undefined) {
-    throw new Error("A new exploration stage requires token, tool-call and wall-clock budgets.");
-  }
-  return {
-    maxTokens: requirePositiveInteger(value.maxTokens, "Exploration stage max tokens"),
-    maxToolCalls: requirePositiveInteger(value.maxToolCalls, "Exploration stage max tool calls"),
-    maxWallClockSeconds: requirePositiveInteger(
-      value.maxWallClockSeconds,
-      "Exploration stage max wall-clock seconds"
-    )
-  };
-}
-
-function requireNewStageResources(
-  value: PlanWorkItemExplorationStageInput["resources"]
-): ExecutionStageResourcePolicy {
-  if (value === undefined) {
-    throw new Error("A new exploration stage requires resource completion policy.");
-  }
-  return value;
-}
-
-function selectedParentResults(group: ExecutionGroup): readonly ExecutionParentResultRef[] {
-  if (group.resolution === undefined) {
-    throw new Error(`ExecutionGroup is unresolved: ${group.id}.`);
-  }
-  return group.resolution.selectedLaneIds.map((laneId) => {
-    const lane = group.lanes.find(({ id }) => id === laneId);
-    if (lane?.result === undefined) {
-      throw new Error(`Selected ExecutionLane result is missing: ${group.id}/${laneId}.`);
-    }
-    return {
-      executionGroupId: group.id,
-      executionLaneId: lane.id,
-      resultDigest: contextContentDigest(lane.result)
-    };
-  });
-}
-
-function nextExplorationStage(stage: WorkItemExplorationStage): WorkItemExplorationStage {
-  const index = WORK_ITEM_EXPLORATION_STAGES.indexOf(stage);
-  const next = WORK_ITEM_EXPLORATION_STAGES[index + 1];
-  if (next === undefined) throw new Error("Resolve is the final exploration stage.");
-  return next;
-}
-
-function executionStrategyCapacity(strategy: ExecutionStrategy): number {
-  return requirePositiveInteger(
-    strategy.mode === "fixed" ? strategy.count : strategy.max,
-    "Execution strategy capacity"
-  );
-}
-
 function validateWorkItemExecutionGroup(
-  group: ExecutionGroup,
+  group: WorkItemExecutionGroup,
   taskId: string,
   workItemId: string
-): ExecutionGroup {
-  validateExecutionGroup(group);
-  if (group.taskId !== taskId || group.purpose !== "execution") {
+): WorkItemExecutionGroup {
+  validateExecutionGroupRecord(group);
+  if (group.taskId !== taskId) {
     throw new Error(`Work Item ExecutionGroup provenance is invalid: ${workItemId}.`);
   }
-  if (group.target.kind !== "work-item"
-    || group.target.workItemId !== workItemId
-    || group.target.taskId !== taskId) {
-    throw new Error(`Work Item ExecutionGroup target is invalid: ${workItemId}.`);
+  if (group.assignment.workItemId !== workItemId
+    || group.assignment.taskId !== taskId) {
+    throw new Error(`Work Item ExecutionGroup Assignment is invalid: ${workItemId}.`);
   }
   return group;
 }

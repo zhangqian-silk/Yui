@@ -22,6 +22,7 @@ import {
   resolveExecutionGroup,
   type ExecutionLaneGitSnapshot
 } from "../execution/executionGroup.js";
+import { updateWorkItemExecutionLane } from "../execution/workItemExecution.js";
 import {
   isRuntimeLaunchReservation,
   runtimeLifecycleTarget
@@ -503,35 +504,15 @@ export function terminalizeExactTaskTurn(
       ? undefined
       : workItemExecutionGroupById(item, turn.executionGroupId);
     if (item !== null && group !== undefined) {
-      let grouped = recordExecutionLaneResult(
-        group,
-        turn.executionLaneId,
-      {
-        summary: input.outcome.summary,
-        ...(input.reviewResult?.report === undefined ? {} : { report: input.reviewResult.report }),
-        ...(input.reviewResult?.checks === undefined ? {} : { checks: input.reviewResult.checks }),
-        ...(input.reviewResult?.findings === undefined ? {} : { findings: input.reviewResult.findings }),
-        ...(input.reviewResult?.evidence === undefined ? {} : { evidence: input.reviewResult.evidence }),
-        ...(input.reviewResult?.evidenceCommit === undefined ? {} : { evidenceCommit: input.reviewResult.evidenceCommit }),
-        ...(input.reviewResult?.gitSnapshot === undefined ? {} : { gitSnapshot: input.reviewResult.gitSnapshot })
-      },
-        input.outcome.status,
-        now
-      );
-      if (input.settleFailedExecutionGroup === true
-        && input.outcome.status === "failed"
-        && grouped.resolution === undefined
-        && grouped.lanes.every((lane) => (
-          lane.status === "completed"
-          || lane.status === "failed"
-          || lane.status === "skipped"
-        ))) {
-        grouped = resolveExecutionGroup(grouped, {
-          decision: "blocked",
-          summary: input.outcome.summary
+      if (input.outcome.status === "completed" || input.settleFailedExecutionGroup === true) {
+        const grouped = updateWorkItemExecutionLane(group, turn.executionLaneId, {
+          currentTurnId: turn.id,
+          ...(input.outcome.status === "completed"
+            ? { successfulTurnId: turn.id, disposition: "succeeded" as const }
+            : { disposition: "failed" as const })
         }, now);
+        store.saveWorkItem(input.taskId, updateWorkItemExecutionGroup(item, grouped, now));
       }
-      store.saveWorkItem(input.taskId, updateWorkItemExecutionGroup(item, grouped, now));
     }
   }
   store.saveTurn(terminal);

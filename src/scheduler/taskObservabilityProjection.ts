@@ -1,6 +1,7 @@
 import type { ContextSnapshot } from "../context/contextSnapshot.js";
 import type { TaskEvent } from "../event/taskEvent.js";
-import type { ExecutionGroup, ExecutionLaneStatus } from "../execution/executionGroup.js";
+import type { ExecutionGroup } from "../execution/executionGroup.js";
+import type { WorkItemExecutionGroup } from "../execution/workItemExecution.js";
 import { isDeepStrictEqual } from "node:util";
 import {
   observedExecutionResourceUsage,
@@ -151,31 +152,23 @@ export function buildTaskObservabilityProjection(
     });
     const stages = groups.map((group) => {
       const summary = summariesById.get(group.id);
+      const settled = group.lanes.every(({ disposition }) => disposition !== "open");
       return Object.freeze({
         groupId: group.id,
-        ...(group.stage === undefined ? {} : {
-          mode: group.stage.mode,
-          stage: group.stage.stage,
-          round: group.stage.round,
-          stageAttempt: group.stage.stageAttempt
-        }),
+        mode: "replicated",
         laneCount: group.lanes.length,
-        activeLaneCount: group.lanes.filter(({ status }) => status === "pending" || status === "running").length,
-        terminalLaneCount: group.lanes.filter(({ status }) => isTerminalLane(status)).length,
-        ...(group.resolution === undefined ? {} : { resolution: group.resolution.decision }),
+        activeLaneCount: group.lanes.filter(({ disposition }) => disposition === "open").length,
+        terminalLaneCount: group.lanes.filter(({ disposition }) => disposition !== "open").length,
+        ...(!settled ? {} : {
+          resolution: group.lanes.some(({ disposition }) => disposition === "failed")
+            ? "failed"
+            : "succeeded"
+        }),
         ...(summary?.resources === undefined ? {} : { resources: summary.resources })
       });
     });
-    const itemCost = projectCost(groups, input.turns, input.events, now);
+    const itemCost = projectWorkItemCost(groups, input.turns, now);
     const itemContext = projectContext(groups, input.turns, input.contextSnapshots);
-    const evidence = groups.flatMap((group) => group.lanes.flatMap((lane) => (
-      lane.result?.evidence ?? []
-    )));
-    const openFindingCount = groups.reduce((count, group) => count + group.lanes.reduce(
-      (laneCount, lane) => laneCount + (lane.result?.findings ?? [])
-        .filter(({ status }) => status === "open").length,
-      0
-    ), 0);
     return Object.freeze({
       workItemId: item.id,
       title: item.title,
@@ -186,8 +179,8 @@ export function buildTaskObservabilityProjection(
       stages,
       cost: itemCost,
       context: itemContext,
-      evidenceCount: evidence.length,
-      openFindingCount
+      evidenceCount: 0,
+      openFindingCount: 0
     });
   });
   const cost = projectCost(input.executionGroups, input.turns, input.events, now);
@@ -347,8 +340,41 @@ function projectCost(
   });
 }
 
+function projectWorkItemCost(
+  groups: readonly WorkItemExecutionGroup[],
+  turns: readonly Turn[],
+  now: Date
+): TaskCostProjection {
+  const groupIds = new Set(groups.map(({ id }) => id));
+  const attempts = turns.filter(({ executionGroupId }) => (
+    executionGroupId !== undefined && groupIds.has(executionGroupId)
+  ));
+  const wallClockSeconds = groups.reduce((total, group) => {
+    const started = Date.parse(group.createdAt);
+    const ended = group.lanes.some(({ disposition }) => disposition === "open")
+      ? now.getTime()
+      : Date.parse(group.updatedAt);
+    return total + (Number.isFinite(started) && Number.isFinite(ended)
+      ? Math.max(0, Math.floor((ended - started) / 1_000))
+      : 0);
+  }, 0);
+  const laneCount = groups.reduce((total, group) => total + group.lanes.length, 0);
+  return Object.freeze({
+    tokens: 0,
+    toolCalls: 0,
+    wallClockSeconds,
+    tokensObservable: false,
+    toolCallsObservable: false,
+    laneCount,
+    groupCount: groups.length,
+    retryCount: Math.max(0, attempts.length - laneCount),
+    marginalValuePercent: null,
+    marginalValueStatus: "unavailable"
+  });
+}
+
 function projectContext(
-  groups: readonly ExecutionGroup[],
+  groups: readonly (ExecutionGroup | WorkItemExecutionGroup)[],
   turns: readonly Turn[],
   snapshots?: readonly ContextSnapshot[]
 ): TaskContextProjection {
@@ -359,7 +385,9 @@ function projectContext(
     digest: string;
   }>();
   for (const group of groups) {
-    const ref = group.stage?.contextSnapshotRef;
+    const ref = "assignment" in group
+      ? group.assignment.contextSnapshotRef
+      : group.stage?.contextSnapshotRef;
     if (ref !== undefined) refs.set(ref.id, ref);
   }
   for (const turn of turns) {
@@ -442,8 +470,4 @@ function stageDurationSeconds(groups: readonly ExecutionGroup[], now: Date): num
     ? now.getTime()
     : Math.max(...ended);
   return Math.max(0, Math.floor((end - Math.min(...started)) / 1_000));
-}
-
-function isTerminalLane(status: ExecutionLaneStatus): boolean {
-  return status === "completed" || status === "failed" || status === "skipped";
 }

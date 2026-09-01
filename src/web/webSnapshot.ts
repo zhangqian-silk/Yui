@@ -8,7 +8,7 @@ import {
   buildTaskExecutionProjection,
   type TaskExecutionProjection
 } from "../scheduler/taskExecutionProjection.js";
-import { summarizeExecutionGroup } from "../execution/executionGroup.js";
+import { summarizeWorkItemExecutionGroup } from "../execution/workItemExecution.js";
 import { currentWorkItemExecutionGroup } from "../workItem/workItem.js";
 import {
   classifyRuntimeHealth,
@@ -219,7 +219,7 @@ export function buildWebTaskDetail(
         return {
           ...item,
           observability: workItemObservability.get(item.id),
-          ...(group === undefined ? {} : { currentExecution: summarizeExecutionGroup(group) })
+          ...(group === undefined ? {} : { currentExecution: summarizeWorkItemExecutionGroup(group) })
         };
       }),
       turns,

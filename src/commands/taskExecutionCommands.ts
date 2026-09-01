@@ -1,5 +1,6 @@
 import { createTaskEvent } from "../event/taskEvent.js";
 import { recordExecutionLaneResult } from "../execution/executionGroup.js";
+import { updateWorkItemExecutionLane } from "../execution/workItemExecution.js";
 import { usageError } from "../errors/cliError.js";
 import { requestDurableJobCancel } from "../job/durableJob.js";
 import { finishReviewRound, updateReviewExecutionGroup } from "../review/reviewRound.js";
@@ -271,10 +272,13 @@ function failExecutionAttempts(
       const lane = group?.lanes.find(({ id }) => id === turn.executionLaneId);
       if (item !== undefined && group !== undefined && lane !== undefined
         && item.currentExecutionGroupId === group.id
-        && !["completed", "failed", "skipped"].includes(lane.status)) {
+        && lane.disposition === "open") {
         const updated = updateWorkItemExecutionGroup(
           item,
-          recordExecutionLaneResult(group, lane.id, { summary }, "failed", now),
+          updateWorkItemExecutionLane(group, lane.id, {
+            currentTurnId: turn.id,
+            disposition: "failed"
+          }, now),
           now
         );
         workItems.set(item.id, updated);

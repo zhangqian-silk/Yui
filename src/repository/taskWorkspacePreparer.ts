@@ -125,16 +125,6 @@ export type PreparedExecutionLane = Readonly<{
   persisted: boolean;
 }>;
 
-export type ExecutionGroupCandidateMaterialization = Readonly<{
-  workspace?: ManagedWorkspace;
-  snapshot?: CandidateGitSnapshot;
-  restoreTargets: readonly Readonly<{
-    path: string;
-    head: string;
-    mergedHead: string;
-  }>[];
-}>;
-
 export class WorkspaceCleanupBlockedError extends Error {
   constructor(
     readonly reason: string,
@@ -1199,175 +1189,6 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
     }
   }
 
-  /** Merge every selected lane's committed output into the WorkItem owner. */
-  async materializeExecutionGroupCandidate(
-    taskId: string,
-    workItemId: string,
-    executionGroupId: string,
-    selectedLaneIds: readonly string[]
-  ): Promise<ExecutionGroupCandidateMaterialization> {
-    const item = requireWorkItem(this.store, taskId, workItemId);
-    const task = requireTask(this.store, taskId);
-    const group = workItemExecutionGroupById(item, executionGroupId);
-    if (group === undefined || group.id !== executionGroupId) {
-      throw new Error(`ExecutionGroup is not attached to Work Item: ${executionGroupId}.`);
-    }
-    const workspace = this.store.getWorkItemWorkspace(taskId, workItemId);
-    const selected = (selectedLaneIds.length === 0
-      ? group.lanes.filter((lane) => lane.status === "completed")
-      : group.lanes.filter((lane) => selectedLaneIds.includes(lane.id)));
-    if (selected.some((lane) => lane.status !== "completed")) {
-      throw new Error(`ExecutionGroup has a selected Lane without terminal output: ${executionGroupId}.`);
-    }
-    if (selected.length === 0) throw new Error(`ExecutionGroup has no selected Lane outputs: ${executionGroupId}.`);
-    // A Gitless Task has no WorkItem workspace to materialize.  Its selected
-    // Lane reports still form a valid non-Git Candidate; no fake workspace or
-    // commit snapshot is introduced.
-    if (workspace === null) {
-      if (task.projectBindings.length === 0
-        && selected.every((lane) => lane.result?.gitSnapshot === undefined)) {
-        return { restoreTargets: [] };
-      }
-      throw new Error(`Work Item workspace is not ready for Candidate materialization: ${workItemId}.`);
-    }
-    if (workspace.owner.type !== "work-item") {
-      throw new Error(`Work Item workspace owner is invalid for Candidate materialization: ${workItemId}.`);
-    }
-    const pendingMerges = new Map<string, string[]>();
-    const restoreTargets: Array<{ path: string; head: string; mergedHead?: string }> = [];
-    const writableProjectIds = workspace.entries
-      .filter(({ access }) => access === "write")
-      .map(({ projectId }) => projectId);
-    if (writableProjectIds.length === 0) {
-      for (const lane of selected) {
-        if (lane.result?.gitSnapshot !== undefined) {
-          throw new Error(`Read-only Lane must not carry a Git snapshot: ${lane.id}.`);
-        }
-      }
-      return {
-        workspace,
-        // A read-only WorkItem has no Lane Git output, but its frozen
-        // WorkItem workspace is still the legitimate Candidate review
-        // context. Keep that Candidate snapshot separate from Lane output.
-        snapshot: await this.snapshotCandidateWorkspace(workspace),
-        restoreTargets: []
-      };
-    }
-    for (const lane of selected) {
-      const laneSnapshot = lane.result?.gitSnapshot;
-      if (laneSnapshot === undefined) {
-        throw new Error(`Selected Lane has no frozen Git snapshot: ${lane.id}.`);
-      }
-      const snapshotProjectIds = laneSnapshot.projects.map(({ projectId }) => projectId).sort();
-      if (!isDeepStrictEqual(snapshotProjectIds, [...writableProjectIds].sort())) {
-        throw new Error(`Selected Lane Git snapshot Project scope changed: ${lane.id}.`);
-      }
-      const laneWorkspace = this.store.getManagedWorkspace({
-        type: "execution-lane",
-        taskId,
-        executionGroupId,
-        executionLaneId: lane.id,
-        purpose: "execution",
-        workItemId
-      });
-      if (laneWorkspace === null) {
-        // fixed(1) retains the WorkItem owner as its single normal-path workspace.
-        if (group.lanes.length === 1) {
-          for (const target of workspace.entries.filter(({ access }) => access === "write")) {
-            const frozen = laneSnapshot.projects.find(({ projectId }) => projectId === target.projectId);
-            if (frozen === undefined) throw new Error(`Selected Lane snapshot omits Project: ${lane.id}/${target.projectId}.`);
-            if (await this.git.headRef(target.path) !== frozen.branch || !await this.git.isClean(target.path)) {
-              throw new Error(`Single-Lane workspace is not clean on its managed branch: ${lane.id}/${target.projectId}.`);
-            }
-            const targetHead = (await this.git.inspect(target.path, "HEAD")).baseCommit;
-            if (targetHead !== frozen.headCommit) {
-              throw new Error(`Single-Lane workspace changed before resolution: ${lane.id}/${target.projectId}.`);
-            }
-          }
-          continue;
-        }
-        throw new Error(`Selected Execution Lane workspace is not adopted: ${lane.id}.`);
-      }
-      for (const target of workspace.entries.filter(({ access }) => access === "write")) {
-        const source = laneWorkspace.entries.find(({ projectId }) => projectId === target.projectId);
-        if (source === undefined) throw new Error(`Selected Lane omits Project: ${lane.id}/${target.projectId}.`);
-        const frozen = laneSnapshot.projects.find(({ projectId }) => projectId === target.projectId);
-        if (frozen === undefined) throw new Error(`Selected Lane snapshot omits Project: ${lane.id}/${target.projectId}.`);
-        if (await this.git.headRef(source.path) !== frozen.branch || frozen.branch !== source.branch) {
-          throw new Error(`Selected Lane left its managed branch: ${lane.id}/${target.projectId}.`);
-        }
-        if (!await this.git.isClean(source.path)) {
-          throw new Error(`Selected Lane has uncommitted output: ${lane.id}/${target.projectId}.`);
-        }
-        const sourceHead = (await this.git.inspect(source.path, "HEAD")).baseCommit;
-        if (sourceHead !== frozen.headCommit) {
-          throw new Error(`Selected Lane advanced before resolution: ${lane.id}/${target.projectId}.`);
-        }
-        const targetHead = (await this.git.inspect(target.path, "HEAD")).baseCommit;
-        if (sourceHead !== targetHead && !await this.git.isAncestor(target.path, sourceHead, targetHead)) {
-          const pending = pendingMerges.get(target.path) ?? [];
-          pending.push(frozen.headCommit);
-          pendingMerges.set(target.path, pending);
-          if (!restoreTargets.some(({ path }) => path === target.path)) {
-            restoreTargets.push({ path: target.path, head: targetHead });
-          }
-        }
-      }
-    }
-    try {
-      for (const [targetPath, sourceRefs] of pendingMerges) {
-        await this.git.mergeWorktree({ targetPath, sourceRefs });
-        const target = restoreTargets.find(({ path }) => path === targetPath);
-        if (target !== undefined) {
-          target.mergedHead = (await this.git.inspect(targetPath, "HEAD")).baseCommit;
-        }
-      }
-      return {
-        workspace,
-        snapshot: await this.snapshotCandidateWorkspace(workspace),
-        restoreTargets: restoreTargets
-          .filter((target): target is { path: string; head: string; mergedHead: string } => (
-            target.mergedHead !== undefined && target.mergedHead !== target.head
-          ))
-      };
-    } catch (error) {
-      for (const target of [...restoreTargets].reverse()) {
-        if (target.mergedHead === undefined) continue;
-        try {
-          await this.git.resetWorktree({
-            targetPath: target.path,
-            expectedHead: target.mergedHead,
-            restoreHead: target.head
-          });
-        } catch (restoreError) {
-          throw new Error(
-            `Candidate materialization failed and Git compensation could not restore ${target.path}.`,
-            { cause: restoreError }
-          );
-        }
-      }
-      throw error;
-    }
-  }
-
-  async restoreExecutionGroupCandidateMaterialization(
-    materialization: ExecutionGroupCandidateMaterialization
-  ): Promise<void> {
-    for (const target of [...materialization.restoreTargets].reverse()) {
-      const current = (await this.git.inspect(target.path, "HEAD")).baseCommit;
-      if (current === target.head) continue;
-      if (current !== target.mergedHead) {
-        throw new Error(
-          `Candidate materialization compensation found unexpected Git head: ${target.path}.`
-        );
-      }
-      await this.git.resetWorktree({
-        targetPath: target.path,
-        expectedHead: target.mergedHead,
-        restoreHead: target.head
-      });
-    }
-  }
 
   async cleanupExecutionLaneWorkspace(
     taskId: string,
@@ -1383,8 +1204,13 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
       ? (item === null ? undefined : workItemExecutionGroupById(item, executionGroupId))
       : this.store.getReviewRound(taskId, lineage.reviewRoundId)?.executionGroup;
     const lane = group?.lanes.find(({ id }) => id === executionLaneId);
+    const terminal = lane === undefined
+      ? false
+      : "disposition" in lane
+        ? lane.disposition !== "open"
+        : ["completed", "failed", "skipped"].includes(lane.status);
     if (group === undefined
-      || lane === undefined || !["completed", "failed", "skipped"].includes(lane.status)) {
+      || lane === undefined || !terminal) {
       throw new Error(`Execution Lane is not terminally resolved: ${taskId}/${executionLaneId}.`);
     }
     const workspace = this.store.listManagedWorkspaces(taskId).find(({ owner }) => (

@@ -7,7 +7,7 @@ import {
   buildTurnContextDelta,
   contextSnapshotDeltaRefIds,
   expandTurnContextRef,
-  freezeExecutionStageContextSnapshot,
+  freezeWorkItemExecutionAssignmentContextSnapshot,
   freezeReviewStageContextSnapshot,
   freezeTurnContextSnapshot
 } from "../context/turnContextPack.js";
@@ -188,7 +188,6 @@ import {
   currentWorkItemExecutionGroup,
   workItemExecutionGroupById,
   createWorkItem,
-  planWorkItemExplorationStage,
   attachWorkItemExecutionGroup,
   updateWorkItemExecutionGroup,
   retireWorkItem,
@@ -207,38 +206,29 @@ import {
   addExecutionLane,
   createExecutionGroup,
   recordExecutionLaneResult,
-  queueExecutionLaneRetry,
   resolveExecutionGroup,
-  restartExecutionLane,
-  skipPendingExecutionLanes,
   updateExecutionLane,
-  WORK_ITEM_EXECUTION_MODES,
   type ExecutionGroup,
   type ExecutionStrategy,
   type ExecutionLaneWorkspace,
-  type ExecutionTarget,
-  type WorkItemExecutionMode
+  type ExecutionTarget
 } from "../execution/executionGroup.js";
 import {
-  DEFAULT_EXECUTION_STAGE_TOKEN_BUDGET_PER_LANE,
-  executionStageSpendClosed,
-  observedExecutionResourceUsage,
+  createWorkItemExecutionAssignment,
+  createWorkItemExecutionGroup,
+  updateWorkItemExecutionLane,
+  workItemExecutionGroupSettled,
+  type WorkItemExecutionLaneWorkspace
+} from "../execution/workItemExecution.js";
+import {
   planResourceAdmissions,
-  projectExecutionStageResources,
   resolveResourceBrokerPolicy,
-  routeExecutionStage,
   type ResourceLaneIdentity
 } from "../execution/resourceBroker.js";
 import {
   resolveControllerTaskConcurrency,
   resolveRuntimeHealth
 } from "../config/yuiConfig.js";
-import {
-  assertIndependentVerificationRoles,
-  candidateConvergenceEvidenceSufficient,
-  candidateConvergenceDirective,
-  validateCandidateConvergenceResolution
-} from "../execution/candidateConvergence.js";
 import {
   type ManagedWorkspace
 } from "../worktree/managedWorkspace.js";
@@ -458,8 +448,6 @@ export type TaskCommandOptions = Readonly<{
   completionPublishedTreeProof?: TaskCompletionPublishedTreeProof;
   workItemIntegrationProof?: WorkItemIntegrationProof;
   candidateGitSnapshot?: CandidateGitSnapshot;
-  /** Managed Candidate workspace; null is an explicit Gitless/no-workspace preflight. */
-  candidateWorkspace?: ManagedWorkspace | null;
   /** CLI-verified clean Task-main snapshot for exact direct capture or safe delivery promotion. */
   directTaskMainSnapshot?: DirectTaskMainSnapshot;
   /** Prepared by the repository/workspace lifecycle before command mutation. */
@@ -661,99 +649,31 @@ export function runTaskCommand(
   }
 }
 
-/**
- * The single Lane-role plan shared by CLI preflight and dispatch mutation.
- * For a new Group the WorkItem assignee is the implicit first Lane unless it
- * was already supplied. During adaptive expansion the explicit roles are the
- * new Lanes; the existing assignee is not re-added.
- */
-export function normalizedExecutionLaneRoles(
+/** Pure preflight shared by workspace preparation and the dispatch mutation. */
+export function planReplicatedWorkItemLanes(
   assignee: string,
   requestedRoles: readonly string[],
-  expanding = false
-): readonly string[] {
-  if (expanding) return [...requestedRoles];
-  if (requestedRoles.length === 0) return [assignee];
-  return requestedRoles[0] === assignee
-    ? [...requestedRoles]
-    : [assignee, ...requestedRoles];
-}
-
-export type NormalizedExecutionLanePlan = Readonly<{
-  expanding: boolean;
-  resumingQueued: boolean;
+  nextGroupId: string
+): Readonly<{
   roles: readonly string[];
-  strategy: ExecutionStrategy;
-  capacity: number;
-  requestedCount: number;
   laneIds: readonly string[];
-}>;
-
-/** A bounded same-stage retry repeats the frozen topology and Lane owners. */
-export function resolvedExecutionStageRetryGroup(
-  group: ExecutionGroup | undefined
-): ExecutionGroup | undefined {
-  if (group?.stage === undefined || group.resolution === undefined) return undefined;
-  if (group.resolution.decision !== "retry"
-    && group.resolution.decision !== "blocked") return undefined;
-  return group.stage.stage === "resolve" && group.resolution.decision === "retry"
-    ? undefined
-    : group;
-}
-
-/** Derive the complete Worker Lane plan once for both preflight and mutation. */
-export function normalizedExecutionLanePlan(input: Readonly<{
-  assignee: string;
-  requestedRoles: readonly string[];
-  requestedStrategy?: ExecutionStrategy;
-  existingGroup?: Pick<ExecutionGroup, "id" | "lanes" | "strategy">;
-  resolvedRetryGroup?: Pick<ExecutionGroup, "lanes" | "strategy">;
-  status: WorkItemStatus;
-  nextGroupId: string;
-  retryLaneId?: string;
-  phase?: "dispatch" | "retry";
-}>): NormalizedExecutionLanePlan {
-  const retry = input.phase === "retry" || input.retryLaneId !== undefined;
-  const queued = !retry && input.status === "running" && input.existingGroup !== undefined
-    && input.requestedRoles.length === 0
-    ? input.existingGroup.lanes.filter(({ status, effective }) => (
-        status === "pending" && effective !== undefined
-      ))
-    : [];
-  const resumingQueued = queued.length > 0;
-  const expanding = !retry
-    && !resumingQueued
-    && input.status === "running"
-    && input.existingGroup !== undefined;
-  const roles = retry
-    ? []
-    : resumingQueued
-      ? queued.map(({ roleName }) => roleName)
-    : input.resolvedRetryGroup !== undefined && input.requestedRoles.length === 0
-      ? input.resolvedRetryGroup.lanes.map(({ roleName }) => roleName)
-    : normalizedExecutionLaneRoles(input.assignee, input.requestedRoles, expanding);
-  const strategy = input.existingGroup?.strategy
-    ?? input.requestedStrategy
-    ?? input.resolvedRetryGroup?.strategy
-    ?? { mode: "fixed", count: roles.length };
-  const capacity = strategy.mode === "fixed" ? strategy.count : strategy.max;
-  const requestedCount = retry
-    ? input.existingGroup?.lanes.length ?? 0
-    : resumingQueued
-      ? input.existingGroup!.lanes.length
-    : expanding
-      ? input.existingGroup!.lanes.length + roles.length
-      : roles.length;
-  const laneIds = input.retryLaneId !== undefined
-    ? [input.retryLaneId]
-    : retry
-      ? []
-      : resumingQueued
-        ? queued.map(({ id }) => id)
-      : input.existingGroup === undefined
-      ? roles.map((_, index) => `${input.nextGroupId}-lane-${index + 1}`)
-      : roles.map((_, index) => `${input.existingGroup!.id}-lane-${input.existingGroup!.lanes.length + index + 1}`);
-  return { expanding, resumingQueued, roles, strategy, capacity, requestedCount, laneIds };
+}> {
+  const roles = [...requestedRoles];
+  if (roles.length === 1) {
+    throw usageError(
+      "Exactly one --lane-role is invalid; omit --lane-role for direct execution or provide at least two distinct roles."
+    );
+  }
+  if (new Set(roles).size !== roles.length) {
+    throw usageError("Each replicated Lane must use a distinct Task Role.");
+  }
+  if (roles.includes(assignee)) {
+    throw usageError("A replicated Lane Role cannot be the WorkItem assignee.");
+  }
+  return {
+    roles,
+    laneIds: roles.map((_, index) => `${nextGroupId}-lane-${index + 1}`)
+  };
 }
 
 function activeResourceLaneIdentities(store: TaskWorkflowStore): ResourceLaneIdentity[] {
@@ -2472,7 +2392,6 @@ function taskWorkCommand(
   if (command === "update") return updateWork(rest, store, options);
   if (command === "scope") return output(updateWorkScope(rest, store, options));
   if (command === "dispatch") return output(dispatchWork(rest, store, options));
-  if (command === "group") return resolveWorkExecutionGroup(rest, store, options);
   if (command === "review") {
     return rest[0] === "retry"
       ? retryFailedTaskReviewRound(rest.slice(1), store, options)
@@ -2750,777 +2669,200 @@ function dispatchWork(
   store: TaskWorkflowStore,
   options: TaskCommandOptions
 ): string {
-  const usage = "Task work dispatch usage: yui task work dispatch <task>/<work> [--input <text>] [--strategy fixed:<count>|adaptive:<max>] [--lane-role <role> ...] [--mode <single|parallel-diverse|ensemble-replicated|adversarial|adaptive-exploration>] [--max-rounds <count>] [--stage-max-attempts <count>] [--stage-max-tokens <count>] [--stage-max-tool-calls <count>] [--stage-max-seconds <count>] [--stage-quorum <count>] [--stage-straggler-seconds <count>] [--stage-min-marginal-value <0-100>].";
+  const usage = "Task work dispatch usage: yui task work dispatch <task>/<work> [--input <text>] [--lane-role <role> ...].";
   const parsed = parseMultiValueTail(
     args,
-    new Set([
-      "--input",
-      "--strategy",
-      "--mode",
-      "--max-rounds",
-      "--stage-max-attempts",
-      "--stage-max-tokens",
-      "--stage-max-tool-calls",
-      "--stage-max-seconds",
-      "--stage-quorum",
-      "--stage-straggler-seconds",
-      "--stage-min-marginal-value"
-    ]),
+    new Set(["--input"]),
     new Set(["--lane-role"]),
     usage
   );
   exactPositionals(parsed.positionals, 1, usage);
-  const requestedStrategy = parseExecutionStrategy(parsed.options.get("--strategy"), usage);
   const requestedLaneRoles = parsed.multiOptions.get("--lane-role") ?? [];
-  const requestedMode = parseWorkItemExecutionMode(parsed.options.get("--mode"), usage);
-  const requestedMaxRounds = parseOptionalPositiveInteger(
-    parsed.options.get("--max-rounds"),
-    "--max-rounds",
-    usage
-  );
-  const requestedStageMaxAttempts = parseOptionalPositiveInteger(
-    parsed.options.get("--stage-max-attempts"),
-    "--stage-max-attempts",
-    usage
-  );
-  const requestedStageMaxTokens = parseOptionalPositiveInteger(
-    parsed.options.get("--stage-max-tokens"),
-    "--stage-max-tokens",
-    usage
-  );
-  const requestedStageMaxToolCalls = parseOptionalPositiveInteger(
-    parsed.options.get("--stage-max-tool-calls"),
-    "--stage-max-tool-calls",
-    usage
-  );
-  const requestedStageMaxSeconds = parseOptionalPositiveInteger(
-    parsed.options.get("--stage-max-seconds"),
-    "--stage-max-seconds",
-    usage
-  );
-  const requestedStageQuorum = parseOptionalPositiveInteger(
-    parsed.options.get("--stage-quorum"),
-    "--stage-quorum",
-    usage
-  );
-  const requestedStageStragglerSeconds = parseOptionalPositiveInteger(
-    parsed.options.get("--stage-straggler-seconds"),
-    "--stage-straggler-seconds",
-    usage
-  );
-  const requestedStageMinMarginalValue = parseOptionalPercentage(
-    parsed.options.get("--stage-min-marginal-value"),
-    "--stage-min-marginal-value",
-    usage
-  );
-  const requestedResourceOptions = [
-    requestedStageMaxTokens,
-    requestedStageMaxToolCalls,
-    requestedStageMaxSeconds,
-    requestedStageQuorum,
-    requestedStageStragglerSeconds,
-    requestedStageMinMarginalValue
-  ];
-  const explorationMode = requestedMode === undefined || requestedMode === "single"
-    ? undefined
-    : requestedMode;
   const now = clock(options);
   const dispatch = store.transaction((tx) => {
     const item = requireWorkItem(tx, parsed.positionals[0], options);
     const task = requireTask(tx, item.taskId);
-    if (task.status !== "active") {
-      throw usageError(inactiveTaskMessage(task, "dispatch"));
-    }
-    assertTaskExecutionEnabled(task, "dispatching work");
-    taskActor(tx, options, task.id);
-    const currentGroup = currentWorkItemExecutionGroup(item);
-    const existingGroup = currentGroup?.resolution === undefined
-      ? currentGroup
-      : undefined;
-    if (item.status === "failed" && existingGroup !== undefined) {
-      throw usageError(
-        `Work Item ${item.id} retains unresolved ExecutionGroup ${existingGroup.id}; `
-        + "retry the exact failed Turn so completed Lane results remain reusable."
-      );
-    }
-    const expanding = item.status === "running" && existingGroup !== undefined;
-    const continuingExploration = currentGroup?.stage !== undefined
-      && currentGroup.resolution !== undefined
-      && (item.status === "running" || item.status === "failed");
-    const resolvedRetryGroup = resolvedExecutionStageRetryGroup(currentGroup);
-    const startingExploration = item.executionGroups.length === 0
-      && explorationMode !== undefined;
-    if (!expanding
-      && !continuingExploration
-      && item.status !== "pending"
-      && item.status !== "failed") {
-      throw usageError(`Work item ${item.id} cannot be dispatched from ${item.status}.`);
-    }
-    if (requestedMode === "single" && currentGroup?.stage !== undefined) {
-      throw usageError("An exploration WorkItem cannot return to single mode.");
-    }
-    if (explorationMode !== undefined
-      && item.executionGroups.length > 0
-      && currentGroup?.stage === undefined) {
-      throw usageError("A WorkItem cannot enter exploration after single-mode ExecutionGroups.");
-    }
-    if (!startingExploration
-      && !continuingExploration
-      && (requestedMaxRounds !== undefined
-        || requestedStageMaxAttempts !== undefined
-        || requestedResourceOptions.some((value) => value !== undefined))) {
-      throw usageError("Exploration limits require an explicit non-single --mode.");
-    }
-    if (existingGroup !== undefined && (requestedMode !== undefined
-      || requestedMaxRounds !== undefined
-      || requestedStageMaxAttempts !== undefined
-      || requestedResourceOptions.some((value) => value !== undefined))) {
-      throw usageError(`Execution stage configuration is frozen: ${existingGroup!.id}.`);
-    }
+    if (task.status !== "active") throw usageError(inactiveTaskMessage(task, "dispatch"));
     if (item.assignee === undefined) {
       throw usageError(
         `Work Item has no Task Role assignee: ${item.id}. `
-        + `The Task Leader must run "yui task work update ${item.id} running", `
-        + "then execute it directly or create native subagents in the Leader Session."
+        + `The Task Leader must run "yui task work update ${item.id} running" and execute it directly.`
       );
     }
-    if (expanding) taskActor(tx, options, task.id);
+    const lanePlan = planReplicatedWorkItemLanes(
+      item.assignee,
+      requestedLaneRoles,
+      `execution-group-${tx.peekNextTurnId(task.id)}`
+    );
+    if (lanePlan.roles.length === 0) {
+      throw usageError("Direct WorkItem dispatch is not available yet.");
+    }
+    const currentGroup = currentWorkItemExecutionGroup(item);
+    if (item.status !== "pending" && item.status !== "failed") {
+      throw usageError(`Work item ${item.id} cannot be dispatched from ${item.status}.`);
+    }
+    if (currentGroup !== undefined && !workItemExecutionGroupSettled(currentGroup)) {
+      throw usageError(
+        `Work Item ${item.id} retains open ExecutionGroup ${currentGroup.id}; retry or settle its exact Lane Turns.`
+      );
+    }
     assertWorkItemDependenciesCompleted(tx, item);
     const leaderOwned = item.assignee === "leader";
     const workspace = leaderOwned
       ? tx.getTaskWorkspace(task.id)
       : tx.getWorkItemWorkspace(task.id, item.id);
-    if (!leaderOwned && workspace?.owner.type === "work-item"
-      && workspace.owner.workItemId !== item.id) {
+    if (workspace === null) {
       throw usageError(
-        `Task Role ${item.assignee} still uses the isolated worktree for ${workspace.owner.workItemId}; `
-        + `cleanup ${workspace.owner.workItemId} before dispatching ${item.id}.`
+        leaderOwned
+          ? `Leader-owned Work Item ${item.id} requires the Task main workspace.`
+          : `Work Item ${item.id} must be isolated with its approved Project scope before dispatch.`
       );
     }
-    if (task.projectBindings.length > 0) {
-      const ownsExpectedWorkspace = leaderOwned
-        ? workspace?.owner.type === "task" && workspace.owner.taskId === task.id
-        : workspace?.owner.type === "work-item" && workspace.owner.workItemId === item.id;
-      const writable = workspace !== null && ownsExpectedWorkspace
-        ? workspace.entries
-          .filter(({ access }) => access === "write")
-          .map(({ projectId }) => projectId)
-          .sort()
-        : [];
-      const visible = workspace !== null && ownsExpectedWorkspace
-        ? workspace.entries.map(({ projectId }) => projectId).sort()
-        : [];
-      if (
-        !isDeepStrictEqual(writable, [...item.writeProjectIds].sort())
-        || !isDeepStrictEqual(
-          visible,
-          task.projectBindings.map(({ projectId }) => projectId).sort()
-        )
-      ) {
-        throw usageError(
-          leaderOwned
-            ? `Leader-owned Work Item ${item.id} must cover the Task main-worktree Project scope.`
-            : `Work Item ${item.id} must be isolated with its approved Project scope before dispatch.`
-        );
-      }
+    const visible = workspace.entries.map(({ projectId }) => projectId).sort();
+    const expectedVisible = task.projectBindings.map(({ projectId }) => projectId).sort();
+    const writable = workspace.entries
+      .filter(({ access }) => access === "write")
+      .map(({ projectId }) => projectId)
+      .sort();
+    if (!isDeepStrictEqual(visible, expectedVisible)
+      || !isDeepStrictEqual(writable, [...item.writeProjectIds].sort())) {
+      throw usageError(`Work Item ${item.id} workspace does not match its approved Project scope.`);
     }
-    const rawInput = trimmed(parsed.options.get("--input")) ?? item.objective;
-    const runWorkspace = workspace ?? undefined;
-    const lanePlan = normalizedExecutionLanePlan({
-      assignee: item.assignee,
-      requestedRoles: requestedLaneRoles,
-      requestedStrategy,
-      existingGroup,
-      resolvedRetryGroup,
-      status: item.status,
-      nextGroupId: `execution-group-${tx.peekNextTurnId(task.id)}`,
-      retryLaneId: undefined,
-      phase: "dispatch"
-    });
-    const laneRoles = lanePlan.roles;
-    if (laneRoles.length === 0) {
-      throw usageError("At least one --lane-role is required when expanding an ExecutionGroup.");
-    }
-    if (new Set(laneRoles).size !== laneRoles.length) {
-      throw usageError("Each ExecutionGroup Lane must use a distinct Task Role.");
-    }
-    const strategy = lanePlan.strategy;
-    if (existingGroup !== undefined && requestedStrategy !== undefined
-      && !sameExecutionStrategy(existingGroup.strategy, requestedStrategy)) {
-      throw usageError(`ExecutionGroup strategy is frozen: ${existingGroup.id}.`);
-    }
-    const available = lanePlan.capacity;
-    const requestedCount = lanePlan.requestedCount;
-    if (requestedCount > available) {
-      throw usageError(`ExecutionGroup Lane count ${requestedCount} exceeds its ${strategy.mode} capacity ${available}.`);
-    }
-    if (strategy.mode === "fixed"
-      && !lanePlan.expanding
-      && !lanePlan.resumingQueued
-      && laneRoles.length !== strategy.count) {
-      throw usageError(`fixed:${strategy.count} requires exactly ${strategy.count} --lane-role values.`);
-    }
-    const roles = laneRoles.map((name) => requireRole(tx, task.id, name));
-    const plans = roles.map((role) => {
+    const roles = lanePlan.roles.map((name) => requireRole(tx, task.id, name));
+    for (const role of roles) {
       if (tx.getActiveTurn(task.id, role.name) !== null) {
         throw usageError(`${task.id}/${role.name} already has an active turn.`);
       }
-      return {
-        role,
-        turnId: tx.nextTurnId(task.id)
-      };
-    });
-    let group = existingGroup;
-    if (group === undefined) {
-      const groupId = `execution-group-${plans[0]!.turnId}`;
-      const stage = !startingExploration && !continuingExploration
-        ? undefined
-        : (() => {
-            const config = tx.getConfig();
-            const health = resolveRuntimeHealth(config.runtimeHealth);
-            const maxWallClockSeconds = requestedStageMaxSeconds
-              ?? Math.floor(health.stallWindowMs / 1_000);
-            const quorum = requestedStageQuorum
-              ?? (strategy.mode === "fixed" ? strategy.count : 1);
-            if (quorum > available) {
-              throw usageError(`Execution stage quorum ${quorum} exceeds Lane capacity ${available}.`);
-            }
-            return planWorkItemExplorationStage(item, {
-              ...(explorationMode === undefined ? {} : { mode: explorationMode }),
-              ...(requestedMaxRounds === undefined ? {} : { maxRounds: requestedMaxRounds }),
-              ...(requestedStageMaxAttempts === undefined
-                ? {}
-                : { maxAttempts: requestedStageMaxAttempts }),
-              ...(startingExploration
-                ? { convergence: { schemaVersion: 1 as const } }
-                : {}),
-              resourceBudget: {
-                maxTokens: requestedStageMaxTokens
-                  ?? DEFAULT_EXECUTION_STAGE_TOKEN_BUDGET_PER_LANE * available,
-                maxToolCalls: requestedStageMaxToolCalls ?? 100 * available,
-                maxWallClockSeconds
-              },
-              resources: {
-                schemaVersion: 1 as const,
-                quorum,
-                deadlineAt: new Date(now.getTime() + maxWallClockSeconds * 1_000).toISOString(),
-                stragglerAfterSeconds: requestedStageStragglerSeconds
-                  ?? Math.floor(health.quietAfterMs / 1_000),
-                minimumMarginalValuePercent: requestedStageMinMarginalValue ?? 10
-              },
-              strategy,
-              contextSnapshotRef: contextSnapshotRef(freezeExecutionStageContextSnapshot(tx, {
-                taskId: task.id,
-                workItemId: item.id,
-                executionGroupId: groupId
-              }, now))
-            });
-          })();
-      group = createExecutionGroup(
-        groupId,
-        task.id,
-        {
-          purpose: "execution",
-          target: executionTargetForWorkItem(task.id, item.id, item.revision, item, workspace),
-          strategy,
-          lanes: laneRoles.map((roleName) => ({ roleName })),
-          ...(stage === undefined ? {} : { stage })
-        },
-        now
-      );
-    } else if (lanePlan.expanding) {
-      for (const roleName of laneRoles) {
-        group = addExecutionLane(group, { roleName }, now);
-      }
     }
-    if (group.stage !== undefined) {
-      assertIndependentVerificationRoles(item, group.stage, laneRoles);
-    }
-    const lanes = lanePlan.resumingQueued
-      ? lanePlan.laneIds.map((laneId) => group.lanes.find(({ id }) => id === laneId)!)
-      : lanePlan.expanding
-      ? group.lanes.slice(-plans.length)
-      : group.lanes.slice(0, plans.length);
-    if (lanes.length !== plans.length) throw new Error(`ExecutionGroup Lane planning drift: ${group.id}.`);
-    const createdTurns: Turn[] = [];
-    const queuedAdmissions: string[] = [];
-    let runningGroup: ExecutionGroup = group;
-    const config = tx.getConfig();
-    const controllerConcurrency = resolveControllerTaskConcurrency(config.controllerTaskConcurrency);
-    const brokerPolicy = resolveResourceBrokerPolicy({
-      maxActiveLanes: controllerConcurrency,
-      maxActiveLanesPerProvider: controllerConcurrency,
-      maxQueuedLanesPerGroup: Math.max(controllerConcurrency, available)
-    });
-    const activeResources = activeResourceLaneIdentities(tx);
-    const queuedResources = projectQueuedResourceLaneIdentities(tx, now);
-    const stageResources = group.stage === undefined
-      ? undefined
-      : projectExecutionStageResources({
-          group,
-          stageGroups: [...item.executionGroups, group],
-          usage: observedExecutionResourceUsage({
-            group,
-            stageGroups: [...item.executionGroups, group],
-            turns: tx.listTurns(task.id),
-            events: tx.listEvents(task.id)
-          }),
-          now
-        });
-    const stageSpendClosed = stageResources !== undefined
-      && executionStageSpendClosed(stageResources);
-    for (let index = 0; index < plans.length; index += 1) {
-      const plan = plans[index]!;
-      const lane = lanes[index]!;
-      const laneIsolated = plans.length > 1 || group.lanes.length > 1 || group.strategy.mode === "adaptive";
-      const storedLaneWorkspace = laneIsolated
-        ? tx.getManagedWorkspace({
-            type: "execution-lane",
-            taskId: task.id,
-            executionGroupId: group.id,
-            executionLaneId: lane.id,
-            purpose: "execution",
-            workItemId: item.id
-          }) ?? undefined
-        : undefined;
-      const laneManagedWorkspace = laneIsolated
-        ? options.executionLaneWorkspaces?.get(lane.id) ?? storedLaneWorkspace
-        : runWorkspace;
-      if (laneIsolated && laneManagedWorkspace === undefined && options.yuiHome !== undefined) {
-        throw usageError(`Execution Lane workspace preflight is missing: ${group.id}/${lane.id}.`);
-      }
-      const effective = lane.effective ?? resolveEffectiveLaunch({
-          role: plan.role,
-          purpose: "execution",
-          ...(laneManagedWorkspace === undefined ? {} : { workspace: laneManagedWorkspace }),
-          workItemWriteProjectIds: item.writeProjectIds
-        });
-      const sessions = tx.getTaskRoleSessionSet(task.id, plan.role.name);
-      const dispatchMode = roleAgentSessionResumeMode(sessions, effective.agentId, effective);
-      const laneWorkspace = laneManagedWorkspace === undefined
-        ? undefined
-        : {
-            root: laneManagedWorkspace.root,
-            writableProjectIds: [...item.writeProjectIds]
-          };
-      const request: ResourceLaneIdentity = {
-        taskId: task.id,
-        workItemId: item.id,
-        executionGroupId: group.id,
-        executionLaneId: lane.id,
-        providerId: effective.adapterId,
-        agentId: effective.agentId,
-        ...(effective.model === undefined ? {} : { model: effective.model }),
-        requestedAt: lane.effective === undefined ? now.toISOString() : lane.updatedAt
-      };
-      const admission = planResourceAdmissions({
-        policy: brokerPolicy,
-        active: activeResources,
-        queued: queuedResources.filter(({ taskId, executionGroupId, executionLaneId }) => !(
-          taskId === request.taskId
-          && executionGroupId === request.executionGroupId
-          && executionLaneId === request.executionLaneId
-        )),
-        requests: [request]
-      })[0]!;
-      const frozenDirective = lane.directive ?? rawInput;
-      if (stageSpendClosed || admission.decision !== "admitted") {
-        if (lane.effective === undefined || lane.directive === undefined) {
-          runningGroup = updateExecutionLane(runningGroup, lane.id, {
-            effective,
-            workspace: laneWorkspace,
-            directive: frozenDirective
-          }, now);
-        }
-        queuedAdmissions.push(
-          stageSpendClosed
-            ? `${lane.id}: stage budget/deadline reached`
-            : `${lane.id}: ${admission.reason}`
-        );
-        if (!queuedResources.some(({ taskId, executionGroupId, executionLaneId }) => (
-          taskId === request.taskId
-          && executionGroupId === request.executionGroupId
-          && executionLaneId === request.executionLaneId
-        ))) queuedResources.push(request);
-        continue;
-      }
-      activeResources.push(request);
-      const runningLane = lane.status === "failed"
-        ? restartExecutionLane(runningGroup, lane.id, {
-            turnId: plan.turnId,
-            effective,
-            workspace: laneWorkspace,
-            directive: frozenDirective
-          }, now)
-        : updateExecutionLane(runningGroup, lane.id, {
-            status: "running",
-            turnId: plan.turnId,
-            effective,
-            workspace: laneWorkspace,
-            directive: frozenDirective
-          }, now);
-      runningGroup = runningLane;
-      const input = createTurnInput({
-        source: { type: "yui", channel: "workitem-dispatch" },
-        directive: `${frozenDirective}\nFrozen target: ${group.target.fingerprint}.`
-          + (group.stage === undefined
-            ? ""
-            : `\nExploration stage: ${group.stage.stage}; round=${group.stage.round}; attempt=${group.stage.stageAttempt}.`
-              + (group.stage.resources === undefined
-                ? ""
-                : `\nResource budget: tokens=${group.stage.budget.maxTokens}; tools=${group.stage.budget.maxToolCalls}; wall=${group.stage.budget.maxWallClockSeconds}s; quorum=${group.stage.resources.quorum}; deadline=${group.stage.resources.deadlineAt}; straggler=${group.stage.resources.stragglerAfterSeconds}s.`)
-              + (group.stage.convergence === undefined
-                ? ""
-                : `\n${candidateConvergenceDirective(group.stage)}`)),
-        deltaRefIds: []
-      });
-      createdTurns.push(createTurn(
-        plan.turnId,
-        task.id,
-        plan.role.name,
-        dispatchMode,
-        input,
-        now,
-        {
-          workItemId: item.id,
-          executionGroupId: runningGroup.id,
-          executionLaneId: lane.id,
-          ...(laneManagedWorkspace === undefined ? {} : { workspace: laneManagedWorkspace }),
-          effective
-        }
-      ));
-    }
-    // A failed WorkItem must be reopened before attaching or updating its
-    // execution Group. Each persisted transform advances exactly one revision.
+    const rawInput = trimmed(parsed.options.get("--input")) ?? item.objective;
     let workItemForDispatch = item.status === "failed"
       ? retryFailedWorkItem(item, now)
       : item;
-    if (workItemForDispatch !== item) tx.saveWorkItem(task.id, workItemForDispatch);
-    workItemForDispatch = currentWorkItemExecutionGroup(workItemForDispatch) === undefined
-      ? attachWorkItemExecutionGroup(workItemForDispatch, runningGroup, now)
-      : updateWorkItemExecutionGroup(workItemForDispatch, runningGroup, now);
-    if (workItemForDispatch !== item) {
-      tx.saveWorkItem(task.id, workItemForDispatch);
-    }
+    const groupId = `execution-group-${tx.peekNextTurnId(task.id)}`;
+    const assignmentContext = contextSnapshotRef(freezeWorkItemExecutionAssignmentContextSnapshot(tx, {
+      taskId: task.id,
+      workItemId: item.id
+    }, now));
+    const plans = roles.map((role, index) => {
+      const laneId = `${groupId}-lane-${index + 1}`;
+      const managedWorkspace = options.executionLaneWorkspaces?.get(laneId);
+      if (managedWorkspace === undefined && options.yuiHome !== undefined) {
+        throw usageError(`Execution Lane workspace preflight is missing: ${groupId}/${laneId}.`);
+      }
+      const laneWorkspace = managedWorkspace ?? workspace;
+      const effective = resolveEffectiveLaunch({
+        role,
+        purpose: "execution",
+        workspace: laneWorkspace,
+        workItemWriteProjectIds: item.writeProjectIds
+      });
+      return {
+        role,
+        laneId,
+        managedWorkspace: laneWorkspace,
+        effective,
+        turnId: tx.nextTurnId(task.id),
+        dispatchMode: roleAgentSessionResumeMode(
+          tx.getTaskRoleSessionSet(task.id, role.name),
+          effective.agentId,
+          effective
+        )
+      };
+    });
+    const assignment = createWorkItemExecutionAssignment({
+      input: rawInput,
+      objective: item.objective,
+      acceptance: item.acceptance,
+      contextSnapshotRef: assignmentContext,
+      taskId: task.id,
+      workItemId: item.id,
+      workItemRevision: workItemForDispatch.revision,
+      projects: workspace.entries
+        .filter(({ projectId }) => item.writeProjectIds.includes(projectId))
+        .map(({ projectId, baseCommit }) => ({ projectId, baseCommit })),
+      dependencyFacts: item.dependsOn.map((dependencyId) => {
+        const dependency = requireWorkItem(tx, `${task.id}/${dependencyId}`, options);
+        return { workItemId: dependency.id, revision: dependency.revision };
+      })
+    });
+    const group = createWorkItemExecutionGroup(
+      groupId,
+      task.id,
+      assignment,
+      plans.map((plan): Readonly<{
+        roleName: string;
+        effective: EffectiveLaunchSnapshot;
+        workspace: WorkItemExecutionLaneWorkspace;
+        currentTurnId: string;
+      }> => ({
+        roleName: plan.role.name,
+        effective: plan.effective,
+        workspace: {
+          root: plan.managedWorkspace.root,
+          writableProjectIds: [...item.writeProjectIds]
+        },
+        currentTurnId: plan.turnId
+      })),
+      now
+    );
+    workItemForDispatch = attachWorkItemExecutionGroup(workItemForDispatch, group, now);
     if (workItemForDispatch.status !== "running") {
       workItemForDispatch = updateWorkItemStatus(workItemForDispatch, "running", now);
-      tx.saveWorkItem(task.id, workItemForDispatch);
     }
-    for (const lane of runningGroup.lanes) {
-      const prepared = options.executionLaneWorkspaces?.get(lane.id);
-      if (prepared !== undefined) {
-        if (prepared.owner.type !== "execution-lane"
-          || prepared.owner.executionGroupId !== runningGroup.id
-          || prepared.owner.executionLaneId !== lane.id) {
-          throw usageError(`Execution Lane workspace identity does not match dispatch: ${runningGroup.id}/${lane.id}.`);
+    tx.saveWorkItem(task.id, workItemForDispatch);
+    const turns = plans.map((plan, index) => {
+      const turn = createTurn(
+        plan.turnId,
+        task.id,
+        plan.role.name,
+        plan.dispatchMode,
+        createTurnInput({
+          source: { type: "yui", channel: "workitem-dispatch" },
+          directive: assignment.input,
+          deltaRefIds: []
+        }),
+        now,
+        {
+          workItemId: item.id,
+          executionGroupId: group.id,
+          executionLaneId: group.lanes[index]!.id,
+          workspace: plan.managedWorkspace,
+          effective: plan.effective
         }
-        if (options.laneDispatchProjectPaths !== undefined) {
-          // The prepared workspaces were created under a held maintenance
-          // fence that this transaction still holds. Re-prove the Task
-          // binding set and exact Project paths match the preparation
-          // snapshot: a migrate in the prepare/adopt gap fails closed here
-          // rather than stranding a Lane on the external checkout.
-          const currentIds = task.projectBindings.map(({ projectId }) => projectId).sort();
-          const proofIds = [...options.laneDispatchProjectPaths.keys()].sort();
-          if (currentIds.length !== proofIds.length
-            || currentIds.some((projectId, index) => projectId !== proofIds[index])) {
-            throw new Error(`Task Project bindings changed during Lane dispatch: ${task.id}.`);
-          }
-          for (const [projectId, preparedPath] of options.laneDispatchProjectPaths) {
-            if (requireProject(tx, projectId).path !== preparedPath) {
-              throw new Error(`Project path changed during Lane dispatch: ${projectId}.`);
-            }
-          }
-        }
-        if (tx.getManagedWorkspace(prepared.owner) === null) tx.saveManagedWorkspace(prepared);
-      }
-    }
-    for (let index = 0; index < createdTurns.length; index += 1) {
-      const unboundTurn = createdTurns[index]!;
+      );
       const snapshot = freezeTurnContextSnapshot(tx, {
         taskId: task.id,
-        roleName: unboundTurn.roleName,
+        roleName: turn.roleName,
         purpose: "execution",
         workItemId: item.id
-      }, now, "controller", runningGroup.stage?.contextSnapshotRef);
-      const turnWithLineage = withTurnContextSnapshot(
-        unboundTurn,
+      }, now, "controller", assignment.contextSnapshotRef);
+      const withContext = withTurnContextSnapshot(
+        turn,
         contextSnapshotRef(snapshot),
         contextSnapshotDeltaRefIds(tx, snapshot)
       );
-      createdTurns[index] = turnWithLineage;
-      const role = requireRole(tx, task.id, unboundTurn.roleName);
-      tx.saveTurn(turnWithLineage);
-      tx.saveActiveTurn(turnWithLineage);
-      enqueueWork(tx, roleMailbox(task.id, role.name), "turn-dispatched", now, [
-        turnRef(task.id, turnWithLineage.id),
+      const prepared = options.executionLaneWorkspaces?.get(group.lanes[index]!.id);
+      if (prepared !== undefined && tx.getManagedWorkspace(prepared.owner) === null) {
+        tx.saveManagedWorkspace(prepared);
+      }
+      tx.saveTurn(withContext);
+      tx.saveActiveTurn(withContext);
+      enqueueWork(tx, roleMailbox(task.id, plan.role.name), "turn-dispatched", now, [
+        turnRef(task.id, withContext.id),
         workItemRef(task.id, item.id)
       ]);
-      recordTaskEvent(tx, task.id, "turn.dispatched", turnLaunchEventPayload(turnWithLineage), now);
-    }
-    return { turns: createdTurns, queuedAdmissions, group: runningGroup };
+      recordTaskEvent(tx, task.id, "turn.dispatched", turnLaunchEventPayload(withContext), now);
+      return withContext;
+    });
+    return { turns };
   });
   for (const turn of dispatch.turns) {
     notifyMailbox(options.runtime, roleMailbox(turn.taskId, turn.roleName), turn.taskId);
   }
-  const backpressure = dispatch.queuedAdmissions.length === 0
-    ? ""
-    : `; ${dispatch.queuedAdmissions.length} Lane(s) retained pending by Resource Broker`;
-  const first = dispatch.turns[0];
-  return first === undefined
-    ? `No Lane admitted; ${dispatch.queuedAdmissions.join("; ")}\n`
-    : `Dispatch queued for ${first.taskId}/${first.roleName} (${first.id})${dispatch.turns.length > 1 ? `; ${dispatch.turns.length} Lanes` : ""}${backpressure}\n`;
+  return `Dispatch queued for ${dispatch.turns.length} replicated Lanes\n`;
 }
 
-function resolveWorkExecutionGroup(
-  args: string[],
-  store: TaskWorkflowStore,
-  options: TaskCommandOptions
-): TaskCommandExecution {
-  const usage = "Task work group resolve usage: yui task work group resolve <task>/<work> --decision <accept|reject|retry|blocked> --summary <text> [--lane <lane-id> ...] [--early-stop <marginal-value-percent>].";
-  if (args[0] !== "resolve") throw usageError(usage);
-  const parsed = parseMultiValueTail(
-    args.slice(1),
-    new Set(["--decision", "--summary", "--early-stop"]),
-    new Set(["--lane"]),
-    usage
-  );
-  exactPositionals(parsed.positionals, 1, usage);
-  const decision = parseExecutionResolutionDecision(parsed.options.get("--decision"), usage);
-  const summary = requiredOption(parsed.options, "--summary");
-  const selectedLaneIds = parsed.multiOptions.get("--lane");
-  const earlyStopMarginalValue = parseOptionalPercentage(
-    parsed.options.get("--early-stop"),
-    "--early-stop",
-    usage
-  );
-  const now = clock(options);
-  const result = store.transaction((tx) => {
-    const item = requireWorkItem(tx, parsed.positionals[0], options);
-    const task = requireTask(tx, item.taskId);
-    if (task.status !== "active") throw usageError(inactiveTaskMessage(task, "resolving an ExecutionGroup"));
-    taskActor(tx, options, task.id);
-    let group = currentWorkItemExecutionGroup(item);
-    if (group === undefined
-      || (group.stage === undefined
-        && group.lanes.length < 2
-        && group.strategy.mode !== "adaptive")) {
-      throw usageError(`Work Item ${item.id} has no resolvable ExecutionGroup.`);
-    }
-    if (item.status !== "running") {
-      throw usageError(`Work Item ${item.id} cannot resolve from ${item.status}.`);
-    }
-    if (decision !== "accept" && group.stage?.resources !== undefined) {
-      const activeLaneIds = group.lanes
-        .filter(({ status }) => status === "running")
-        .map(({ id }) => id);
-      if (activeLaneIds.length > 0) {
-        throw usageError(
-          `Active Lanes must settle before ${decision}; Resource Broker will not kill them: ${activeLaneIds.join(", ")}.`
-        );
-      }
-      group = skipPendingExecutionLanes(
-        group,
-        group.lanes.filter(({ status }) => status === "pending").map(({ id }) => id),
-        `Leader resolved the stage as ${decision} before queued Lanes started.`,
-        now
-      );
-    }
-    const acceptedLaneIds = decision === "accept"
-      ? selectedLaneIds ?? group.lanes
-        .filter((lane) => lane.status === "completed")
-        .map(({ id }) => id)
-      : undefined;
-    if (earlyStopMarginalValue !== undefined) {
-      if (decision !== "accept" || acceptedLaneIds === undefined) {
-        throw usageError("--early-stop requires --decision accept.");
-      }
-      if (group.stage?.resources === undefined) {
-        throw usageError("--early-stop requires a T6 resource-scheduled exploration stage.");
-      }
-      const resources = projectExecutionStageResources({
-        group,
-        stageGroups: item.executionGroups,
-        usage: observedExecutionResourceUsage({
-          group,
-          stageGroups: item.executionGroups,
-          turns: tx.listTurns(task.id),
-          events: tx.listEvents(task.id)
-        }),
-        now
-      });
-      const routing = routeExecutionStage({
-        group,
-        resources,
-        evidenceSufficient: candidateConvergenceEvidenceSufficient(
-          item,
-          group,
-          acceptedLaneIds
-        ),
-        disagreement: "unknown",
-        marginalValuePercent: earlyStopMarginalValue
-      });
-      if (!routing.earlyTerminationAllowed) {
-        throw usageError(
-          "Early termination is forbidden until quorum and acceptance-level evidence are sufficient."
-        );
-      }
-      if (routing.action !== "resolve" && routing.retainActiveLaneIds.length === 0) {
-        throw usageError(routing.reason);
-      }
-      group = skipPendingExecutionLanes(
-        group,
-        routing.cancelPendingLaneIds,
-        `Stopped after quorum and sufficient evidence; observed marginal value ${earlyStopMarginalValue}%.`,
-        now
-      );
-      if (routing.retainActiveLaneIds.length > 0) {
-        const waiting = updateWorkItemExecutionGroup(item, group, now);
-        tx.saveWorkItem(task.id, waiting);
-        return {
-          item: waiting,
-          group,
-          reviewDispatch: null,
-          waitingForStragglers: true
-        };
-      }
-    }
-    const resolutionSummary = acceptedLaneIds === undefined
-      ? summary
-      : aggregateExecutionLaneSummary(summary, group, acceptedLaneIds);
-    const resolved = resolveExecutionGroup(group, {
-      decision,
-      summary: resolutionSummary,
-      ...(decision === "accept"
-        ? { selectedLaneIds: acceptedLaneIds }
-        : selectedLaneIds === undefined ? {} : { selectedLaneIds })
-    }, now);
-    validateCandidateConvergenceResolution(item, resolved);
-    const groupedItem = updateWorkItemExecutionGroup(item, resolved, now);
-    tx.saveWorkItem(task.id, groupedItem);
-    if (decision !== "accept") {
-      const failed = updateWorkItemStatus(groupedItem, "failed", now, summary);
-      tx.saveWorkItem(task.id, failed);
-      enqueueWork(tx, leaderMailbox(task.id), "work-group-resolved", now, [
-        workItemRef(task.id, item.id)
-      ]);
-      return {
-        item: failed,
-        group: resolved,
-        reviewDispatch: null,
-        waitingForStragglers: false
-      };
-    }
-    if (resolved.stage !== undefined && resolved.stage.stage !== "resolve") {
-      enqueueWork(tx, leaderMailbox(task.id), "work-group-resolved", now, [
-        workItemRef(task.id, item.id)
-      ]);
-      return {
-        item: groupedItem,
-        group: resolved,
-        reviewDispatch: null,
-        waitingForStragglers: false
-      };
-    }
-    const eligible = resolved.lanes
-      .filter((lane) => resolved.resolution?.selectedLaneIds.includes(lane.id) ?? false)
-      .map((lane) => lane.turnId === undefined ? null : tx.getTurn(task.id, lane.turnId))
-      .find((run): run is Turn => run !== null && run !== undefined && run.status === "completed");
-    if (eligible === undefined) {
-      throw usageError(`ExecutionGroup ${group.id} has no completed selected Lane Turn to capture.`);
-    }
-    const candidateWorkspace = options.candidateWorkspace;
-    if (candidateWorkspace === undefined && options.yuiHome !== undefined) {
-      throw usageError(`ExecutionGroup ${group.id} Candidate materialization preflight is missing.`);
-    }
-    const configuredReview = tx.getReviewConfig();
-    const taskFinalContract = taskFinalReviewContractForMutation(tx, task.id, options);
-    const candidatePolicy = taskFinalContract === undefined
-      ? workItemReviewConfig(configuredReview)
-      : taskFinalReviewConfig(taskFinalContract);
-    const candidate = submitWorkItemCandidate(groupedItem, {
-      summary: resolutionSummary,
-      source: { type: "turn", turnId: eligible.id },
-      executionGroupId: resolved.id,
-      executionLaneId: eligible.executionLaneId,
-      ...(candidatePolicy === null ? {} : { reviewPolicy: candidatePolicy }),
-      ...(taskFinalContract === undefined ? {} : { taskFinalReviewContract: taskFinalContract }),
-      ...(candidateWorkspace === null
-        ? {}
-        : candidateWorkspace === undefined
-          ? (eligible.workspace === undefined ? {} : { workspace: eligible.workspace })
-          : { workspace: candidateWorkspace }),
-      ...(options.candidateGitSnapshot === undefined ? {} : { gitSnapshot: options.candidateGitSnapshot })
-    }, now);
-    tx.saveWorkItem(task.id, candidate);
-    const reviewDispatch = candidatePolicy?.trigger === "always"
-      ? queueReviewRound(tx, candidate, candidatePolicy, "policy", now)
-      : null;
-    enqueueWork(tx, leaderMailbox(task.id), "candidate-ready", now, [
-      turnRef(task.id, eligible.id),
-      workItemRef(task.id, item.id)
-    ]);
-    return {
-      item: candidate,
-      group: resolved,
-      reviewDispatch,
-      waitingForStragglers: false
-    };
-  });
-  if (result.waitingForStragglers) {
-    return output(
-      `Stopped pending spend for ${result.group.id}; active stragglers are retained until they settle: ${result.group.lanes.filter(({ status }) => status === "running").map(({ id }) => id).join(", ")}\n`,
-      { workItem: result.item, executionGroup: result.group }
-    );
-  }
-  return output(
-    `Resolved ExecutionGroup ${result.group.id} as ${decision}; Work Item ${result.item.id} is ${result.item.status}.\n`,
-    { workItem: result.item, executionGroup: result.group }
-  );
-}
 
-function aggregateExecutionLaneSummary(
-  leaderSummary: string,
-  group: ExecutionGroup,
-  selectedLaneIds?: readonly string[]
-): string {
-  const selected = selectedLaneIds === undefined ? null : new Set(selectedLaneIds);
-  const lanes = group.lanes.filter((lane) => selected === null || selected.has(lane.id)).map((lane) => {
-    const result = lane.result;
-    return [
-      `Lane ${lane.id} (${lane.roleName}) status=${lane.status}`,
-      result?.report === undefined ? "" : `report=${result.report}`,
-      result?.checks === undefined ? "" : `checks=${JSON.stringify(result.checks)}`,
-      result?.findings === undefined ? "" : `findings=${JSON.stringify(result.findings)}`,
-      result?.evidence === undefined ? "" : `evidence=${JSON.stringify(result.evidence)}`,
-      result?.evidenceCommit === undefined ? "" : `evidenceCommit=${result.evidenceCommit}`,
-    ].filter((part) => part.length > 0).join("; ");
-  });
-  return [leaderSummary.trim(), ...lanes].filter((part) => part.length > 0).join("\n");
-}
-
-function executionTargetForWorkItem(
-  taskId: string,
-  workItemId: string,
-  revision: number,
-  item: WorkItem,
-  workspace: ReturnType<TaskWorkflowStore["getWorkItemWorkspace"]>
-): ExecutionTarget {
-  const projects = item.writeProjectIds.flatMap((projectId) => {
-    const entry = workspace?.entries.find((candidate) => candidate.projectId === projectId);
-    return entry === undefined ? [] : [{ projectId, commit: entry.baseCommit }];
-  });
-  const fingerprint = JSON.stringify({ taskId, workItemId, revision, projects });
-  return {
-    schemaVersion: 1,
-    kind: "work-item",
-    taskId,
-    workItemId,
-    revision,
-    projects,
-    fingerprint
-  };
-}
 
 function executionTargetForReviewRound(
   task: Task,
@@ -5577,11 +4919,11 @@ function retryTurn(
       retryItem !== null
       && currentRetryGroup !== undefined
       && currentRetryGroup.id === previous.executionGroupId
-      && currentRetryGroup.resolution === undefined
+      && !workItemExecutionGroupSettled(currentRetryGroup)
       && retryLaneBefore !== undefined
       && retryLaneBefore.id === previous.executionLaneId
-      && retryLaneBefore.status === "failed"
-      && retryLaneBefore.turnId === previous.id
+      && retryLaneBefore.disposition === "open"
+      && retryLaneBefore.currentTurnId === previous.id
     );
     if (!exactCurrentLane) {
       throw usageError(
@@ -5628,76 +4970,17 @@ function retryTurn(
           root: retryManagedWorkspace.root,
           writableProjectIds: [...(retryItem?.writeProjectIds ?? [])]
         };
-    const retryDirective = retryLane?.directive
+    const retryDirective = retryGroup?.assignment.input
       ?? previous.inputs[0]!.input.directive
       ?? retryItem?.objective
       ?? `Retry Turn ${previous.id}.`;
-    let queuedReason: string | undefined;
-    if (retryGroup !== undefined && retryLane !== undefined && retryItem !== null) {
-      const config = tx.getConfig();
-      const controllerConcurrency = resolveControllerTaskConcurrency(config.controllerTaskConcurrency);
-      const capacity = retryGroup.strategy.mode === "fixed"
-        ? retryGroup.strategy.count
-        : retryGroup.strategy.max;
-      const policy = resolveResourceBrokerPolicy({
-        maxActiveLanes: controllerConcurrency,
-        maxActiveLanesPerProvider: controllerConcurrency,
-        maxQueuedLanesPerGroup: Math.max(controllerConcurrency, capacity)
-      });
-      if (retryGroup.stage !== undefined) {
-        const stageGroups = retryItem.executionGroups;
-        const resources = projectExecutionStageResources({
-          group: retryGroup,
-          stageGroups,
-          usage: observedExecutionResourceUsage({
-            group: retryGroup,
-            stageGroups,
-            turns: tx.listTurns(task.id),
-            events: tx.listEvents(task.id)
-          }),
-          now
-        });
-        if (executionStageSpendClosed(resources)) {
-          throw usageError(
-            `Execution stage budget/deadline is exhausted; resolve Group ${retryGroup.id} instead of retrying.`
-          );
-        }
-      }
-      const admission = planResourceAdmissions({
-        policy,
-        active: activeResourceLaneIdentities(tx),
-        queued: projectQueuedResourceLaneIdentities(tx, now),
-        requests: [{
-          taskId: task.id,
-          workItemId: retryItem.id,
-          executionGroupId: retryGroup.id,
-          executionLaneId: retryLane.id,
-          providerId: effective.adapterId,
-          agentId: effective.agentId,
-          ...(effective.model === undefined ? {} : { model: effective.model }),
-          requestedAt: now.toISOString()
-        }]
-      })[0]!;
-      if (admission.decision === "blocked") {
-        throw usageError(`Execution Lane retry queue is full: ${admission.reason}.`);
-      }
-      if (admission.decision === "queued") queuedReason = admission.reason;
-    }
-    const turnId = queuedReason === undefined ? tx.nextTurnId(task.id) : undefined;
+    const queuedReason: string | undefined = undefined;
+    const turnId = tx.nextTurnId(task.id);
     const runningGroup = retryGroup === undefined || retryLane === undefined
       ? undefined
-      : queuedReason === undefined
-        ? restartExecutionLane(retryGroup, retryLane.id, {
-            turnId: turnId!,
-            effective,
-            ...(laneWorkspace === undefined ? {} : { workspace: laneWorkspace }),
-            directive: retryDirective
-          }, now)
-        : queueExecutionLaneRetry(retryGroup, retryLane.id, {
-            effective,
-            ...(laneWorkspace === undefined ? {} : { workspace: laneWorkspace }),
-            directive: retryDirective
-          }, now);
+      : updateWorkItemExecutionLane(retryGroup, retryLane.id, {
+          currentTurnId: turnId
+        }, now);
     // Restart the bound lane and reopen the failed WorkItem as two ordered
     // single-step record revisions, matching the dispatch path. Folding both
     // transforms into one save would move the WorkItem two revisions at once,
@@ -5718,21 +5001,12 @@ function retryTurn(
         tx.saveWorkItem(task.id, retriedItemWithGroup);
       }
     }
-    if (queuedReason !== undefined) {
-      return {
-        kind: "queued" as const,
-        taskId: task.id,
-        roleName: role.name,
-        laneId: retryLane!.id,
-        reason: queuedReason
-      };
-    }
     const retrySnapshot = freezeTurnContextSnapshot(tx, {
       taskId: task.id,
       roleName: role.name,
       purpose: "execution",
       ...(previous.workItemId === undefined ? {} : { workItemId: previous.workItemId })
-    }, now, "controller", retryGroup?.stage?.contextSnapshotRef);
+    }, now, "controller", retryGroup?.assignment.contextSnapshotRef);
     const input = createTurnInput({
       source: {
         type: "yui",
@@ -5781,11 +5055,6 @@ function retryTurn(
     }, now);
     return { kind: "turn" as const, turn: created };
   });
-  if (retried.kind === "queued") {
-    return output(
-      `Retry retained pending for ${retried.taskId}/${retried.laneId}: ${retried.reason}\n`
-    );
-  }
   notifyMailbox(
     options.runtime,
     roleMailbox(retried.turn.taskId, retried.turn.roleName),
@@ -8386,45 +7655,6 @@ function parseExecutionStrategy(
     `Invalid execution strategy: ${value}. Use fixed:<count> or adaptive:<max>.`,
     usage
   );
-}
-
-function parseWorkItemExecutionMode(
-  value: string | undefined,
-  usage: string
-): WorkItemExecutionMode | undefined {
-  if (value === undefined) return undefined;
-  const normalized = value.trim().toLowerCase() as WorkItemExecutionMode;
-  if (WORK_ITEM_EXECUTION_MODES.includes(normalized)) return normalized;
-  throw usageError(
-    `Invalid WorkItem execution mode: ${value}. Use ${WORK_ITEM_EXECUTION_MODES.join(", ")}.`,
-    usage
-  );
-}
-
-function parseOptionalPositiveInteger(
-  value: string | undefined,
-  label: string,
-  usage: string
-): number | undefined {
-  if (value === undefined) return undefined;
-  const parsed = Number(value);
-  if (!Number.isSafeInteger(parsed) || parsed <= 0) {
-    throw usageError(`${label} must be a positive integer.`, usage);
-  }
-  return parsed;
-}
-
-function parseOptionalPercentage(
-  value: string | undefined,
-  label: string,
-  usage: string
-): number | undefined {
-  if (value === undefined) return undefined;
-  const parsed = Number(value);
-  if (!Number.isSafeInteger(parsed) || parsed < 0 || parsed > 100) {
-    throw usageError(`${label} must be an integer from 0 to 100.`, usage);
-  }
-  return parsed;
 }
 
 function sameExecutionStrategy(

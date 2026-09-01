@@ -14,6 +14,10 @@ import {
   type ExecutionGroupSummary
 } from "../execution/executionGroup.js";
 import type { ExecutionGroupHealthSummary } from "../execution/executionHealth.js";
+import {
+  summarizeWorkItemExecutionGroup,
+  type WorkItemExecutionGroup
+} from "../execution/workItemExecution.js";
 import { currentWorkItemExecutionGroup } from "../workItem/workItem.js";
 import { operationalTaskRecords } from "../task/taskRecordRetirement.js";
 import { projectReviewDecision } from "../review/reviewDecision.js";
@@ -365,10 +369,7 @@ export function runTaskContextCommand(
                 )]),
             ...(currentWorkItemExecutionGroup(item) === undefined
               ? []
-              : renderExecutionGroup(
-                  currentWorkItemExecutionGroup(item)!,
-                  executionGroupsById.get(currentWorkItemExecutionGroup(item)!.id)
-                )),
+              : renderWorkItemExecutionGroup(currentWorkItemExecutionGroup(item)!)),
             ...(item.acceptance.length === 0
               ? []
               : [`    Acceptance: ${item.acceptance.map(compactText).join("; ")}`]),
@@ -751,6 +752,18 @@ function renderExecutionGroup(
     ...(summary.resolution === undefined
       ? []
       : [`      Resolution: ${summary.resolution.decision} — ${compactText(summary.resolution.summary)}`])
+  ];
+}
+
+function renderWorkItemExecutionGroup(group: WorkItemExecutionGroup): string[] {
+  const summary = summarizeWorkItemExecutionGroup(group);
+  return [
+    `    Execution Group ${summary.groupId} [replicated]: ${summary.openLaneCount} open / ${summary.succeededLaneCount} succeeded / ${summary.failedLaneCount} failed`,
+    ...summary.laneSummaries.map((lane) => (
+      `      Lane ${lane.laneId} (#${lane.ordinal}, ${lane.roleName}`
+      + `${lane.currentTurnId === undefined ? "" : `, turn ${lane.currentTurnId}`})`
+      + ` [${lane.disposition}]`
+    ))
   ];
 }
 
