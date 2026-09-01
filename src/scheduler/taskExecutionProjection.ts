@@ -905,7 +905,7 @@ function collectBlockers(
     }
     if (item.status === "pending" && (item.dependsOn ?? []).some((id) => {
       const status = byId.get(id)?.status;
-      return status !== "completed" && status !== "retired";
+      return status !== "completed";
     })) {
       blockers.push({
         kind: "work",
