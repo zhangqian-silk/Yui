@@ -3,7 +3,8 @@ import type { AgentAdapterId } from "./adapterCatalog.js";
 const OWNED_ARGUMENTS_BY_ADAPTER: Readonly<Record<AgentAdapterId, readonly string[]>> = {
   codex: [
     "resume", "fork", "exec", "e", "review",
-    "--model", "-m", "--config", "-c", "--sandbox", "-s",
+    "--model", "-m", "--config", "-c", "--remote", "--remote-auth-token-env",
+    "--sandbox", "-s",
     "--ask-for-approval", "-a", "--search", "--profile", "-p",
     "--add-dir", "--cd", "-C", "--full-auto",
     "--dangerously-bypass-approvals-and-sandbox",

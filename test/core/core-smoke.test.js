@@ -15,7 +15,12 @@ import {
   releaseProcessing
 } from "../../dist/coordination/workMailbox.js";
 import { createTaskEvent } from "../../dist/event/taskEvent.js";
+import {
+  configuredAgentToDefinition,
+  createConfiguredAgent
+} from "../../dist/agent/agent.js";
 import { resolveAgentAdapter } from "../../dist/executor/agentAdapter.js";
+import * as roleLaunchPlanner from "../../dist/executor/fileRoleLaunchPlanner.js";
 import {
   bindTaskRoleProviderRuntime,
   createRoleSessionSet,
@@ -29,10 +34,16 @@ import {
   stopTaskExecutionCommand
 } from "../../dist/commands/taskExecutionCommands.js";
 import { runTaskCommand } from "../../dist/commands/taskCommands.js";
-import { createRole, createRoleAgentBinding } from "../../dist/role/role.js";
+import {
+  createGlobalRole,
+  createRole,
+  createRoleAgentBinding
+} from "../../dist/role/role.js";
+import { materializeSessionBootstrap } from "../../dist/context/sessionBootstrapManifest.js";
 import { builtinAgentDriverRegistry } from "../../dist/runtime/builtinAgentDrivers.js";
 import { serializeAgentErrorRaw, standardAgentError } from "../../dist/runtime/agentError.js";
 import { runtimeLifecycleTarget } from "../../dist/runtime/lifecycleReservation.js";
+import { createExactControlPlaneDescriptor } from "../../dist/runtime/exactControlPlane.js";
 import { startStructuredProviderSession } from "../../dist/runtime/structuredProviderHost.js";
 import {
   acceptProviderTurn,
@@ -163,6 +174,109 @@ test("Managed Codex shares the native App Server used by interactive clients", (
     },
     workspace: "/tmp/yui-shared-codex-runtime"
   }, "new"), /cannot be scoped to one shared-daemon thread/u);
+});
+
+test("Global Codex Sessions use the shared daemon and retain a process-independent Context entry", (t) => {
+  const home = mkdtempSync(join(tmpdir(), "yui-global-codex-context-"));
+  t.after(() => rmSync(home, { recursive: true, force: true }));
+  const now = new Date("2026-09-01T00:00:00.000Z");
+  assert.throws(
+    () => createConfiguredAgent("custom", "codex", "codex", ["--remote", "unix://"], [], now),
+    /Agent base argument is reserved by adapter codex: --remote/u
+  );
+  ensureStorageSchema(home);
+  const store = new SqliteTaskStore(home);
+  t.after(() => store.close());
+  const agent = createConfiguredAgent("codex", "codex", "codex", [], [], now);
+  const binding = createRoleAgentBinding(configuredAgentToDefinition(agent));
+  const role = createGlobalRole(
+    "operator",
+    [binding],
+    binding.agentId,
+    home,
+    now
+  );
+  store.saveConfiguredAgent(agent);
+  store.saveGlobalRole(role);
+  assert.throws(() => resolveAgentAdapter("codex").compileNew({
+    agent: configuredAgentToDefinition(agent),
+    config: {
+      adapterId: "codex",
+      permission: { strategy: "bypass" },
+      advanced: { rawArgs: ["--remote", "unix://"] }
+    },
+    workspace: home
+  }), /Advanced rawArgs contains reserved argument: --remote/u);
+  const controlPlane = createExactControlPlaneDescriptor({
+    executable: process.execPath,
+    cliEntry: join(root, "dist", "cli.js"),
+    yuiHome: home
+  });
+  const bootstrap = materializeSessionBootstrap({
+    yuiHome: home,
+    role,
+    owner: { scope: "global" },
+    roleKind: "operator",
+    skills: [],
+    controlPlane
+  });
+
+  assert.equal(typeof roleLaunchPlanner.addCodexSharedDaemonRemote, "function");
+  assert.deepEqual(
+    roleLaunchPlanner.addCodexSharedDaemonRemote(["--model", "gpt-test"], "new"),
+    ["--model", "gpt-test", "--remote", "unix://"]
+  );
+  assert.deepEqual(
+    roleLaunchPlanner.addCodexSharedDaemonRemote(
+      ["--model", "gpt-test", "resume", "thread-1"],
+      "resume"
+    ),
+    ["--model", "gpt-test", "--remote", "unix://", "resume", "thread-1"]
+  );
+  const remoteWithContext = roleLaunchPlanner.addCodexSharedDaemonRemote(
+    ["--model", "gpt-test"],
+    "new",
+    {
+      PATH: "/not-forwarded",
+      YUI_HOME: home,
+      YUI_ROLE: "operator",
+      YUI_SESSION_MANIFEST: bootstrap.manifestPath,
+      YUI_SESSION_SCOPE: "global"
+    }
+  );
+  assert.deepEqual(remoteWithContext.slice(-4, -2), ["--remote", "unix://"]);
+  assert.equal(remoteWithContext.at(-2), "--config");
+  assert.match(remoteWithContext.at(-1), /shell_environment_policy\.set=/u);
+  assert.match(remoteWithContext.at(-1), /"YUI_ROLE"="operator"/u);
+  assert.doesNotMatch(remoteWithContext.at(-1), /PATH/u);
+  const planned = new roleLaunchPlanner.FileRoleLaunchPlanner(home, store, {
+    cliPath: join(root, "dist", "cli.js"),
+    environment: { ...bareEnv, CODEX_HOME: join(home, "codex-home") }
+  }).planGlobalRole({
+    roleName: role.name,
+    agentId: agent.id,
+    adapterId: agent.adapterId,
+    mode: "new",
+    launchId: "operator-launch-1"
+  });
+  assert.ok(planned.launch.args.includes("--remote"));
+  assert.ok(planned.launch.args.includes("unix://"));
+  assert.ok(planned.launch.args.some((argument) => (
+    argument.includes("shell_environment_policy.set=")
+    && argument.includes("YUI_SESSION_MANIFEST")
+  )));
+  assert.doesNotMatch(bootstrap.manifest.contextProtocol.loadCommand, /\$YUI_/u);
+  assert.doesNotMatch(bootstrap.manifest.contextProtocol.loadCommand, /--yui-control/u);
+  assert.match(bootstrap.manifest.contextProtocol.loadCommand, /session context 'operator' --json/u);
+  assert.match(bootstrap.manifest.contextProtocol.loadCommand, /YUI_HOME=/u);
+  const directContext = JSON.parse(execFileSync(
+    "/bin/sh",
+    ["-c", bootstrap.manifest.contextProtocol.loadCommand],
+    { cwd: home, encoding: "utf8", env: bareEnv }
+  ));
+  const directContextData = JSON.parse(directContext.output);
+  assert.equal(directContextData.identity.roleName, "operator");
+  assert.equal(directContextData.identity.scope, "global");
 });
 
 test("Managed Codex performs the App Server WebSocket handshake through its proxy", async (t) => {

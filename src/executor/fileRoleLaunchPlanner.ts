@@ -797,7 +797,17 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
     const scopedLaunch = owner.scope === "task"
       ? this.#applyWorkspaceScope(owner.taskId, role, launch, workspaceOverride)
       : launch;
-    const ordinaryConversationLaunch = withCodexThreadEnvironment(scopedLaunch);
+    const sharedDaemonLaunch = owner.scope === "global" && configured.adapterId === "codex"
+      ? {
+          ...scopedLaunch,
+          args: addCodexSharedDaemonRemote(
+            scopedLaunch.args,
+            launchMode,
+            scopedLaunch.env
+          )
+        }
+      : scopedLaunch;
+    const ordinaryConversationLaunch = withCodexThreadEnvironment(sharedDaemonLaunch);
     return {
       role: {
         name: role.name,
@@ -1157,6 +1167,43 @@ function addCodexSessionNotify(
     throw new Error("Codex resume launch shape is invalid.");
   }
   return [...args.slice(0, -2), ...managed, ...args.slice(-2)];
+}
+
+/**
+ * Global Codex keeps its native TUI, but the TUI is only a client attachment
+ * to the user's shared App Server. The daemon owns the Thread and its writer,
+ * so Desktop can open the same Yui-created Thread without a second rollout
+ * writer or a Yui-specific takeover.
+ */
+export function addCodexSharedDaemonRemote(
+  args: readonly string[],
+  mode: "new" | "resume",
+  environment: Readonly<Record<string, string>> = {}
+): string[] {
+  const sessionEnvironment = Object.fromEntries(Object.entries(environment).filter(
+    ([name]) => name.startsWith("YUI_")
+  ));
+  const remote = [
+    "--remote",
+    "unix://",
+    ...(Object.keys(sessionEnvironment).length === 0
+      ? []
+      : ["--config", codexShellEnvironmentConfig(sessionEnvironment)])
+  ];
+  if (mode === "new") return [...args, ...remote];
+  if (args.length < 2 || args.at(-2) !== "resume") {
+    throw new Error("Codex resume launch shape is invalid.");
+  }
+  return [...args.slice(0, -2), ...remote, ...args.slice(-2)];
+}
+
+function codexShellEnvironmentConfig(
+  environment: Readonly<Record<string, string>>
+): string {
+  const entries = Object.entries(environment)
+    .sort(([left], [right]) => left.localeCompare(right))
+    .map(([name, value]) => `${JSON.stringify(name)}=${JSON.stringify(value)}`);
+  return `shell_environment_policy.set={${entries.join(",")}}`;
 }
 
 /**

@@ -43,6 +43,14 @@ byte-forwarding `codex app-server proxy` and reaches the same native daemon used
 by interactive Codex clients. The daemon owns the thread and its writer state.
 The Agent Host owns only its disposable proxy process and WebSocket attachment.
 
+Global Codex Roles keep the native TUI presentation, but Yui connects that TUI
+to the same default App Server daemon. The connection endpoint is internal
+runtime configuration and cannot be overridden by Agent or Role arguments.
+The TUI is therefore a client attachment rather than a second rollout writer.
+Its Session Manifest carries a self-contained Global Context command, so
+opening the same thread in Desktop does not depend on environment inherited
+from the Yui-created TUI process.
+
 The shared daemon must already be available through the installed Codex client.
 Yui never starts, restarts, or stops it in response to a Task, thread, or proxy
 error; daemon/CLI repair remains outside Task lifecycle recovery.
