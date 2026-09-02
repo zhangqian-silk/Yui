@@ -765,8 +765,9 @@ const taskChildren: readonly NodeInput[] = [
       },
       {
         name: "review",
-        summary: "Ask the configured reviewer to inspect a WorkItem candidate.",
-        usage: "yui task work review <task>/<work>",
+        summary: "Ask the configured reviewer to inspect a WorkItem candidate directly or with replicated Producers.",
+        usage: "yui task work review <task>/<work> [--lane-role <producer-role> --lane-role <producer-role> ...]",
+        options: ["--lane-role"],
         executable: true,
         sections: [
           { id: "retry", title: "Task-final recovery", entries: ["retry"] },

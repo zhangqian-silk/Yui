@@ -557,9 +557,13 @@ authorized expansions.
   then make the Leader-owned accept/reject decision. Do not create a Reviewer
   Role merely to satisfy an old setup convention.
 - `always`: keep the Candidate decision pending until its required ReviewRound
-  is terminal. The Review does not globally pause unrelated Leader work.
+  is terminal. Policy-triggered WorkItem Review uses direct execution. The
+  Review does not globally pause unrelated Leader work.
 - `leader`: decide whether the existing evidence is sufficient. Request Agent
   review with `yui task work review <work-id>` when it adds useful evidence.
+  Add at least two distinct `--lane-role` values only when independent
+  Producer inspections of that same frozen Candidate materially improve the
+  evidence; one value is invalid.
 - `final`: keep WorkItem acceptance and integration independent. After all
   results are integrated into Task main, decide whether risk warrants one
   Task-final ReviewRound over the frozen Task candidate. A Task contract may

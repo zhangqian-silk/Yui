@@ -90,11 +90,13 @@ assigned WorkItem without `--lane-role` by default. That direct WorkItem Turn
 is durable and has no ExecutionGroup. Request replicated execution with at
 least two distinct Lane Roles only when current Task evidence justifies
 independent attempts at the same frozen Assignment. This execution choice is
-separate from Task decomposition and WorkItem count. Direct Review likewise
-uses one main Reviewer Turn with no Group. Replicated Review uses at least two
+separate from Task decomposition and WorkItem count. Direct Candidate or
+Task-final Review likewise uses one main Reviewer Turn with no Group.
+Replicated Review is an explicit choice in either scope: it uses at least two
 distinct Producer Lane Roles over one frozen Assignment, waits for every Lane
 to settle, and gives the main Reviewer the durable successful results for one
-authoritative synthesis Turn.
+authoritative synthesis Turn. Automatic policy-triggered Candidate Review
+stays direct.
 
 Risk controls review and evidence strength. Use one Task-final Review of the
 frozen Task main when it materially protects the control plane, whether or not

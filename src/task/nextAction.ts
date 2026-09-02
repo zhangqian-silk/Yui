@@ -304,7 +304,9 @@ export function projectNextAction(facts: NextActionFacts): NextAction {
               preconditions: [
                 { fact: "A Review Producer Lane is open", satisfied: true, ref: reviewRef }
               ],
-              recommendedCommand: `yui task work review ${task.id}/${candidateReady.id}`
+              recommendedCommand:
+                `yui task work review ${task.id}/${candidateReady.id}`
+                + reviewLaneRoleOptions(activeReview)
             });
           }
           const runRef = activeReview.reviewerTurnId === undefined
@@ -350,7 +352,9 @@ export function projectNextAction(facts: NextActionFacts): NextAction {
           { fact: "ReviewRound is pending", satisfied: true, ref: reviewRef },
           { fact: "Reviewer Turn exists", satisfied: false }
         ],
-        recommendedCommand: `yui task work review ${task.id}/${candidateReady.id}`
+        recommendedCommand:
+          `yui task work review ${task.id}/${candidateReady.id}`
+          + reviewLaneRoleOptions(activeReview)
       });
     }
     const refs = [
@@ -653,6 +657,7 @@ export function projectNextAction(facts: NextActionFacts): NextAction {
             ],
             recommendedCommand:
               `yui task review request ${task.id} --role ${activeFinal.reviewerRoleName}`
+              + reviewLaneRoleOptions(activeFinal)
           });
         }
         const runRef = activeFinal.reviewerTurnId === undefined
@@ -713,7 +718,9 @@ export function projectNextAction(facts: NextActionFacts): NextAction {
         { fact: "Task-final ReviewRound is pending", satisfied: true, ref: reviewRef },
         { fact: "Reviewer Turn exists", satisfied: false }
       ],
-      recommendedCommand: `yui task review retry ${task.id}/${activeFinal.id}`
+      recommendedCommand:
+        `yui task review request ${task.id} --role ${activeFinal.reviewerRoleName}`
+        + reviewLaneRoleOptions(activeFinal)
     });
   }
 
@@ -908,6 +915,12 @@ function activeReviewRoundRun(round: ReviewRound, activeTurns: readonly Turn[]):
     if (run !== undefined) return run;
   }
   return undefined;
+}
+
+function reviewLaneRoleOptions(round: ReviewRound): string {
+  return round.executionGroup?.lanes
+    .map(({ roleName }) => ` --lane-role ${roleName}`)
+    .join("") ?? "";
 }
 
 function reviewGroupNeedsDispatch(

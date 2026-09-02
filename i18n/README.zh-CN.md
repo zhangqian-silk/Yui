@@ -187,6 +187,22 @@ review。冻结头变化时创建新的语义 Round；同一 Reviewer 的兼容�
 所有候选、ReviewRound 和 Leader 决策都集中在原 WorkItem 下；reject
 后的下一轮会复用原执行 Role、Session 与 workspace，并追加新候选。
 
+显式 WorkItem Candidate Review 与 Task-final Review 默认都直接创建一个 main
+Reviewer Turn；只有 Leader 明确提供至少两个不同的 `--lane-role` 时才使用复制执行。
+所有 Producer Lane 在隔离 workspace 中检查同一冻结 Assignment，全部 settle 且至少
+两个成功后，才创建一个权威 main synthesis Turn。自动 policy 触发的 Candidate
+Review 始终保持直接执行。
+
+```sh
+yui task work review <task-id>/<work-item-id>
+yui task work review <task-id>/<work-item-id> \
+  --lane-role security-reviewer --lane-role correctness-reviewer
+
+yui task review request <task-id> --role reviewer
+yui task review request <task-id> --role reviewer \
+  --lane-role security-reviewer --lane-role correctness-reviewer
+```
+
 查看已有 Task 的详细状态时，优先使用 `task context`。它一次聚合 Task、Brief、Active Decision、最近的 Milestone、Role、当前及最近的 WorkItem 与关联 Turn、最近的 Message、Open/Resolved InputRequest 和 Event。终端输出会精简历史和长文本；`yui --json task context <task-id>` 会在顶层 `data` 中返回完整记录。
 
 Task identity 由一个有界交付目标决定，而不是由涉及几个仓库决定。带仓库的

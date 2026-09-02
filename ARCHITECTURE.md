@@ -110,6 +110,9 @@ successful Lane.
 - `ReviewRound` records one semantic judgment. A WorkItem Review references
   that WorkItem's immutable Candidate. A Task-final Review references the
   frozen Task heads directly and has no synthetic WorkItem/Candidate anchor.
+  Either scope executes directly through one main Reviewer Turn or, when the
+  Leader explicitly supplies at least two Producer Roles, through one frozen
+  replicated Assignment followed by one authoritative main synthesis Turn.
   It is never another WorkItem.
 
 Adding another Agent requires an explicit adapter implementation. Profiles do

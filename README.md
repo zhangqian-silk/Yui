@@ -308,9 +308,15 @@ Worker in its existing Session, review again, or request user input.
 A failed review remains visible evidence and wakes the Leader, but does not
 take that decision away from the Leader.
 
-Task-final Review is direct unless the Leader names Producer Roles:
+An explicit WorkItem Candidate or Task-final Review is direct unless the
+Leader names Producer Roles. Policy-triggered WorkItem Review remains direct
+by default:
 
 ```sh
+yui task work review <task-id>/<work-item-id>
+yui task work review <task-id>/<work-item-id> \
+  --lane-role security-reviewer --lane-role correctness-reviewer
+
 yui task review request <task-id> --role reviewer
 yui task review request <task-id> --role reviewer \
   --lane-role security-reviewer --lane-role correctness-reviewer
@@ -325,9 +331,9 @@ Producers are never rerun during Lane or main retry. Producer output is durable
 non-authoritative evidence; only the main Reviewer result completes the Round,
 updates the finding ledger, and supplies the semantic Review outcome.
 
-Task context and next-action expose direct Review facts: every frozen Project
-commit, its relation to the current candidate, the active Turn, and the Reviewer
-workspace. A request that fails after Round creation retains the ReviewRound
+Task context and next-action expose the Review shape, every frozen Project
+commit, its relation to the current candidate, Producer and main Turns, and
+their owned workspaces. A request that fails after Round creation retains the ReviewRound
 and reports its exact reason; the Leader opens that Round and decides whether
 to retry, inspect or clean the workspace, use another Reviewer, or continue
 other work.

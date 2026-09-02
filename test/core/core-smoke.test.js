@@ -114,7 +114,9 @@ import {
 } from "../../dist/task/task.js";
 import {
   attachWorkItemExecutionGroup,
+  createCandidateGitSnapshot,
   createWorkItem,
+  submitWorkItemCandidate,
   updateWorkItemStatus
 } from "../../dist/workItem/workItem.js";
 import { createManagedWorkspace } from "../../dist/worktree/managedWorkspace.js";
@@ -1613,7 +1615,7 @@ test("direct and replicated WorkItem execution converge through exact Lane retry
   assert.match(mainTurn.inputs[0].input.directive, new RegExp(groupId, "u"));
 });
 
-test("direct and replicated Review keep Producer results non-authoritative across main retry", (t) => {
+test("direct and replicated Review keep Producer results non-authoritative", (t) => {
   const home = mkdtempSync(join(tmpdir(), "yui-review-execution-smoke-"));
   t.after(() => rmSync(home, { recursive: true, force: true }));
   ensureStorageSchema(home);
@@ -1667,7 +1669,15 @@ test("direct and replicated Review keep Producer results non-authoritative acros
     }]
   }, now));
   const binding = createRoleAgentBinding({ id: "codex", adapterId: "codex" });
-  for (const roleName of ["reviewer-direct", "reviewer-main", "producer-a", "producer-b"]) {
+  for (const roleName of [
+    "reviewer-direct",
+    "reviewer-main",
+    "producer-a",
+    "producer-b",
+    "candidate-main",
+    "candidate-a",
+    "candidate-b"
+  ]) {
     store.saveGlobalRole(createGlobalRole(
       roleName,
       [binding],
@@ -1698,6 +1708,29 @@ test("direct and replicated Review keep Producer results non-authoritative acros
     store.saveReviewRound(task.id, attached);
     return attached;
   };
+  const laneWorkspacesFor = (round) => new Map(round.executionGroup.lanes.map((lane) => {
+    const laneRoot = join(home, lane.id);
+    return [lane.id, createManagedWorkspace({
+      owner: {
+        type: "execution-lane",
+        taskId: task.id,
+        executionGroupId: round.executionGroup.id,
+        executionLaneId: lane.id,
+        purpose: "review",
+        reviewRoundId: round.id
+      },
+      root: laneRoot,
+      entries: [{
+        projectId: project.id,
+        directory: "app",
+        access: "write",
+        path: join(laneRoot, "app"),
+        branch: lane.id,
+        baseRef: commit,
+        baseCommit: commit
+      }]
+    }, now)];
+  }));
   const finish = (turn, status, completedAt, report, producerLabel) => {
     const result = store.transaction((tx) => terminalizeExactTaskTurn(tx, {
       taskId: task.id,
@@ -1737,7 +1770,7 @@ test("direct and replicated Review keep Producer results non-authoritative acros
     return result.turn;
   };
 
-  const revisionBeforeInvalidRequest = store.getRevision();
+  const revisionBeforeInvalidCandidateRequest = store.getRevision();
   assert.throws(() => runTaskCommand([
     "review", "request", task.id,
     "--role", "reviewer-main",
@@ -1747,7 +1780,7 @@ test("direct and replicated Review keep Producer results non-authoritative acros
     environment: bareEnv,
     actualTaskReviewCandidate: candidate
   }), /zero or at least two --lane-role/u);
-  assert.equal(store.getRevision(), revisionBeforeInvalidRequest);
+  assert.equal(store.getRevision(), revisionBeforeInvalidCandidateRequest);
   assert.deepEqual(store.listReviewRounds(task.id), []);
 
   runTaskCommand([
@@ -1801,50 +1834,7 @@ test("direct and replicated Review keep Producer results non-authoritative acros
   );
   replicatedRound = attachWorkspace(replicatedRound, "review-main");
   const groupId = replicatedRound.executionGroup.id;
-  const laneWorkspaces = new Map(replicatedRound.executionGroup.lanes.map((lane) => {
-    const laneRoot = join(home, lane.id);
-    const laneProjectPath = join(laneRoot, "app");
-    mkdirSync(laneProjectPath, { recursive: true });
-    return [lane.id, createManagedWorkspace({
-      owner: {
-        type: "execution-lane",
-        taskId: task.id,
-        executionGroupId: groupId,
-        executionLaneId: lane.id,
-        purpose: "review",
-        reviewRoundId: replicatedRound.id
-      },
-      root: laneRoot,
-      entries: [{
-        projectId: project.id,
-        directory: "app",
-        access: "write",
-        path: laneProjectPath,
-        branch: lane.id,
-        baseRef: commit,
-        baseCommit: commit
-      }]
-    }, now)];
-  }));
-  const [firstLane, secondLane] = replicatedRound.executionGroup.lanes;
-  const collidingWorkspaces = new Map(laneWorkspaces);
-  collidingWorkspaces.set(secondLane.id, createManagedWorkspace({
-    owner: laneWorkspaces.get(secondLane.id).owner,
-    root: laneWorkspaces.get(firstLane.id).root,
-    entries: laneWorkspaces.get(secondLane.id).entries
-  }, now));
-  const revisionBeforeCollision = store.getRevision();
-  assert.throws(() => dispatchPreparedReviewRound(task.id, replicatedRound.id, store, {
-    now: () => new Date("2026-09-02T00:13:30.000Z"),
-    environment: bareEnv,
-    actualTaskReviewCandidate: candidate,
-    executionLaneWorkspaces: collidingWorkspaces
-  }), /Review Producer workspaces collide/u);
-  assert.equal(store.getRevision(), revisionBeforeCollision);
-  assert.equal(
-    store.listTurns(task.id).filter(({ reviewRoundId }) => reviewRoundId === replicatedRound.id).length,
-    0
-  );
+  const laneWorkspaces = laneWorkspacesFor(replicatedRound);
   dispatchPreparedReviewRound(task.id, replicatedRound.id, store, {
     now: () => new Date("2026-09-02T00:14:00.000Z"),
     environment: bareEnv,
@@ -1911,44 +1901,6 @@ test("direct and replicated Review keep Producer results non-authoritative acros
     []
   );
 
-  const frozenGroup = store.getReviewRound(task.id, replicatedRound.id).executionGroup;
-  finish(
-    initialMain,
-    "failed",
-    new Date("2026-09-02T00:17:00.000Z"),
-    "",
-    "main-failed"
-  );
-  assert.equal(store.getReviewRound(task.id, replicatedRound.id).status, "failed");
-  runTaskCommand(
-    ["turn", "retry", `${task.id}/${initialMain.id}`],
-    store,
-    {
-      now: () => new Date("2026-09-02T00:18:00.000Z"),
-      environment: bareEnv,
-      actualTaskReviewCandidate: candidate
-    }
-  );
-  assert.deepEqual(
-    store.getReviewRound(task.id, replicatedRound.id).executionGroup,
-    frozenGroup
-  );
-  const retriedMain = dispatchPreparedReviewRound(task.id, replicatedRound.id, store, {
-    now: () => new Date("2026-09-02T00:19:00.000Z"),
-    environment: bareEnv,
-    actualTaskReviewCandidate: candidate
-  });
-  assert.ok(retriedMain);
-  assert.notEqual(retriedMain.id, initialMain.id);
-  assert.equal(retriedMain.sourceExecutionGroupId, groupId);
-  assert.equal(
-    store.listTurns(task.id).filter(({ executionGroupId }) => executionGroupId === groupId).length,
-    2
-  );
-  assert.deepEqual(
-    store.getReviewRound(task.id, replicatedRound.id).executionGroup,
-    frozenGroup
-  );
   const authoritativeReport = JSON.stringify({
     summary: "Main synthesis found one issue.",
     checks: [{ name: "core", outcome: "passed" }],
@@ -1963,15 +1915,15 @@ test("direct and replicated Review keep Producer results non-authoritative acros
     }]
   });
   finish(
-    retriedMain,
+    initialMain,
     "completed",
-    new Date("2026-09-02T00:20:00.000Z"),
+    new Date("2026-09-02T00:17:00.000Z"),
     authoritativeReport,
     "main"
   );
   const terminalRound = store.getReviewRound(task.id, replicatedRound.id);
   assert.equal(terminalRound.status, "completed");
-  assert.equal(terminalRound.reviewerTurnId, retriedMain.id);
+  assert.equal(terminalRound.reviewerTurnId, initialMain.id);
   assert.equal(terminalRound.report, authoritativeReport);
   assert.equal(store.listReviewFindings(task.id).length, 1);
   assert.equal(
@@ -1981,6 +1933,107 @@ test("direct and replicated Review keep Producer results non-authoritative acros
   assert.deepEqual(store.listWorkItems(task.id), []);
   assert.deepEqual(store.listChangeSets(task.id), []);
   assert.deepEqual(store.listIntegrationAttempts(task.id), []);
+  const candidateWorkspace = createManagedWorkspace({
+    owner: { type: "work-item", taskId: task.id, workItemId: "work-item-1" },
+    root: join(home, "candidate"),
+    entries: [{
+      projectId: project.id,
+      directory: "app",
+      access: "write",
+      path: join(home, "candidate", "app"),
+      branch: "candidate",
+      baseRef: commit,
+      baseCommit: commit
+    }]
+  }, now);
+  store.saveManagedWorkspace(candidateWorkspace);
+  let item = updateWorkItemStatus(createWorkItem("work-item-1", task.id, {
+    title: "Candidate implementation",
+    objective: "Review the exact submitted implementation.",
+    acceptance: ["Inspect the frozen Candidate."],
+    writeProjectIds: [project.id]
+  }, now), "running", now);
+  item = submitWorkItemCandidate(item, {
+    summary: "Candidate ready.",
+    source: { type: "direct" },
+    reviewPolicy: { roleName: "candidate-main", trigger: "leader" },
+    workspace: candidateWorkspace,
+    gitSnapshot: createCandidateGitSnapshot(candidateWorkspace, [{
+      projectId: project.id,
+      commit
+    }])
+  }, now);
+  store.saveWorkItem(task.id, item);
+
+  const revisionBeforeInvalidRequest = store.getRevision();
+  assert.throws(() => runTaskCommand([
+    "work", "review", `${task.id}/${item.id}`,
+    "--lane-role", "candidate-a"
+  ], store, {
+    now: () => now,
+    environment: bareEnv
+  }), /zero or at least two --lane-role/u);
+  assert.equal(store.getRevision(), revisionBeforeInvalidRequest);
+
+  const revisionBeforeProducerCollision = store.getRevision();
+  assert.throws(() => runTaskCommand([
+    "work", "review", `${task.id}/${item.id}`,
+    "--lane-role", "leader",
+    "--lane-role", "candidate-b"
+  ], store, {
+    now: () => now,
+    environment: bareEnv
+  }), /separate from the Candidate producer/u);
+  assert.equal(store.getRevision(), revisionBeforeProducerCollision);
+
+  runTaskCommand([
+    "work", "review", `${task.id}/${item.id}`,
+    "--lane-role", "candidate-a",
+    "--lane-role", "candidate-b"
+  ], store, {
+    now: () => now,
+    environment: bareEnv
+  });
+  let round = store.listReviewRounds(task.id).at(-1);
+  assert.equal(round.scope ?? "work-item", "work-item");
+  assert.deepEqual(
+    round.executionGroup.lanes.map(({ roleName }) => roleName),
+    ["candidate-a", "candidate-b"]
+  );
+  assert.deepEqual(round.executionGroup.assignment, {
+    schemaVersion: 1,
+    input: `Review the frozen WorkItem Candidate for ReviewRound ${round.id}.`,
+    objective: item.objective,
+    acceptance: item.acceptance,
+    contextSnapshotRef: round.executionGroup.assignment.contextSnapshotRef,
+    taskId: task.id,
+    reviewRoundId: round.id,
+    reviewBaseCommit: commit,
+    scope: "work-item",
+    workItemId: item.id,
+    candidateId: item.candidates.at(-1).id,
+    projects: [{ projectId: project.id, baseCommit: commit }]
+  });
+  assert.equal(
+    projectNextAction(store.readNextActionFacts(task.id)).recommendedCommand,
+    `yui task work review ${task.id}/${item.id}`
+      + " --lane-role candidate-a --lane-role candidate-b"
+  );
+  round = attachWorkspace(round, "candidate-review");
+  dispatchPreparedReviewRound(task.id, round.id, store, {
+    now: () => new Date("2026-09-03T00:01:00.000Z"),
+    environment: bareEnv,
+    executionLaneWorkspaces: laneWorkspacesFor(round)
+  });
+  const candidateProducerTurns = store.listTurns(task.id).filter(({ reviewRoundId }) => (
+    reviewRoundId === round.id
+  ));
+  assert.equal(candidateProducerTurns.length, 2);
+  assert.equal(new Set(candidateProducerTurns.map(({ workspace }) => workspace.root)).size, 2);
+  assert.ok(candidateProducerTurns.every(({ executionGroupId }) => (
+    executionGroupId === round.executionGroup.id
+  )));
+  assert.equal(store.getReviewRound(task.id, round.id).reviewerTurnId, undefined);
 });
 
 test("Leader replicated Lanes derive from Task main without a WorkItem workspace", async (t) => {

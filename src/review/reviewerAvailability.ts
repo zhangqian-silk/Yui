@@ -60,8 +60,7 @@ export function projectReviewerAvailability(
     };
   }
   const activeRound = store.listReviewRounds(taskId).find((round) => (
-    (round.scope ?? "work-item") === "task"
-    && (round.status === "pending" || round.status === "running")
+    (round.status === "pending" || round.status === "running")
     && (round.reviewerRoleName === reviewerRoleName
       || round.executionGroup?.lanes.some(({ roleName }) => roleName === reviewerRoleName) === true)
   ));
