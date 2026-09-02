@@ -524,9 +524,9 @@ export function terminalizeExactTaskTurn(
       })
     : undefined;
   const incompleteProducer = producer !== undefined
-    && turn.effective.writeProjectIds.length > 0
-    && (!producerCoversWriteProjects(producer, turn.effective.writeProjectIds)
-      || producer.checks.length === 0);
+    && (producer.checks.length === 0
+      || (turn.effective.writeProjectIds.length > 0
+        && !producerCoversWriteProjects(producer, turn.effective.writeProjectIds)));
   const terminal = input.outcome.status === "completed" && !incompleteProducer
     ? completeTurn(turn, input.outcome.summary, now, input.outcome.provider, producer)
     : failTurn(

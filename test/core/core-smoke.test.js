@@ -1611,9 +1611,9 @@ test("Leader replicated Lanes derive from Task main without a WorkItem workspace
   store.saveConfig({ ...store.getConfig(), defaultWorkspace: workspaceRoot });
   const now = new Date("2026-09-02T00:10:00.000Z");
   const projectRoot = join(home, "project");
-  const laneRoot = join(home, "lane-project");
+  const laneRoots = [join(home, "lane-project-1"), join(home, "lane-project-2")];
   mkdirSync(projectRoot, { recursive: true });
-  mkdirSync(laneRoot, { recursive: true });
+  for (const laneRoot of laneRoots) mkdirSync(laneRoot, { recursive: true });
   const project = createProject(
     "project-1",
     "app",
@@ -1638,7 +1638,8 @@ test("Leader replicated Lanes derive from Task main without a WorkItem workspace
     }
   ), taskIdentity, now), now);
   store.saveTask(task);
-  const head = "a".repeat(40);
+  const recordedBase = "a".repeat(40);
+  const currentHead = "b".repeat(40);
   store.saveManagedWorkspace(createManagedWorkspace({
     owner: { type: "task", taskId: task.id },
     root: join(home, "task-main"),
@@ -1649,7 +1650,7 @@ test("Leader replicated Lanes derive from Task main without a WorkItem workspace
       path: projectRoot,
       branch: "main",
       baseRef: "main",
-      baseCommit: head
+      baseCommit: recordedBase
     }]
   }, now));
   const item = createWorkItem("work-item-1", task.id, {
@@ -1658,25 +1659,70 @@ test("Leader replicated Lanes derive from Task main without a WorkItem workspace
     writeProjectIds: [project.id]
   }, now);
   store.saveWorkItem(task.id, item);
+  const binding = createRoleAgentBinding({ id: "codex", adapterId: "codex" });
+  for (const roleName of ["leader", "producer-a", "producer-b"]) {
+    store.saveRole(task.id, createRole(
+      task.id,
+      roleName,
+      [binding],
+      binding.agentId,
+      home,
+      now
+    ));
+  }
   const ensureCalls = [];
   const git = {
+    isClean: async () => true,
+    headRef: async () => "main",
+    inspect: async () => ({ baseCommit: currentHead }),
+    isAncestor: async (_path, ancestor, descendant) => (
+      ancestor === recordedBase && descendant === currentHead
+    ),
     ensureWorktree: async (input) => {
       ensureCalls.push(input);
-      return { path: laneRoot, branch: "yui/task-1/lane" };
+      return {
+        path: laneRoots[ensureCalls.length - 1],
+        branch: `yui/task-1/lane-${ensureCalls.length}`
+      };
     }
   };
   const preparer = new FileTaskWorkspacePreparer(home, store, git, () => now);
-  const workspace = await preparer.prepareExecutionLaneWorkspace(
-    task.id,
-    "execution-group-1",
-    "execution-group-1-lane-1",
-    { purpose: "execution", workItemId: item.id }
+  const inputHeads = await preparer.snapshotExecutionLaneInputHeads(
+    store.getTaskWorkspace(task.id),
+    item.writeProjectIds
   );
+  const groupId = `execution-group-${store.peekNextTurnId(task.id)}`;
+  const laneWorkspaces = new Map();
+  for (const ordinal of [1, 2]) {
+    const laneId = `${groupId}-lane-${ordinal}`;
+    laneWorkspaces.set(laneId, await preparer.prepareExecutionLaneWorkspace(
+      task.id,
+      groupId,
+      laneId,
+      { purpose: "execution", workItemId: item.id, inputHeads }
+    ));
+  }
   assert.equal(store.getWorkItemWorkspace(task.id, item.id), null);
-  assert.equal(ensureCalls.length, 1);
-  assert.equal(ensureCalls[0].baseRef, head);
-  assert.equal(workspace.entries[0].baseCommit, head);
-  assert.equal(workspace.entries[0].access, "write");
+  assert.equal(ensureCalls.length, 2);
+  assert.deepEqual(inputHeads, [{ projectId: project.id, headCommit: currentHead }]);
+  for (const [ordinal, workspace] of [...laneWorkspaces.values()].entries()) {
+    assert.equal(ensureCalls[ordinal].baseRef, currentHead);
+    assert.equal(workspace.entries[0].baseCommit, currentHead);
+    assert.equal(workspace.entries[0].access, "write");
+  }
+  runTaskCommand([
+    "work", "dispatch", `${task.id}/${item.id}`,
+    "--lane-role", "producer-a",
+    "--lane-role", "producer-b"
+  ], store, {
+    now: () => now,
+    environment: bareEnv,
+    executionLaneWorkspaces: laneWorkspaces
+  });
+  assert.deepEqual(
+    store.getWorkItem(task.id, item.id).executionGroups[0].assignment.projects,
+    [{ projectId: project.id, baseCommit: currentHead }]
+  );
 });
 
 test("producer evidence covers every writable Project and drives WorkItem observability", (t) => {
@@ -1709,11 +1755,11 @@ test("producer evidence covers every writable Project and drives WorkItem observ
     digest: "c".repeat(64)
   };
 
-  const prepare = (workItemId, groupId, firstTurnId) => {
+  const prepare = (workItemId, groupId, firstTurnId, writeProjectIds = projectIds) => {
     const item = updateWorkItemStatus(createWorkItem(workItemId, task.id, {
       title: workItemId,
       assignee: "producer-a",
-      writeProjectIds: projectIds
+      writeProjectIds
     }, now), "running", now);
     const laneWorkspaces = roles.map((role, index) => createManagedWorkspace({
       owner: {
@@ -1725,21 +1771,24 @@ test("producer evidence covers every writable Project and drives WorkItem observ
         workItemId
       },
       root: join(home, `${groupId}-lane-${index + 1}`),
-      entries: projectIds.map((projectId, projectIndex) => ({
-        projectId,
-        directory: projectId,
-        access: "write",
-        path: join(home, `${groupId}-lane-${index + 1}-${projectId}`),
-        branch: `${groupId}-lane-${index + 1}`,
-        baseRef: commits[projectIndex],
-        baseCommit: commits[projectIndex]
-      }))
+      entries: writeProjectIds.map((projectId) => {
+        const projectIndex = projectIds.indexOf(projectId);
+        return {
+          projectId,
+          directory: projectId,
+          access: "write",
+          path: join(home, `${groupId}-lane-${index + 1}-${projectId}`),
+          branch: `${groupId}-lane-${index + 1}`,
+          baseRef: commits[projectIndex],
+          baseCommit: commits[projectIndex]
+        };
+      })
     }, now));
     const effective = laneWorkspaces.map((workspace, index) => resolveEffectiveLaunch({
       role: roles[index],
       purpose: "execution",
       workspace,
-      workItemWriteProjectIds: projectIds
+      workItemWriteProjectIds: writeProjectIds
     }));
     const assignment = createWorkItemExecutionAssignment({
       input: "Produce the same frozen result.",
@@ -1749,13 +1798,16 @@ test("producer evidence covers every writable Project and drives WorkItem observ
       taskId: task.id,
       workItemId,
       workItemRevision: item.revision,
-      projects: projectIds.map((projectId, index) => ({ projectId, baseCommit: commits[index] })),
+      projects: writeProjectIds.map((projectId) => ({
+        projectId,
+        baseCommit: commits[projectIds.indexOf(projectId)]
+      })),
       dependencyFacts: []
     });
     const group = createWorkItemExecutionGroup(groupId, task.id, assignment, roles.map((role, index) => ({
       roleName: role.name,
       effective: effective[index],
-      workspace: { root: laneWorkspaces[index].root, writableProjectIds: projectIds },
+      workspace: { root: laneWorkspaces[index].root, writableProjectIds: writeProjectIds },
       currentTurnId: index === 0 ? firstTurnId : `${firstTurnId}-sibling`
     })), now);
     const groupedItem = attachWorkItemExecutionGroup(item, group, now);
@@ -1795,6 +1847,17 @@ test("producer evidence covers every writable Project and drives WorkItem observ
   }, new Date("2026-09-02T00:21:00.000Z")));
   assert.equal(rejected.turn.status, "failed");
   assert.equal(rejected.turn.result.failureReason, "missing-result");
+
+  const gitless = prepare("work-item-3", "execution-group-3", "turn-3", []);
+  const rejectedGitless = store.transaction((tx) => terminalizeExactTaskTurn(tx, {
+    taskId: task.id,
+    roleName: gitless.turn.roleName,
+    agentId: gitless.turn.effective.agentId,
+    turnId: gitless.turn.id,
+    outcome: { status: "completed", summary: "No validation evidence." }
+  }, new Date("2026-09-02T00:21:30.000Z")));
+  assert.equal(rejectedGitless.turn.status, "failed");
+  assert.equal(rejectedGitless.turn.result.failureReason, "missing-result");
 
   const complete = prepare("work-item-2", "execution-group-2", "turn-2");
   const accepted = store.transaction((tx) => terminalizeExactTaskTurn(tx, {

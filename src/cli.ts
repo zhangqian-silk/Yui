@@ -2372,12 +2372,22 @@ async function prepareExecutionLaneWorkspacesForCommand(
       if (project === null) throw new Error(`Project not found: ${projectId}.`);
       projectPaths.set(projectId, project.path);
     }
+    const source = item.assignee === "leader"
+      ? store.getTaskWorkspace(item.taskId)
+      : store.getWorkItemWorkspace(item.taskId, item.id);
+    if (source === null) {
+      throw usageError(`Execution Lane source workspace is not ready: ${item.id}.`);
+    }
+    const inputHeads = await preparer.snapshotExecutionLaneInputHeads(
+      source,
+      item.writeProjectIds
+    );
     for (const laneId of plan.laneIds) {
       map.set(laneId, await preparer.prepareExecutionLaneWorkspace(
         item.taskId,
         plan.groupId,
         laneId,
-        { purpose: "execution", workItemId: item.id },
+        { purpose: "execution", workItemId: item.id, inputHeads },
         { current: held.current }
       ));
     }

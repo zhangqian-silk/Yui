@@ -2915,6 +2915,17 @@ function dispatchWork(
         )
       };
     });
+    const assignmentProjects = plans[0]!.managedWorkspace.entries
+      .filter(({ projectId }) => item.writeProjectIds.includes(projectId))
+      .map(({ projectId, baseCommit }) => ({ projectId, baseCommit }));
+    if (plans.some(({ managedWorkspace }) => !isDeepStrictEqual(
+      managedWorkspace.entries
+        .filter(({ projectId }) => item.writeProjectIds.includes(projectId))
+        .map(({ projectId, baseCommit }) => ({ projectId, baseCommit })),
+      assignmentProjects
+    ))) {
+      throw usageError(`Execution Lane input heads disagree: ${groupId}.`);
+    }
     const assignment = createWorkItemExecutionAssignment({
       input: replicatedProducerAssignmentInput(rawInput, item.writeProjectIds.length > 0),
       objective: item.objective,
@@ -2923,9 +2934,7 @@ function dispatchWork(
       taskId: task.id,
       workItemId: item.id,
       workItemRevision: workItemForDispatch.revision,
-      projects: workspace.entries
-        .filter(({ projectId }) => item.writeProjectIds.includes(projectId))
-        .map(({ projectId, baseCommit }) => ({ projectId, baseCommit })),
+      projects: assignmentProjects,
       dependencyFacts: item.dependsOn.map((dependencyId) => {
         const dependency = requireWorkItem(tx, `${task.id}/${dependencyId}`, options);
         return { workItemId: dependency.id, revision: dependency.revision };
