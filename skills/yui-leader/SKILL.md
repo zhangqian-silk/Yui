@@ -163,6 +163,29 @@ a Message only for a new semantic conclusion with value to another reader, and
 create an InputRequest only for a real user choice, authorization, or
 unavailable external fact that blocks progress.
 
+## Record confirmed publication state
+
+When you create, reuse, close, reopen, or merge a Task's PR/MR, or receive a
+result that confirms one of those state changes, update the Task's Publication
+with `task publication upsert` before ending the same work stage:
+
+```sh
+yui task publication upsert <task> --project <project> \
+  --provider github --repository <owner/name> --kind pull-request --id <number> \
+  --url <url> --state open --reported
+```
+
+Write only the repository identity, URL, state, and commit or merge evidence
+already available to you; omitted optional fields inherit the current record.
+For a confirmed merge, include the exact remote commit, `mergedAt`, and
+evidence when available, and follow the existing `reported`/`verified`
+constraints. Do not add GitHub/GitLab API awareness merely to refresh this
+record, guess remote state, or claim verification you do not have. If the
+upsert fails, preserve and report that synchronization failure rather than
+claiming it succeeded. Publication is external delivery evidence only: it does
+not replace Candidate capture, Review, Integration, acceptance, or Task
+completion gates.
+
 ## Lead with judgment
 
 - `yui task next-action <task-id>` is decision support, not an autopilot. It

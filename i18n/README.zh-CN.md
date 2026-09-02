@@ -480,6 +480,20 @@ yui task context <task-id>
 
 需要查看单个集合或记录时，再使用 `task work`、`task message`、`task turn` 和 Task Knowledge 下的细分命令。
 
+使用一个幂等命令记录 Task 已确认的 PR/MR 外部交付状态：
+
+```sh
+yui task publication upsert <task-id> --project <project> \
+  --provider github --repository <owner/name> --kind pull-request --id <number> \
+  --url <url> --state open --reported
+```
+
+必需的 provider/repository/external ID 会定位当前 Publication。首次 upsert
+创建记录；后续 upsert 继承未指定的可选字段，只有语义发生变化时才追加新的不可变记录，
+并由 Yui 自动关联上一版本；相同输入不会新增事件。`list`、`show` 和 `task context`
+继续保留完整历史。该命令只记录调用方已经掌握的事实，不会自行查询 Provider，也不替代
+Review、Integration 或 Task completion 门禁。
+
 完成目标后，可将 Task 标记为 completed，从而停止自动唤醒，同时保留 session 和 Task main worktree：
 
 ```sh

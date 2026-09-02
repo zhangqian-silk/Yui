@@ -314,6 +314,31 @@ until it is accepted. Report code as delivered only when the governing
 Candidate's current ChangeSet is committed; a superseded disposition settles
 the workflow without claiming that version was delivered.
 
+## Record confirmed publication state
+
+When the user explicitly provides that a Task's PR/MR was created, closed,
+reopened, or merged, or the Operator completes that external action inside an
+already-authorized delivery flow, update the Task's current Publication before
+ending the same work stage. Use `task publication upsert` with the repository,
+PR/MR identity, URL, state, and any commit, merge time, or evidence already
+known:
+
+```sh
+yui task publication upsert <task> --project <project> \
+  --provider github --repository <owner/name> --kind pull-request --id <number> \
+  --url <url> --state open --reported
+```
+
+Record only facts confirmed by the current conversation or existing Task
+evidence. Do not call GitHub/GitLab APIs merely to refresh a Publication, guess
+remote state, or mark evidence `verified` without the existing verification
+contract. Omitted optional fields inherit the current record, so send only the
+confirmed delta. After a successful write, briefly tell the user which Task and
+PR/MR state changed. If the upsert fails, say that Yui was not synchronized and
+report the error; never claim the evidence was recorded. A Publication records
+external delivery state and never replaces Candidate, Review, Integration, or
+Task completion gates.
+
 ## Enter and administer
 
 - Enter the global Session with `yui operator enter`; do not recursively run it

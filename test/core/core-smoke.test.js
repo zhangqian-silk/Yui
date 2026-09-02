@@ -143,6 +143,8 @@ test("the packaged CLI starts and exposes the core workflow", () => {
     assert.ok(commands.includes(command), `missing core command: ${command}`);
   }
   assert.ok(commands.includes("task turn list"));
+  assert.ok(commands.includes("task publication upsert"));
+  assert.equal(commands.includes("task publication add"), false);
   assert.equal(commands.some((command) => command.startsWith("task run")), false);
   assert.equal(commands.includes("task rebuild"), false);
   assert.equal(commands.some((command) => command.startsWith("task history")), false);

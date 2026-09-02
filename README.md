@@ -680,6 +680,22 @@ yui task context <task-id>
 
 Use the narrower `task work`, `task message`, `task turn`, and Task Knowledge commands when you need one collection or record.
 
+Record a Task's confirmed PR/MR delivery state with one idempotent command:
+
+```sh
+yui task publication upsert <task-id> --project <project> \
+  --provider github --repository <owner/name> --kind pull-request --id <number> \
+  --url <url> --state open --reported
+```
+
+The required provider/repository/external ID selects the current Publication.
+The first upsert creates it; later upserts inherit omitted optional fields and
+append a new immutable record only when the semantics change. Yui links that
+record to the previous version automatically, while identical input creates no
+event. `list`, `show`, and `task context` retain the complete history. This
+records facts already known to the caller; it does not query a provider or
+replace Review, Integration, or Task completion gates.
+
 When the requested outcome is finished, complete the Task to stop automatic Leader wakes without deleting its sessions or Task main worktree:
 
 ```sh

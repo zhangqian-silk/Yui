@@ -1951,8 +1951,7 @@ export class SqliteTaskStore implements TaskStore {
           const latest = latestSqlitePublicationReference(sameExternal);
           if (stored.supersedes !== latest.id) {
             throw new StorageRecordError(
-              `Publication external identity conflicts with ${latest.id}; `
-              + `explicitly supersede that record: ${key}.`
+              `Publication external identity conflicts with current record ${latest.id}: ${key}.`
             );
           }
         } else if (stored.supersedes !== undefined) {

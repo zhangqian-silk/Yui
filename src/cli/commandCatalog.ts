@@ -606,14 +606,14 @@ const taskChildren: readonly NodeInput[] = [
   },
   {
     name: "publication",
-    summary: "Record external PR/MR publication evidence for a Task.",
-    sections: [{ id: "manage", title: "Commands", entries: ["add", "list", "show"] }],
+    summary: "Create or update external PR/MR publication evidence for a Task.",
+    sections: [{ id: "manage", title: "Commands", entries: ["upsert", "list", "show"] }],
     children: [
       {
-        name: "add",
-        summary: "Record an external PR/MR and its publication state.",
-        usage: "yui task publication add <task> --project <project> --provider <github|gitlab> --repository <owner/name> --kind <pull-request|merge-request> --id <external-id> [--url <url>] [--title <text>] [--source-branch <branch>] [--target-branch <branch>] [--local-commit <sha>] [--remote-commit <sha>] [--state <open|merged|closed>] [--reported|--verified] [--evidence <text>] [--supersede <publication-id>] [--merged-at <iso-timestamp>]",
-        options: ["--project", "--provider", "--repository", "--kind", "--id", "--url", "--title", "--source-branch", "--target-branch", "--local-commit", "--remote-commit", "--state", "--reported", "--verified", "--evidence", "--supersede", "--merged-at"]
+        name: "upsert",
+        summary: "Create or immutably update an external PR/MR and its publication state.",
+        usage: "yui task publication upsert <task> --project <project> --provider <github|gitlab> --repository <owner/name> --kind <pull-request|merge-request> --id <external-id> [--url <url>] [--title <text>] [--source-branch <branch>] [--target-branch <branch>] [--local-commit <sha>] [--remote-commit <sha>] [--state <open|merged|closed>] [--reported|--verified] [--evidence <text>] [--merged-at <iso-timestamp>]",
+        options: ["--project", "--provider", "--repository", "--kind", "--id", "--url", "--title", "--source-branch", "--target-branch", "--local-commit", "--remote-commit", "--state", "--reported", "--verified", "--evidence", "--merged-at"]
       },
       {
         name: "list",
