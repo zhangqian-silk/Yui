@@ -1206,7 +1206,7 @@ function selectOpenWorkItem(workItems: readonly WorkItem[]): OpenWorkItemSelecti
   const eligible = openItems.find((item) => (
     item.dependsOn.every((dependencyId) => {
       const status = byId.get(dependencyId)?.status;
-      return status === "completed" || status === "retired";
+      return status === "completed";
     })
   ));
   if (eligible !== undefined) return { kind: "ready", item: eligible };
@@ -1220,7 +1220,7 @@ function selectOpenWorkItem(workItems: readonly WorkItem[]): OpenWorkItemSelecti
     visited.add(current.id);
     const blockedBy = current.dependsOn.find((dependencyId) => {
       const status = byId.get(dependencyId)?.status;
-      return status !== "completed" && status !== "retired";
+      return status !== "completed";
     });
     if (blockedBy === undefined) return { kind: "ready", item: current };
     const dependency = byId.get(blockedBy);
