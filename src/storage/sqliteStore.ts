@@ -269,14 +269,26 @@ export class SqliteTaskStore implements TaskStore {
     // those rows has found corruption, not a bootstrap opportunity.
     const databaseExisted = existsSync(databasePath);
     this.#db = new Database(databasePath);
-    // §4.1 / §9: WAL, no fsync weakening, FKs on, busy timeout for CLI contention.
-    this.#db.pragma("journal_mode = WAL");
-    this.#db.pragma("synchronous = FULL");
-    this.#db.pragma("foreign_keys = ON");
-    this.#db.pragma("busy_timeout = 5000");
-    this.#db.pragma("wal_autocheckpoint = 1000");
-    migrateSqliteSchema(this.#db);
-    this.#ensureSeedRows(databaseExisted);
+    try {
+      // §4.1 / §9: WAL, no fsync weakening, FKs on, busy timeout for CLI contention.
+      this.#db.pragma("journal_mode = WAL");
+      this.#db.pragma("synchronous = FULL");
+      this.#db.pragma("foreign_keys = ON");
+      this.#db.pragma("busy_timeout = 5000");
+      this.#db.pragma("wal_autocheckpoint = 1000");
+      migrateSqliteSchema(this.#db, {
+        mode: !databaseExisted ? "apply" : "validate"
+      });
+      const schema = inspectSqliteSchemaMigrations(this.#db);
+      this.#openedSchemaHead = {
+        version: schema.currentVersion,
+        checksum: schema.currentChecksum
+      };
+      this.#ensureSeedRows(databaseExisted);
+    } catch (error) {
+      this.#db.close();
+      throw error;
+    }
   }
 
   rootDirectory(): string { return this.#rootDir; }
@@ -296,9 +308,8 @@ export class SqliteTaskStore implements TaskStore {
   /**
    * Guarantee the `home_meta` and `config` singleton rows exist.
    *
-   * A fresh database (created by this connection, or opened in migration
-   * bulk-load mode) is bootstrapped with defaults. An existing database
-   * opened in production mode that is missing either row is corrupt —
+   * A fresh database created by this connection is bootstrapped with defaults.
+   * An existing database that is missing either row is corrupt —
    * truncated, partially migrated, or hand-edited — and must fail closed
    * instead of silently masking the damage with fresh defaults (Issue 01
    * cross-issue handoff: INSERT OR IGNORE could hide migration corruption).
@@ -307,7 +318,7 @@ export class SqliteTaskStore implements TaskStore {
     const hasHomeMeta = this.#db.prepare("SELECT 1 FROM home_meta WHERE id = 1").get() !== undefined;
     const hasConfig = this.#db.prepare("SELECT 1 FROM config WHERE id = 1").get() !== undefined;
     if (hasHomeMeta && hasConfig) return;
-    if (databaseExisted && !this.#migration) {
+    if (databaseExisted) {
       const missing = [
         !hasHomeMeta ? "home_meta" : null,
         !hasConfig ? "config" : null
