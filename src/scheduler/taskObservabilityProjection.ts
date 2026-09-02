@@ -256,6 +256,10 @@ function rootCauses(
       result.push(currentId);
       return;
     }
+    if (item.status === "retired") {
+      result.push(item.id);
+      return;
+    }
     const unresolved = item.dependsOn.filter((dependency) => !dependencySatisfied(dependency, byId));
     if (unresolved.length === 0) {
       if (item.status === "failed" || item.status === "awaiting_acceptance") result.push(item.id);
@@ -263,9 +267,7 @@ function rootCauses(
     }
     for (const dependency of unresolved) {
       const target = byId.get(dependency);
-      if (target?.status === "failed"
-        || target?.status === "awaiting_acceptance"
-        || target?.status === "retired") result.push(target.id);
+      if (target?.status === "failed" || target?.status === "awaiting_acceptance") result.push(target.id);
       else visit(dependency);
     }
   };

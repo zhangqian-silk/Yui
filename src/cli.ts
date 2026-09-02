@@ -78,6 +78,7 @@ import {
 import { runProjectCommand } from "./commands/projectCommands.js";
 import { runProfileCommand } from "./commands/profileCommands.js";
 import {
+  assertWorkItemDependenciesCompletedForCommand,
   dispatchPreparedReviewRound,
   failPendingReviewRound,
   preserveReviewRoundWorkspace,
@@ -229,7 +230,8 @@ import { isAcceptedTaskReviewBaseline } from "./review/reviewAcceptance.js";
 import { NodeGitWorkspace } from "./repository/gitWorkspace.js";
 import {
   currentWorkItemExecutionGroup,
-  workItemExecutionGroupById
+  workItemExecutionGroupById,
+  type WorkItem
 } from "./workItem/workItem.js";
 
 const VERSION = YUI_VERSION;
@@ -1367,6 +1369,7 @@ export async function main(): Promise<void> {
         }
       }
     }
+    assertWorkItemExecutionDependenciesForCommand(resolved, store, process.env);
     if (resolved[1] === "work" && resolved[2] === "dispatch") {
       const workItemId = resolved[3];
       const reference = workItemId === undefined
@@ -2213,6 +2216,28 @@ function cliTaskRecordReference(
   } catch (error) {
     throw usageError(error instanceof Error ? error.message : String(error));
   }
+}
+
+function assertWorkItemExecutionDependenciesForCommand(
+  args: readonly string[],
+  store: TaskStore,
+  environment: NodeJS.ProcessEnv
+): void {
+  let item: WorkItem | undefined;
+  if (args[0] === "task" && args[1] === "work" && args[2] === "dispatch"
+    && args[3] !== undefined) {
+    const reference = cliWorkItemReference(args[3], environment);
+    item = store.getWorkItem(reference.taskId, reference.localId) ?? undefined;
+  } else if (args[0] === "task" && args[1] === "turn" && args[2] === "retry"
+    && args[3] !== undefined) {
+    const reference = cliTaskRecordReference(args[3], "turn", environment);
+    const turn = store.getTurn(reference.taskId, reference.localId);
+    item = turn?.purpose === "execution" && turn.workItemId !== undefined
+      ? store.getWorkItem(turn.taskId, turn.workItemId) ?? undefined
+      : undefined;
+  }
+  if (item === undefined) return;
+  assertWorkItemDependenciesCompletedForCommand(store, item);
 }
 
 async function candidateSnapshotForTaskCommand(

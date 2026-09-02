@@ -211,6 +211,10 @@ import {
   type WorkItemStatus
 } from "../workItem/workItem.js";
 import {
+  assertWorkItemDependenciesCompleted as assertWorkItemDependencyGate,
+  WorkItemDependencyGateError
+} from "../workItem/dependencyGate.js";
+import {
   addExecutionLane,
   createExecutionGroup,
   recordExecutionLaneResult,
@@ -2835,7 +2839,7 @@ function updateWork(
     if (current.assignee === undefined) {
       taskActor(tx, options, task.id);
       if (status === "running") {
-        assertWorkItemDependenciesCompleted(tx, current);
+        assertWorkItemDependenciesCompletedForCommand(tx, current);
       }
       if (status === "completed" && current.status === "awaiting_acceptance") {
         throw usageError(
@@ -3087,7 +3091,7 @@ function dispatchWork(
       );
     }
     if (expanding) taskActor(tx, options, task.id);
-    assertWorkItemDependenciesCompleted(tx, item);
+    assertWorkItemDependenciesCompletedForCommand(tx, item);
     const leaderOwned = item.assignee === "leader";
     const workspace = leaderOwned
       ? tx.getTaskWorkspace(task.id)
@@ -5801,6 +5805,7 @@ function retryTurn(
     if (retryItem !== null && retryItem.status !== "failed" && !groupedRunningRetry) {
       throw usageError(`Work Item ${retryItem.id} is not retryable from ${retryItem.status}.`);
     }
+    if (retryItem !== null) assertWorkItemDependenciesCompletedForCommand(tx, retryItem);
     const runWorkspace = previous.workspace
       ?? (retryItem === null
         ? tx.getTaskWorkspace(task.id)
@@ -7720,15 +7725,17 @@ function taskRecordReference(
   }
 }
 
-function assertWorkItemDependenciesCompleted(
+export function assertWorkItemDependenciesCompletedForCommand(
   store: TaskWorkflowStore,
   item: WorkItem
 ): void {
-  for (const dependencyId of item.dependsOn) {
-    const dependency = store.getWorkItem(item.taskId, dependencyId);
-    if (dependency === null || dependency.status !== "completed") {
-      throw usageError(`Work Item dependency is not completed: ${dependencyId}.`);
+  try {
+    assertWorkItemDependencyGate(store, item);
+  } catch (error) {
+    if (error instanceof WorkItemDependencyGateError) {
+      throw usageError(error.message, undefined, error.details);
     }
+    throw error;
   }
 }
 
