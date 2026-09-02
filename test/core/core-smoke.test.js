@@ -79,6 +79,7 @@ import {
 } from "../../dist/execution/workItemExecution.js";
 import { projectReviewerAvailability } from "../../dist/review/reviewerAvailability.js";
 import { projectNextAction } from "../../dist/task/nextAction.js";
+import { projectTaskRemoteDelivery } from "../../dist/task/remoteDelivery.js";
 import { listPublicCommandPaths } from "../../dist/cli/commandCatalog.js";
 import { runUpdate } from "../../dist/cli/updateOrchestrator.js";
 import { acquireHandoverLock, readHandoverFence } from "../../dist/release/runtimeRelease.js";
@@ -144,12 +145,77 @@ test("the packaged CLI starts and exposes the core workflow", () => {
   }
   assert.ok(commands.includes("task turn list"));
   assert.ok(commands.includes("task publication upsert"));
+  assert.ok(commands.includes("task remote-delivery"));
   assert.equal(commands.includes("task publication add"), false);
   assert.equal(commands.some((command) => command.startsWith("task run")), false);
   assert.equal(commands.includes("task rebuild"), false);
   assert.equal(commands.some((command) => command.startsWith("task history")), false);
   assert.equal(commands.includes("task review rebind"), false);
   assert.equal(commands.includes("task role session switch"), false);
+});
+
+test("remote delivery projects exact merged Task heads without conflating verification", () => {
+  const baseCommit = "1".repeat(40);
+  const headCommit = "2".repeat(40);
+  const projection = projectTaskRemoteDelivery({
+    task: {
+      schemaVersion: 6,
+      id: "task-1",
+      title: "Publish exact head",
+      status: "active",
+      executionGate: { state: "enabled" },
+      projectBindings: [{
+        projectId: "project-1",
+        directory: "Repo",
+        baseRef: "master"
+      }],
+      createdAt: "2026-09-02T00:00:00.000Z",
+      updatedAt: "2026-09-02T00:00:00.000Z"
+    },
+    events: [],
+    publications: [{
+      schemaVersion: 1,
+      id: "publication-1",
+      taskId: "task-1",
+      projectId: "project-1",
+      provider: "github",
+      repository: "example/repo",
+      externalKind: "pull-request",
+      externalId: "17",
+      localCommit: headCommit,
+      remoteCommit: "3".repeat(40),
+      state: "merged",
+      verification: "reported",
+      recordedBy: "operator",
+      source: "manual",
+      createdAt: "2026-09-02T00:01:00.000Z"
+    }],
+    managedWorkspaces: [{
+      schemaVersion: 2,
+      owner: { type: "task", taskId: "task-1" },
+      root: "/tmp/task-1",
+      entries: [{
+        projectId: "project-1",
+        directory: "Repo",
+        access: "write",
+        path: "/tmp/task-1/Repo",
+        branch: "yui/task-1/main",
+        baseRef: "master",
+        baseCommit
+      }],
+      createdAt: "2026-09-02T00:00:00.000Z",
+      updatedAt: "2026-09-02T00:00:00.000Z"
+    }],
+    turns: [],
+    currentCandidate: {
+      projects: [{ projectId: "project-1", commit: headCommit }]
+    }
+  });
+  assert.equal(projection.status, "merged");
+  assert.equal(projection.allMerged, true);
+  assert.equal(projection.allVerified, false);
+  assert.equal(projection.projects[0].expectedLocalCommit, headCommit);
+  assert.equal(projection.projects[0].remoteCommit, "3".repeat(40));
 });
 
 test("update quiesces the exact Controller before an adjacent storage migration", () => {

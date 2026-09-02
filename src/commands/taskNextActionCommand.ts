@@ -29,6 +29,10 @@ import {
   type ReviewDecisionProjection
 } from "../review/reviewDecision.js";
 import type { TaskReviewCandidate } from "../review/reviewRound.js";
+import {
+  projectTaskRemoteDeliveryFromStore,
+  renderTaskRemoteDelivery
+} from "./taskRemoteDeliveryCommand.js";
 
 type NextActionExecutionView = Readonly<Pick<
   TaskExecutionProjection,
@@ -99,6 +103,11 @@ export function runTaskNextActionCommand(
     }
     const events = reader.listEvents(taskId);
     const task = reader.getTask(taskId)!;
+    const remoteDelivery = projectTaskRemoteDeliveryFromStore(
+      reader,
+      task,
+      currentTaskReviewCandidate
+    );
     const operationalTurns = operationalTaskRecords(
       reader.listTurns(taskId),
       events,
@@ -137,7 +146,8 @@ export function runTaskNextActionCommand(
       knowledgeProposals,
       reviewDecision,
       execution: nextActionExecutionView(execution),
-      orchestration
+      orchestration,
+      remoteDelivery
     };
   });
   if (asJson) {
@@ -157,7 +167,8 @@ export function runTaskNextActionCommand(
       data.knowledgeProposals,
       data.reviewDecision,
       data.execution,
-      data.orchestration.advisories
+      data.orchestration.advisories,
+      data.remoteDelivery
     ),
     data
   };
@@ -190,11 +201,13 @@ function renderNextAction(
   }[],
   reviewDecision: ReviewDecisionProjection,
   execution: NextActionExecutionView,
-  orchestrationAdvisories: readonly OrchestrationAdvisory[]
+  orchestrationAdvisories: readonly OrchestrationAdvisory[],
+  remoteDelivery: ReturnType<typeof projectTaskRemoteDeliveryFromStore>
 ): string {
   const lines = [
     `Task: ${action.taskId}`,
     `Type: ${taskType ?? "unspecified"}`,
+    renderTaskRemoteDelivery(remoteDelivery).trimEnd(),
     `Next action: ${action.kind}`,
     `Reason: ${action.reason}`,
     `Execution view: ${execution.status}; owner/action=${execution.owner}/${execution.action}; reason=${execution.reason}; ${execution.summary}`,

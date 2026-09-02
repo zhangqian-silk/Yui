@@ -89,6 +89,11 @@ import {
   planReplicatedWorkItemLanes,
   validateTaskArchiveRequest
 } from "./commands/taskCommands.js";
+import {
+  assertTaskRemoteDeliveryIntegrated,
+  createTaskRemoteDeliveryProof,
+  type TaskRemoteDeliveryProof
+} from "./commands/taskRemoteDeliveryCommand.js";
 import { taskActor } from "./commands/taskActor.js";
 import {
   parseTaskExecutionStartRequest,
@@ -1311,15 +1316,35 @@ export async function main(): Promise<void> {
       });
       return;
     }
+    let archiveRemoteDeliveryProof: TaskRemoteDeliveryProof | undefined;
+    let archiveTaskReviewCandidate: TaskReviewCandidate | undefined;
     if (resolved[1] === "archive") {
       const { taskId, disposition } = validateTaskArchiveRequest(
         resolved.slice(2),
         store,
-        { runtime, environment: process.env, yuiHome: home }
+        {
+          runtime,
+          environment: process.env,
+          yuiHome: home
+        }
       );
       const task = store.getTask(taskId);
       if (task === null) throw new Error(`Task disappeared after archive validation: ${taskId}.`);
       if (task.status !== "archived") {
+        if (disposition === "integrated") {
+          archiveTaskReviewCandidate = await actualTaskReviewCandidateForTaskCommand(
+            resolved,
+            store,
+            workspacePreparer,
+            process.env
+          );
+          archiveRemoteDeliveryProof = createTaskRemoteDeliveryProof(
+            store,
+            task,
+            archiveTaskReviewCandidate ?? null
+          );
+          assertTaskRemoteDeliveryIntegrated(archiveRemoteDeliveryProof.delivery);
+        }
         const workItemIds = store.listManagedWorkspaces(task.id)
           .flatMap(({ owner }) => owner.type === "work-item" ? [owner.workItemId] : []);
         for (const workItemId of workItemIds) {
@@ -1531,12 +1556,14 @@ export async function main(): Promise<void> {
         process.env,
         taskFinalReviewContract
       );
-      const actualTaskReviewCandidate = await actualTaskReviewCandidateForTaskCommand(
-        resolved,
-        store,
-        workspacePreparer,
-        process.env
-      );
+      const actualTaskReviewCandidate = archiveRemoteDeliveryProof === undefined
+        ? await actualTaskReviewCandidateForTaskCommand(
+          resolved,
+          store,
+          workspacePreparer,
+          process.env
+        )
+        : archiveTaskReviewCandidate;
       const deltaRecheckPreflight = await deltaRecheckPreflightForTaskCommand(
         resolved.slice(1),
         store,
@@ -1577,6 +1604,9 @@ export async function main(): Promise<void> {
           ...(actualTaskReviewCandidate === undefined
             ? {}
             : { actualTaskReviewCandidate }),
+          ...(archiveRemoteDeliveryProof === undefined
+            ? {}
+            : { archiveRemoteDeliveryProof }),
           ...(deltaRecheckPreflight === undefined
             ? {}
             : { deltaRecheckPreflight }),
@@ -2582,12 +2612,22 @@ async function actualTaskReviewCandidateForTaskCommand(
       && (round.scope ?? "work-item") === "task") {
       taskId = reference.taskId;
     }
-  } else if ((args[1] === "context" || args[1] === "next-action")
+  } else if (args[1] === "archive"
+    && args[2] !== undefined
+    && args.includes("--integrated")) {
+    taskId = store.getTask(args[2])?.id;
+  } else if ((
+    args[1] === "show"
+    || args[1] === "context"
+    || args[1] === "next-action"
+    || args[1] === "remote-delivery"
+  )
     && args[2] !== undefined) {
     taskId = store.getTask(args[2])?.id;
     decisionSupportRead = true;
   }
-  if (taskId === undefined || store.getTask(taskId)?.status !== "active") return undefined;
+  const status = taskId === undefined ? undefined : store.getTask(taskId)?.status;
+  if (taskId === undefined || (status !== "active" && status !== "retired")) return undefined;
   try {
     return await snapshotActualTaskReviewCandidate(taskId, store, preparer);
   } catch (error) {

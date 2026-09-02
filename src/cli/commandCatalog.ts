@@ -434,6 +434,12 @@ const taskChildren: readonly NodeInput[] = [
     options: ["--json"]
   },
   {
+    name: "remote-delivery",
+    summary: "Project exact Task heads and current PR/MR evidence into merge coverage.",
+    usage: "yui task remote-delivery <task> [--json]",
+    options: ["--json"]
+  },
+  {
     name: "archive",
     summary: "Archive a Task after confirming the main worktree outcome.",
     usage: "yui task archive <id> (--integrated|--abandon)",
@@ -1507,7 +1513,7 @@ export const ROOT_COMMAND = buildNode({
       name: "task",
       summary: "Manage Tasks, WorkItems, Turns, and integration.",
       sections: [
-        { id: "lifecycle", title: "Lifecycle", entries: ["create", "project", "base", "update", "activate", "execution", "complete", "reopen", "retire", "list", "show", "context", "next-action", "archive", "replace", "reconcile", "upstream"] },
+        { id: "lifecycle", title: "Lifecycle", entries: ["create", "project", "base", "update", "activate", "execution", "complete", "reopen", "retire", "list", "show", "context", "next-action", "remote-delivery", "archive", "replace", "reconcile", "upstream"] },
         { id: "collaboration", title: "Collaboration", entries: ["message", "input", "grant", "workflow", "publication", "work", "turn", "review", "integration", "role", "overlap", "change-set"] },
         { id: "knowledge", title: "Task Knowledge", entries: ["brief", "decision", "milestone", "event", "continuation", "wake"] }
       ],

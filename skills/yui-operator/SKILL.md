@@ -339,6 +339,16 @@ report the error; never claim the evidence was recorded. A Publication records
 external delivery state and never replaces Candidate, Review, Integration, or
 Task completion gates.
 
+Use `yui task remote-delivery <task>` when the user asks whether all Task code
+has reached remote or before proposing archive. It derives one merge-coverage
+view from the exact Task delivery heads and current unsuperseded Publications;
+do not infer merged from Task completion or from the mere presence of a PR/MR.
+`allMerged` requires every code-delivery Project to have an exact-head
+Publication in state `merged`; `allVerified` is the independent stronger
+verification axis. `task archive <task> --integrated` is therefore valid only
+when that coverage is satisfied. An intentional non-merge remains the explicit
+`--abandon` path and still requires user authorization for the exact archive.
+
 ## Enter and administer
 
 - Enter the global Session with `yui operator enter`; do not recursively run it

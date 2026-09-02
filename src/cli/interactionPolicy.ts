@@ -258,6 +258,10 @@ export const INTERACTION_POLICIES: readonly InteractionPolicy[] = Object.freeze(
     trailingOptions: { "--all": "flag", "--verbose": "flag" }
   },
   {
+    ...taskTarget("remote-delivery"),
+    trailingOptions: { "--json": "flag" }
+  },
+  {
     ...taskTarget("archive", 2, ["completed", "retired"]),
     trailingOptions: { "--integrated": "flag", "--abandon": "flag" },
     confirmation: { action: "Archive task", targetArgumentIndex: 2 }

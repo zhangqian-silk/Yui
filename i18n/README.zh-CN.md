@@ -494,6 +494,24 @@ yui task publication upsert <task-id> --project <project> \
 继续保留完整历史。该命令只记录调用方已经掌握的事实，不会自行查询 Provider，也不替代
 Review、Integration 或 Task completion 门禁。
 
+可查询每个已交付 Project head 是否都有当前 merged Publication 覆盖：
+
+```sh
+yui task remote-delivery <task-id>
+yui task remote-delivery <task-id> --json
+```
+
+这是只读派生投影，不是新的 Task 状态，也不存在可单独写入的 `merged` 标志。
+active 或 reopened Task 使用当前干净的 Task main heads，并明确标记为 provisional；
+completed 或 archived Task 使用最近一次 `task.completed` 冻结的 heads。每个 Project
+都会展示预期 local commit、匹配的当前未 supersede Publication、PR/MR state、
+verification 与 remote commit。聚合状态为 `none`、`pending`、`partial` 或
+`merged`，并分别暴露 `allMerged` 与 `allVerified`。只有 `localCommit` 精确匹配
+预期 head 且 state 为 `merged` 的当前 Publication 才贡献 merged 覆盖；缺 commit、
+open/closed、陈旧 head 与已 supersede 记录都不会被推断为已合入。Task head 与
+managed base 相同的 Project 不需要 Publication。`task show`、`task context`、
+`task next-action` 和 Web detail 共用同一个 selector。
+
 完成目标后，可将 Task 标记为 completed，从而停止自动唤醒，同时保留 session 和 Task main worktree：
 
 ```sh
@@ -505,7 +523,9 @@ completed Task 在显式 reopen 前会拒绝消息、派发、进入 session、�
 Turn 交付。终态 WorkItem、Review、Integration 与 Lane worktree 会作为非阻塞的
 completion advisory 返回，但必须在 archive 前处理。每个隔离 WorkItem worktree
 仍需显式标记 integrated 或 abandoned，清理时也会删除其受管分支；archive 还必须
-通过 `--integrated` 或 `--abandon` 明确 Task main 的处理结果，之后才会停止
+通过 `--integrated` 或 `--abandon` 明确 Task main 的处理结果。`--integrated`
+还要求 remote-delivery 的 `allMerged=true`；Task completion 本身永远不等同于
+远端已合入。有意不合入时继续使用显式 `--abandon` 路径。之后 archive 才会停止
 session 并清理干净的 Task main。Task 与 WorkItem 记录都会保留，Task main 分支
 作为恢复信息保留，不会被静默删除。
 Task 生命周期的交互选择只展示有效来源状态：activate 只展示 Draft，complete 只展示 active，reopen 只展示 completed。

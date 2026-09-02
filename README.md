@@ -696,6 +696,28 @@ event. `list`, `show`, and `task context` retain the complete history. This
 records facts already known to the caller; it does not query a provider or
 replace Review, Integration, or Task completion gates.
 
+Query whether every delivered Project head is represented by a current merged
+Publication:
+
+```sh
+yui task remote-delivery <task-id>
+yui task remote-delivery <task-id> --json
+```
+
+This is a read-only derived projection, not a Task status or writable `merged`
+flag. Active and reopened Tasks use the current clean Task-main heads and mark
+them provisional; completed and archived Tasks use the latest frozen
+`task.completed` heads. For each Project, Yui reports the expected local
+commit, the matching current unsuperseded Publication, PR/MR state,
+verification, and remote commit. Aggregate coverage is `none`, `pending`,
+`partial`, or `merged`, with independent `allMerged` and `allVerified` values.
+Only a current Publication whose `localCommit` exactly matches the expected
+head and whose state is `merged` contributes merged coverage. Missing commits,
+open/closed records, stale heads, and superseded Publications never imply
+remote delivery. Projects whose Task head equals their managed base need no
+Publication. `task show`, `task context`, `task next-action`, and the Web detail
+projection use this same selector.
+
 When the requested outcome is finished, complete the Task to stop automatic Leader wakes without deleting its sessions or Task main worktree:
 
 ```sh
@@ -735,9 +757,12 @@ worktrees are non-blocking completion advisories, but they must be settled
 before archive. Every isolated WorkItem worktree is explicitly cleaned as
 integrated or abandoned; that cleanup also removes its managed branch. Archive
 requires `--integrated` or `--abandon` to state the Task main outcome and is
-allowed only after Task main is clean. It removes managed worktrees but retains
-Task and WorkItem records. The Task main branch is retained as a recovery
-artifact instead of being silently deleted.
+allowed only after Task main is clean. `--integrated` additionally requires
+remote-delivery `allMerged=true`; Task completion alone is never treated as
+remote merge. An intentional non-merge uses the existing explicit `--abandon`
+path. Archive removes managed worktrees but retains Task and WorkItem records.
+The Task main branch is retained as a recovery artifact instead of being
+silently deleted.
 Task lifecycle completion/selection only suggests valid source states: Draft for activate, active for complete, and completed for reopen.
 
 ## Sessions and tmux

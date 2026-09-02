@@ -186,6 +186,17 @@ claiming it succeeded. Publication is external delivery evidence only: it does
 not replace Candidate capture, Review, Integration, acceptance, or Task
 completion gates.
 
+When deciding or reporting whether all Task code is merged, read
+`yui task remote-delivery <task>` instead of equating `completed` with merged.
+The projection compares the current Task-main heads (provisional while active
+or reopened) or the latest frozen completion heads with current unsuperseded
+Publications. A Project contributes `allMerged` only when the Publication
+records that exact local head in state `merged`; `allVerified` remains a
+separate stronger fact. Reopening and adding a commit therefore makes old merge
+evidence stale until Publication is upserted for the new head. Archive
+`--integrated` consumes this coverage; deliberate non-merge uses the existing
+explicit `--abandon` path.
+
 ## Lead with judgment
 
 - `yui task next-action <task-id>` is decision support, not an autopilot. It

@@ -2222,6 +2222,7 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
     if (main.owner.type !== "task") {
       throw new Error(`Task main workspace ownership is invalid: ${task.id}.`);
     }
+    if (main.entries.length === 0) return "missing";
     return this.#inspectEntries(this.#taskSegment(task), MAIN_WORKTREE, main.entries);
   }
 
@@ -2243,7 +2244,12 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
     const main = this.store.getTaskWorkspace(task.id);
     if (main !== null) {
       assertTaskArchiveState(requireTask(this.store, task.id), task);
-      if (await this.#inspectEntries(this.#taskSegment(task), MAIN_WORKTREE, main.entries) === "dirty") {
+      if (main.entries.length > 0
+        && await this.#inspectEntries(
+          this.#taskSegment(task),
+          MAIN_WORKTREE,
+          main.entries
+        ) === "dirty") {
         return {
           taskId,
           status: "retained-dirty",
