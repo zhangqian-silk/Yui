@@ -71,6 +71,7 @@ import {
   processLeaderWakeups
 } from "../../dist/scheduler/leaderWakeupProcessor.js";
 import { buildTaskExecutionProjection } from "../../dist/scheduler/taskExecutionProjection.js";
+import { projectReviewerAvailability } from "../../dist/review/reviewerAvailability.js";
 import { projectNextAction } from "../../dist/task/nextAction.js";
 import { listPublicCommandPaths } from "../../dist/cli/commandCatalog.js";
 import { acquireHandoverLock, readHandoverFence } from "../../dist/release/runtimeRelease.js";
@@ -529,6 +530,40 @@ test("Provider acceptance consumes only the submitted mailbox prefix", () => {
   assert.equal(consumed.pending.requestCount, 1);
   assert.deepEqual(consumed.pending.dedupeKeys, ["message-2"]);
   assert.deepEqual(consumed.recentDedupeKeys, ["message-1"]);
+});
+
+test("a terminal Reviewer Turn signal does not reserve the next Review slot", () => {
+  const target = { kind: "role", taskId: "task-1", roleName: "reviewer" };
+  const mailbox = enqueueSignal(createWorkMailbox(target), {
+    reason: "review-requested",
+    refs: [{ type: "turn", taskId: "task-1", id: "turn-1" }],
+    occurredAt: "2026-09-02T00:00:00.000Z"
+  });
+  const availability = projectReviewerAvailability({
+    getActiveTurn: () => null,
+    listTurns: () => [{ id: "turn-1", roleName: "reviewer", status: "completed" }],
+    listReviewRounds: () => [],
+    getWorkMailbox: (candidate) => candidate.kind === "role" ? mailbox : null
+  }, "task-1", "reviewer");
+
+  assert.equal(availability.kind, "available");
+  assert.equal(projectReviewerAvailability({
+    getActiveTurn: () => null,
+    listTurns: () => [],
+    listReviewRounds: () => [],
+    getWorkMailbox: (candidate) => candidate.kind === "role" ? mailbox : null
+  }, "task-1", "reviewer").kind, "busy");
+  const processing = claimPending(mailbox, {
+    batchId: "review-delivery",
+    owner: "reviewer",
+    startedAt: "2026-09-02T00:00:01.000Z"
+  });
+  assert.equal(projectReviewerAvailability({
+    getActiveTurn: () => null,
+    listTurns: () => [{ id: "turn-1", roleName: "reviewer", status: "completed" }],
+    listReviewRounds: () => [],
+    getWorkMailbox: (candidate) => candidate.kind === "role" ? processing : null
+  }, "task-1", "reviewer").kind, "busy");
 });
 
 test("Yui and direct Turns share one Provider conversation", () => {
