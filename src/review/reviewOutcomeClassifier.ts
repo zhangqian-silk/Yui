@@ -140,15 +140,6 @@ function failedRoundSemanticEvidence(
   if (looksLikeStructuredReviewReport(round.report ?? "")) {
     return "Failed Round stores a structured Reviewer report.";
   }
-  const semanticLane = (round.executionGroup?.lanes ?? []).find((lane) => (
-    (lane.result?.checks ?? []).length > 0
-    || (lane.result?.findings ?? []).length > 0
-    || (lane.result?.evidence ?? []).length > 0
-    || lane.result?.evidenceCommit !== undefined
-    || lane.result?.gitSnapshot !== undefined
-    || lane.status === "completed"
-  ));
-  if (semanticLane !== undefined) return `Reviewer Lane ${semanticLane.id} delivered semantic evidence.`;
   if (evidence !== undefined) {
     const events = evidence.listEvents(round.taskId);
     const reviewRun = operationalTaskRecords(
@@ -193,30 +184,6 @@ function completedInfrastructureCorroborationFailure(
   }
   if (looksLikeStructuredReviewReport(round.report ?? "")) {
     return "Completed Round stores a structured Reviewer report.";
-  }
-
-  for (const lane of round.executionGroup?.lanes ?? []) {
-    if (lane.status === "pending" || lane.status === "running") {
-      return `Reviewer Lane ${lane.id} is still active.`;
-    }
-    if ((lane.result?.checks ?? []).length > 0
-      || (lane.result?.findings ?? []).length > 0
-      || (lane.result?.evidence ?? []).length > 0
-      || (lane.result?.evidenceCommit !== undefined
-        && lane.result.evidenceCommit !== round.reviewBaseCommit)
-      || lane.result?.gitSnapshot !== undefined) {
-      return `Reviewer Lane ${lane.id} delivered semantic evidence.`;
-    }
-    if (lane.status === "completed") {
-      if (lane.result === undefined
-        || lane.result.summary !== round.summary
-        || lane.result.report !== round.report
-        || lane.result.evidenceCommit !== round.reviewBaseCommit) {
-        return `Reviewer Lane ${lane.id} output is absent or differs from the Round.`;
-      }
-    } else {
-      return `Completed Round has non-completed Reviewer Lane ${lane.id}/${lane.status}.`;
-    }
   }
 
   const allEvents = store.listEvents(round.taskId);

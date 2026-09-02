@@ -8,6 +8,7 @@ import {
   updateReviewExecutionGroup,
   type DeltaRecheckDisposition,
   type ReviewCheck,
+  type ReviewFinding,
   type ReviewRound
 } from "../review/reviewRound.js";
 import { reconcileReviewFindingsAfterReview } from "../review/reviewFindingLedger.js";
@@ -20,12 +21,11 @@ import {
   type TurnProviderResult
 } from "../turn/turn.js";
 import {
-  recordExecutionLaneResult,
-  resolveExecutionGroup,
-  type ExecutionLaneGitSnapshot
-} from "../execution/executionGroup.js";
-import { updateWorkItemExecutionLane } from "../execution/workItemExecution.js";
+  updateExecutionLane,
+  updateWorkItemExecutionLane
+} from "../execution/workItemExecution.js";
 import { reconcileWorkItemMainTurns } from "../execution/workItemMainTurn.js";
+import { reconcileReviewMainTurns } from "../execution/reviewMainTurn.js";
 import {
   isRuntimeLaunchReservation,
   runtimeLifecycleTarget
@@ -40,6 +40,8 @@ import {
   workItemExecutionGroupById,
   updateWorkItemExecutionGroup
 } from "../workItem/workItem.js";
+import type { ExecutionLaneGitSnapshot } from "../repository/executionLaneGitSnapshot.js";
+
 export type ExactReviewRoundTerminalizationResult = Readonly<{
   disposition: "applied" | "obsolete";
   round: ReviewRound | null;
@@ -70,7 +72,8 @@ export function validateExactTurnReviewRound(
     return { disposition: "obsolete", round, reason: "review-round-terminal" };
   }
   const lane = round.executionGroup?.lanes.find(({ id }) => id === turn.executionLaneId);
-  const exactReviewerTurn = round.reviewerTurnId === turn.id || lane?.turnId === turn.id;
+  const exactReviewerTurn = round.reviewerTurnId === turn.id
+    || lane?.currentTurnId === turn.id;
   const exactReviewerRole = round.reviewerRoleName === turn.roleName || lane?.roleName === turn.roleName;
   if (!exactReviewerTurn
     || !exactReviewerRole
@@ -109,7 +112,7 @@ export function validateExactTurnReviewRound(
   }
   if (turn.workspace.owner.type === "execution-lane") {
     if (lane === undefined
-      || lane.turnId !== turn.id
+      || lane.currentTurnId !== turn.id
       || lane.roleName !== turn.roleName
       || lane.workspace?.root !== turn.workspace.root
       || lane.workspace.writableProjectIds.length !== turn.workspace.entries.length
@@ -190,15 +193,13 @@ export function terminalizeExactTurnReviewRound(
       summary?: string;
       report?: string;
       checks?: readonly ReviewCheck[];
-      findings?: readonly import("../execution/executionGroup.js").ExecutionFinding[];
+      findings?: readonly ReviewFinding[];
       evidence?: readonly string[];
       evidenceCommit?: string;
       gitSnapshot?: ExecutionLaneGitSnapshot;
       deltaDisposition?: DeltaRecheckDisposition;
       deltaReasoning?: string;
     }>;
-    /** Explicit retirement closes a fully terminal failed Group instead of leaving a retry path. */
-    settleFailedExecutionGroup?: boolean;
   }>,
   now: Date
 ): ExactReviewRoundTerminalizationResult {
@@ -207,86 +208,20 @@ export function terminalizeExactTurnReviewRound(
     return validation;
   }
   const reviewRound = validation.round;
-  let groupedRound = input.turn.executionGroupId !== undefined
-    && input.turn.executionLaneId !== undefined
-    && reviewRound.executionGroup !== undefined
-    ? updateReviewExecutionGroup(
-        reviewRound,
-        recordExecutionLaneResult(
-          reviewRound.executionGroup,
-          input.turn.executionLaneId,
-          {
-            summary: input.outcome.summary,
-            ...(input.reviewResult?.report === undefined ? {} : { report: input.reviewResult.report }),
-            ...(input.reviewResult?.checks === undefined
-              ? {}
-              : {
-                  checks: input.reviewResult.checks.map(({ name, outcome, details }) => ({
-                    name,
-                    outcome,
-                    ...(details === undefined ? {} : { details })
-                  }))
-                }),
-            ...(input.reviewResult?.findings === undefined
-              ? {}
-              : { findings: input.reviewResult.findings }),
-            ...(input.reviewResult?.evidence === undefined
-              ? {}
-              : { evidence: input.reviewResult.evidence }),
-            ...(input.reviewResult?.evidenceCommit === undefined
-              ? {}
-              : { evidenceCommit: input.reviewResult.evidenceCommit }),
-            ...(input.reviewResult?.gitSnapshot === undefined
-              ? {}
-              : { gitSnapshot: input.reviewResult.gitSnapshot })
-          },
-          input.outcome.status,
-          now
-        )
-      )
-    : reviewRound;
-  if (input.settleFailedExecutionGroup === true
-    && input.outcome.status === "failed"
-    && groupedRound.executionGroup !== undefined
-    && groupedRound.executionGroup.resolution === undefined
-    && groupedRound.executionGroup.lanes.every((lane) => (
-      lane.status === "completed"
-      || lane.status === "failed"
-      || lane.status === "skipped"
-    ))) {
-    groupedRound = updateReviewExecutionGroup(
-      groupedRound,
-      resolveExecutionGroup(groupedRound.executionGroup, {
-        decision: "blocked",
-        summary: input.outcome.summary
-      }, now)
-    );
-  }
-  const groupedMultiLane = groupedRound.executionGroup !== undefined
-    && (groupedRound.executionGroup.lanes.length > 1
-      || groupedRound.executionGroup.strategy.mode === "adaptive");
-  if (groupedMultiLane
-    && groupedRound.executionGroup !== undefined
-    && groupedRound.executionGroup.resolution === undefined) {
-    // A panel Lane only contributes evidence.  The Leader must see every
-    // terminal Lane and explicitly resolve the Group before this ReviewRound
-    // can become terminal.
-    store.saveReviewRound(input.taskId, groupedRound);
-    return { disposition: "applied", round: groupedRound };
+  if (input.turn.executionGroupId !== undefined
+    && input.turn.executionLaneId !== undefined) {
+    // Producer Turns own only their immutable Turn result. The unified Group
+    // is advanced after that result is validated and stored below.
+    return { disposition: "applied", round: reviewRound };
   }
   const terminal = finishReviewRound(
-    groupedRound,
+    reviewRound,
     input.outcome.status,
     input.outcome.summary,
     now,
     input.reviewResult
   );
   store.saveReviewRound(input.taskId, terminal);
-  // Issue 06: a completed (semantic) Round feeds the finding ledger; a failed
-  // execution attempt is skipped by the classifier and never creates findings.
-  if (terminal.status === "completed") {
-    reconcileReviewFindingsAfterReview(store, input.taskId, terminal.id, now);
-  }
   return { disposition: "applied", round: terminal };
 }
 
@@ -299,8 +234,6 @@ export type ExactTurnTerminalizationInput = Readonly<{
   launchId?: string;
   /** Aggregate retirement owns every queued Role signal, not only this Turn. */
   mailboxDisposition?: "exact" | "discard";
-  /** Explicit retirement closes a fully terminal failed Group instead of leaving a retry path. */
-  settleFailedExecutionGroup?: boolean;
   outcome: Readonly<{
     status: "completed" | "failed";
     summary: string;
@@ -311,7 +244,7 @@ export type ExactTurnTerminalizationInput = Readonly<{
     summary?: string;
     report?: string;
     checks?: readonly ReviewCheck[];
-    findings?: readonly import("../execution/executionGroup.js").ExecutionFinding[];
+    findings?: readonly ReviewFinding[];
     evidence?: readonly string[];
     evidenceCommit?: string;
     gitSnapshot?: ExecutionLaneGitSnapshot;
@@ -407,7 +340,6 @@ export function retireExactActiveTurn(
     turnId: input.turnId,
     ...(input.nativeSessionId === undefined ? {} : { nativeSessionId: input.nativeSessionId }),
     ...(input.launchId === undefined ? {} : { launchId: input.launchId }),
-    ...(current.purpose === "review" ? { settleFailedExecutionGroup: true } : {}),
     outcome: { status: "failed", summary: input.reason, failureReason: "missing-result" }
   };
   const session = sessions?.sessions[input.agentId];
@@ -482,18 +414,13 @@ export function terminalizeExactTaskTurn(
     taskId: input.taskId,
     turn,
     outcome: input.outcome,
-    reviewResult: input.reviewResult,
-    ...(input.settleFailedExecutionGroup === undefined
-      ? {}
-      : { settleFailedExecutionGroup: input.settleFailedExecutionGroup })
+    reviewResult: input.reviewResult
   }, now);
   if (reviewRoundTerminalization.disposition !== "applied") {
     return obsolete(turn, reviewRoundTerminalization.reason ?? "review-round-mismatch");
   }
 
   const producer = input.outcome.status === "completed"
-    && turn.purpose === "execution"
-    && turn.workItemId !== undefined
     && turn.executionGroupId !== undefined
     && turn.executionLaneId !== undefined
     ? createProducerTurnResult({
@@ -547,7 +474,7 @@ export function terminalizeExactTaskTurn(
       ? undefined
       : workItemExecutionGroupById(item, turn.executionGroupId);
     if (item !== null && group !== undefined) {
-      if (terminal.status === "completed" || input.settleFailedExecutionGroup === true) {
+      if (terminal.status === "completed") {
         const grouped = updateWorkItemExecutionLane(group, turn.executionLaneId, {
           currentTurnId: turn.id,
           ...(terminal.status === "completed"
@@ -558,7 +485,39 @@ export function terminalizeExactTaskTurn(
       }
     }
   }
+  if (turn.executionGroupId !== undefined
+    && turn.executionLaneId !== undefined
+    && turn.purpose === "review"
+    && turn.reviewRoundId !== undefined) {
+    const round = store.getReviewRound(input.taskId, turn.reviewRoundId);
+    const group = round?.executionGroup;
+    if (round !== null
+      && round !== undefined
+      && group !== undefined
+      && group.id === turn.executionGroupId) {
+      if (terminal.status === "completed") {
+        const grouped = updateExecutionLane(group, turn.executionLaneId, {
+          currentTurnId: turn.id,
+          ...(terminal.status === "completed"
+            ? { successfulTurnId: turn.id, disposition: "succeeded" as const }
+            : { disposition: "failed" as const })
+        }, now);
+        store.saveReviewRound(
+          input.taskId,
+          updateReviewExecutionGroup(round, grouped)
+        );
+      }
+    }
+  }
   store.saveTurn(terminal);
+  if (terminal.status === "completed"
+    && terminal.purpose === "review"
+    && terminal.executionGroupId === undefined
+    && terminal.reviewRoundId !== undefined) {
+    // The authoritative main Turn is durable before the semantic classifier
+    // and finding ledger observe its completed ReviewRound.
+    reconcileReviewFindingsAfterReview(store, input.taskId, terminal.reviewRoundId, now);
+  }
   if (terminal.roleName === "leader") {
     const wake = store.listTaskWakes(input.taskId)
       .find((candidate) => candidate.turnId === terminal.id && candidate.status === "dispatched");
@@ -577,6 +536,7 @@ export function terminalizeExactTaskTurn(
   }
   settleLaunchReservation(store, sessions, input);
   reconcileWorkItemMainTurns(store, input.taskId, now);
+  reconcileReviewMainTurns(store, input.taskId, now);
   return { disposition: "applied", turn: terminal };
 }
 

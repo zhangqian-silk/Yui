@@ -2492,7 +2492,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
             reviewResult = { summary: input.summary, report: input.summary, checks: [] };
           }
         }
-        if (observedTurn.purpose === "execution"
+        if ((observedTurn.purpose === "execution" || observedTurn.purpose === "review")
           && observedTurn.executionGroupId !== undefined
           && observedTurn.executionLaneId !== undefined
           && observedTurn.workspace !== undefined

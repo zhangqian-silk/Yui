@@ -36,9 +36,17 @@ and WorkItem count. Each replicated Lane gets its own durable workspace and
 exact Turn snapshot. Retry or settle the exact unresolved Lane, and never infer
 a Lane result from a shared or non-durable checkout.
 
-Keep Review execution separate. Its ExecutionGroup may use `fixed` or
-`adaptive` strategy, but default to one Reviewer Lane and choose a panel or
-adaptive Review only when the current review need explicitly justifies it.
+Use direct Review by default: one main Reviewer Turn owns the authoritative
+result and has no ExecutionGroup or Lane. Request replicated Review only when
+independent inspection of the same frozen Assignment materially improves the
+evidence. Provide at least two distinct Producer Lane Roles, never the main
+Reviewer Role. Yui waits for every Lane to settle and requires at least two
+successful results before creating one main Reviewer synthesis Turn. Retry or
+settle only unresolved exact Producer Turns; a main retry preserves the Group
+and never reruns successful Producers. Producers are evidence sources only:
+they never create Candidates, ChangeSets, integrations, authoritative findings,
+or the Review outcome. Read the main Reviewer's complete synthesis before
+planning repairs.
 
 ## Default to the Leader-first fast path
 

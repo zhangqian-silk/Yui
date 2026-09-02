@@ -273,8 +273,11 @@ function normalizeSubject(subject: TurnSubject): TurnSubject {
     throw new Error("Turn input execution lineage is incomplete.");
   }
   if (normalized.sourceExecutionGroupId !== undefined
-    && (normalized.workItemId === undefined || normalized.executionGroupId !== undefined)) {
-    throw new Error("Turn input source ExecutionGroup requires a WorkItem main subject.");
+    && ((normalized.workItemId === undefined && normalized.reviewRoundId === undefined)
+      || normalized.executionGroupId !== undefined)) {
+    throw new Error(
+      "Turn input source ExecutionGroup requires a WorkItem or Review main subject."
+    );
   }
   if (normalized.taskId === undefined
     && (normalized.workItemId !== undefined || normalized.reviewRoundId !== undefined

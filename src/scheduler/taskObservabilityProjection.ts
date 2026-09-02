@@ -1,11 +1,9 @@
 import type { ContextSnapshot } from "../context/contextSnapshot.js";
 import type { TaskEvent } from "../event/taskEvent.js";
-import type { ExecutionGroup } from "../execution/executionGroup.js";
-import type { WorkItemExecutionGroup } from "../execution/workItemExecution.js";
-import { isDeepStrictEqual } from "node:util";
-import {
-  observedExecutionResourceUsage
-} from "../execution/resourceBroker.js";
+import type {
+  ExecutionGroup,
+  WorkItemExecutionGroup
+} from "../execution/workItemExecution.js";
 import type { Turn } from "../turn/turn.js";
 import type { SessionTokenMetrics } from "../runtime/sessionTokenMetrics.js";
 import type { WorkItem, WorkItemStatus } from "../workItem/workItem.js";
@@ -277,37 +275,27 @@ function dependencyEdgeStatus(
 function projectCost(
   groups: readonly ExecutionGroup[],
   turns: readonly Turn[],
-  events: readonly TaskEvent[],
+  _events: readonly TaskEvent[],
   now: Date
 ): TaskCostProjection {
-  const stageGroups = latestStageGroups(groups);
-  let tokens = 0;
-  let toolCalls = 0;
-  let wallClockSeconds = 0;
-  let tokensObservable = true;
-  let toolCallsObservable = true;
-  let laneCount = 0;
-  let retryCount = 0;
-  for (const group of stageGroups) {
-    const lineage = groups.filter((candidate) => sameStage(candidate, group));
-    const usage = observedExecutionResourceUsage({ group, stageGroups: lineage, turns, events });
-    tokens += usage.tokens;
-    toolCalls += usage.toolCalls;
-    tokensObservable = tokensObservable && (usage.tokensObservable ?? true);
-    toolCallsObservable = toolCallsObservable && (usage.toolCallsObservable ?? true);
-    wallClockSeconds += stageDurationSeconds(lineage, now);
-    laneCount += group.lanes.length;
-    retryCount += Math.max(0, lineage.length - 1);
-  }
+  const uniqueGroups = [...new Map(groups.map((group) => [group.id, group])).values()];
+  const groupIds = new Set(uniqueGroups.map(({ id }) => id));
+  const attempts = turns.filter(({ executionGroupId }) => (
+    executionGroupId !== undefined && groupIds.has(executionGroupId)
+  ));
+  const laneCount = uniqueGroups.reduce((total, group) => total + group.lanes.length, 0);
   return Object.freeze({
-    tokens,
-    toolCalls,
-    wallClockSeconds,
-    tokensObservable,
-    toolCallsObservable,
+    tokens: 0,
+    toolCalls: 0,
+    wallClockSeconds: uniqueGroups.reduce(
+      (total, group) => total + groupDurationSeconds(group, now),
+      0
+    ),
+    tokensObservable: false,
+    toolCallsObservable: false,
     laneCount,
-    groupCount: stageGroups.length,
-    retryCount,
+    groupCount: uniqueGroups.length,
+    retryCount: Math.max(0, attempts.length - laneCount),
     marginalValuePercent: null,
     marginalValueStatus: "unavailable"
   });
@@ -347,7 +335,7 @@ function projectWorkItemCost(
 }
 
 function projectContext(
-  groups: readonly (ExecutionGroup | WorkItemExecutionGroup)[],
+  groups: readonly ExecutionGroup[],
   turns: readonly Turn[],
   snapshots?: readonly ContextSnapshot[]
 ): TaskContextProjection {
@@ -358,9 +346,7 @@ function projectContext(
     digest: string;
   }>();
   for (const group of groups) {
-    const ref = "assignment" in group
-      ? group.assignment.contextSnapshotRef
-      : group.stage?.contextSnapshotRef;
+    const ref = group.assignment.contextSnapshotRef;
     if (ref !== undefined) refs.set(ref.id, ref);
   }
   for (const turn of turns) {
@@ -395,52 +381,12 @@ function projectContext(
   });
 }
 
-function latestStageGroups(groups: readonly ExecutionGroup[]): ExecutionGroup[] {
-  const latest = new Map<string, ExecutionGroup>();
-  for (const group of groups) {
-    const key = group.stage === undefined ? `group:${group.id}` : stageKey(group);
-    const existing = latest.get(key);
-    if (existing === undefined || compareStageGroup(existing, group) < 0) latest.set(key, group);
-  }
-  return [...latest.values()].sort((left, right) => left.createdAt.localeCompare(right.createdAt));
-}
-
-function sameStage(left: ExecutionGroup, right: ExecutionGroup): boolean {
-  if (left.stage === undefined || right.stage === undefined) return left.id === right.id;
-  return left.taskId === right.taskId
-    && executionTargetKey(left) === executionTargetKey(right)
-    && left.stage.mode === right.stage.mode
-    && left.stage.stage === right.stage.stage
-    && left.stage.round === right.stage.round
-    && isDeepStrictEqual(left.stage.budget, right.stage.budget)
-    && isDeepStrictEqual(left.stage.resources, right.stage.resources);
-}
-
-function stageKey(group: ExecutionGroup): string {
-  const stage = group.stage!;
-  return `${executionTargetKey(group)}\0${stage.mode}\0${stage.stage}\0${stage.round}`;
-}
-
-function executionTargetKey(group: ExecutionGroup): string {
-  const target = group.target;
-  return `${target.kind}\0${target.workItemId ?? ""}\0${target.candidateId ?? ""}`;
-}
-
-function compareStageGroup(left: ExecutionGroup, right: ExecutionGroup): number {
-  return (left.stage?.stageAttempt ?? 1) - (right.stage?.stageAttempt ?? 1)
-    || left.updatedAt.localeCompare(right.updatedAt)
-    || left.id.localeCompare(right.id);
-}
-
-function stageDurationSeconds(groups: readonly ExecutionGroup[], now: Date): number {
-  const started = groups.map(({ createdAt }) => Date.parse(createdAt)).filter(Number.isFinite);
-  const ended = groups.map((group) => Date.parse(group.updatedAt)).filter(Number.isFinite);
-  if (started.length === 0) return 0;
-  const hasOpenWork = groups.some((group) => group.lanes.some(({ status }) => (
-    status === "pending" || status === "running"
-  )));
-  const end = hasOpenWork || ended.length === 0
+function groupDurationSeconds(group: ExecutionGroup, now: Date): number {
+  const started = Date.parse(group.createdAt);
+  const ended = group.lanes.some(({ disposition }) => disposition === "open")
     ? now.getTime()
-    : Math.max(...ended);
-  return Math.max(0, Math.floor((end - Math.min(...started)) / 1_000));
+    : Date.parse(group.updatedAt);
+  return Number.isFinite(started) && Number.isFinite(ended)
+    ? Math.max(0, Math.floor((ended - started) / 1_000))
+    : 0;
 }

@@ -76,15 +76,12 @@ export type ReconcileFindingsResult = Readonly<{
 }>;
 
 /**
- * Extracts reported findings from a completed Round.  The reviewer's JSON
- * report is the authoritative source; panel Rounds fall back to the findings
- * attached to their ExecutionGroup lane results.  A malformed or free-text
- * report yields no findings (the raw report stays authoritative evidence).
+ * Extracts reported findings from a completed Round. The main Reviewer's JSON
+ * report is the only authoritative source. Producer Lane results never enter
+ * the finding ledger.
  */
 export function extractReportedFindings(round: ReviewRound): readonly ExtractedReviewFinding[] {
-  const fromReport = extractFindingsFromReportJson(round.report ?? "");
-  if (fromReport.length > 0) return fromReport;
-  return extractFindingsFromLanes(round);
+  return extractFindingsFromReportJson(round.report ?? "");
 }
 
 function extractFindingsFromReportJson(report: string): readonly ExtractedReviewFinding[] {
@@ -133,31 +130,6 @@ function extractFindingsFromReportJson(report: string): readonly ExtractedReview
       affectedSymbols: stringList(finding.symbols ?? finding.affectedSymbols),
       evidence: stringList(finding.evidence)
     }];
-  });
-}
-
-function extractFindingsFromLanes(round: ReviewRound): readonly ExtractedReviewFinding[] {
-  const lanes = round.executionGroup?.lanes ?? [];
-  return lanes.flatMap((lane) => {
-    const findings = lane.result?.findings ?? [];
-    return findings.flatMap((finding): ExtractedReviewFinding[] => {
-      let severity: ReviewFindingSeverity;
-      try {
-        severity = normalizeReviewFindingSeverity(finding.severity);
-      } catch {
-        return [];
-      }
-      return [{
-        sourceId: finding.id,
-        severity,
-        status: finding.status === "resolved" ? "resolved" : "open",
-        invariant: "review-finding",
-        title: finding.summary,
-        affectedPaths: [],
-        affectedSymbols: [],
-        evidence: []
-      }];
-    });
   });
 }
 

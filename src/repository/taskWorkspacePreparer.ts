@@ -54,9 +54,9 @@ import {
 } from "../worktree/managedWorkspace.js";
 import {
   validateExecutionGroup,
-  type ExecutionGroup,
-  type ExecutionLaneGitSnapshot
-} from "../execution/executionGroup.js";
+  type ExecutionGroup
+} from "../execution/legacyExecutionGroup.js";
+import type { ExecutionLaneGitSnapshot } from "./executionLaneGitSnapshot.js";
 import type { Turn } from "../turn/turn.js";
 import { formatTurnReceiptId } from "../task/taskRecordReference.js";
 import {
@@ -1385,7 +1385,13 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
   async cleanupExecutionLaneWorkspacesForReviewRound(taskId: string, reviewRoundId: string): Promise<GitWorkspaceRemoval> {
     let result: GitWorkspaceRemoval = "missing";
     const round = this.store.getReviewRound(taskId, reviewRoundId);
-    for (const lane of round?.executionGroup?.lanes ?? []) {
+    const lanes = round === null
+      ? []
+      : [
+          ...(round.executionGroup?.lanes ?? []),
+          ...(legacyReviewExecutionGroup(round)?.lanes ?? [])
+        ];
+    for (const lane of lanes) {
       const owner = this.store.listManagedWorkspaces(taskId).find(({ owner }) => (
         owner.type === "execution-lane" && owner.purpose === "review"
           && owner.reviewRoundId === reviewRoundId && owner.executionLaneId === lane.id
@@ -2038,9 +2044,8 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
       .map(({ projectId }) => projectId)
       .sort();
     if (lane === undefined
-      || lane.turnId !== run.id
+      || lane.currentTurnId !== run.id
       || lane.roleName !== run.roleName
-      || lane.reviewRoundId !== round.id
       || lane.workspace?.root !== run.workspace.root
       || !isDeepStrictEqual(
         [...lane.workspace.writableProjectIds].sort(),
@@ -2099,6 +2104,9 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
       this.now()
     );
     for (const lane of round.executionGroup?.lanes ?? []) {
+      assertWorkspaceSessionsRetirable(this.store, task.id, lane.roleName, this.now());
+    }
+    for (const lane of legacyReviewExecutionGroup(round)?.lanes ?? []) {
       assertWorkspaceSessionsRetirable(this.store, task.id, lane.roleName, this.now());
     }
     if (await this.#inspectEntries(
@@ -2621,6 +2629,16 @@ function cleanupExecutionLaneLineage(
         };
       }
     }
+    for (const round of store.listReviewRounds(task.id)) {
+      const group = legacyReviewExecutionGroup(round);
+      if (group?.id === executionGroupId
+        && group.lanes.some(({ id }) => id === executionLaneId)) {
+        return {
+          lineage: { purpose: "review", reviewRoundId: round.id },
+          legacyGroup: group
+        };
+      }
+    }
     throw error;
   }
 }
@@ -2629,6 +2647,12 @@ function legacyExecutionGroups(item: WorkItem): readonly ExecutionGroup[] {
   return (item.legacyExecutionGroups ?? []).map((group) => (
     validateExecutionGroup(group as ExecutionGroup)
   ));
+}
+
+function legacyReviewExecutionGroup(round: ReviewRound): ExecutionGroup | undefined {
+  return round.legacyExecutionGroup === undefined
+    ? undefined
+    : validateExecutionGroup(round.legacyExecutionGroup as ExecutionGroup);
 }
 
 function assertWorkItemWorkspaceEligible(

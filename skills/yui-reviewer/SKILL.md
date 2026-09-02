@@ -30,6 +30,21 @@ frozen Project commits, and assigned workspace. Inspect those exact commits.
 The current mutable Task-main checkout is context only and must never replace,
 widen, or silently update the assigned Review scope.
 
+The Turn also identifies the execution shape. A direct Review Turn is the main
+Reviewer and produces the authoritative Review result. In replicated Review,
+a Producer Lane independently inspects the same frozen Assignment in its own
+Lane workspace and returns durable summary, checks, findings, evidence, and
+exact code references. A Producer result is non-authoritative: do not create a
+Candidate, ChangeSet, integration, ReviewResult, finding-ledger entry, semantic
+outcome, or completion decision.
+
+Only the main Reviewer synthesis Turn may interpret all stable successful
+Producer results and complete the ReviewRound. Inspect every supplied result,
+resolve disagreement through judgment against the frozen sources, and return
+one complete authoritative report. Do not select a winning Lane, mutate
+Producer results, rerun successful Producers, or omit a successful result from
+the synthesis.
+
 ## Separate infrastructure failure from review judgment
 
 Verify the exact Turn identity, Context Pack, frozen head, and ReviewRound-owned

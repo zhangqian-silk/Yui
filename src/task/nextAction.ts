@@ -64,7 +64,6 @@ export type NextActionKind =
   | "request-final-review"
   | "route-review-findings"
   | "resolve-execution-stage"
-  | "resolve-review-group"
   | "resume-review"
   | "retry-execution-lane"
   | "wait-for-owned-execution"
@@ -283,10 +282,8 @@ export function projectNextAction(facts: NextActionFacts): NextAction {
     if (activeReview !== undefined) {
       const reviewRef = ref("review-round", activeReview.id);
       if (activeReview.status === "running") {
-        if (reviewGroupAwaitingResolution(activeReview)) {
-          return buildResolveReviewGroupAction(facts, activeReview);
-        }
-        if (activeReview.reviewerTurnId === undefined) {
+        if (activeReview.reviewerTurnId === undefined
+          && activeReview.executionGroup === undefined) {
           return buildAction(facts, {
             kind: "repair-protocol-inconsistency",
             reason: `ReviewRound ${activeReview.id} is running but has no Reviewer Turn.`,
@@ -299,26 +296,27 @@ export function projectNextAction(facts: NextActionFacts): NextAction {
         }
         const reviewRun = activeReviewRoundRun(activeReview, facts.activeTurns);
         if (reviewRun === undefined) {
-          if (reviewGroupHasResourceQueue(activeReview)) {
+          if (reviewGroupNeedsDispatch(activeReview, facts.activeTurns)) {
             return buildAction(facts, {
               kind: "resume-review",
-              reason: `ReviewRound ${activeReview.id} has Reviewer Lanes waiting for Resource Broker capacity.`,
+              reason: `ReviewRound ${activeReview.id} has Review Producer Lanes ready for dispatch or retry.`,
               refs: [reviewRef],
               preconditions: [
-                { fact: "A Reviewer Lane is durably queued", satisfied: true, ref: reviewRef },
-                { fact: "Resource capacity is available", satisfied: false }
+                { fact: "A Review Producer Lane is open", satisfied: true, ref: reviewRef }
               ],
               recommendedCommand: `yui task work review ${task.id}/${candidateReady.id}`
             });
           }
-  const runRef = ref("turn", activeReview.reviewerTurnId);
+          const runRef = activeReview.reviewerTurnId === undefined
+            ? reviewRef
+            : ref("turn", activeReview.reviewerTurnId);
           return buildAction(facts, {
             kind: "repair-protocol-inconsistency",
-            reason: `ReviewRound ${activeReview.id} references Reviewer Turn ${activeReview.reviewerTurnId}, but that Turn is not active.`,
+            reason: `ReviewRound ${activeReview.id} has no active Producer or main Reviewer Turn.`,
             refs: [reviewRef, runRef],
             conflicts: [reviewRef, runRef],
             preconditions: [
-              { fact: "Reviewer Turn is active", satisfied: false, ref: runRef }
+              { fact: "Review execution is active or ready to dispatch", satisfied: false, ref: runRef }
             ]
           });
         }
@@ -631,10 +629,8 @@ export function projectNextAction(facts: NextActionFacts): NextAction {
     && (activeFinal.status === "pending" || activeFinal.status === "running")) {
     const reviewRef = ref("review-round", activeFinal.id);
     if (activeFinal.status === "running") {
-      if (reviewGroupAwaitingResolution(activeFinal)) {
-        return buildResolveReviewGroupAction(facts, activeFinal);
-      }
-      if (activeFinal.reviewerTurnId === undefined) {
+      if (activeFinal.reviewerTurnId === undefined
+        && activeFinal.executionGroup === undefined) {
         return buildAction(facts, {
           kind: "repair-protocol-inconsistency",
           reason: `Task-final ReviewRound ${activeFinal.id} is running but has no Reviewer Turn.`,
@@ -647,27 +643,28 @@ export function projectNextAction(facts: NextActionFacts): NextAction {
       }
       const reviewRun = activeReviewRoundRun(activeFinal, facts.activeTurns);
       if (reviewRun === undefined) {
-        if (reviewGroupHasResourceQueue(activeFinal)) {
+        if (reviewGroupNeedsDispatch(activeFinal, facts.activeTurns)) {
           return buildAction(facts, {
             kind: "resume-review",
-            reason: `Task-final ReviewRound ${activeFinal.id} has Reviewer Lanes waiting for Resource Broker capacity.`,
+            reason: `Task-final ReviewRound ${activeFinal.id} has Review Producer Lanes ready for dispatch or retry.`,
             refs: [reviewRef],
             preconditions: [
-              { fact: "A Reviewer Lane is durably queued", satisfied: true, ref: reviewRef },
-              { fact: "Resource capacity is available", satisfied: false }
+              { fact: "A Review Producer Lane is open", satisfied: true, ref: reviewRef }
             ],
             recommendedCommand:
               `yui task review request ${task.id} --role ${activeFinal.reviewerRoleName}`
           });
         }
-        const runRef = ref("turn", activeFinal.reviewerTurnId);
+        const runRef = activeFinal.reviewerTurnId === undefined
+          ? reviewRef
+          : ref("turn", activeFinal.reviewerTurnId);
         return buildAction(facts, {
           kind: "repair-protocol-inconsistency",
-          reason: `Task-final ReviewRound ${activeFinal.id} references Reviewer Turn ${activeFinal.reviewerTurnId}, but that Turn is not active.`,
+          reason: `Task-final ReviewRound ${activeFinal.id} has no active Producer or main Reviewer Turn.`,
           refs: [reviewRef, runRef],
           conflicts: [reviewRef, runRef],
           preconditions: [
-            { fact: "Reviewer Turn is active", satisfied: false, ref: runRef }
+            { fact: "Review execution is active or ready to dispatch", satisfied: false, ref: runRef }
           ]
         });
       }
@@ -897,97 +894,31 @@ function latestActiveWorkItemReview(
 }
 
 function activeReviewRoundRun(round: ReviewRound, activeTurns: readonly Turn[]): Turn | undefined {
-  if (round.executionGroup !== undefined) {
-    for (const lane of round.executionGroup.lanes) {
-      if (lane.status !== "running"
-        || lane.reviewRoundId !== round.id
-        || lane.turnId === undefined) {
-        continue;
-      }
-      const run = activeTurns.find((candidate) => (
-        candidate.id === lane.turnId && candidate.roleName === lane.roleName
-      ));
-      if (run !== undefined) return run;
-    }
-    return undefined;
-  }
-  if (round.reviewerTurnId === undefined) return undefined;
-  return activeTurns.find((run) => (
-    run.id === round.reviewerTurnId && run.roleName === round.reviewerRoleName
-  ));
-}
-
-const TERMINAL_REVIEW_LANE_STATUSES = new Set(["completed", "failed"]);
-
-function isPanelReviewRound(round: ReviewRound): boolean {
-  return round.executionGroup !== undefined
-    && (round.executionGroup.lanes.length > 1
-      || round.executionGroup.strategy.mode === "adaptive");
-}
-
-function reviewGroupAwaitingResolution(round: ReviewRound): boolean {
-  return round.status === "running"
-    && round.executionGroup !== undefined
-    && round.executionGroup.resolution === undefined
-    && isPanelReviewRound(round)
-    && round.executionGroup.lanes.every((lane) =>
-      TERMINAL_REVIEW_LANE_STATUSES.has(lane.status));
-}
-
-function reviewGroupHasResourceQueue(round: ReviewRound): boolean {
-  return round.executionGroup !== undefined
-    && round.executionGroup.resolution === undefined
-    && round.executionGroup.lanes.some((lane) => (
-      lane.status === "pending"
-      && lane.turnId === undefined
+  if (round.reviewerTurnId !== undefined) {
+    const main = activeTurns.find((run) => (
+      run.id === round.reviewerTurnId && run.roleName === round.reviewerRoleName
     ));
+    if (main !== undefined) return main;
+  }
+  for (const lane of round.executionGroup?.lanes ?? []) {
+    if (lane.disposition !== "open" || lane.currentTurnId === undefined) continue;
+    const run = activeTurns.find((candidate) => (
+      candidate.id === lane.currentTurnId && candidate.roleName === lane.roleName
+    ));
+    if (run !== undefined) return run;
+  }
+  return undefined;
 }
 
-function buildResolveReviewGroupAction(
-  facts: NextActionFacts,
-  round: ReviewRound
-): NextAction {
-  const group = round.executionGroup!;
-  const refs = [
-    ref("review-round", round.id),
-    ref("execution-group", group.id)
-  ];
-  const resolveCommand = (decision: string) =>
-    `yui task review group resolve ${facts.task.id}/${round.id}`
-    + ` --decision ${decision} --summary \"<decision>\"`;
-  return buildAction(facts, {
-    kind: "resolve-review-group",
-    reason: `Reviewer panel ${group.id} has finished every Lane; the Leader must resolve ReviewRound ${round.id}.`,
-    refs,
-    preconditions: [
-      { fact: "ReviewRound is running", satisfied: true, ref: refs[0] },
-      { fact: "Every Reviewer Lane is terminal", satisfied: true, ref: refs[1] },
-      { fact: "Leader has resolved the Review ExecutionGroup", satisfied: false, ref: refs[1] }
-    ],
-    recommendedCommand: resolveCommand("<accept|reject|blocked>"),
-    alternatives: [
-      {
-        kind: "accept-review-group",
-        reason: "Accept the usable Lane outputs when their evidence satisfies the Task objective.",
-        recommendedCommand: resolveCommand("accept"),
-        refs
-      },
-      {
-        kind: "reject-review-group",
-        reason: "Reject the panel evidence when it does not support the delivery.",
-        recommendedCommand: resolveCommand("reject"),
-        refs
-      },
-      {
-        kind: "block-review-group",
-        reason: "Block the Review when a material dependency or external fact prevents a sound decision.",
-        recommendedCommand: resolveCommand("blocked"),
-        refs
-      }
-    ],
-    judgmentRequired:
-      `Leader must judge Review panel ${group.id} against the Task objective, acceptance criteria, and delivery risk.`
-  });
+function reviewGroupNeedsDispatch(
+  round: ReviewRound,
+  turns: readonly Turn[]
+): boolean {
+  return round.executionGroup?.lanes.some((lane) => (
+    lane.disposition === "open"
+    && (lane.currentTurnId === undefined
+      || turns.find(({ id }) => id === lane.currentTurnId)?.status === "failed")
+  )) === true;
 }
 
 function reviewRoundConflict(
@@ -996,18 +927,15 @@ function reviewRoundConflict(
 ): Inconsistency | null {
   const reviewRef = ref("review-round", round.id);
   if (round.status === "running") {
-    if (reviewGroupAwaitingResolution(round)) {
-      return null;
-    }
-    if (round.reviewerTurnId === undefined) {
+    if (round.reviewerTurnId === undefined && round.executionGroup === undefined) {
       return {
-        reason: `ReviewRound ${round.id} is running but has no Reviewer Turn.`,
+        reason: `ReviewRound ${round.id} is running but has no execution unit.`,
         conflicts: [reviewRef]
       };
     }
     if (activeReviewRoundRun(round, activeTurns) === undefined) {
-      if (reviewGroupHasResourceQueue(round)) return null;
-      const runRef = ref("turn", round.reviewerTurnId);
+      if (round.reviewerTurnId === undefined && round.executionGroup !== undefined) return null;
+      const runRef = ref("turn", round.reviewerTurnId!);
       return {
         reason: `ReviewRound ${round.id} references Reviewer Turn ${round.reviewerTurnId}, but that Turn is not active.`,
         conflicts: [reviewRef, runRef]
@@ -1016,7 +944,9 @@ function reviewRoundConflict(
   }
   if (round.status === "pending") {
     const launchedTurnId = round.reviewerTurnId
-      ?? round.executionGroup?.lanes.find((lane) => lane.turnId !== undefined)?.turnId;
+      ?? round.executionGroup?.lanes.find(
+        (lane) => lane.currentTurnId !== undefined
+      )?.currentTurnId;
     if (launchedTurnId !== undefined) {
       const runRef = ref("turn", launchedTurnId);
       return {

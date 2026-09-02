@@ -43,7 +43,7 @@
 1. **唯一权威**：`WorkItem.dependsOn`（含 WorkItem 自身的 `status` 与 `disposition`）。不存在第二套 TaskGraph 存储、缓存或界面侧状态（D-01/D-02/I-1）。
 2. **边方向**：DAG 一律采用“前置项 → 下游项”：`u → v` 当且仅当 `v.dependsOn` 包含 `u`。`dependsOn` 是每个下游节点存储的反向邻接表；根因分析从 `v` 沿入边反向遍历，不能据此改变图的箭头方向。
 3. **投影纯函数**：给定同一持久快照 `(dependsOn, status, disposition, Turn.workItemId, open InputRequests)`，投影输出唯一确定，与时间、派发顺序、观察者无关。
-4. **表达边界**：DAG 只表达语义与产物依赖；**不表达** Agent、Session、Provider 并发、文件锁或资源配额（属 Layer 2 与 T6 Resource Broker）。
+4. **表达边界**：DAG 只表达语义与产物依赖；**不表达** Agent、Session、Provider 并发、文件锁或执行拓扑。直接或复制执行由 Leader 根据当前事实选择。
 5. **Task 局部性**：依赖边只在同一 Task 聚合内有效。Yui 无 Task-to-Task 原生依赖字段；跨 Task 依赖只记录在 Description/Brief（如本 Task 的 T0=task-27），不创建伪 WorkItem 依赖。
 6. **AND 语义**：一个 WorkItem 的释放要求**全部**边满足。OR-join 不可表达——需要 OR 的场景由 Leader 用动态修订（§6）或退役建模。
 
@@ -161,10 +161,10 @@ WorkItem 仍为严格 6 态机（`pending / running / awaiting_acceptance / comp
 
 ### 6.1 fan-out 与 fan-in
 
-1. **fan-out**：多个 WorkItem 共享同一（组）已满足依赖时，同时进入 `ready` 集。DAG 不限制扇出宽度；实际并发受 Layer 2 与 Resource Broker 约束（现状：每 Role 一个活跃 Turn；T6 统一预算）。
+1. **fan-out**：多个 WorkItem 共享同一（组）已满足依赖时，同时进入 `ready` 集。DAG 不限制扇出宽度；Leader 从当前 Role、Turn、Session 和 workspace 事实选择实际并发。
 2. **fan-in**：多依赖 WorkItem 在全部边 `satisfied` 时一次性释放（AND-join）。汇合点不产出额外状态——`ready` 即是汇合事件。
 3. **菱形**：A → B、A → C、B+C → D。B、C 并行释放；D 等两者都 `completed`。B 失败不影响 C 的释放（边独立分类）；B 被退役且无替换时 D `unreleasable`，C 仍可独立完成。
-4. ** ready 集与派发**：投影产出完整 ready 集；派发顺序与并发度是 Leader 决议（现状）或 Resource Broker 策略（T6）。DAG 语义不规定派发顺序，只规定释放合法性。
+4. ** ready 集与派发**：投影产出完整 ready 集；派发顺序与并发度是 Leader 决议。DAG 语义不规定派发顺序，只规定释放合法性。
 
 ### 6.2 动态修订：加节点
 

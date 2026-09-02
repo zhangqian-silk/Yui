@@ -67,7 +67,7 @@ export type TurnResult = Readonly<{
   output: string;
   completedAt: string;
   provider?: TurnProviderResult;
-  /** Durable producer evidence; successful WorkItem Lanes point here by Turn id. */
+  /** Durable producer evidence; successful WorkItem and Review Lanes point here by Turn id. */
   producer?: ProducerTurnResult;
   failureReason?: TurnFailureReason;
 }>;
@@ -107,8 +107,8 @@ export type TurnInputRecord = Readonly<{
 }>;
 
 export type Turn = {
-  /** v3 adds immutable replicated-Group provenance to WorkItem main Turns. */
-  schemaVersion: 3;
+  /** v4 allows immutable replicated-Group provenance on Review main Turns. */
+  schemaVersion: 4;
   id: string;
   taskId: string;
   roleName: string;
@@ -156,7 +156,7 @@ export function createTurn(
   const timestamp = now.toISOString();
   const normalizedInput = validateTurnInput(input);
   return {
-    schemaVersion: 3,
+    schemaVersion: 4,
     id: requireSafeIdentity(id, "Turn id"),
     taskId: requireSafeIdentity(taskId, "Task id"),
     roleName: requireSafeIdentity(roleName, "Role name"),
@@ -261,7 +261,7 @@ export function validateTurn(run: Turn): Turn {
     "createdAt",
     "updatedAt"
   ], "Turn");
-  if (run.schemaVersion !== 3) throw new Error("Turn must use schemaVersion 3.");
+  if (run.schemaVersion !== 4) throw new Error("Turn must use schemaVersion 4.");
   validateTaskRecordReference({ taskId: run.taskId, localId: run.id }, "turn");
   requireSafeIdentity(run.roleName, "Role name");
   if (run.mode !== "new" && run.mode !== "resume") {
@@ -296,11 +296,12 @@ export function validateTurn(run: Turn): Turn {
   }
   if (run.sourceExecutionGroupId !== undefined) {
     requireSafeIdentity(run.sourceExecutionGroupId, "Source ExecutionGroup id");
-    if (run.purpose !== "execution" || run.workItemId === undefined) {
-      throw new Error("A source ExecutionGroup requires a WorkItem execution Turn.");
+    if ((run.purpose === "execution" && run.workItemId === undefined)
+      || (run.purpose === "review" && run.reviewRoundId === undefined)) {
+      throw new Error("A source ExecutionGroup requires a main execution or review Turn.");
     }
     if (run.executionGroupId !== undefined || run.executionLaneId !== undefined) {
-      throw new Error("A WorkItem main Turn cannot also be an Execution Lane Turn.");
+      throw new Error("A main Turn cannot also be an Execution Lane Turn.");
     }
   }
   if (run.workspace !== undefined) {

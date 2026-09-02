@@ -4,7 +4,8 @@ import Database from "better-sqlite3";
 
 import { validateTurn } from "../../turn/turn.js";
 import { validateWorkItem } from "../../workItem/workItem.js";
-import { validateExecutionGroup } from "../../execution/executionGroup.js";
+import { validateReviewRound } from "../../review/reviewRound.js";
+import { validateExecutionGroup } from "../../execution/legacyExecutionGroup.js";
 import { SqliteTaskStore } from "../sqliteStore.js";
 import {
   inspectStorageSchema,
@@ -20,7 +21,7 @@ const FIRST_SUPPORTED_AGGREGATE_VERSION = 21;
 export type StorageUpgradeStep = Readonly<{
   fromAggregate: number;
   toAggregate: number;
-  recordKind: "workItem" | "turn";
+  recordKind: "workItem" | "turn" | "reviewRound";
   fromRecordVersion: number;
   toRecordVersion: number;
 }>;
@@ -251,7 +252,9 @@ function migrationPlan(
   const all: readonly StorageUpgradeStep[] = [
     { fromAggregate: 21, toAggregate: 22, recordKind: "workItem", fromRecordVersion: 13, toRecordVersion: 14 },
     { fromAggregate: 22, toAggregate: 23, recordKind: "turn", fromRecordVersion: 1, toRecordVersion: 2 },
-    { fromAggregate: 23, toAggregate: 24, recordKind: "turn", fromRecordVersion: 2, toRecordVersion: 3 }
+    { fromAggregate: 23, toAggregate: 24, recordKind: "turn", fromRecordVersion: 2, toRecordVersion: 3 },
+    { fromAggregate: 24, toAggregate: 25, recordKind: "reviewRound", fromRecordVersion: 6, toRecordVersion: 7 },
+    { fromAggregate: 25, toAggregate: 26, recordKind: "turn", fromRecordVersion: 3, toRecordVersion: 4 }
   ];
   return all.filter(({ fromAggregate }) => fromAggregate >= manifest.aggregateSchemaVersion);
 }
@@ -267,6 +270,8 @@ function recordVersionsMatchAggregate(
   if (aggregate <= 21) expected.workItem = 13;
   if (aggregate <= 22) expected.turn = 1;
   else if (aggregate === 23) expected.turn = 2;
+  else if (aggregate <= 25) expected.turn = 3;
+  if (aggregate <= 24) expected.reviewRound = 6;
   const actualKinds = Object.keys(actual).sort();
   const expectedKinds = Object.keys(expected).sort();
   return actualKinds.length === expectedKinds.length
@@ -292,11 +297,22 @@ function validateMigrationDatabase(home: string, manifest: ParsedStorageManifest
     }
     const expectedTurn = manifest.aggregateSchemaVersion <= 22
       ? 1
-      : manifest.aggregateSchemaVersion === 23 ? 2 : 3;
+      : manifest.aggregateSchemaVersion === 23
+        ? 2
+        : manifest.aggregateSchemaVersion <= 25 ? 3 : 4;
     for (const { payload } of database.prepare("SELECT payload FROM turns").all() as { payload: string }[]) {
       const turn = jsonRecord(payload, "Turn");
-      if (![expectedTurn, 2, 3].includes(turn.schemaVersion as number)) {
+      if (![expectedTurn, 2, 3, 4].includes(turn.schemaVersion as number)) {
         throw new Error(`Turn payload version ${String(turn.schemaVersion)} does not match its manifest.`);
+      }
+    }
+    const expectedReviewRound = manifest.aggregateSchemaVersion <= 24 ? 6 : 7;
+    for (const { payload } of database.prepare("SELECT payload FROM review_rounds").all() as { payload: string }[]) {
+      const round = jsonRecord(payload, "ReviewRound");
+      if (![expectedReviewRound, 7].includes(round.schemaVersion as number)) {
+        throw new Error(
+          `ReviewRound payload version ${String(round.schemaVersion)} does not match its manifest.`
+        );
       }
     }
   } finally {
@@ -316,6 +332,8 @@ function applyMigration(home: string, manifest: ParsedStorageManifest, now: Date
       if (manifest.aggregateSchemaVersion <= 21) migrateWorkItems13To14(database, now);
       if (manifest.aggregateSchemaVersion <= 22) migrateTurns(database, 1, 2);
       if (manifest.aggregateSchemaVersion <= 23) migrateTurns(database, 2, 3);
+      if (manifest.aggregateSchemaVersion <= 24) migrateReviewRounds6To7(database, now);
+      if (manifest.aggregateSchemaVersion <= 25) migrateTurns(database, 3, 4);
     }).immediate();
   } finally {
     database.close();
@@ -406,6 +424,113 @@ function migrateWorkItems13To14(database: Database.Database, now: Date): void {
   }
 }
 
+/**
+ * Preserve valid historical Review semantics while retiring the removed
+ * strategy/resolution protocol. Terminal rounds keep their authoritative
+ * result and store the old Group as opaque evidence. An active old Group
+ * cannot be reinterpreted as the new immutable producer unit, so the Round
+ * and its active Turns are explicitly failed with an append-only audit event.
+ */
+function migrateReviewRounds6To7(database: Database.Database, now: Date): void {
+  const timestamp = now.toISOString();
+  const rows = database.prepare(
+    "SELECT task_id, review_round_id, payload FROM review_rounds"
+  ).all() as { task_id: string; review_round_id: string; payload: string }[];
+  for (const row of rows) {
+    const round = jsonRecord(row.payload, "ReviewRound");
+    if (round.schemaVersion === 7) continue;
+    if (round.schemaVersion !== 6) {
+      throw new Error(
+        `ReviewRound ${row.review_round_id} cannot migrate from version `
+        + `${String(round.schemaVersion)}.`
+      );
+    }
+    const legacyGroup = round.executionGroup;
+    if (legacyGroup !== undefined) {
+      if (typeof legacyGroup !== "object" || legacyGroup === null || Array.isArray(legacyGroup)) {
+        throw new Error(`ReviewRound ${row.review_round_id} has invalid legacy ExecutionGroup.`);
+      }
+      validateExecutionGroup(legacyGroup as never);
+    }
+    const activeLegacyGroup = legacyGroup !== undefined
+      && (round.status === "pending" || round.status === "running");
+    const {
+      executionGroup: _executionGroup,
+      legacyExecutionGroup: _legacyExecutionGroup,
+      ...base
+    } = round;
+    const summary = "The pre-v7 Review ExecutionGroup protocol was retired during storage upgrade; request a current Review.";
+    const migrated = {
+      ...base,
+      schemaVersion: 7,
+      ...(legacyGroup === undefined ? {} : { legacyExecutionGroup: legacyGroup }),
+      ...(activeLegacyGroup
+        ? {
+            status: "failed",
+            summary,
+            report: summary,
+            checks: [],
+            endedAt: timestamp
+          }
+        : {})
+    };
+    validateReviewRound(migrated as never);
+    const rowTimestamp = activeLegacyGroup
+      ? timestamp
+      : typeof migrated.endedAt === "string"
+        ? migrated.endedAt
+        : typeof round.createdAt === "string"
+          ? round.createdAt
+          : timestamp;
+    database.prepare(
+      "UPDATE review_rounds SET status = ?, payload = ?, updated_at = ? "
+      + "WHERE task_id = ? AND review_round_id = ?"
+    ).run(
+      migrated.status,
+      JSON.stringify(migrated),
+      rowTimestamp,
+      row.task_id,
+      row.review_round_id
+    );
+    if (!activeLegacyGroup) continue;
+
+    const terminalizedTurnIds: string[] = [];
+    const turns = database.prepare(
+      "SELECT turn_id, payload FROM turns WHERE task_id = ?"
+    ).all(row.task_id) as { turn_id: string; payload: string }[];
+    for (const turnRow of turns) {
+      const turn = jsonRecord(turnRow.payload, "Turn");
+      if (turn.status !== "active" || turn.reviewRoundId !== row.review_round_id) continue;
+      const terminal = {
+        ...turn,
+        status: "failed",
+        result: {
+          schemaVersion: 1,
+          output: summary,
+          completedAt: timestamp,
+          failureReason: "cancelled"
+        },
+        updatedAt: timestamp
+      };
+      database.prepare(
+        "UPDATE turns SET status = 'failed', payload = ?, updated_at = ? "
+        + "WHERE task_id = ? AND turn_id = ?"
+      ).run(JSON.stringify(terminal), timestamp, row.task_id, turnRow.turn_id);
+      database.prepare("DELETE FROM active_turns WHERE task_id = ? AND turn_id = ?")
+        .run(row.task_id, turnRow.turn_id);
+      terminalizedTurnIds.push(turnRow.turn_id);
+    }
+    appendMigrationAuditEvent(database, row.task_id, timestamp, {
+      reviewRoundId: row.review_round_id,
+      executionGroupId: typeof (legacyGroup as Record<string, unknown>).id === "string"
+        ? (legacyGroup as Record<string, unknown>).id as string
+        : "unknown",
+      terminalizedTurnIds: terminalizedTurnIds.join(",") || "none",
+      reason: "legacy-review-execution-protocol-retired"
+    });
+  }
+}
+
 function migrateTurns(database: Database.Database, from: number, to: number): void {
   const rows = database.prepare("SELECT task_id, turn_id, payload FROM turns").all() as {
     task_id: string;
@@ -419,11 +544,36 @@ function migrateTurns(database: Database.Database, from: number, to: number): vo
       throw new Error(`Turn ${row.turn_id} cannot migrate from version ${String(turn.schemaVersion)}.`);
     }
     const migrated = { ...turn, schemaVersion: to };
-    if (to === 3) validateTurn(migrated as never);
+    if (to === 4) validateTurn(migrated as never);
     database.prepare(
       "UPDATE turns SET payload = ? WHERE task_id = ? AND turn_id = ?"
     ).run(JSON.stringify(migrated), row.task_id, row.turn_id);
   }
+}
+
+function appendMigrationAuditEvent(
+  database: Database.Database,
+  taskId: string,
+  occurredAt: string,
+  payload: Readonly<Record<string, string>>
+): void {
+  const sequence = database.prepare(
+    `INSERT INTO id_sequences (task_id, kind, high_water) VALUES (?, 'event', 1)
+     ON CONFLICT(task_id, kind) DO UPDATE SET high_water = high_water + 1
+     RETURNING high_water`
+  ).get(taskId) as { high_water: number };
+  const event = {
+    schemaVersion: 2,
+    id: `event-${sequence.high_water}`,
+    taskId,
+    type: "review.legacy-execution-terminalized",
+    payload,
+    createdAt: occurredAt
+  };
+  database.prepare(
+    "INSERT INTO events (task_id, event_id, type, occurred_at, payload) "
+    + "VALUES (?, ?, ?, ?, ?)"
+  ).run(taskId, event.id, event.type, occurredAt, JSON.stringify(event));
 }
 
 function assertDatabaseHealthy(database: Database.Database): void {
@@ -450,6 +600,7 @@ function validateCurrentStore(home: string): void {
     store.getConfig();
     for (const taskId of store.listTasks().map(({ id }) => id)) {
       for (const item of store.listWorkItems(taskId)) validateWorkItem(item);
+      for (const round of store.listReviewRounds(taskId)) validateReviewRound(round);
       for (const turn of store.listTurns(taskId)) validateTurn(turn);
     }
   } finally {

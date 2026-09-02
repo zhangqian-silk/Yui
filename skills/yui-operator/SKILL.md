@@ -175,7 +175,9 @@ produce isolated Git results. For an ordinary assigned WorkItem, dispatch the
 assignee directly without `--lane-role`; this durable Turn has no
 ExecutionGroup. Select replicated WorkItem Lanes only for an explicit need for
 independent attempts at the same frozen Assignment. Keep Review
-`fixed`/`adaptive` strategy separate from WorkItem dispatch.
+direct by default. Replicated Review requires at least two distinct Producer
+Lane Roles over one frozen Assignment and one separate main Reviewer synthesis
+Turn; Producer results are durable evidence, not authoritative Review outcomes.
 
 Managed workspaces are owner-keyed, not Role-keyed: Task main, WorkItem
 Develop, ReviewRound, and IntegrationAttempt each retain their own durable
