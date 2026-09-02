@@ -1370,7 +1370,12 @@ function archiveTaskCommand(
       throw usageError(`Task ${task.id} must be completed or retired before it can be archived.`);
     }
     const remoteDelivery = request.disposition === "integrated"
-      ? assertTaskRemoteDeliveryProof(tx, task, options.archiveRemoteDeliveryProof)
+      ? assertTaskRemoteDeliveryProof(
+        tx,
+        task,
+        options.archiveRemoteDeliveryProof,
+        { forceUnverified: request.forceUnverified }
+      )
       : undefined;
     assertNoOpenInputRequests(tx, task.id, "archiving the Task");
     const unresolvedIntegration = tx.listIntegrationAttempts(task.id).find((integration) => (
@@ -1446,7 +1451,10 @@ function archiveTaskCommand(
         : {
             mergeCoverage: remoteDelivery.status,
             allMerged: String(remoteDelivery.allMerged),
-            allVerified: String(remoteDelivery.allVerified)
+            allVerified: String(remoteDelivery.allVerified),
+            ...(request.forceUnverified && !remoteDelivery.allVerified
+              ? { verificationOverride: "true" }
+              : {})
           }),
       ...(remoteProjectHeads === undefined ? {} : { projectHeads: remoteProjectHeads }),
       ...(remoteProjectBases === undefined ? {} : { projectBases: remoteProjectBases })
@@ -1630,14 +1638,33 @@ function assertTaskRetirementProof(
 
 export function parseTaskArchiveArguments(
   args: readonly string[]
-): Readonly<{ taskId: string; disposition: "integrated" | "abandoned" }> {
-  const usage = "Task archive usage: yui task archive <id> (--integrated|--abandon).";
-  if (args.length !== 2 || !["--integrated", "--abandon"].includes(args[1] ?? "")) {
+): Readonly<{
+  taskId: string;
+  disposition: "integrated" | "abandoned";
+  forceUnverified: boolean;
+}> {
+  const usage = "Task archive usage: "
+    + "yui task archive <id> (--integrated [--force]|--abandon).";
+  const taskId = args[0]?.trim();
+  const flags = args.slice(1);
+  if (taskId === undefined
+    || taskId.length === 0
+    || flags.some((flag, index) => (
+      !["--integrated", "--abandon", "--force"].includes(flag)
+      || flags.indexOf(flag) !== index
+    ))) {
+    throw usageError(usage);
+  }
+  const integrated = flags.includes("--integrated");
+  const abandoned = flags.includes("--abandon");
+  const forceUnverified = flags.includes("--force");
+  if (integrated === abandoned || (forceUnverified && !integrated)) {
     throw usageError(usage);
   }
   return {
-    taskId: args[0]!,
-    disposition: args[1] === "--integrated" ? "integrated" : "abandoned"
+    taskId,
+    disposition: integrated ? "integrated" : "abandoned",
+    forceUnverified
   };
 }
 
@@ -1654,7 +1681,7 @@ export function validateTaskArchiveRequest(
   args: readonly string[],
   store: TaskWorkflowStore,
   options: TaskCommandOptions = {}
-): Readonly<{ taskId: string; disposition: "integrated" | "abandoned" }> {
+): ReturnType<typeof parseTaskArchiveArguments> {
   const request = parseTaskArchiveArguments(args);
   const task = requireTask(store, request.taskId);
   taskActor(store, options, task.id);

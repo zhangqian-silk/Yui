@@ -442,8 +442,8 @@ const taskChildren: readonly NodeInput[] = [
   {
     name: "archive",
     summary: "Archive a Task after confirming the main worktree outcome.",
-    usage: "yui task archive <id> (--integrated|--abandon)",
-    options: ["--integrated", "--abandon"]
+    usage: "yui task archive <id> (--integrated [--force]|--abandon)",
+    options: ["--integrated", "--abandon", "--force"]
   },
   { name: "reconcile", summary: "Run one immediate Controller reconciliation.", usage: "yui task reconcile <id>" },
   {
@@ -613,13 +613,18 @@ const taskChildren: readonly NodeInput[] = [
   {
     name: "publication",
     summary: "Create or update external PR/MR publication evidence for a Task.",
-    sections: [{ id: "manage", title: "Commands", entries: ["upsert", "list", "show"] }],
+    sections: [{ id: "manage", title: "Commands", entries: ["upsert", "verify", "list", "show"] }],
     children: [
       {
         name: "upsert",
         summary: "Create or immutably update an external PR/MR and its publication state.",
         usage: "yui task publication upsert <task> --project <project> --provider <github|gitlab> --repository <owner/name> --kind <pull-request|merge-request> --id <external-id> [--url <url>] [--title <text>] [--source-branch <branch>] [--target-branch <branch>] [--local-commit <sha>] [--remote-commit <sha>] [--state <open|merged|closed>] [--reported|--verified] [--evidence <text>] [--merged-at <iso-timestamp>]",
         options: ["--project", "--provider", "--repository", "--kind", "--id", "--url", "--title", "--source-branch", "--target-branch", "--local-commit", "--remote-commit", "--state", "--reported", "--verified", "--evidence", "--merged-at"]
+      },
+      {
+        name: "verify",
+        summary: "Verify one current GitHub PR against the exact Task delivery head through gh.",
+        usage: "yui task publication verify (<task>/<publication-id> | <task> <publication-id>)"
       },
       {
         name: "list",

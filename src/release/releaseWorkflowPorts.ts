@@ -1,10 +1,7 @@
-import { execFile } from "node:child_process";
 import { createHash, randomBytes } from "node:crypto";
-import { accessSync, constants } from "node:fs";
 import { chmod, mkdir, mkdtemp, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { delimiter, dirname, isAbsolute, join, resolve } from "node:path";
-import { promisify } from "node:util";
+import { dirname, join, resolve } from "node:path";
 
 import { runUpdate, type StagedPackage, type UpdatePorts, type UpdateResult } from "../cli/updateOrchestrator.js";
 import { activatedControllerEntrypoint } from "../cli/updatePorts.js";
@@ -30,6 +27,15 @@ import {
 } from "../verification/verificationGateService.js";
 import { findL2ArtifactForCommit } from "../verification/gateArtifactStore.js";
 import type { GateArtifactStorePort } from "../verification/gateArtifact.js";
+import {
+  createExecFileCommandRunner,
+  createPinnedCommandRunner,
+  resolveExecutable,
+  type CommandRunner
+} from "../external/pinnedCommandRunner.js";
+
+export { resolveExecutable } from "../external/pinnedCommandRunner.js";
+export type { CommandRunner } from "../external/pinnedCommandRunner.js";
 
 /**
  * The outcome of one external step attempt. A `timeout` means the request may
@@ -84,13 +90,6 @@ export type ReleaseWorkflowPorts = Readonly<{
   }>): Promise<ReleaseStepQuery>;
 }>;
 
-export type CommandRunner = (
-  command: string,
-  args: readonly string[],
-  cwd?: string,
-  env?: Readonly<Record<string, string>>
-) => Promise<{ code: number; stdout: string; stderr: string }>;
-
 /** The input of one step attempt; the idempotency key makes re-attempts safe. */
 export type ReleaseStepInput = Readonly<{
   step: ReleaseStepPlan;
@@ -99,24 +98,7 @@ export type ReleaseStepInput = Readonly<{
   params: Readonly<Record<string, string>>;
 }>;
 
-const defaultRunCommand: CommandRunner = async (command, args, cwd, env) => {
-  const exec = promisify(execFile);
-  try {
-    const { stdout, stderr } = await exec(command, args, {
-      cwd,
-      maxBuffer: 16 * 1024 * 1024,
-      ...(env === undefined ? {} : { env: { ...process.env, ...env } })
-    });
-    return { code: 0, stdout, stderr };
-  } catch (error) {
-    const failure = error as { code?: number | string; stdout?: string; stderr?: string; message?: string };
-    return {
-      code: typeof failure.code === "number" ? failure.code : 1,
-      stdout: failure.stdout ?? "",
-      stderr: failure.stderr ?? failure.message ?? String(error)
-    };
-  }
-};
+const defaultRunCommand = createExecFileCommandRunner();
 
 /**
  * The external commands the production adapter shells out to. Each one is
@@ -133,22 +115,6 @@ const PINNED_EXTERNAL_COMMANDS: readonly string[] = ["gh", "git", "npm", "tar", 
  * command that cannot be resolved returns undefined. Callers must fail closed
  * without invoking a mutable PATH fallback.
  */
-export function resolveExecutable(command: string, environmentPath: string | undefined): string | undefined {
-  if (isAbsolute(command)) return command;
-  const pathValue = environmentPath ?? "";
-  for (const directory of pathValue.split(delimiter)) {
-    if (directory.length === 0) continue;
-    const candidate = resolve(directory, command);
-    try {
-      accessSync(candidate, constants.X_OK);
-      return candidate;
-    } catch {
-      // Keep walking PATH.
-    }
-  }
-  return undefined;
-}
-
 /**
  * Wrap the default runner so every external command is pinned to the
  * absolute path resolved at construction. Injected runners (tests) are used
@@ -159,32 +125,7 @@ export function resolveExecutable(command: string, environmentPath: string | und
  * unresolvable for the adapter's lifetime.
  */
 export function createPinnedRunner(base: CommandRunner): CommandRunner {
-  const pinned = new Map<string, string | undefined>();
-  for (const name of PINNED_EXTERNAL_COMMANDS) {
-    pinned.set(name, resolveExecutable(name, process.env.PATH));
-  }
-  return (command, args, cwd, env) => {
-    // P2 (rr24): `Map.get` returns undefined both for a missing key and for
-    // a key whose resolved value is undefined (a command that was not on
-    // PATH at construction). Use `Map.has` to distinguish them so the
-    // negative cache holds: a command resolved as missing stays missing even
-    // if it appears on PATH later in the adapter's lifetime.
-    let resolved: string | undefined;
-    if (pinned.has(command)) {
-      resolved = pinned.get(command);
-    } else {
-      resolved = isAbsolute(command) ? command : resolveExecutable(command, process.env.PATH);
-      pinned.set(command, resolved);
-    }
-    if (resolved === undefined) {
-      return Promise.resolve({
-        code: 127,
-        stdout: "",
-        stderr: `Unable to resolve trusted executable: ${command}`
-      });
-    }
-    return base(resolved, args, cwd, env);
-  };
+  return createPinnedCommandRunner(base, PINNED_EXTERNAL_COMMANDS);
 }
 
 /**

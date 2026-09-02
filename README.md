@@ -696,6 +696,23 @@ event. `list`, `show`, and `task context` retain the complete history. This
 records facts already known to the caller; it does not query a provider or
 replace Review, Integration, or Task completion gates.
 
+Verify one current GitHub Publication against the real PR state:
+
+```sh
+yui task publication verify <task-id>/<publication-id>
+```
+
+Verification is an explicit external read. The first implementation invokes a
+trusted, PATH-pinned local `gh` executable and reuses its authentication; Yui
+does not store a GitHub token. The command requires the current unsuperseded
+Publication to record the exact Task delivery head, then requires GitHub to
+report the same PR head as merged and to return a remote merge commit. It
+rechecks the Task head and Publication after the remote call before appending a
+new immutable `verified` record. Missing `gh`, unavailable authentication,
+ambiguous provider output, open/closed PRs, moved heads, and concurrent local
+changes fail without recording verification. GitLab verification is not
+implemented in this first version.
+
 Query whether every delivered Project head is represented by a current merged
 Publication:
 
@@ -717,6 +734,8 @@ open/closed records, stale heads, and superseded Publications never imply
 remote delivery. Projects whose Task head equals their managed base need no
 Publication. `task show`, `task context`, `task next-action`, and the Web detail
 projection use this same selector.
+`Archive --integrated coverage` requires both `allMerged=true` and
+`allVerified=true`.
 
 When the requested outcome is finished, complete the Task to stop automatic Leader wakes without deleting its sessions or Task main worktree:
 
@@ -758,11 +777,16 @@ before archive. Every isolated WorkItem worktree is explicitly cleaned as
 integrated or abandoned; that cleanup also removes its managed branch. Archive
 requires `--integrated` or `--abandon` to state the Task main outcome and is
 allowed only after Task main is clean. `--integrated` additionally requires
-remote-delivery `allMerged=true`; Task completion alone is never treated as
-remote merge. An intentional non-merge uses the existing explicit `--abandon`
-path. Archive removes managed worktrees but retains Task and WorkItem records.
-The Task main branch is retained as a recovery artifact instead of being
-silently deleted.
+remote-delivery `allMerged=true` and `allVerified=true`; Task completion or a
+reported merge alone is never treated as verified remote delivery. When every
+exact Task head is merged but one or more Publications remain `reported`, the
+command identifies those Publications and refuses archive. An explicitly
+authorized `task archive <task-id> --integrated --force` may override only that
+verification gap and records the override in the archive event; it never
+bypasses missing, stale, open, or closed merge evidence. An intentional
+non-merge uses the existing explicit `--abandon` path. Archive removes managed
+worktrees but retains Task and WorkItem records. The Task main branch is
+retained as a recovery artifact instead of being silently deleted.
 Task lifecycle completion/selection only suggests valid source states: Draft for activate, active for complete, and completed for reopen.
 
 ## Sessions and tmux

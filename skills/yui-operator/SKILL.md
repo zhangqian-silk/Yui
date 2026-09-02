@@ -330,14 +330,19 @@ yui task publication upsert <task> --project <project> \
 ```
 
 Record only facts confirmed by the current conversation or existing Task
-evidence. Do not call GitHub/GitLab APIs merely to refresh a Publication, guess
-remote state, or mark evidence `verified` without the existing verification
-contract. Omitted optional fields inherit the current record, so send only the
-confirmed delta. After a successful write, briefly tell the user which Task and
-PR/MR state changed. If the upsert fails, say that Yui was not synchronized and
-report the error; never claim the evidence was recorded. A Publication records
-external delivery state and never replaces Candidate, Review, Integration, or
-Task completion gates.
+evidence. When you execute an authorized GitHub PR merge yourself, immediately
+upsert the exact local/remote commit result and run
+`yui task publication verify <task>/<publication>` before ending the same work
+stage. The verifier uses local `gh` authentication to query the real PR,
+requires its head to equal the Task delivery head, and appends an immutable
+verified superseding record. Do not query merely to refresh state when the
+current authorization does not cover that real external resource. Omitted
+optional fields inherit the current record, so send only the confirmed delta.
+After successful synchronization and verification, briefly tell the user which
+Task and PR state changed. If either command fails, say that Yui is not
+verified and report the error; never claim the evidence was recorded. A
+Publication records external delivery state and never replaces Candidate,
+Review, Integration, or Task completion gates.
 
 Use `yui task remote-delivery <task>` when the user asks whether all Task code
 has reached remote or before proposing archive. It derives one merge-coverage
@@ -345,9 +350,14 @@ view from the exact Task delivery heads and current unsuperseded Publications;
 do not infer merged from Task completion or from the mere presence of a PR/MR.
 `allMerged` requires every code-delivery Project to have an exact-head
 Publication in state `merged`; `allVerified` is the independent stronger
-verification axis. `task archive <task> --integrated` is therefore valid only
-when that coverage is satisfied. An intentional non-merge remains the explicit
-`--abandon` path and still requires user authorization for the exact archive.
+verification axis. `task archive <task> --integrated` requires both. When merge
+coverage exists but verification is missing, report the exact Publications and
+run `task publication verify` if the current authorization permits the external
+read. `--integrated --force` may override only that verified-evidence gap and
+must have explicit user authorization for the exact Task; it never overrides
+missing, stale, open, or closed merge evidence. An intentional non-merge
+remains the explicit `--abandon` path and still requires user authorization
+for the exact archive.
 
 ## Enter and administer
 
@@ -425,7 +435,11 @@ other Yui mechanics the Operator can safely perform.
 Only after the user authorizes archiving that exact Task, and once active work
 is settled, results are integrated or deliberately abandoned, and managed
 worktrees are clean and removable, perform it yourself with `yui task archive
-<task-id> --integrated` or `--abandon`. Archive stops every Task Role runtime,
+<task-id> --integrated` or `--abandon`. If `--integrated` reports merged but
+unverified Publications, verify them first when authorized. Use
+`--integrated --force` only when the user explicitly authorizes accepting that
+specific verification gap; do not infer force authority from general archive
+authorization. Archive stops every Task Role runtime,
 including the Leader, removes clean retained WorkItem, ReviewRound, and Task
 worktrees, and retains Task, WorkItem, Turn, Candidate, Integration, and native
 Session history. Dirty worktrees, active Turns, and unresolved Integration

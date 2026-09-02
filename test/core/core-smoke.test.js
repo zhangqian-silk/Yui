@@ -145,6 +145,7 @@ test("the packaged CLI starts and exposes the core workflow", () => {
   }
   assert.ok(commands.includes("task turn list"));
   assert.ok(commands.includes("task publication upsert"));
+  assert.ok(commands.includes("task publication verify"));
   assert.ok(commands.includes("task remote-delivery"));
   assert.equal(commands.includes("task publication add"), false);
   assert.equal(commands.some((command) => command.startsWith("task run")), false);
@@ -214,6 +215,7 @@ test("remote delivery projects exact merged Task heads without conflating verifi
   assert.equal(projection.status, "merged");
   assert.equal(projection.allMerged, true);
   assert.equal(projection.allVerified, false);
+  assert.equal(projection.integratedCoverageSatisfied, false);
   assert.equal(projection.projects[0].expectedLocalCommit, headCommit);
   assert.equal(projection.projects[0].remoteCommit, "3".repeat(40));
 });

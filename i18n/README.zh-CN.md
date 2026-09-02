@@ -494,6 +494,20 @@ yui task publication upsert <task-id> --project <project> \
 继续保留完整历史。该命令只记录调用方已经掌握的事实，不会自行查询 Provider，也不替代
 Review、Integration 或 Task completion 门禁。
 
+可针对当前 GitHub Publication 查询真实 PR 状态并记录验证结果：
+
+```sh
+yui task publication verify <task-id>/<publication-id>
+```
+
+验证是一次显式的外部读取。一期调用 PATH 中已固定绝对路径的可信本地 `gh`，复用
+`gh` 自己的认证，Yui 不保存 GitHub token。命令先要求当前未 supersede
+Publication 的 local commit 精确等于 Task 交付 head，再要求 GitHub 返回相同的
+PR head、真实 merged 状态和远端合入 commit。远端调用结束后还会重新核对 Task head
+与 Publication，全部不变才追加新的不可变 `verified` 记录。缺少 `gh`、认证不可用、
+Provider 输出不明确、PR 仍 open/closed、head 已移动或本地权威并发变化时都不会写入
+verified。一期不支持 GitLab 远端验证。
+
 可查询每个已交付 Project head 是否都有当前 merged Publication 覆盖：
 
 ```sh
@@ -511,6 +525,8 @@ verification 与 remote commit。聚合状态为 `none`、`pending`、`partial` 
 open/closed、陈旧 head 与已 supersede 记录都不会被推断为已合入。Task head 与
 managed base 相同的 Project 不需要 Publication。`task show`、`task context`、
 `task next-action` 和 Web detail 共用同一个 selector。
+`Archive --integrated coverage` 同时要求 `allMerged=true` 和
+`allVerified=true`。
 
 完成目标后，可将 Task 标记为 completed，从而停止自动唤醒，同时保留 session 和 Task main worktree：
 
@@ -524,10 +540,14 @@ Turn 交付。终态 WorkItem、Review、Integration 与 Lane worktree 会作为
 completion advisory 返回，但必须在 archive 前处理。每个隔离 WorkItem worktree
 仍需显式标记 integrated 或 abandoned，清理时也会删除其受管分支；archive 还必须
 通过 `--integrated` 或 `--abandon` 明确 Task main 的处理结果。`--integrated`
-还要求 remote-delivery 的 `allMerged=true`；Task completion 本身永远不等同于
-远端已合入。有意不合入时继续使用显式 `--abandon` 路径。之后 archive 才会停止
-session 并清理干净的 Task main。Task 与 WorkItem 记录都会保留，Task main 分支
-作为恢复信息保留，不会被静默删除。
+还要求 remote-delivery 的 `allMerged=true` 与 `allVerified=true`；Task
+completion 或只有 reported 的 merge 都不等同于已验证远端交付。如果所有精确
+Task head 都已合入但仍有 Publication 是 `reported`，archive 会列出这些记录并拒绝。
+只有获得明确授权后，`task archive <task-id> --integrated --force` 才能仅覆盖这一
+verification 缺口，并在归档事件中记录 override；它不能绕过缺失、陈旧、open 或
+closed 的合入证据。有意不合入时继续使用显式 `--abandon` 路径。之后 archive 才会
+停止 session 并清理干净的 Task main。Task 与 WorkItem 记录都会保留，Task main
+分支作为恢复信息保留，不会被静默删除。
 Task 生命周期的交互选择只展示有效来源状态：activate 只展示 Draft，complete 只展示 active，reopen 只展示 completed。
 
 ## Session 与 tmux

@@ -157,7 +157,7 @@ export function projectTaskRemoteDelivery(
     codeProjectCount: codeProjects.length,
     mergedProjectCount,
     verifiedProjectCount,
-    integratedCoverageSatisfied: allMerged,
+    integratedCoverageSatisfied: allMerged && allVerified,
     projects
   };
 }

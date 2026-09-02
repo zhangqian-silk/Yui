@@ -177,14 +177,18 @@ yui task publication upsert <task> --project <project> \
 
 Write only the repository identity, URL, state, and commit or merge evidence
 already available to you; omitted optional fields inherit the current record.
-For a confirmed merge, include the exact remote commit, `mergedAt`, and
-evidence when available, and follow the existing `reported`/`verified`
-constraints. Do not add GitHub/GitLab API awareness merely to refresh this
-record, guess remote state, or claim verification you do not have. If the
-upsert fails, preserve and report that synchronization failure rather than
-claiming it succeeded. Publication is external delivery evidence only: it does
-not replace Candidate capture, Review, Integration, acceptance, or Task
-completion gates.
+For a reported merge, include the exact local commit, remote commit,
+`mergedAt`, and evidence when available. When you execute an authorized GitHub
+PR merge yourself, immediately upsert that merge result and run
+`yui task publication verify <task>/<publication>` before ending the same work
+stage. The verifier queries the exact GitHub PR through local `gh`, checks its
+head against the Task delivery head, and appends the verified superseding
+record. If either synchronization or verification fails, preserve and report
+the failure rather than claiming verified delivery. Do not run provider
+verification merely to refresh state when the current authorization does not
+cover that real external resource. Publication is external delivery evidence
+only: it does not replace Candidate capture, Review, Integration, acceptance,
+or Task completion gates.
 
 When deciding or reporting whether all Task code is merged, read
 `yui task remote-delivery <task>` instead of equating `completed` with merged.
@@ -194,8 +198,12 @@ Publications. A Project contributes `allMerged` only when the Publication
 records that exact local head in state `merged`; `allVerified` remains a
 separate stronger fact. Reopening and adding a commit therefore makes old merge
 evidence stale until Publication is upserted for the new head. Archive
-`--integrated` consumes this coverage; deliberate non-merge uses the existing
-explicit `--abandon` path.
+`--integrated` requires both exact merged and verified coverage. If every head
+is merged but a Publication is still reported, run its explicit verification
+before proposing archive. `--integrated --force` may override only that
+verification gap and requires explicit user authorization for the exact Task;
+it never overrides missing, stale, open, or closed merge evidence. Deliberate
+non-merge uses the existing explicit `--abandon` path.
 
 ## Lead with judgment
 

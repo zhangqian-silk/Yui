@@ -12,9 +12,11 @@ import {
   type PublicationReferenceInput,
   type PublicationExternalKind,
   type PublicationProvider,
+  type PublicationRecordedBy,
   type PublicationState,
   type PublicationVerification
 } from "../task/publicationReference.js";
+import type { Task } from "../task/task.js";
 import { resolveTaskRecordReference } from "../task/taskRecordReference.js";
 import type {
   TaskCommandExecution,
@@ -108,51 +110,14 @@ function upsertPublication(
       ? { mergedAt: requiredOption(parsed.options, "--merged-at", usage) }
       : {})
   };
-  const externalKey = `${input.provider}/${input.repository}/${input.externalId}`;
   const now = clock(options);
-  const result = store.transaction((tx) => {
-    const existing = tx.findPublicationReferenceByExternalKey(externalKey);
-    if (existing !== null && existing.taskId !== task.id) {
-      throw dataError(
-        `Publication external identity already belongs to Task ${existing.taskId}: ${externalKey}.`
-      );
-    }
-    const effective = existing === null
-      ? input
-      : inheritPublicationInput(existing, input);
-    if (existing !== null) {
-      const semantic = createPublicationReference(
-        existing.id,
-        task.id,
-        {
-          ...effective,
-          recordedBy: existing.recordedBy,
-          source: existing.source
-        },
-        new Date(existing.createdAt)
-      );
-      if (isDeepStrictEqual(
-        publicationSemantics(semantic),
-        publicationSemantics(existing)
-      )) {
-        return { reference: existing, idempotent: true };
-      }
-    }
-    const reference = createPublicationReference(
-      tx.nextPublicationReferenceId(task.id),
-      task.id,
-      {
-        ...effective,
-        ...(existing === null ? {} : { supersedes: existing.id }),
-        recordedBy: actor,
-        source: "manual"
-      },
-      now
-    );
-    tx.savePublicationReference(task.id, reference);
-    recordPublicationEvent(tx, reference, now);
-    return { reference, idempotent: false };
-  });
+  const result = store.transaction((tx) => upsertTaskPublication(
+    tx,
+    task,
+    input,
+    actor,
+    now
+  ));
   return output(
     result.idempotent
       ? `Publication reference already current: ${result.reference.id}.\n`
@@ -163,6 +128,62 @@ function upsertPublication(
       }) for ${result.reference.taskId}.\n`,
     result.reference
   );
+}
+
+/**
+ * One immutable Publication upsert against the caller's current transaction.
+ * External verification uses the same lineage and idempotency path as manual
+ * evidence instead of maintaining a second mutation protocol.
+ */
+export function upsertTaskPublication(
+  store: TaskWorkflowStore,
+  task: Task,
+  input: PublicationReferenceInput,
+  actor: PublicationRecordedBy,
+  now: Date
+): Readonly<{ reference: PublicationReference; idempotent: boolean }> {
+  const externalKey = `${input.provider}/${input.repository}/${input.externalId}`;
+  const existing = store.findPublicationReferenceByExternalKey(externalKey);
+  if (existing !== null && existing.taskId !== task.id) {
+    throw dataError(
+      `Publication external identity already belongs to Task ${existing.taskId}: ${externalKey}.`
+    );
+  }
+  const effective = existing === null
+    ? input
+    : inheritPublicationInput(existing, input);
+  if (existing !== null) {
+    const semantic = createPublicationReference(
+      existing.id,
+      task.id,
+      {
+        ...effective,
+        recordedBy: existing.recordedBy,
+        source: existing.source
+      },
+      new Date(existing.createdAt)
+    );
+    if (isDeepStrictEqual(
+      publicationSemantics(semantic),
+      publicationSemantics(existing)
+    )) {
+      return { reference: existing, idempotent: true };
+    }
+  }
+  const reference = createPublicationReference(
+    store.nextPublicationReferenceId(task.id),
+    task.id,
+    {
+      ...effective,
+      ...(existing === null ? {} : { supersedes: existing.id }),
+      recordedBy: actor,
+      source: "manual"
+    },
+    now
+  );
+  store.savePublicationReference(task.id, reference);
+  recordPublicationEvent(store, reference, now);
+  return { reference, idempotent: false };
 }
 
 function listPublications(args: string[], store: TaskWorkflowStore): TaskCommandExecution {

@@ -98,7 +98,8 @@ export function createTaskRemoteDeliveryProof(
 export function assertTaskRemoteDeliveryProof(
   store: TaskRemoteDeliveryStore,
   task: Task,
-  proof: TaskRemoteDeliveryProof | undefined
+  proof: TaskRemoteDeliveryProof | undefined,
+  options: Readonly<{ forceUnverified?: boolean }> = {}
 ): TaskRemoteDelivery {
   if (proof === undefined || proof.schemaVersion !== 1) {
     throw usageError(`Task remote-delivery preflight proof is required: ${task.id}.`);
@@ -112,26 +113,46 @@ export function assertTaskRemoteDeliveryProof(
   )) {
     throw usageError(`Task Publication evidence changed after remote-delivery preflight: ${task.id}.`);
   }
-  assertTaskRemoteDeliveryIntegrated(proof.delivery);
+  assertTaskRemoteDeliveryIntegrated(proof.delivery, options);
   return proof.delivery;
 }
 
 export function assertTaskRemoteDeliveryIntegrated(
-  delivery: TaskRemoteDelivery
+  delivery: TaskRemoteDelivery,
+  options: Readonly<{ forceUnverified?: boolean }> = {}
 ): void {
-  if (delivery.integratedCoverageSatisfied) return;
-  const uncovered = delivery.projects
-    .filter((project) => project.codeDelivery !== "none" && !project.merged)
+  if (!delivery.allMerged) {
+    const uncovered = delivery.projects
+      .filter((project) => project.codeDelivery !== "none" && !project.merged)
+      .map((project) => (
+        `${project.projectId}/${project.coverage}`
+        + (project.publication === null ? "" : `/${project.publication.id}`)
+      ))
+      .join(", ");
+    throw usageError(
+      `Task ${delivery.taskId} is not fully merged into remote delivery: ${
+        uncovered || "expected Project heads are unavailable"
+      }. Record confirmed current-head evidence with task publication upsert, `
+      + "or use task archive --abandon for an intentional non-merge."
+    );
+  }
+  if (delivery.allVerified || options.forceUnverified === true) return;
+  const unverified = delivery.projects
+    .filter((project) => (
+      project.codeDelivery !== "none"
+      && project.merged
+      && !project.verified
+    ))
     .map((project) => (
       `${project.projectId}/${project.coverage}`
       + (project.publication === null ? "" : `/${project.publication.id}`)
     ))
     .join(", ");
   throw usageError(
-    `Task ${delivery.taskId} is not fully merged into remote delivery: ${
-      uncovered || "expected Project heads are unavailable"
-    }. Record confirmed current-head evidence with task publication upsert, `
-    + "or use task archive --abandon for an intentional non-merge."
+    `Task ${delivery.taskId} has merged Publication evidence that is not verified: `
+    + `${unverified || "verification evidence is unavailable"}. Run task publication verify `
+    + "for each Publication, or repeat task archive --integrated --force to explicitly "
+    + "override verification. --force never overrides missing, stale, open, or closed merge evidence."
   );
 }
 

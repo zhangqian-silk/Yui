@@ -94,6 +94,8 @@ import {
   createTaskRemoteDeliveryProof,
   type TaskRemoteDeliveryProof
 } from "./commands/taskRemoteDeliveryCommand.js";
+import { runTaskPublicationVerifyCommand } from "./commands/taskPublicationVerifyCommand.js";
+import { createGitHubCliPublicationVerifier } from "./external/githubPublicationVerifier.js";
 import { taskActor } from "./commands/taskActor.js";
 import {
   parseTaskExecutionStartRequest,
@@ -1092,6 +1094,28 @@ export async function main(): Promise<void> {
       emit(result.output, false, result.data);
       return;
     }
+    if (resolved[1] === "publication" && resolved[2] === "verify") {
+      const result = await runTaskPublicationVerifyCommand(
+        resolved.slice(3),
+        store,
+        {
+          verifiers: {
+            github: createGitHubCliPublicationVerifier({
+              environmentPath: process.env.PATH
+            })
+          },
+          candidateForTask: async (taskId) => {
+            const status = store.getTask(taskId)?.status;
+            return status === "active" || status === "retired"
+              ? snapshotActualTaskReviewCandidate(taskId, store, workspacePreparer)
+              : null;
+          },
+          environment: process.env
+        }
+      );
+      emit(result.output, false, result.data);
+      return;
+    }
     if (resolved[1] === "overlap") {
       const result = await runTaskOverlapCommand(resolved.slice(2), store);
       emit(result.output, false, result.data);
@@ -1319,7 +1343,7 @@ export async function main(): Promise<void> {
     let archiveRemoteDeliveryProof: TaskRemoteDeliveryProof | undefined;
     let archiveTaskReviewCandidate: TaskReviewCandidate | undefined;
     if (resolved[1] === "archive") {
-      const { taskId, disposition } = validateTaskArchiveRequest(
+      const { taskId, disposition, forceUnverified } = validateTaskArchiveRequest(
         resolved.slice(2),
         store,
         {
@@ -1343,7 +1367,10 @@ export async function main(): Promise<void> {
             task,
             archiveTaskReviewCandidate ?? null
           );
-          assertTaskRemoteDeliveryIntegrated(archiveRemoteDeliveryProof.delivery);
+          assertTaskRemoteDeliveryIntegrated(
+            archiveRemoteDeliveryProof.delivery,
+            { forceUnverified }
+          );
         }
         const workItemIds = store.listManagedWorkspaces(task.id)
           .flatMap(({ owner }) => owner.type === "work-item" ? [owner.workItemId] : []);
