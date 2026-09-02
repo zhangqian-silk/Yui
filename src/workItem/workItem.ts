@@ -119,6 +119,11 @@ export type WorkItem = {
   writeProjectIds: readonly string[];
   /** Immutable execution history for this WorkItem. */
   executionGroups: readonly WorkItemExecutionGroup[];
+  /**
+   * Immutable pre-v14 execution history retained only for audit after the
+   * execution-model migration. It is never dispatch or recovery authority.
+   */
+  legacyExecutionGroups?: readonly Readonly<Record<string, unknown>>[];
   /** Current iteration Group; historical Groups remain addressable by id. */
   currentExecutionGroupId?: string;
   /** Explicit Git refs for the initial writable WorkItem worktree. */
@@ -481,6 +486,13 @@ export function validateWorkItem(workItem: WorkItem): WorkItem {
   }
   if (!Array.isArray(workItem.executionGroups)) {
     throw new Error("Work Item executionGroups are invalid.");
+  }
+  if (workItem.legacyExecutionGroups !== undefined
+    && (!Array.isArray(workItem.legacyExecutionGroups)
+      || workItem.legacyExecutionGroups.some((group) => (
+        typeof group !== "object" || group === null || Array.isArray(group)
+      )))) {
+    throw new Error("Work Item legacy execution history is invalid.");
   }
   const groupIds = new Set<string>();
   for (const group of workItem.executionGroups) {

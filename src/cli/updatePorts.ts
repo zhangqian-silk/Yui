@@ -7,10 +7,9 @@
  * `npm install --global --prefix <tmp>`, so the live global install is never
  * touched until the binary-activation step. Preflight invokes the STAGED binary's
  * internal `yui upgrade --update-preflight` contract so the target version
- * proves that the Home already implements the exact current contract. After
- * the parent stops the exact old Controller, only the binary is promoted;
- * update never rewrites or switches storage. Post-verify invokes the actually
- * activated global binary.
+ * proves that the Home is current or has a complete migration path. After the
+ * parent stops the exact old Controller, the binary is promoted and the staged
+ * artifact applies that path before post-verify invokes the activated binary.
  *
  * Two hardening guarantees this module enforces:
  *
@@ -170,6 +169,30 @@ export function createUpdatePorts(
         { cwd: process.cwd(), env: { ...environment, YUI_HOME: home }, shell: false }
       );
       return interpretPreflight(result);
+    },
+
+    migrate(staged: StagedPackage, home: string): void {
+      const result = run(
+        staged.binaryPath,
+        ["--json", "upgrade"],
+        {
+          cwd: process.cwd(),
+          env: {
+            ...environment,
+            YUI_HOME: home,
+            YUI_UPDATE_HANDOVER_OWNER_PID: String(process.pid)
+          },
+          shell: false
+        }
+      );
+      const data = parseSuccessEnvelopeData(result);
+      if (result.status !== 0
+        || data === null
+        || (data.outcome !== "upgraded" && data.outcome !== "already-current")) {
+        throw runtimeError(
+          "The staged binary did not return a successful storage-upgrade result."
+        );
+      }
     },
 
     activateBinary(staged: StagedPackage): void {
@@ -726,6 +749,9 @@ function runControllerCommand(
       env: {
         ...environment,
         YUI_HOME: home,
+        // Lifecycle capture needs the schema-independent resource inventory,
+        // not the optional current-schema identity health verdict.
+        YUI_STATUS_IDENTITY: "0",
         // This exact lifecycle child is part of the update process that owns
         // the handover lock. Managed Sessions never receive this bypass.
         YUI_UPDATE_HANDOVER_OWNER_PID: String(process.pid)
@@ -1052,19 +1078,55 @@ function interpretPreflight(result: SpawnSyncReturns<Buffer>): UpdatePreflight {
   };
 }
 
-/** Only the exact current storage contract is a green update preflight. */
+/** Accept only an exact current Home or a complete staged migration plan. */
 function parseUpdatePreflightResult(data: Record<string, unknown>): UpdatePreflight | null {
-  if (data.status !== "already-current" || data.stepCount !== 0) return null;
+  if ((data.status !== "already-current" && data.status !== "migration-ready")
+    || !Number.isSafeInteger(data.stepCount)
+    || (data.stepCount as number) < 0
+    || (data.status === "already-current" && data.stepCount !== 0)
+    || (data.status === "migration-ready" && (data.stepCount as number) < 1)) return null;
   const homeClassification = data.classification;
   if (!isRecord(homeClassification) || !isRecord(homeClassification.classification)) return null;
   const classification = homeClassification.classification;
-  if (
-    classification.verdict !== "USABLE"
-    || classification.status !== "current"
-  ) {
-    return null;
+  if (data.status === "already-current") {
+    if (classification.verdict !== "USABLE" || classification.status !== "current") return null;
+    return { status: "already-current", stepCount: 0 };
   }
-  return { status: "already-current" };
+  if (classification.verdict !== "MIGRATABLE"
+    || classification.status !== "migration-ready") return null;
+  if (!Array.isArray(data.steps)
+    || data.steps.length !== data.stepCount
+    || !isCompleteMigrationStepChain(data.steps, homeClassification)) return null;
+  return { status: "migration-ready", stepCount: data.stepCount as number };
+}
+
+function isCompleteMigrationStepChain(
+  steps: readonly unknown[],
+  classification: Record<string, unknown>
+): boolean {
+  const source = classification.aggregateVersion;
+  const target = classification.latestAggregateVersion;
+  return Number.isSafeInteger(source)
+    && Number.isSafeInteger(target)
+    && (target as number) > (source as number)
+    && steps.length === (target as number) - (source as number)
+    && steps.every((step, index) => (
+      isAdjacentMigrationStep(step)
+      && step.fromAggregate === (source as number) + index
+      && step.toAggregate === (source as number) + index + 1
+    ));
+}
+
+function isAdjacentMigrationStep(value: unknown): value is Record<string, unknown> & Readonly<{
+  fromAggregate: number;
+  toAggregate: number;
+}> {
+  return isRecord(value)
+    && Number.isSafeInteger(value.fromAggregate)
+    && value.toAggregate === (value.fromAggregate as number) + 1
+    && (value.recordKind === "workItem" || value.recordKind === "turn")
+    && Number.isSafeInteger(value.fromRecordVersion)
+    && value.toRecordVersion === (value.fromRecordVersion as number) + 1;
 }
 
 function parseUpdateBlockers(value: unknown): readonly UpdateBlockerIdentity[] | undefined {

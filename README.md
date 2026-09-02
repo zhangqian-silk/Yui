@@ -89,18 +89,18 @@ and `task integration start`, keep their subordinate IDs local to that Task.
 Candidate IDs are local to their WorkItem and carry both Task and WorkItem
 provenance.
 
-Yui records layout, aggregate, and per-record-family versions in `schema.json`,
-but runtime admission has only two outcomes: exact current, or rejected. A
-missing, older, newer, or malformed contract is never converted by the running
-release. `yui doctor` and `yui upgrade [--dry-run]` are read-only diagnostics;
-`yui upgrade` does not stage, repair, back up, or switch a Home.
+Yui records layout, aggregate, and per-record-family versions in `schema.json`.
+Runtime admission still has only two outcomes: exact current, or rejected; a
+Controller never migrates storage while serving work. `yui upgrade --dry-run`
+is read-only, while `yui upgrade` applies only the release's explicit adjacent
+migration graph. Missing steps, newer layouts, and malformed Homes fail closed.
 
 `yui update` stages and pins one exact package, runs that staged binary's
-current-contract preflight, stops the exact old Controller, activates the same
-artifact, verifies the installed binary and current Home, and starts the
-replacement Controller. Storage is not copied or migrated. If the staged
-release cannot open the Home exactly, the update stops before activation and
-leaves both the Home and current installation unchanged.
+storage preflight, stops the exact old Controller, activates the same artifact,
+applies any complete adjacent migration path, verifies the installed binary and
+current Home, and starts the replacement Controller. If no complete path exists,
+the update stops before activation and leaves both the Home and current
+installation unchanged.
 
 To retain an old Home, keep it byte-for-byte and open it only with its original
 Yui version for read-only inspection. For unfinished work, initialize a new
@@ -763,10 +763,10 @@ Global Context entry:
 yui session enter <global-role>
 ```
 
-`yui update` accepts only the current Home contract and never migrates storage.
-For an older Home, keep its Sessions stopped, inspect it with the original Yui
-version, and let the current Operator recreate unfinished intent as new Tasks in
-a newly initialized Home. Runtime ids and mailbox state are not copied.
+`yui update` accepts the current Home contract or a complete centralized
+migration path. Unsupported older Homes remain untouched; inspect those with a
+compatible Yui version and let the current Operator recreate unfinished intent
+as new Tasks in a newly initialized Home.
 
 tmux fixes a pane's history capacity when that pane is created. Existing panes
 retain their configured capacity; managed runtime output remains observable in
@@ -942,15 +942,16 @@ yui project reset|replace|retire|delete
 ```
 
 `yui update` stages the newly published package side by side and asks that exact
-binary to verify that the Home already matches its current storage contract.
+binary to verify either a current Home or a complete adjacent migration path.
 Only then does it stop the exact old Controller, activate the same concrete
-package version, validate the actually installed binary and Home, and start the
-replacement Controller. It never migrates or switches storage. An older or
-otherwise unsupported Home blocks preflight and remains untouched.
+package version, apply that path, validate the actually installed binary and
+Home, and start the replacement Controller. Unsupported Homes block preflight
+and remain untouched.
 
-`yui upgrade [--dry-run]` is retained as a read-only storage admission
-diagnostic. It reports current, uninitialized, invalid, or unsupported state and
-the Operator action; it never performs an upgrade.
+`yui upgrade --dry-run` reports the exact adjacent steps without writing.
+`yui upgrade` applies those steps transactionally to SQLite record payloads and
+then advances the atomic manifest; rerunning completes an interrupted manifest
+advance without inventing repair behavior.
 
 Agent environment bindings store process-environment variable names, never secret values. Adapter-owned lifecycle arguments cannot be overridden through raw arguments.
 

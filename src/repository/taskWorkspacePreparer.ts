@@ -1056,8 +1056,13 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
       : { release: () => {}, current: heldFence.current };
     try {
       const lineage = executionLaneLineage(this.store, lockedTask, executionGroupId, executionLaneId, hint);
+      const item = lineage.purpose === "execution"
+        ? this.store.getWorkItem(taskId, lineage.workItemId)
+        : null;
       const source = lineage.purpose === "execution"
-        ? this.store.getWorkItemWorkspace(taskId, lineage.workItemId)
+        ? item?.assignee === LEADER_ROLE
+          ? this.store.getTaskWorkspace(taskId)
+          : this.store.getWorkItemWorkspace(taskId, lineage.workItemId)
         : this.store.getReviewRoundWorkspace(taskId, lineage.reviewRoundId);
       if (source === null) {
         throw new Error(`Execution Lane source workspace is not ready: ${executionLaneId}.`);
@@ -1102,9 +1107,6 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
       }
       return existing;
     }
-    const item = lineage.purpose === "execution"
-      ? this.store.getWorkItem(taskId, lineage.workItemId)
-      : null;
     const writable = new Set(lineage.purpose === "execution"
       ? item?.writeProjectIds ?? []
       : lockedTask.projectBindings.map(({ projectId }) => projectId));

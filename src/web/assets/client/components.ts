@@ -549,8 +549,13 @@ export function workItemCard(item, titles, t, locale, actions, taskId) {
     metrics.append(node("span", "", t("detail.contextSnapshots") + " · "
       + observability.context.snapshotCount));
     metrics.append(node("span", "", t("detail.evidence") + " · "
-      + observability.evidenceCount));
-    if (observability.openFindingCount > 0) {
+      + (observability.evidenceCount == null
+        ? t("detail.unobserved")
+        : observability.evidenceCount)));
+    if (observability.openFindingCount == null) {
+      metrics.append(node("span", "", t("detail.openFindings") + " · "
+        + t("detail.unobserved")));
+    } else if (observability.openFindingCount > 0) {
       metrics.append(chip(t("detail.openFindings") + " · " + observability.openFindingCount, "is-danger"));
     }
     body.append(metrics);

@@ -15,6 +15,7 @@ import {
   completeTurn,
   createProducerTurnResult,
   failTurn,
+  type ProducerTurnResult,
   type Turn,
   type TurnProviderResult
 } from "../turn/turn.js";
@@ -524,7 +525,8 @@ export function terminalizeExactTaskTurn(
     : undefined;
   const incompleteProducer = producer !== undefined
     && turn.effective.writeProjectIds.length > 0
-    && (producer.codeRefs.length === 0 || producer.checks.length === 0);
+    && (!producerCoversWriteProjects(producer, turn.effective.writeProjectIds)
+      || producer.checks.length === 0);
   const terminal = input.outcome.status === "completed" && !incompleteProducer
     ? completeTurn(turn, input.outcome.summary, now, input.outcome.provider, producer)
     : failTurn(
@@ -576,6 +578,19 @@ export function terminalizeExactTaskTurn(
   settleLaunchReservation(store, sessions, input);
   reconcileWorkItemMainTurns(store, input.taskId, now);
   return { disposition: "applied", turn: terminal };
+}
+
+function producerCoversWriteProjects(
+  producer: ProducerTurnResult,
+  writeProjectIds: readonly string[]
+): boolean {
+  const expected = [...new Set(writeProjectIds)].sort();
+  const observed = producer.codeRefs.flatMap(({ projectId }) => (
+    projectId === undefined ? [] : [projectId]
+  ));
+  return observed.length === expected.length
+    && new Set(observed).size === observed.length
+    && [...observed].sort().every((projectId, index) => projectId === expected[index]);
 }
 
 function settleLaunchReservation(

@@ -273,7 +273,7 @@ function unsupportedVersion(
   if (current < required) {
     return new StorageSchemaError(
       "STORAGE_SCHEMA_UNSUPPORTED",
-      `${label} ${current} is older than required ${component} version ${required}; no migration is available in this Yui release.`
+      `${label} ${current} is older than required ${component} version ${required}; run \`yui upgrade --dry-run\` to inspect whether a complete migration path is available.`
     );
   }
   return new StorageSchemaError(

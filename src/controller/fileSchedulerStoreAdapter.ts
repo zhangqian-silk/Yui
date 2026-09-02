@@ -172,6 +172,7 @@ import {
 } from "../runtime/runtimeObservation.js";
 import { projectRuntimeTaskEvents } from "../runtime/runtimeProjection.js";
 import { contextSnapshotRef } from "../context/contextSnapshot.js";
+import { snapshotExecutionLaneWorkspaceSync } from "../repository/executionLaneGitSnapshot.js";
 import {
   contextSnapshotDeltaRefIds,
   freezeTurnContextSnapshot
@@ -219,7 +220,8 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
   constructor(
     readonly store: TaskStore,
     private readonly telemetry: SchedulerTelemetry | null = null,
-    private readonly drivers: AgentDriverRegistry = builtinAgentDriverRegistry()
+    private readonly drivers: AgentDriverRegistry = builtinAgentDriverRegistry(),
+    private readonly snapshotExecutionLaneWorkspace = snapshotExecutionLaneWorkspaceSync
   ) {}
 
   freezeLeaderContextSnapshot(taskId: string, roleName: string, now: Date) {
@@ -2488,6 +2490,16 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
             };
           } catch {
             reviewResult = { summary: input.summary, report: input.summary, checks: [] };
+          }
+        }
+        if (observedTurn.purpose === "execution"
+          && observedTurn.executionGroupId !== undefined
+          && observedTurn.executionLaneId !== undefined
+          && observedTurn.workspace !== undefined
+          && providerStatus === "completed") {
+          const gitSnapshot = this.snapshotExecutionLaneWorkspace(store, observedTurn.workspace);
+          if (gitSnapshot !== undefined) {
+            reviewResult = { ...(reviewResult ?? {}), gitSnapshot };
           }
         }
         const terminalized = terminalizeExactTaskTurn(store, {

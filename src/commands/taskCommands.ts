@@ -5263,22 +5263,50 @@ function retryTurn(
         `Turn ${previous.id} no longer owns the current WorkItem main synthesis.`
       );
     }
+    const directMainTurns = retryItem === null
+      ? []
+      : chronologicalTurns(tx.listTurns(task.id).filter((turn) => (
+          turn.purpose === "execution"
+          && turn.workItemId === retryItem.id
+          && turn.executionGroupId === undefined
+          && turn.executionLaneId === undefined
+          && turn.sourceExecutionGroupId === undefined
+        )));
+    const retriesDirectMain = retryItem !== null
+      && !retriesExecutionLane
+      && !retriesSynthesisMain;
+    const exactDirectMain = !retriesDirectMain || (
+      (retryItem.status === "running" || retryItem.status === "failed")
+      && retryItem.assignee === previous.roleName
+      && directMainTurns.at(-1)?.id === previous.id
+    );
+    if (!exactDirectMain) {
+      throw usageError(
+        `Turn ${previous.id} no longer owns the current direct WorkItem execution.`
+      );
+    }
     const groupedRunningRetry = retryItem?.status === "running"
       && retriesExecutionLane
       && exactCurrentLane;
     const synthesisRunningRetry = retryItem?.status === "running"
       && retriesSynthesisMain
       && exactSourceMain;
+    const directRunningRetry = retryItem?.status === "running"
+      && retriesDirectMain
+      && exactDirectMain;
     if (retryItem !== null
       && retryItem.status !== "failed"
       && !groupedRunningRetry
-      && !synthesisRunningRetry) {
+      && !synthesisRunningRetry
+      && !directRunningRetry) {
       throw usageError(`Work Item ${retryItem.id} is not retryable from ${retryItem.status}.`);
     }
     const runWorkspace = previous.workspace
       ?? (retryItem === null
         ? tx.getTaskWorkspace(task.id)
-        : tx.getWorkItemWorkspace(task.id, retryItem.id))
+        : retryItem.assignee === "leader"
+          ? tx.getTaskWorkspace(task.id)
+          : tx.getWorkItemWorkspace(task.id, retryItem.id))
       ?? undefined;
     const retryGroup = retryItem === null || previous.executionGroupId === undefined
       ? undefined
@@ -5330,6 +5358,23 @@ function retryTurn(
         || !isDeepStrictEqual(storedMainWorkspace, previous.workspace)
         || !isDeepStrictEqual(currentMainWorkspace, previous.workspace)) {
         throw dataError(`Turn ${previous.id} WorkItem main workspace is missing or has drifted.`);
+      }
+    }
+    if (retriesDirectMain) {
+      const storedDirectWorkspace = previous.workspace === undefined
+        ? null
+        : tx.getManagedWorkspace(previous.workspace.owner);
+      const currentDirectWorkspace = retryItem?.assignee === "leader"
+        ? tx.getTaskWorkspace(task.id)
+        : retryItem === null
+          ? null
+          : tx.getWorkItemWorkspace(task.id, retryItem.id);
+      if (previous.workspace === undefined
+        || storedDirectWorkspace === null
+        || currentDirectWorkspace === null
+        || !isDeepStrictEqual(storedDirectWorkspace, previous.workspace)
+        || !isDeepStrictEqual(currentDirectWorkspace, previous.workspace)) {
+        throw dataError(`Turn ${previous.id} direct WorkItem workspace is missing or has drifted.`);
       }
     }
     const effective = retryLane?.effective ?? resolveEffectiveLaunch({

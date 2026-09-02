@@ -93,8 +93,8 @@ export type WorkItemObservabilityProjection = Readonly<{
   groupIds: readonly string[];
   cost: TaskCostProjection;
   context: TaskContextProjection;
-  evidenceCount: number;
-  openFindingCount: number;
+  evidenceCount: number | null;
+  openFindingCount: number | null;
 }>;
 
 export type TaskObservabilityProjection = Readonly<{
@@ -130,6 +130,7 @@ export function buildTaskObservabilityProjection(
     const groups = item.executionGroups;
     const itemCost = projectWorkItemCost(groups, input.turns, now);
     const itemContext = projectContext(groups, input.turns, input.contextSnapshots);
+    const producerObservability = projectWorkItemProducerObservability(item, input.turns);
     return Object.freeze({
       workItemId: item.id,
       title: item.title,
@@ -137,8 +138,8 @@ export function buildTaskObservabilityProjection(
       groupIds: groups.map(({ id }) => id),
       cost: itemCost,
       context: itemContext,
-      evidenceCount: 0,
-      openFindingCount: 0
+      evidenceCount: producerObservability?.evidenceCount ?? null,
+      openFindingCount: producerObservability?.openFindingCount ?? null
     });
   });
   const cost = projectCost(input.executionGroups, input.turns, input.events, now);
@@ -150,6 +151,34 @@ export function buildTaskObservabilityProjection(
     context,
     sessionTokens: Object.freeze([...(input.sessionTokens ?? [])])
   });
+}
+
+function projectWorkItemProducerObservability(
+  item: WorkItem,
+  turns: readonly Turn[]
+): Readonly<{ evidenceCount: number; openFindingCount: number }> | null {
+  const successfulLanes = item.executionGroups.flatMap((group) => group.lanes.flatMap((lane) => (
+    lane.disposition === "succeeded" ? [{ group, lane }] : []
+  )));
+  let evidenceCount = 0;
+  let openFindingCount = 0;
+  for (const { group, lane } of successfulLanes) {
+    const turn = lane.successfulTurnId === undefined
+      ? undefined
+      : turns.find(({ id }) => id === lane.successfulTurnId);
+    const producer = turn?.result?.producer;
+    if (turn === undefined
+      || producer === undefined
+      || turn.status !== "completed"
+      || turn.taskId !== item.taskId
+      || turn.workItemId !== item.id
+      || turn.executionGroupId !== group.id
+      || turn.executionLaneId !== lane.id
+      || turn.roleName !== lane.roleName) return null;
+    evidenceCount += producer.evidence.length;
+    openFindingCount += producer.findings.filter(({ status }) => status === "open").length;
+  }
+  return { evidenceCount, openFindingCount };
 }
 
 function projectDag(workItems: readonly WorkItem[]): TaskDagProjection {

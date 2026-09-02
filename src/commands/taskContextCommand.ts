@@ -782,5 +782,5 @@ function resourceUsageLabel(
 function renderWorkItemObservability(
   item: WorkItemObservabilityProjection
 ): string {
-  return `    Observability (read-only): tokens=${item.cost.tokensObservable ? item.cost.tokens : "unobserved"}; tools=${item.cost.toolCallsObservable ? item.cost.toolCalls : "unobserved"}; wall=${item.cost.wallClockSeconds}s; retries=${item.cost.retryCount}; snapshots=${item.context.snapshotCount}; evidence=${item.evidenceCount}; open-findings=${item.openFindingCount}; compression=${item.context.compressionStatus}`;
+  return `    Observability (read-only): tokens=${item.cost.tokensObservable ? item.cost.tokens : "unobserved"}; tools=${item.cost.toolCallsObservable ? item.cost.toolCalls : "unobserved"}; wall=${item.cost.wallClockSeconds}s; retries=${item.cost.retryCount}; snapshots=${item.context.snapshotCount}; evidence=${item.evidenceCount ?? "unobserved"}; open-findings=${item.openFindingCount ?? "unobserved"}; compression=${item.context.compressionStatus}`;
 }

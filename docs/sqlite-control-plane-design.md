@@ -24,14 +24,16 @@ Ordinary commands open a Home only when all of these are true:
 2. `yui.db` exists and opens through the current schema loader.
 3. Record validation and reference integrity succeed.
 
-An older, newer, incomplete, or malformed Home fails closed. `yui doctor` and
-`yui upgrade [--dry-run]` report the reason without changing the Home. There is
-no in-process normalization, migration, repair worker, file-Store fallback,
-dual read/write, backup switch, or migration receipt protocol.
+An older, newer, incomplete, or malformed Home fails ordinary admission.
+`yui doctor` and `yui upgrade --dry-run` report the reason without changing the
+Home; explicit `yui upgrade` writes only when the centralized graph has every
+adjacent step and the Controller lifecycle is quiesced. There is no in-process
+normalization, repair worker, file-Store fallback, dual read/write, backup
+switch, or migration receipt protocol.
 
-If unfinished work exists in an old Home, preserve it byte-for-byte. Use its
-original Yui release for read-only inspection, then initialize a new Home and
-let the Operator create a new Task from the objective, relevant WorkItems,
+If an old Home has no complete migration path, preserve it byte-for-byte. Use
+its original Yui release for read-only inspection, then initialize a new Home
+and let the Operator create a new Task from the objective, relevant WorkItems,
 repository state, and available Turn summaries. New records receive new
 identities; Provider/session state is not imported.
 
@@ -61,10 +63,10 @@ Leader remains the authority for WorkItem and Task completion.
 
 `yui update` stages an exact package, asks that staged binary to verify the
 existing Home against its current contract, stops the exact Controller,
-activates the same package, verifies the installed binary and Home, and starts
-the replacement Controller. It does not mutate storage layout or records.
+activates the same package, applies any preflighted adjacent aggregate migration,
+verifies the installed binary and Home, and starts the replacement Controller.
+The Controller is stopped before any record mutation.
 
-Any persistent schema change must deliberately introduce a new centralized
-migration in the future. Until such a transition is explicitly authorized, the
-production registry exposes only the current baseline and historical Homes are
-rejected.
+Every persistent schema change must add an explicit adjacent step to the
+centralized migration graph. This release supports aggregate 21→22→23→24
+(WorkItem 13→14 and Turn 1→2→3); Homes outside a complete path are rejected.
