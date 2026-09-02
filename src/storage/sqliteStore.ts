@@ -146,7 +146,7 @@ import {
   TELEMETRY_KEEP_PER_GENERATION,
   TELEMETRY_TURN_CAP
 } from "./sqliteSchema.js";
-import { inspectStorageSchema } from "./storageSchema.js";
+import { inspectStorageSchema, StorageSchemaError } from "./storageSchema.js";
 
 /** Options for {@link SqliteTaskStore}. */
 export type SqliteTaskStoreOptions = Readonly<{
@@ -263,29 +263,20 @@ export class SqliteTaskStore implements TaskStore {
     mkdirSync(rootDir, { recursive: true, mode: 0o700 });
     const filename = _options.databaseFilename ?? "yui.db";
     const databasePath = join(rootDir, filename);
+    // Remember whether the database file existed before this connection opened
+    // it. A store that creates the file is bootstrapping a fresh database and
+    // may seed its singleton rows; a store that opens an existing file missing
+    // those rows has found corruption, not a bootstrap opportunity.
     const databaseExisted = existsSync(databasePath);
     this.#db = new Database(databasePath);
-    try {
-      // §4.1 / §9: WAL, no fsync weakening, FKs on, busy timeout for CLI contention.
-      this.#db.pragma("journal_mode = WAL");
-      this.#db.pragma("synchronous = FULL");
-      this.#db.pragma("foreign_keys = ON");
-      this.#db.pragma("busy_timeout = 5000");
-      this.#db.pragma("wal_autocheckpoint = 1000");
-      migrateSqliteSchema(this.#db, {
-        mode: !databaseExisted ? "apply" : "validate"
-      });
-      const schema = inspectSqliteSchemaMigrations(this.#db);
-      this.#openedSchemaHead = {
-        version: schema.currentVersion,
-        checksum: schema.currentChecksum
-      };
-      this.#seedHomeMeta();
-      this.#seedConfig();
-    } catch (error) {
-      this.#db.close();
-      throw error;
-    }
+    // §4.1 / §9: WAL, no fsync weakening, FKs on, busy timeout for CLI contention.
+    this.#db.pragma("journal_mode = WAL");
+    this.#db.pragma("synchronous = FULL");
+    this.#db.pragma("foreign_keys = ON");
+    this.#db.pragma("busy_timeout = 5000");
+    this.#db.pragma("wal_autocheckpoint = 1000");
+    migrateSqliteSchema(this.#db);
+    this.#ensureSeedRows(databaseExisted);
   }
 
   rootDirectory(): string { return this.#rootDir; }
@@ -301,6 +292,36 @@ export class SqliteTaskStore implements TaskStore {
   databaseHandle(): Database.Database { return this.#db; }
 
   // -- transaction primitives -------------------------------------------------
+
+  /**
+   * Guarantee the `home_meta` and `config` singleton rows exist.
+   *
+   * A fresh database (created by this connection, or opened in migration
+   * bulk-load mode) is bootstrapped with defaults. An existing database
+   * opened in production mode that is missing either row is corrupt —
+   * truncated, partially migrated, or hand-edited — and must fail closed
+   * instead of silently masking the damage with fresh defaults (Issue 01
+   * cross-issue handoff: INSERT OR IGNORE could hide migration corruption).
+   */
+  #ensureSeedRows(databaseExisted: boolean): void {
+    const hasHomeMeta = this.#db.prepare("SELECT 1 FROM home_meta WHERE id = 1").get() !== undefined;
+    const hasConfig = this.#db.prepare("SELECT 1 FROM config WHERE id = 1").get() !== undefined;
+    if (hasHomeMeta && hasConfig) return;
+    if (databaseExisted && !this.#migration) {
+      const missing = [
+        !hasHomeMeta ? "home_meta" : null,
+        !hasConfig ? "config" : null
+      ].filter((value): value is string => value !== null).join(", ");
+      throw new StorageSchemaError(
+        "STORAGE_SCHEMA_INVALID",
+        `SQLite database is corrupt: required singleton row(s) missing (${missing}). `
+        + "The database may be truncated or partially migrated. Restore yui.db from a "
+        + "backup, or re-run `yui upgrade` to rebuild it from state.json."
+      );
+    }
+    if (!hasHomeMeta) this.#seedHomeMeta();
+    if (!hasConfig) this.#seedConfig();
+  }
 
   #seedHomeMeta(): void {
     const now = new Date().toISOString();
