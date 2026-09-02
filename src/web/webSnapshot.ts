@@ -4,6 +4,7 @@ import { type Task, type TaskStatus } from "../task/task.js";
 import type { WorkItem, WorkItemStatus } from "../workItem/workItem.js";
 import { isRoleTurnStalled, latestTurnDurableProgressAt } from "../scheduler/roleTurnStall.js";
 import type { TaskEvent } from "../event/taskEvent.js";
+import { retiredTaskRecordIds } from "../task/taskRecordRetirement.js";
 import {
   buildTaskExecutionProjection,
   type TaskExecutionProjection
@@ -154,6 +155,7 @@ export function buildWebTaskDetail(
     });
     const turns = reader.listTurns(taskId);
     const events = reader.listEvents?.(taskId) ?? [];
+    const retiredMessageIds = retiredTaskRecordIds(events, "message");
     const needsAttentionTurns = turns
       .filter((turn) => turn.status === "active" && isRoleTurnStalled(events, turn.id))
       .map((turn) => ({
@@ -225,7 +227,10 @@ export function buildWebTaskDetail(
       runtimeHealth: { needsAttentionTurns, activeTurns: activeTurnHealth },
       reviewRounds: reader.listReviewRounds(taskId),
       openInputs: inputs.filter((request) => request.status === "open"),
-      messages: reader.listMessages(taskId),
+      messages: reader.listMessages(taskId).map((message) => ({
+        ...message,
+        status: retiredMessageIds.has(message.id) ? "retired" : "active"
+      })),
       decisions: reader.listDecisions(taskId),
       milestones: reader.listMilestones(taskId)
     };

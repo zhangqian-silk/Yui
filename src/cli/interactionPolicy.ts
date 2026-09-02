@@ -8,6 +8,7 @@ export type CandidateProviderName =
   | "input-requests"
   | "integration-attempts"
   | "jobs"
+  | "messages"
   | "projects"
   | "turns"
   | "task-decisions"
@@ -31,6 +32,7 @@ export type SelectableEntity =
   | "decision"
   | "event"
   | "milestone"
+  | "message"
   | "task-role"
   | "work-item";
 
@@ -291,6 +293,27 @@ export const INTERACTION_POLICIES: readonly InteractionPolicy[] = Object.freeze(
     }]
   })),
   {
+    commandPath: ["task", "message", "update"],
+    selectors: [{
+      argumentIndex: 3,
+      entity: "message",
+      provider: "messages",
+      actionTarget: true
+    }],
+    trailingOptions: { "--body-file": "value", "--wake-policy": "value" }
+  },
+  {
+    commandPath: ["task", "message", "retire"],
+    selectors: [{
+      argumentIndex: 3,
+      entity: "message",
+      provider: "messages",
+      actionTarget: true
+    }],
+    trailingOptions: { "--reason": "value" },
+    confirmation: { action: "Retire Task Message", targetArgumentIndex: 3 }
+  },
+  {
     commandPath: ["task", "input", "request"],
     selectors: [{
       argumentIndex: 3,
@@ -436,14 +459,15 @@ export const INTERACTION_POLICIES: readonly InteractionPolicy[] = Object.freeze(
       }
     ],
     trailingOptions: {
-      "--objective": "value", "--accept": "value", "--after": "value", "--role": "value"
+      "--objective": "value", "--accept": "value", "--after": "value", "--role": "value",
+      "--project": "value", "--base-ref": "value"
     }
   },
   {
     commandPath: ["task", "work", "list"],
     selectors: [{ argumentIndex: 3, entity: "task", provider: "tasks", actionTarget: true }]
   },
-  ...["show", "update", "dispatch", "isolate", "capture", "cleanup", "accept", "reject"]
+  ...["show", "edit", "update", "dispatch", "isolate", "capture", "cleanup", "accept", "reject"]
     .map((command): InteractionPolicy => ({
       commandPath: ["task", "work", command],
       selectors: [{
@@ -452,7 +476,24 @@ export const INTERACTION_POLICIES: readonly InteractionPolicy[] = Object.freeze(
         provider: "work-items",
         actionTarget: true
       }],
-      ...(command === "update"
+      ...(command === "edit"
+        ? {
+            trailingOptions: {
+              "--title": "value" as const,
+              "--objective": "value" as const,
+              "--accept": "value" as const,
+              "--clear-acceptance": "flag" as const,
+              "--after": "value" as const,
+              "--clear-dependencies": "flag" as const,
+              "--project": "value" as const,
+              "--clear-projects": "flag" as const,
+              "--base-ref": "value" as const,
+              "--clear-base-refs": "flag" as const,
+              "--role": "value" as const,
+              "--clear-role": "flag" as const
+            }
+          }
+        : command === "update"
         ? { trailingOptions: { "--summary": "value" as const } }
         : command === "dispatch"
           ? { trailingOptions: { "--input": "value" as const } }

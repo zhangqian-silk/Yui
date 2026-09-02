@@ -24,6 +24,7 @@ import { createTaskEvent, type TaskEvent, type TaskEventPayload } from "../event
 import {
   createTaskRecordRetirement,
   isTaskRecordRetired,
+  operationalTaskRecords,
   taskRecordRetirement
 } from "../task/taskRecordRetirement.js";
 import {
@@ -59,11 +60,16 @@ import { renderRoleDetails } from "../output/rolePresentation.js";
 import {
   createTaskMessage,
   taskMessageAuthorLabel,
+  updateDraftTaskMessage,
   type TaskMessage,
   type TaskMessageAuthor,
   type TaskMessageContext,
   type TaskMessageKind
 } from "../message/message.js";
+import {
+  assertDraftTaskExecutionFree,
+  validateDraftWorkItemEdit
+} from "../task/draftPlan.js";
 import type {
   TaskRetirementProof,
   WorkItemIntegrationProof
@@ -188,6 +194,7 @@ import {
   currentWorkItemExecutionGroup,
   workItemExecutionGroupById,
   createWorkItem,
+  editDraftWorkItemDefinition,
   attachWorkItemExecutionGroup,
   updateWorkItemExecutionGroup,
   retireWorkItem,
@@ -202,6 +209,10 @@ import {
   type WorkItemCandidate,
   type WorkItemStatus
 } from "../workItem/workItem.js";
+import {
+  assertWorkItemDependenciesCompleted as assertWorkItemDependencyGate,
+  WorkItemDependencyGateError
+} from "../workItem/dependencyGate.js";
 import {
   addExecutionLane,
   createExecutionGroup,
@@ -635,7 +646,10 @@ export function runTaskCommand(
     case "archive": return output(archiveTaskCommand(rest, store, options));
     case "retire": return retireTaskCommand(rest, store, options);
     case "reconcile": return output(reconcileTaskCommand(rest, store, options));
-    case "message": return output(taskMessageCommand(rest, store, options));
+    case "message": {
+      const execution = taskMessageCommand(rest, store, options);
+      return typeof execution === "string" ? output(execution) : execution;
+    }
     case "wake": return taskWakeDispatch(rest, store, options);
     case "project": return taskProjectCommand(rest, store, options);
     case "input": return runTaskInputCommand(rest, store, options);
@@ -1015,12 +1029,16 @@ function showTaskCommand(args: string[], store: TaskWorkflowStore): TaskCommandE
   const verifiedMergedPublications = publications.filter((reference) => (
     reference.state === "merged" && reference.verification === "verified"
   )).length;
+  const currentMessageCount = operationalTaskRecords(messages, events, "message").length;
+  const currentWorkItemCount = work.filter(({ status }) => status !== "retired").length;
   const counts = {
     messages: messages.length,
+    currentMessages: currentMessageCount,
     decisions: decisions.length,
     milestones: milestones.length,
     events: events.length,
     workItems: work.length,
+    currentWorkItems: currentWorkItemCount,
     turns: store.listTurns(task.id).length,
     changeSets: changeSets.length,
     integrations: integrations.length,
@@ -1057,11 +1075,13 @@ function showTaskCommand(args: string[], store: TaskWorkflowStore): TaskCommandE
         ]),
     ...(task.cwd === undefined ? [] : [`Workspace: ${task.cwd}`]),
     `Messages: ${counts.messages}`,
+    `Current messages: ${currentMessageCount}`,
     `Brief: ${brief === null ? "no" : "yes"}`,
     `Decisions: ${counts.decisions}`,
     `Milestones: ${counts.milestones}`,
     `Events: ${counts.events}`,
     `Work items: ${counts.workItems}`,
+    `Current work items: ${currentWorkItemCount}`,
     `Turns: ${counts.turns}`,
     `ChangeSets: ${counts.changeSets}`,
     `Integration Attempts: ${counts.integrations}`,
@@ -1593,7 +1613,7 @@ function taskMessageCommand(
   args: string[],
   store: TaskWorkflowStore,
   options: TaskCommandOptions
-): string {
+): string | TaskCommandExecution {
   const [command, ...rest] = args;
   if (command === "send") {
     const usage = "Task message send usage: yui task message send <id> (<body>|--body-file <path|->) [--wake-policy leader|none].";
@@ -1711,12 +1731,79 @@ function taskMessageCommand(
       defaultTableWidth()
     )}\n`;
   }
+  if (command === "update") {
+    return updateMessage(rest, store, options);
+  }
   if (command === "retire") {
     return retireMessage(rest, store, options);
   }
   throw usageError(command === undefined
     ? "Task message command is required."
     : `Unknown command: task message ${command}`);
+}
+
+function updateMessage(
+  args: string[],
+  store: TaskWorkflowStore,
+  options: TaskCommandOptions
+): TaskCommandExecution {
+  const usage = "Task message update usage: yui task message update <task>/<message> (<body>|--body-file <path|->) [--wake-policy leader|none].";
+  const parsed = parseTail(args, new Set(["--body-file", "--wake-policy"]), usage);
+  if (parsed.positionals.length < 1 || parsed.positionals.length > 2) throw usageError(usage);
+  const body = readCommandText(
+    parsed.positionals[1],
+    parsed.options.get("--body-file"),
+    "--body",
+    usage
+  );
+  const wakePolicyRaw = parsed.options.get("--wake-policy");
+  const wakePolicy = wakePolicyRaw === undefined
+    ? undefined
+    : wakePolicyRaw === "leader" || wakePolicyRaw === "none"
+      ? wakePolicyRaw
+      : (() => {
+          throw usageError(`--wake-policy must be 'leader' or 'none': ${wakePolicyRaw}.`);
+        })();
+  const reference = taskRecordReference(
+    parsed.positionals[0],
+    "message",
+    "Message reference",
+    options
+  );
+  const now = clock(options);
+  const result = store.transaction((tx) => {
+    const task = requireTask(tx, reference.taskId);
+    if (task.status !== "draft") {
+      throw usageError(`Task Message update is Draft-only: ${task.id}/${task.status}.`);
+    }
+    assertDraftTaskExecutionFree(tx, task);
+    const actor = taskActor(tx, options, task.id);
+    if (actor !== "user" && actor !== "operator") {
+      throw usageError("Only the user or Operator may update a Draft Task Message.");
+    }
+    const message = tx.listMessages(task.id).find(({ id }) => id === reference.localId);
+    if (message === undefined) {
+      throw dataError(`Task Message not found: ${task.id}/${reference.localId}.`);
+    }
+    if (isTaskRecordRetired(tx.listEvents(task.id), "message", message.id)) {
+      throw usageError(`Task Message is retired: ${task.id}/${message.id}.`);
+    }
+    const updated = updateDraftTaskMessage(message, {
+      body,
+      ...(wakePolicy === undefined ? {} : { wakePolicy })
+    });
+    tx.updateMessage(task.id, updated);
+    recordTaskEvent(tx, task.id, "message.updated", {
+      messageId: updated.id,
+      updatedBy: actor,
+      ...(wakePolicy === undefined ? {} : { wakePolicy })
+    }, now);
+    return { task, message: updated };
+  });
+  options.runtime?.notifyStateChanged(result.task.id);
+  return output(`Updated Task Message ${result.task.id}/${result.message.id}\n`, {
+    message: result.message
+  });
 }
 
 function retireMessage(
@@ -1738,6 +1825,7 @@ function retireMessage(
   const result = store.transaction((tx) => {
     const task = requireTask(tx, reference.taskId);
     assertTaskOpen(task);
+    if (task.status === "draft") assertDraftTaskExecutionFree(tx, task);
     const actor = taskActor(tx, options, task.id);
     const message = tx.listMessages(task.id).find(({ id }) => id === reference.localId);
     if (message === undefined) {
@@ -1750,10 +1838,12 @@ function retireMessage(
     // Remove an isolated pending wake for this exact directive. A merged batch
     // is retained because its other signals remain actionable; context and
     // actionability projections still filter the retired message below.
-    try {
-      settleExactWorkExecution(tx, leaderMailbox(task.id), messageRef(task.id, message.id));
-    } catch {
-      // Merged pending work cannot be split without losing unrelated signals.
+    if (task.status === "active") {
+      try {
+        settleExactWorkExecution(tx, leaderMailbox(task.id), messageRef(task.id, message.id));
+      } catch {
+        // Merged pending work cannot be split without losing unrelated signals.
+      }
     }
     tx.saveEvent(task.id, createTaskRecordRetirement({
       eventId: tx.nextEventId(task.id),
@@ -2398,6 +2488,7 @@ function taskWorkCommand(
   if (command === "create") return createWork(rest, store, options);
   if (command === "list") return listWork(rest, store);
   if (command === "show") return showWork(rest, store, options);
+  if (command === "edit") return editWork(rest, store, options);
   if (command === "update") return updateWork(rest, store, options);
   if (command === "scope") return output(updateWorkScope(rest, store, options));
   if (command === "dispatch") return output(dispatchWork(rest, store, options));
@@ -2412,6 +2503,121 @@ function taskWorkCommand(
   throw usageError(command === undefined
     ? "Task work command is required."
     : `Unknown command: task work ${command}`);
+}
+
+function editWork(
+  args: string[],
+  store: TaskWorkflowStore,
+  options: TaskCommandOptions
+): TaskCommandExecution {
+  const usage = "Task work edit usage: yui task work edit <task>/<work> [--title <text>] [--objective <text>] [--accept <criterion> ...|--clear-acceptance] [--after <work> ...|--clear-dependencies] [--project <project> ...|--clear-projects] [--base-ref <project>=<ref> ...|--clear-base-refs] [--role <name>|--clear-role].";
+  const parsed = parseMultiValueTail(
+    args,
+    new Set(["--title", "--objective", "--role"]),
+    new Set(["--accept", "--after", "--project", "--base-ref"]),
+    usage,
+    new Set([
+      "--clear-acceptance",
+      "--clear-dependencies",
+      "--clear-projects",
+      "--clear-base-refs",
+      "--clear-role"
+    ])
+  );
+  exactPositionals(parsed.positionals, 1, usage);
+  const optionCount = parsed.options.size + parsed.multiOptions.size;
+  if (optionCount === 0) throw usageError("At least one Work Item definition field is required.", usage);
+  assertReplaceOrClear(parsed, "--accept", "--clear-acceptance", usage);
+  assertReplaceOrClear(parsed, "--after", "--clear-dependencies", usage);
+  assertReplaceOrClear(parsed, "--project", "--clear-projects", usage);
+  assertReplaceOrClear(parsed, "--base-ref", "--clear-base-refs", usage);
+  if (parsed.options.has("--role") && parsed.options.has("--clear-role")) {
+    throw usageError("--role and --clear-role cannot be combined.", usage);
+  }
+  const now = clock(options);
+  const result = store.transaction((tx) => {
+    const item = requireWorkItem(tx, parsed.positionals[0], options);
+    const task = requireTask(tx, item.taskId);
+    if (task.status !== "draft") {
+      throw usageError(`Work Item definition edit is Draft-only: ${task.id}/${task.status}.`);
+    }
+    assertDraftTaskExecutionFree(tx, task);
+    const actor = taskActor(tx, options, task.id);
+    if (actor !== "user" && actor !== "operator") {
+      throw usageError("Only the user or Operator may edit a Draft Work Item.");
+    }
+    if (item.status === "retired") {
+      throw usageError(`Work Item is retired: ${item.id}.`);
+    }
+    const projects = parsed.multiOptions.has("--project")
+      ? parsed.multiOptions.get("--project")!.map((reference) => {
+          const project = resolveProject(
+            task.projectBindings.map(({ projectId }) => requireProject(tx, projectId)),
+            reference
+          );
+          if (project === null) throw usageError(`Task Project not found: ${reference}.`);
+          assertProjectActive(project, "edit a Work Item");
+          return project.id;
+        })
+      : parsed.options.has("--clear-projects") ? [] : undefined;
+    const baseRefs = parsed.multiOptions.has("--base-ref")
+      ? parseWorkItemBaseRefs(
+          parsed.multiOptions.get("--base-ref")!,
+          task,
+          tx,
+          projects ?? item.writeProjectIds,
+          usage
+        )
+      : parsed.options.has("--clear-base-refs") ? null : undefined;
+    const assignee = parsed.options.has("--role")
+      ? requiredOption(parsed.options, "--role")
+      : parsed.options.has("--clear-role") ? null : undefined;
+    if (typeof assignee === "string") requireRole(tx, task.id, assignee);
+    const updated = editDraftWorkItemDefinition(item, {
+      ...(parsed.options.has("--title")
+        ? { title: requiredOption(parsed.options, "--title") }
+        : {}),
+      ...(parsed.options.has("--objective")
+        ? { objective: requiredOption(parsed.options, "--objective") }
+        : {}),
+      ...(parsed.multiOptions.has("--accept")
+        ? { acceptance: parsed.multiOptions.get("--accept")! }
+        : parsed.options.has("--clear-acceptance") ? { acceptance: [] } : {}),
+      ...(parsed.multiOptions.has("--after")
+        ? { dependsOn: parsed.multiOptions.get("--after")! }
+        : parsed.options.has("--clear-dependencies") ? { dependsOn: [] } : {}),
+      ...(projects === undefined ? {} : { writeProjectIds: projects }),
+      ...(baseRefs === undefined ? {} : { baseRefs }),
+      ...(assignee === undefined ? {} : { assignee })
+    }, now);
+    validateDraftWorkItemEdit(tx, task, updated);
+    tx.saveWorkItem(task.id, updated);
+    const changedFields = [
+      parsed.options.has("--title") ? "title" : undefined,
+      parsed.options.has("--objective") ? "objective" : undefined,
+      parsed.multiOptions.has("--accept") || parsed.options.has("--clear-acceptance")
+        ? "acceptance" : undefined,
+      parsed.multiOptions.has("--after") || parsed.options.has("--clear-dependencies")
+        ? "dependsOn" : undefined,
+      parsed.multiOptions.has("--project") || parsed.options.has("--clear-projects")
+        ? "writeProjectIds" : undefined,
+      parsed.multiOptions.has("--base-ref") || parsed.options.has("--clear-base-refs")
+        ? "baseRefs" : undefined,
+      parsed.options.has("--role") || parsed.options.has("--clear-role")
+        ? "assignee" : undefined
+    ].filter((field): field is string => field !== undefined);
+    recordTaskEvent(tx, task.id, "work.edited", {
+      workItemId: updated.id,
+      revision: String(updated.revision),
+      fields: changedFields.join(","),
+      editedBy: actor
+    }, now);
+    return { task, item: updated };
+  });
+  options.runtime?.notifyStateChanged(result.task.id);
+  return output(`Edited Work Item ${result.task.id}/${result.item.id}\n`, {
+    workItem: result.item
+  });
 }
 
 function createWork(
@@ -2561,7 +2767,7 @@ function updateWork(
     if (current.assignee === undefined) {
       taskActor(tx, options, task.id);
       if (status === "running") {
-        assertWorkItemDependenciesCompleted(tx, current);
+        assertWorkItemDependenciesCompletedForCommand(tx, current);
       }
       if (status === "completed" && current.status === "awaiting_acceptance") {
         throw usageError(
@@ -2769,6 +2975,7 @@ function dispatchWork(
     const task = requireTask(tx, item.taskId);
     taskActor(tx, options, task.id);
     if (task.status !== "active") throw usageError(inactiveTaskMessage(task, "dispatch"));
+    assertTaskExecutionEnabled(task, "dispatching work");
     if (item.assignee === undefined) {
       throw usageError(
         `Work Item has no Task Role assignee: ${item.id}. `
@@ -2789,7 +2996,7 @@ function dispatchWork(
         `Work Item ${item.id} retains open ExecutionGroup ${currentGroup.id}; retry or settle its exact Lane Turns.`
       );
     }
-    assertWorkItemDependenciesCompleted(tx, item);
+    assertWorkItemDependenciesCompletedForCommand(tx, item);
     const leaderOwned = item.assignee === "leader";
     const workspace = leaderOwned
       ? tx.getTaskWorkspace(task.id)
@@ -3287,20 +3494,23 @@ function retireWork(
   exactPositionals(parsed.positionals, 1, usage);
   const workItemId = parsed.positionals[0]!;
   const summary = requiredOption(parsed.options, "--summary");
-  const replacementWorkItemId = parsed.options.get("--replacement");
+  const replacementReference = parsed.options.get("--replacement");
   const now = clock(options);
   const retired = store.transaction((tx) => {
     const item = requireWorkItem(tx, workItemId, options);
     const task = requireTask(tx, item.taskId);
-    if (task.status !== "active") {
-      throw usageError(`Task is not active: ${task.id}/${task.status}.`);
+    if (task.status !== "active" && task.status !== "draft") {
+      throw usageError(`Task is not open for Work Item retirement: ${task.id}/${task.status}.`);
     }
+    if (task.status === "draft") assertDraftTaskExecutionFree(tx, task);
     const actor = taskActor(tx, options, task.id);
-    if (replacementWorkItemId !== undefined) {
-      const replacement = requireWorkItem(tx, replacementWorkItemId, options);
+    const replacement = replacementReference === undefined
+      ? undefined
+      : requireWorkItem(tx, replacementReference, options);
+    if (replacement !== undefined) {
       if (replacement.taskId !== task.id) {
         throw usageError(
-          `Replacement Work Item must belong to the same Task: ${replacementWorkItemId}.`
+          `Replacement Work Item must belong to the same Task: ${replacementReference}.`
         );
       }
       if (replacement.id === item.id) {
@@ -3310,54 +3520,56 @@ function retireWork(
     // rr4/finding-5: A Work Item with an active DurableJob cannot be retired —
     // the runner may still be using its workspace. Block on queued, running,
     // and unacknowledged unknown-needs-attention jobs owned by this Work Item.
-    const activeWorkItemJob = tx.listDurableJobs(task.id).find((job) => (
-      job.owner.kind === "work-item"
-      && job.owner.workItemId === item.id
-      && (
-        job.status === "queued"
-        || job.status === "running"
-        || (job.status === "unknown-needs-attention" && job.acknowledgedAt === undefined)
-      )
-    ));
-    if (activeWorkItemJob !== undefined) {
-      throw usageError(
-        `Work Item ${item.id} has an active DurableJob: `
-        + `${activeWorkItemJob.id}/${activeWorkItemJob.status}. `
-        + "Cancel or acknowledge it before retiring."
-      );
-    }
-    for (const run of tx.listTurns(task.id).filter((candidate) => (
-      candidate.status === "active" && candidate.workItemId === item.id
-    ))) {
-      const terminal = terminalizeExactTaskTurn(tx, {
-        taskId: task.id,
-        roleName: run.roleName,
-        agentId: run.effective.agentId,
-        turnId: run.id,
-        outcome: {
-          status: "failed",
-          summary: `Work Item retired: ${summary}`
-        }
-      }, now);
-      if (terminal.disposition !== "applied") {
+    if (task.status === "active") {
+      const activeWorkItemJob = tx.listDurableJobs(task.id).find((job) => (
+        job.owner.kind === "work-item"
+        && job.owner.workItemId === item.id
+        && (
+          job.status === "queued"
+          || job.status === "running"
+          || (job.status === "unknown-needs-attention" && job.acknowledgedAt === undefined)
+        )
+      ));
+      if (activeWorkItemJob !== undefined) {
         throw usageError(
-          `Work Item Turn changed during retirement: ${run.id}/${terminal.reason ?? "obsolete"}.`
+          `Work Item ${item.id} has an active DurableJob: `
+          + `${activeWorkItemJob.id}/${activeWorkItemJob.status}. `
+          + "Cancel or acknowledge it before retiring."
         );
+      }
+      for (const run of tx.listTurns(task.id).filter((candidate) => (
+        candidate.status === "active" && candidate.workItemId === item.id
+      ))) {
+        const terminal = terminalizeExactTaskTurn(tx, {
+          taskId: task.id,
+          roleName: run.roleName,
+          agentId: run.effective.agentId,
+          turnId: run.id,
+          outcome: {
+            status: "failed",
+            summary: `Work Item retired: ${summary}`
+          }
+        }, now);
+        if (terminal.disposition !== "applied") {
+          throw usageError(
+            `Work Item Turn changed during retirement: ${run.id}/${terminal.reason ?? "obsolete"}.`
+          );
+        }
       }
     }
     const next = retireWorkItem(item, {
       by: actor,
       summary,
-      ...(replacementWorkItemId === undefined ? {} : { replacementWorkItemId })
+      ...(replacement === undefined ? {} : { replacementWorkItemId: replacement.id })
     }, now);
     if (next !== item) {
       tx.saveWorkItem(task.id, next);
       recordTaskEvent(tx, task.id, "work.retired", {
         workItemId: next.id,
         summary,
-        ...(replacementWorkItemId === undefined
+        ...(replacement === undefined
           ? {}
-          : { replacementWorkItemId }),
+          : { replacementWorkItemId: replacement.id }),
         ...(actor === "leader" ? leaderActionEventPayload(tx, task.id, options) : { retiredBy: actor })
       }, now);
       tx.saveEvent(task.id, createTaskRecordRetirement({
@@ -5310,6 +5522,7 @@ function retryTurn(
       && !directRunningRetry) {
       throw usageError(`Work Item ${retryItem.id} is not retryable from ${retryItem.status}.`);
     }
+    if (retryItem !== null) assertWorkItemDependenciesCompletedForCommand(tx, retryItem);
     const runWorkspace = previous.workspace
       ?? (retryItem === null
         ? tx.getTaskWorkspace(task.id)
@@ -7209,16 +7422,17 @@ function taskRecordReference(
   }
 }
 
-function assertWorkItemDependenciesCompleted(
+export function assertWorkItemDependenciesCompletedForCommand(
   store: TaskWorkflowStore,
   item: WorkItem
 ): void {
-  for (const dependencyId of item.dependsOn) {
-    const dependency = store.getWorkItem(item.taskId, dependencyId);
-    if (dependency === null
-      || (dependency.status !== "completed" && dependency.status !== "retired")) {
-      throw usageError(`Work Item dependency is not completed: ${dependencyId}.`);
+  try {
+    assertWorkItemDependencyGate(store, item);
+  } catch (error) {
+    if (error instanceof WorkItemDependencyGateError) {
+      throw usageError(error.message, undefined, error.details);
     }
+    throw error;
   }
 }
 
@@ -7361,6 +7575,47 @@ function parseWorkCreateArgs(
     projects,
     baseRefs
   };
+}
+
+function assertReplaceOrClear(
+  parsed: ParsedMultiTail,
+  replaceOption: string,
+  clearOption: string,
+  usage: string
+): void {
+  if (parsed.multiOptions.has(replaceOption) && parsed.options.has(clearOption)) {
+    throw usageError(`${replaceOption} and ${clearOption} cannot be combined.`, usage);
+  }
+}
+
+function parseWorkItemBaseRefs(
+  values: readonly string[],
+  task: Task,
+  store: TaskWorkflowStore,
+  writableProjectIds: readonly string[],
+  usage: string
+): WorkItemProjectBaseRef[] {
+  const baseRefs = values.map((value): WorkItemProjectBaseRef => {
+    const separator = value.indexOf("=");
+    if (separator <= 0 || separator === value.length - 1) {
+      throw usageError("--base-ref must use <project>=<ref>.", usage);
+    }
+    const reference = value.slice(0, separator);
+    const project = resolveProject(
+      task.projectBindings.map(({ projectId }) => requireProject(store, projectId)),
+      reference
+    );
+    if (project === null) throw usageError(`Task Project not found: ${reference}.`);
+    assertProjectActive(project, "edit a Work Item");
+    if (!writableProjectIds.includes(project.id)) {
+      throw usageError(`Work Item base-ref Project must be writable: ${project.id}.`);
+    }
+    return { projectId: project.id, baseRef: value.slice(separator + 1) };
+  });
+  if (new Set(baseRefs.map(({ projectId }) => projectId)).size !== baseRefs.length) {
+    throw usageError("Each Work Item Project may specify at most one base ref.", usage);
+  }
+  return baseRefs;
 }
 
 function parseTaskPriority(value: string): TaskPriority {

@@ -3,6 +3,7 @@ import type { TaskStore } from "../storage/taskStore.js";
 import { operationalTaskRecords } from "../task/taskRecordRetirement.js";
 import { TASK_COMPLETION_PUBLISHED_TREE_AUTHORIZED_EVENT } from "../task/publicationReference.js";
 import { TURN_INPUT_MAX_DELTAS } from "./turnInputContract.js";
+import { assertWorkItemDependenciesCompleted } from "../workItem/dependencyGate.js";
 import {
   contextContentDigest,
   contextSnapshotRef,
@@ -167,11 +168,10 @@ export function freezeWorkItemExecutionAssignmentContextSnapshot(
     materialize("L2", "task", task.id, task),
     materialize("L3", "work-item", workItem.id, workItem)
   ];
+  assertWorkItemDependenciesCompleted(store, workItem);
   for (const dependencyId of workItem.dependsOn) {
     const dependency = store.getWorkItem(task.id, dependencyId);
-    if (dependency === null || dependency.status !== "completed") {
-      throw new Error(`ExecutionAssignment dependency is not accepted: ${dependencyId}.`);
-    }
+    if (dependency === null) throw new Error(`WorkItem dependency disappeared: ${dependencyId}.`);
     materialized.push(materialize("L3", "accepted-work-item", dependency.id, dependency));
   }
   for (const binding of task.projectBindings) {
@@ -460,13 +460,10 @@ function collectAuthorizedContext(
     if (item === null) throw new Error(`Turn WorkItem not found: ${run.workItemId}.`);
     result.push(materialize("L3", "work-item", item.id, item));
     if (view === "worker") {
+      assertWorkItemDependenciesCompleted(store, item);
       for (const dependencyId of item.dependsOn) {
         const dependency = store.getWorkItem(task.id, dependencyId);
-        if (dependency === null
-          || (dependency.status !== "completed" && dependency.status !== "retired")) {
-          throw new Error(`Turn WorkItem dependency is not accepted: ${dependencyId}.`);
-        }
-        if (dependency.status === "retired") continue;
+        if (dependency === null) throw new Error(`WorkItem dependency disappeared: ${dependencyId}.`);
         result.push(materialize("L3", "accepted-work-item", dependency.id, dependency));
       }
     }

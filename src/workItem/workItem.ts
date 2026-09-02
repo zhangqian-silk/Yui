@@ -140,6 +140,16 @@ export type WorkItem = {
   endedAt?: string;
 };
 
+export type WorkItemDefinitionUpdate = Readonly<{
+  title?: string;
+  objective?: string;
+  acceptance?: readonly string[];
+  dependsOn?: readonly string[];
+  writeProjectIds?: readonly string[];
+  baseRefs?: readonly WorkItemProjectBaseRef[] | null;
+  assignee?: string | null;
+}>;
+
 const TERMINAL_STATUSES: readonly WorkItemStatus[] = [
   "completed",
   "failed",
@@ -193,6 +203,58 @@ export function createWorkItem(
     createdAt: timestamp,
     updatedAt: timestamp
   });
+}
+
+/** Replace the mutable definition of an execution-free Draft WorkItem. */
+export function editDraftWorkItemDefinition(
+  workItem: WorkItem,
+  update: WorkItemDefinitionUpdate,
+  now: Date
+): WorkItem {
+  validateWorkItem(workItem);
+  if (workItem.status !== "pending"
+    || workItem.executionGroups.length > 0
+    || workItem.candidates.length > 0
+    || workItem.disposition !== undefined
+    || workItem.workspaceDisposition !== undefined) {
+    throw new Error(`Work Item has execution or retirement facts: ${workItem.id}.`);
+  }
+  const next = {
+    ...workItem,
+    ...(update.title === undefined
+      ? {}
+      : { title: requireText(update.title, "Work item title") }),
+    ...(update.objective === undefined
+      ? {}
+      : { objective: requireText(update.objective, "Work item objective") }),
+    ...(update.acceptance === undefined
+      ? {}
+      : { acceptance: normalizedUniqueText(update.acceptance, "Work item acceptance criterion") }),
+    ...(update.dependsOn === undefined
+      ? {}
+      : { dependsOn: normalizedUniqueIdentities(update.dependsOn, "Work item dependency") }),
+    ...(update.writeProjectIds === undefined
+      ? {}
+      : {
+          writeProjectIds: normalizedUniqueIdentities(
+            update.writeProjectIds,
+            "Work item writable Project"
+          )
+        }),
+    revision: workItem.revision + 1,
+    updatedAt: now.toISOString()
+  } as WorkItem;
+  if (update.baseRefs === null) delete next.baseRefs;
+  else if (update.baseRefs !== undefined) {
+    const normalized = normalizeProjectBaseRefs(update.baseRefs);
+    if (normalized.length === 0) delete next.baseRefs;
+    else next.baseRefs = normalized;
+  }
+  if (update.assignee === null) delete next.assignee;
+  else if (update.assignee !== undefined) {
+    next.assignee = requireIdentity(update.assignee, "Work item assignee");
+  }
+  return validateWorkItem(next);
 }
 
 export function submitWorkItemCandidate(

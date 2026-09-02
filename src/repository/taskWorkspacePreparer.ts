@@ -29,6 +29,7 @@ import {
   bindTaskWorkspaceIdentity,
   type Task
 } from "../task/task.js";
+import { validateDraftTaskForActivation } from "../task/draftPlan.js";
 import { createTaskEvent } from "../event/taskEvent.js";
 import { enqueueWork } from "../coordination/workMailboxQueue.js";
 import {
@@ -233,6 +234,7 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
             changed: false
           };
         }
+        validateDraftTaskForActivation(this.store, task);
         const { release, current } = this.#acquireTaskProjectMaintenanceLocks(task);
         try {
           return await this.#prepareTaskWorkspaceLocked(current.id, true);
@@ -316,6 +318,7 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
     if (!activate && task.status !== "active") {
       throw new Error(`Task is not open for workspace preparation: ${task.id}.`);
     }
+    if (activate) validateDraftTaskForActivation(this.store, task);
     const existing = this.store.getTaskWorkspace(task.id);
     if (activate && (
       task.workspaceIdentity !== undefined
@@ -360,6 +363,7 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
             || latest.projectBindings.length !== 0) {
             throw new Error(`Task changed while preparing its Gitless workspace: ${task.id}.`);
           }
+          if (activate) validateDraftTaskForActivation(tx, latest);
           const current = tx.getTaskWorkspace(task.id);
           // `createManagedWorkspace` stamps a fresh updatedAt on every call.
           // Gitless preparation is idempotent, so compare only stable identity
@@ -544,6 +548,7 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
         if (!isDeepStrictEqual(latest.projectBindings, task.projectBindings)) {
           throw new Error(`Task Projects changed while preparing its workspace: ${task.id}.`);
         }
+        if (activate) validateDraftTaskForActivation(tx, latest);
         // Revalidate the Project catalog path after acquiring the fence: a
         // concurrent migration must not leave a persisted worktree whose Git
         // common dir is the old external checkout. A changed path rides the

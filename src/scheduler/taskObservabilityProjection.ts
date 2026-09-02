@@ -236,13 +236,17 @@ function rootCauses(
       result.push(currentId);
       return;
     }
+    if (item.status === "retired") {
+      result.push(item.id);
+      return;
+    }
     const unresolved = item.dependsOn.filter((dependency) => !dependencySatisfied(dependency, byId));
     if (unresolved.length === 0) {
       if (item.status === "failed" || item.status === "awaiting_acceptance") result.push(item.id);
       return;
     }
     for (const dependency of unresolved) {
-      const target = resolveDependency(dependency, byId);
+      const target = byId.get(dependency);
       if (target?.status === "failed" || target?.status === "awaiting_acceptance") result.push(target.id);
       else visit(dependency);
     }
@@ -255,10 +259,7 @@ function dependencySatisfied(
   id: string,
   byId: ReadonlyMap<string, WorkItem>
 ): boolean {
-  const target = resolveDependency(id, byId);
-  return target !== undefined && (target.status === "completed" || (
-    target.status === "retired" && target.disposition?.replacementWorkItemId === undefined
-  ));
+  return byId.get(id)?.status === "completed";
 }
 
 function dependencyEdgeStatus(
@@ -268,24 +269,9 @@ function dependencyEdgeStatus(
   const target = byId.get(id);
   if (target === undefined) return "dead";
   if (dependencySatisfied(id, byId)) return "satisfied";
-  const resolved = resolveDependency(id, byId);
-  if (resolved === undefined) return "dead";
-  if (resolved.status === "failed" || resolved.status === "awaiting_acceptance") return "failed-open";
+  if (target.status === "retired") return "dead";
+  if (target.status === "failed" || target.status === "awaiting_acceptance") return "failed-open";
   return "active";
-}
-
-function resolveDependency(
-  id: string,
-  byId: ReadonlyMap<string, WorkItem>
-): WorkItem | undefined {
-  const visited = new Set<string>();
-  let current = byId.get(id);
-  while (current?.status === "retired" && current.disposition?.replacementWorkItemId !== undefined) {
-    if (visited.has(current.id)) return undefined;
-    visited.add(current.id);
-    current = byId.get(current.disposition.replacementWorkItemId);
-  }
-  return current;
 }
 
 function projectCost(
