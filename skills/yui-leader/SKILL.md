@@ -20,17 +20,25 @@ transactional fences resolve races.
 
 Do not invent another execution entity or a `yui ... subagent` command.
 
-## Use one Lane strategy for every managed execution
+## Default WorkItems to direct execution
 
-Treat single- and multi-Lane work as the same ExecutionGroup contract. A
-fixed one-Lane dispatch may use the WorkItem/ReviewRound owner directly; every
-panel or adaptive Lane gets its own durable execution-Lane workspace and exact
-Turn snapshot. Accept defaults to all usable terminal Lane outputs (or the
-explicit selection), and the Candidate/Review result aggregates each selected
-Lane's summary, checks, findings, evidence, and Git snapshot. Rejecting an
-already-resolved Group always creates a fresh Group on redispatch; retry an
-unresolved failed Lane in its existing Group. Never fall back to a shared Role
-workspace or infer a Lane result from a non-durable checkout.
+Use the WorkItem's existing owner or assignee directly in the main workspace
+Yui supplies for that execution. A Leader-owned WorkItem uses Task main; a
+Worker-owned WorkItem uses its Develop workspace. Dispatch an assigned WorkItem
+without `--lane-role` by default. That direct WorkItem Turn is durable and has
+no ExecutionGroup.
+
+Request replicated WorkItem execution only when current Task evidence justifies
+independent production attempts at the same frozen Assignment. Provide at
+least two distinct Lane Roles; do not include the WorkItem assignee as a Lane.
+This is an execution choice for one WorkItem, separate from Task decomposition
+and WorkItem count. Each replicated Lane gets its own durable workspace and
+exact Turn snapshot. Retry or settle the exact unresolved Lane, and never infer
+a Lane result from a shared or non-durable checkout.
+
+Keep Review execution separate. Its ExecutionGroup may use `fixed` or
+`adaptive` strategy, but default to one Reviewer Lane and choose a panel or
+adaptive Review only when the current review need explicitly justifies it.
 
 ## Default to the Leader-first fast path
 
@@ -141,9 +149,10 @@ continuation report with result content, the child becomes durable-result:
 Task event holding the full result. After a parent crash, read durable-result
 children by their event reference instead of rerunning them; rerun only
 best-effort children whose result was never externalized. Critical,
-non-repeatable, or independently verifiable work must use a Yui
-WorkItem/ExecutionGroup, not a native subagent, because only a managed Lane
-owns an independent Turn, receipt, and workspace.
+non-repeatable, or independently verifiable work must use a managed Yui
+WorkItem Turn, not a native subagent. A direct WorkItem Turn already owns its
+independent Turn, receipt, and workspace; replicated Lanes are needed only for
+multiple independent attempts at the same Assignment.
 
 For a managed Task Role or Reviewer Turn, persist any changed semantic checkpoint,
 then end the active Leader Turn with a truthful final report. Yui stores its Turn

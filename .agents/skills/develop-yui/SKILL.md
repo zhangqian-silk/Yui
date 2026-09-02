@@ -83,6 +83,16 @@ not by itself justify extra WorkItems. Investigation, implementation steps,
 tests, findings, and small repair edits stay inside the existing Task or
 WorkItem instead of becoming a record-by-record diary.
 
+For an ordinary WorkItem, use its existing owner or assignee directly in the
+main workspace Yui supplies for that execution. A Leader-owned WorkItem uses
+Task main; a Worker-owned WorkItem uses its Develop workspace. Dispatch an
+assigned WorkItem without `--lane-role` by default. That direct WorkItem Turn
+is durable and has no ExecutionGroup. Request replicated execution with at
+least two distinct Lane Roles only when current Task evidence justifies
+independent attempts at the same frozen Assignment. This execution choice is
+separate from Task decomposition and WorkItem count; `fixed` and `adaptive`
+strategies belong to Review execution, not WorkItem dispatch.
+
 Risk controls review and evidence strength. Use one Task-final Review of the
 frozen Task main when it materially protects the control plane, whether or not
 the Task used WorkItems. Route findings to the original owner; the Leader fixes
