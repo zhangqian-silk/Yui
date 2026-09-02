@@ -151,7 +151,7 @@ details.work-item-card>summary.record-head~*{margin-top:0}
 .exec-signal.is-blocker{background:var(--danger-soft);border:1px solid color-mix(in srgb,var(--danger) 30%,transparent)}
 .exec-signal-kind{flex:none;font-family:var(--font-mono);font-size:9.5px;letter-spacing:.06em;text-transform:uppercase;color:var(--muted)}
 .exec-signal-text{min-width:0;color:var(--text)}
-/* Unified execution Group (Lanes + resolution) */
+/* WorkItem execution and recovery */
 .exec-group{gap:8px}
 .lane-list{display:grid;gap:4px}
 .lane-row{display:flex;align-items:center;gap:9px;padding:5px 9px;border-radius:var(--radius);background:var(--bg-3);border:1px solid var(--border);font-size:11.5px}
@@ -159,9 +159,8 @@ details.work-item-card>summary.record-head~*{margin-top:0}
 .lane-role{font-family:var(--font-body);font-weight:700;font-size:12px;color:var(--text)}
 .lane-status{font-family:var(--font-mono);font-size:9.5px;letter-spacing:.06em;text-transform:uppercase;color:var(--muted)}
 .lane-summary{flex:1;min-width:0;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.execution-stage-meta,.execution-resource-meta,.work-item-observability{gap:10px;flex-wrap:wrap}
-.work-item-stages{margin-top:6px}
-.execution-stage-meta .chip,.execution-resource-meta .chip{margin-left:auto}
+.execution-resource-meta,.work-item-observability{gap:10px;flex-wrap:wrap}
+.execution-resource-meta .chip{margin-left:auto}
 .observability-metrics{display:grid;grid-template-columns:repeat(6,minmax(0,1fr));gap:8px;margin-top:12px}
 .observability-metrics .metric{min-height:52px;padding:8px 10px}
 .observability-metrics .metric-value{font-size:18px}

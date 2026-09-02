@@ -498,7 +498,7 @@ function requireCapturableContext(
     }
     const candidate = item.candidates.at(-1);
     if (
-      candidate?.source.type !== "direct"
+      candidate === undefined
       || !sameTaskFinalReviewContract(
         candidate.taskFinalReviewContract,
         taskFinalReviewContract

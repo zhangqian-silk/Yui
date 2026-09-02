@@ -6,6 +6,10 @@ import {
   runtimeLifecycleTarget
 } from "../runtime/lifecycleReservation.js";
 import type { ReviewRound } from "../review/reviewRound.js";
+import {
+  validateExecutionGroup,
+  type ExecutionGroup
+} from "../execution/executionGroup.js";
 import type { TaskStore } from "../storage/taskStore.js";
 import type { Task } from "../task/task.js";
 import type {
@@ -454,7 +458,8 @@ export class TaskWorkspaceCoordinator {
   #workItemRoleNames(item: WorkItem): readonly string[] {
     return [
       ...(item.assignee === undefined ? [] : [item.assignee]),
-      ...(item.executionGroups.flatMap((group) => group.lanes.map(({ roleName }) => roleName)))
+      ...([...item.executionGroups, ...legacyExecutionGroups(item)]
+        .flatMap((group) => group.lanes.map(({ roleName }) => roleName)))
     ];
   }
 
@@ -548,6 +553,12 @@ export class TaskWorkspaceCoordinator {
     }
     return item.assignee;
   }
+}
+
+function legacyExecutionGroups(item: WorkItem): readonly ExecutionGroup[] {
+  return (item.legacyExecutionGroups ?? []).map((group) => (
+    validateExecutionGroup(group as ExecutionGroup)
+  ));
 }
 
 function sameProjectScope(

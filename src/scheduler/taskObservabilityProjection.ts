@@ -1,15 +1,14 @@
 import type { ContextSnapshot } from "../context/contextSnapshot.js";
 import type { TaskEvent } from "../event/taskEvent.js";
-import type { ExecutionGroup, ExecutionLaneStatus } from "../execution/executionGroup.js";
+import type { ExecutionGroup } from "../execution/executionGroup.js";
+import type { WorkItemExecutionGroup } from "../execution/workItemExecution.js";
 import { isDeepStrictEqual } from "node:util";
 import {
-  observedExecutionResourceUsage,
-  type ExecutionStageResourceProjection
+  observedExecutionResourceUsage
 } from "../execution/resourceBroker.js";
 import type { Turn } from "../turn/turn.js";
 import type { SessionTokenMetrics } from "../runtime/sessionTokenMetrics.js";
 import type { WorkItem, WorkItemStatus } from "../workItem/workItem.js";
-import type { ExecutionGroupHealthSummary } from "../execution/executionHealth.js";
 
 export type TaskDagNodeStatus =
   | "ready"
@@ -91,25 +90,11 @@ export type WorkItemObservabilityProjection = Readonly<{
   workItemId: string;
   title: string;
   status: WorkItemStatus;
-  currentGroupId?: string;
   groupIds: readonly string[];
-  executionGroups: readonly ExecutionGroupHealthSummary[];
-  stages: readonly Readonly<{
-    groupId: string;
-    mode?: string;
-    stage?: string;
-    round?: number;
-    stageAttempt?: number;
-    laneCount: number;
-    activeLaneCount: number;
-    terminalLaneCount: number;
-    resolution?: string;
-    resources?: ExecutionStageResourceProjection;
-  }>[];
   cost: TaskCostProjection;
   context: TaskContextProjection;
-  evidenceCount: number;
-  openFindingCount: number;
+  evidenceCount: number | null;
+  openFindingCount: number | null;
 }>;
 
 export type TaskObservabilityProjection = Readonly<{
@@ -124,7 +109,6 @@ export type TaskObservabilityProjection = Readonly<{
 export type TaskObservabilityInput = Readonly<{
   workItems: readonly WorkItem[];
   executionGroups: readonly ExecutionGroup[];
-  groupSummaries?: readonly ExecutionGroupHealthSummary[];
   turns: readonly Turn[];
   events: readonly TaskEvent[];
   contextSnapshots?: readonly ContextSnapshot[];
@@ -141,53 +125,21 @@ export function buildTaskObservabilityProjection(
   input: TaskObservabilityInput
 ): TaskObservabilityProjection {
   const now = input.now ?? new Date();
-  const summariesById = new Map((input.groupSummaries ?? []).map((summary) => [summary.groupId, summary]));
   const dag = projectDag(input.workItems);
   const workItems = input.workItems.map((item) => {
     const groups = item.executionGroups;
-    const executionGroups = groups.flatMap((group) => {
-      const summary = summariesById.get(group.id);
-      return summary === undefined ? [] : [summary];
-    });
-    const stages = groups.map((group) => {
-      const summary = summariesById.get(group.id);
-      return Object.freeze({
-        groupId: group.id,
-        ...(group.stage === undefined ? {} : {
-          mode: group.stage.mode,
-          stage: group.stage.stage,
-          round: group.stage.round,
-          stageAttempt: group.stage.stageAttempt
-        }),
-        laneCount: group.lanes.length,
-        activeLaneCount: group.lanes.filter(({ status }) => status === "pending" || status === "running").length,
-        terminalLaneCount: group.lanes.filter(({ status }) => isTerminalLane(status)).length,
-        ...(group.resolution === undefined ? {} : { resolution: group.resolution.decision }),
-        ...(summary?.resources === undefined ? {} : { resources: summary.resources })
-      });
-    });
-    const itemCost = projectCost(groups, input.turns, input.events, now);
+    const itemCost = projectWorkItemCost(groups, input.turns, now);
     const itemContext = projectContext(groups, input.turns, input.contextSnapshots);
-    const evidence = groups.flatMap((group) => group.lanes.flatMap((lane) => (
-      lane.result?.evidence ?? []
-    )));
-    const openFindingCount = groups.reduce((count, group) => count + group.lanes.reduce(
-      (laneCount, lane) => laneCount + (lane.result?.findings ?? [])
-        .filter(({ status }) => status === "open").length,
-      0
-    ), 0);
+    const producerObservability = projectWorkItemProducerObservability(item, input.turns);
     return Object.freeze({
       workItemId: item.id,
       title: item.title,
       status: item.status,
-      ...(item.currentExecutionGroupId === undefined ? {} : { currentGroupId: item.currentExecutionGroupId }),
       groupIds: groups.map(({ id }) => id),
-      executionGroups,
-      stages,
       cost: itemCost,
       context: itemContext,
-      evidenceCount: evidence.length,
-      openFindingCount
+      evidenceCount: producerObservability?.evidenceCount ?? null,
+      openFindingCount: producerObservability?.openFindingCount ?? null
     });
   });
   const cost = projectCost(input.executionGroups, input.turns, input.events, now);
@@ -199,6 +151,34 @@ export function buildTaskObservabilityProjection(
     context,
     sessionTokens: Object.freeze([...(input.sessionTokens ?? [])])
   });
+}
+
+function projectWorkItemProducerObservability(
+  item: WorkItem,
+  turns: readonly Turn[]
+): Readonly<{ evidenceCount: number; openFindingCount: number }> | null {
+  const successfulLanes = item.executionGroups.flatMap((group) => group.lanes.flatMap((lane) => (
+    lane.disposition === "succeeded" ? [{ group, lane }] : []
+  )));
+  let evidenceCount = 0;
+  let openFindingCount = 0;
+  for (const { group, lane } of successfulLanes) {
+    const turn = lane.successfulTurnId === undefined
+      ? undefined
+      : turns.find(({ id }) => id === lane.successfulTurnId);
+    const producer = turn?.result?.producer;
+    if (turn === undefined
+      || producer === undefined
+      || turn.status !== "completed"
+      || turn.taskId !== item.taskId
+      || turn.workItemId !== item.id
+      || turn.executionGroupId !== group.id
+      || turn.executionLaneId !== lane.id
+      || turn.roleName !== lane.roleName) return null;
+    evidenceCount += producer.evidence.length;
+    openFindingCount += producer.findings.filter(({ status }) => status === "open").length;
+  }
+  return { evidenceCount, openFindingCount };
 }
 
 function projectDag(workItems: readonly WorkItem[]): TaskDagProjection {
@@ -333,8 +313,41 @@ function projectCost(
   });
 }
 
+function projectWorkItemCost(
+  groups: readonly WorkItemExecutionGroup[],
+  turns: readonly Turn[],
+  now: Date
+): TaskCostProjection {
+  const groupIds = new Set(groups.map(({ id }) => id));
+  const attempts = turns.filter(({ executionGroupId }) => (
+    executionGroupId !== undefined && groupIds.has(executionGroupId)
+  ));
+  const wallClockSeconds = groups.reduce((total, group) => {
+    const started = Date.parse(group.createdAt);
+    const ended = group.lanes.some(({ disposition }) => disposition === "open")
+      ? now.getTime()
+      : Date.parse(group.updatedAt);
+    return total + (Number.isFinite(started) && Number.isFinite(ended)
+      ? Math.max(0, Math.floor((ended - started) / 1_000))
+      : 0);
+  }, 0);
+  const laneCount = groups.reduce((total, group) => total + group.lanes.length, 0);
+  return Object.freeze({
+    tokens: 0,
+    toolCalls: 0,
+    wallClockSeconds,
+    tokensObservable: false,
+    toolCallsObservable: false,
+    laneCount,
+    groupCount: groups.length,
+    retryCount: Math.max(0, attempts.length - laneCount),
+    marginalValuePercent: null,
+    marginalValueStatus: "unavailable"
+  });
+}
+
 function projectContext(
-  groups: readonly ExecutionGroup[],
+  groups: readonly (ExecutionGroup | WorkItemExecutionGroup)[],
   turns: readonly Turn[],
   snapshots?: readonly ContextSnapshot[]
 ): TaskContextProjection {
@@ -345,7 +358,9 @@ function projectContext(
     digest: string;
   }>();
   for (const group of groups) {
-    const ref = group.stage?.contextSnapshotRef;
+    const ref = "assignment" in group
+      ? group.assignment.contextSnapshotRef
+      : group.stage?.contextSnapshotRef;
     if (ref !== undefined) refs.set(ref.id, ref);
   }
   for (const turn of turns) {
@@ -428,8 +443,4 @@ function stageDurationSeconds(groups: readonly ExecutionGroup[], now: Date): num
     ? now.getTime()
     : Math.max(...ended);
   return Math.max(0, Math.floor((end - Math.min(...started)) / 1_000));
-}
-
-function isTerminalLane(status: ExecutionLaneStatus): boolean {
-  return status === "completed" || status === "failed" || status === "skipped";
 }

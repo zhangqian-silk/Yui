@@ -75,8 +75,10 @@ returns through the parent Conversation, and if that Session is lost before
 the Leader consumes it, the child may need to rerun. Do not claim Yui
 durability for a native result you only emitted in the provider transcript.
 When the child brief requires a durable, independently recoverable result,
-the Leader must dispatch the work as a Yui WorkItem/ExecutionGroup instead —
-native subagents never own a Yui Turn, receipt, or workspace.
+the Leader must dispatch the work as a managed Yui WorkItem Turn instead. A
+direct WorkItem Turn already owns its durable Turn, receipt, and workspace;
+replicated Lanes are needed only for multiple independent attempts. Native
+subagents never own a Yui Turn, receipt, or workspace.
 
 ## Task Role Turn
 

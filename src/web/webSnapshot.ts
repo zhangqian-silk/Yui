@@ -9,8 +9,7 @@ import {
   buildTaskExecutionProjection,
   type TaskExecutionProjection
 } from "../scheduler/taskExecutionProjection.js";
-import { summarizeExecutionGroup } from "../execution/executionGroup.js";
-import { currentWorkItemExecutionGroup } from "../workItem/workItem.js";
+import { projectWorkItemExecution } from "../execution/workItemExecutionProjection.js";
 import {
   classifyRuntimeHealth,
   projectRuntimeTaskEvents,
@@ -33,6 +32,7 @@ export type WebDashboardStore = Pick<TaskStore,
   | "getTurn"
   | "getWorkItem"
   | "listRoles"
+  | "listRoleSessionSets"
   | "getTaskRoleSessionSet"
   | "listWorkItems"
   | "listContextSnapshots"
@@ -204,6 +204,8 @@ export function buildWebTaskDetail(
     });
     const execution = buildTaskExecutionProjection(reader, taskId, task, now);
     if (execution === null) return null;
+    const workItems = reader.listWorkItems(taskId);
+    const roleSessionSets = reader.listRoleSessionSets(taskId);
     const workItemObservability = new Map(
       execution.observability.workItems.map((item) => [item.workItemId, item])
     );
@@ -216,14 +218,11 @@ export function buildWebTaskDetail(
       observability: execution.observability,
       brief: reader.getTaskBrief(taskId),
       roles,
-      workItems: reader.listWorkItems(taskId).map((item) => {
-        const group = currentWorkItemExecutionGroup(item);
-        return {
-          ...item,
-          observability: workItemObservability.get(item.id),
-          ...(group === undefined ? {} : { currentExecution: summarizeExecutionGroup(group) })
-        };
-      }),
+      workItems: workItems.map((item) => ({
+        ...item,
+        observability: workItemObservability.get(item.id),
+        execution: projectWorkItemExecution(item, turns, roleSessionSets)
+      })),
       turns,
       runtimeHealth: { needsAttentionTurns, activeTurns: activeTurnHealth },
       reviewRounds: reader.listReviewRounds(taskId),

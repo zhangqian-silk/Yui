@@ -704,7 +704,7 @@ const taskChildren: readonly NodeInput[] = [
       title: "Commands",
       entries: [
         "create", "list", "show", "edit", "update", "scope", "dispatch", "isolate", "capture", "cleanup",
-        "review", "group", "accept", "reject", "retire"
+        "review", "accept", "reject", "retire"
       ]
     }],
     children: [
@@ -744,24 +744,8 @@ const taskChildren: readonly NodeInput[] = [
       {
         name: "dispatch",
         summary: "Dispatch a work item to its Role.",
-        usage: "yui task work dispatch <task>/<work> [--input <text>] [--strategy fixed:<count>|adaptive:<max>] [--lane-role <role> ...] [--mode <single|parallel-diverse|ensemble-replicated|adversarial|adaptive-exploration>] [--max-rounds <count>] [--stage-max-attempts <count>] [--stage-max-tokens <count>] [--stage-max-tool-calls <count>] [--stage-max-seconds <count>] [--stage-quorum <count>] [--stage-straggler-seconds <count>] [--stage-min-marginal-value <0-100>]",
-        options: ["--input", "--strategy", "--lane-role", "--mode", "--max-rounds", "--stage-max-attempts", "--stage-max-tokens", "--stage-max-tool-calls", "--stage-max-seconds", "--stage-quorum", "--stage-straggler-seconds", "--stage-min-marginal-value"],
-        optionValues: {
-          "--mode": ["single", "parallel-diverse", "ensemble-replicated", "adversarial", "adaptive-exploration"]
-        }
-      },
-      {
-        name: "group",
-        summary: "Resolve a Worker ExecutionGroup after its Lanes finish.",
-        executable: true,
-        sections: [{ id: "manage", title: "Commands", entries: ["resolve"] }],
-        children: [{
-          name: "resolve",
-          summary: "Select Lane outputs and resolve the Worker group.",
-          usage: "yui task work group resolve <task>/<work> --decision <accept|reject|retry|blocked> --summary <text> [--lane <lane-id> ...] [--early-stop <marginal-value-percent>]",
-          options: ["--decision", "--summary", "--lane", "--early-stop"],
-          optionValues: { "--decision": ["accept", "reject", "retry", "blocked"] }
-        }]
+        usage: "yui task work dispatch <task>/<work> [--input <text>] [--lane-role <role> ...]",
+        options: ["--input", "--lane-role"]
       },
       {
         name: "isolate",
@@ -844,7 +828,7 @@ const taskChildren: readonly NodeInput[] = [
       },
       {
         name: "settle",
-        summary: "Close an obsolete stranded final Review Turn without requesting a retry Round.",
+        summary: "Explicitly settle a failed WorkItem Lane or an obsolete stranded final Review Turn.",
         usage: "yui task turn settle <task>/<turn>"
       },
       {

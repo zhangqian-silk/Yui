@@ -171,7 +171,11 @@ review rounds, findings, or small fixes. A WorkItem is justified only when it
 has its own meaningful requirement, owner, acceptance boundary, and useful
 independent progress—normally enough work for a different Worker to advance in
 parallel. Integration evidence is derived later from WorkItems that actually
-produce isolated Git results.
+produce isolated Git results. For an ordinary assigned WorkItem, dispatch the
+assignee directly without `--lane-role`; this durable Turn has no
+ExecutionGroup. Select replicated WorkItem Lanes only for an explicit need for
+independent attempts at the same frozen Assignment. Keep Review
+`fixed`/`adaptive` strategy separate from WorkItem dispatch.
 
 Managed workspaces are owner-keyed, not Role-keyed: Task main, WorkItem
 Develop, ReviewRound, and IntegrationAttempt each retain their own durable

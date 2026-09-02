@@ -1,5 +1,5 @@
 import {
-  normalizedUniqueIdentities,
+  normalizedUniqueText,
   requireIdentity,
   requireText
 } from "../domain/validation.js";
@@ -41,6 +41,7 @@ export type TurnSubject = Readonly<{
   reviewRoundId?: string;
   executionGroupId?: string;
   executionLaneId?: string;
+  sourceExecutionGroupId?: string;
 }>;
 
 export type TurnInput = Readonly<{
@@ -182,7 +183,7 @@ function normalizeInput(input: Readonly<{
   const snapshot = input.contextSnapshotRef === undefined
     ? undefined
     : validateContextSnapshotRef(input.contextSnapshotRef);
-  const deltaRefIds = normalizedUniqueIdentities(
+  const deltaRefIds = normalizedUniqueText(
     input.deltaRefIds,
     "Turn input delta ref"
   );
@@ -262,7 +263,8 @@ function normalizeSubject(subject: TurnSubject): TurnSubject {
     "workItemId",
     "reviewRoundId",
     "executionGroupId",
-    "executionLaneId"
+    "executionLaneId",
+    "sourceExecutionGroupId"
   ];
   if (Object.keys(normalized).some((key) => !allowed.includes(key))) {
     throw new Error("Turn input subject contains an unknown field.");
@@ -270,9 +272,14 @@ function normalizeSubject(subject: TurnSubject): TurnSubject {
   if ((normalized.executionGroupId === undefined) !== (normalized.executionLaneId === undefined)) {
     throw new Error("Turn input execution lineage is incomplete.");
   }
+  if (normalized.sourceExecutionGroupId !== undefined
+    && (normalized.workItemId === undefined || normalized.executionGroupId !== undefined)) {
+    throw new Error("Turn input source ExecutionGroup requires a WorkItem main subject.");
+  }
   if (normalized.taskId === undefined
     && (normalized.workItemId !== undefined || normalized.reviewRoundId !== undefined
-      || normalized.executionGroupId !== undefined)) {
+      || normalized.executionGroupId !== undefined
+      || normalized.sourceExecutionGroupId !== undefined)) {
     throw new Error("Turn input child subject requires a Task id.");
   }
   return Object.freeze(normalized);

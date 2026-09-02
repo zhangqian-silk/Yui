@@ -10,10 +10,11 @@
  * Version of the on-disk layout (`schema.json` plus the SQLite database).
  *
  * Layout 8 is the current SQLite WAL control-plane layout: the authoritative
- * store is `yui.db`. Layout 8 is the only layout this release reads and writes;
- * older Homes are rejected and must not be upgraded in place.
+ * store is `yui.db`. Layout 8 is the only physical layout this release reads
+ * and writes; logical aggregate upgrades within layout 8 use the centralized
+ * adjacent migration graph.
  */
 export const CURRENT_STORAGE_LAYOUT_VERSION = 8;
 
-/** Version of the logical aggregates persisted in SQLite. */
-export const CURRENT_AGGREGATE_SCHEMA_VERSION = 21;
+/** Aggregate 24 persists Turn v3 WorkItem main-Group provenance. */
+export const CURRENT_AGGREGATE_SCHEMA_VERSION = 24;

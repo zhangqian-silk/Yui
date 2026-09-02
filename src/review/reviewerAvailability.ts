@@ -40,8 +40,9 @@ export function projectReviewerAvailability(
   taskId: string,
   reviewerRoleName: string
 ): ReviewerAvailability {
+  const turns = store.listTurns(taskId);
   const active = store.getActiveTurn(taskId, reviewerRoleName)
-    ?? store.listTurns(taskId).find((run) => (
+    ?? turns.find((run) => (
       run.roleName === reviewerRoleName && run.status === "active"
     ));
   if (active !== null && active !== undefined) {
@@ -80,7 +81,12 @@ export function projectReviewerAvailability(
     taskId,
     roleName: reviewerRoleName
   });
-  if (reviewerMailbox !== null && mailboxHasWork(reviewerMailbox)) {
+  if (reviewerMailbox !== null && reviewerMailboxHasActionableWork(
+    reviewerMailbox,
+    turns,
+    taskId,
+    reviewerRoleName
+  )) {
     return mailboxBusy(reviewerRoleName, "mailbox", reviewerMailbox);
   }
   const runtimeMailbox = store.getWorkMailbox(runtimeLifecycleTarget({
@@ -96,6 +102,25 @@ export function projectReviewerAvailability(
     reviewerRoleName,
     retryable: true
   };
+}
+
+function reviewerMailboxHasActionableWork(
+  mailbox: WorkMailbox,
+  turns: readonly Turn[],
+  taskId: string,
+  reviewerRoleName: string
+): boolean {
+  if (mailbox.processing !== null) return true;
+  const pending = nextPendingBatch(mailbox);
+  if (pending === null) return false;
+  if (pending.refs.length === 0) return true;
+  return pending.refs.some((ref) => {
+    if (ref.type !== "turn" || ref.taskId !== taskId) return true;
+    const turn = turns.find(({ id }) => id === ref.id);
+    return turn === undefined
+      || turn.roleName !== reviewerRoleName
+      || turn.status === "active";
+  });
 }
 
 function mailboxBusy(

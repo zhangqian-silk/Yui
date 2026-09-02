@@ -6,11 +6,9 @@ import { createTaskBrief } from "../dist/brief/taskBrief.js";
 import { createTurnInput } from "../dist/context/turnInputContract.js";
 import { createDecision, supersedeDecision } from "../dist/decision/decision.js";
 import {
-  createExecutionGroup,
-  recordExecutionLaneResult,
-  resolveExecutionGroup,
-  updateExecutionLane
-} from "../dist/execution/executionGroup.js";
+  createWorkItemExecutionAssignment,
+  createWorkItemExecutionGroup
+} from "../dist/execution/workItemExecution.js";
 import { createTaskEvent } from "../dist/event/taskEvent.js";
 import { resolveEffectiveLaunch } from "../dist/executor/effectiveLaunch.js";
 import {
@@ -45,7 +43,6 @@ import {
   createWorkItem,
   retireWorkItem,
   submitWorkItemCandidate,
-  updateWorkItemExecutionGroup,
   updateWorkItemStatus
 } from "../dist/workItem/workItem.js";
 import { createReviewRound } from "../dist/review/reviewRound.js";
@@ -121,7 +118,7 @@ store.transaction((writer) => {
   writer.saveConfiguredAgent(codex);
   writer.saveConfiguredAgent(claude);
   writer.saveConfig({
-    schemaVersion: 5,
+    schemaVersion: 6,
     defaultAgent: "codex",
     defaultWorkspace: resolve(yuiHome, "workspace"),
     currentTaskId: "task-1",
@@ -169,7 +166,7 @@ store.transaction((writer) => {
 
   // --- Work items with execution groups, candidates, and review rounds ---
 
-  // work-item-1: completed with a Turn result, candidate, and review round.
+  // work-item-1: completed direct main Turn with a Candidate and review round.
   const work1 = updateWorkItemStatus(createWorkItem("work-item-1", "task-1", {
     title: "Build HTTP and snapshot API",
     objective: "Serve a read-only dashboard snapshot and task detail over loopback HTTP.",
@@ -177,58 +174,22 @@ store.transaction((writer) => {
     assignee: "leader",
     writeProjectIds: ["project-1"]
   }, at("2026-07-18T03:00:00Z")), "running", at("2026-07-18T03:01:00Z"));
-  const group1 = createExecutionGroup("exec-group-1", "task-1", {
-    purpose: "execution",
-    target: {
-      schemaVersion: 1,
-      kind: "work-item",
-      taskId: "task-1",
-      workItemId: "work-item-1",
-      revision: 1,
-      projects: [{ projectId: "project-1", commit: COMMIT }],
-      fingerprint: "seed-group-1"
-    },
-    roleName: "leader"
-  }, at("2026-07-18T03:02:00Z"));
-  let work1WithGroup = attachWorkItemExecutionGroup(work1, group1, at("2026-07-18T03:03:00Z"));
   const effective1 = resolveEffectiveLaunch({ role: roles[0], purpose: "execution" });
   const turn1 = completeTurn(createTurn("turn-1", "task-1", "leader", "new", seedTurnInput("Implement the HTTP snapshot API.", "work-item-1"), at("2026-07-18T03:05:00Z"), {
     workItemId: "work-item-1",
-    executionGroupId: "exec-group-1",
-    executionLaneId: "exec-group-1-lane-1",
     effective: effective1
   }), "API implemented and focused tests pass.", at("2026-07-22T08:00:00Z"));
-  const group1Running = updateExecutionLane(group1, "exec-group-1-lane-1", {
-    status: "running",
-    turnId: "turn-1"
-  }, at("2026-07-18T03:06:00Z"));
-  work1WithGroup = updateWorkItemExecutionGroup(work1WithGroup, group1Running, at("2026-07-18T03:07:00Z"));
-  const group1Completed = recordExecutionLaneResult(group1Running, "exec-group-1-lane-1", {
+  const work1Candidate = submitWorkItemCandidate(work1, {
     summary: "API implemented and focused tests pass.",
-    findings: [
-      { id: "finding-1", severity: "medium", summary: "Snapshot endpoint lacks ETag caching.", status: "open" },
-      { id: "finding-2", severity: "low", summary: "Dashboard title could use more contrast.", status: "resolved" }
-    ]
-  }, "completed", at("2026-07-22T08:00:00Z"));
-  const work1Completed = updateWorkItemExecutionGroup(work1WithGroup, group1Completed, at("2026-07-22T08:01:00Z"));
-  const work1Candidate = submitWorkItemCandidate(work1Completed, {
-    summary: "API implemented and focused tests pass.",
-    source: { type: "turn", turnId: "turn-1" },
-    executionGroupId: "exec-group-1",
-    executionLaneId: "exec-group-1-lane-1"
+    source: { type: "turn", turnId: "turn-1" }
   }, at("2026-07-22T08:05:00Z"));
   const review1 = createReviewRound(
     "review-round-1", "task-1", "work-item-1", "candidate-1",
     "reviewer", "policy", COMMIT, at("2026-07-22T08:10:00Z")
   );
-  const group1Resolved = resolveExecutionGroup(group1Completed, {
-    decision: "accept",
-    summary: "API verified; accepting the candidate."
-  }, at("2026-07-22T08:15:00Z"));
-  const work1Resolved = updateWorkItemExecutionGroup(work1Candidate, group1Resolved, at("2026-07-22T08:16:00Z"));
-  const work1Done = updateWorkItemStatus(work1Resolved, "completed", at("2026-07-22T08:20:00Z"), "API and security headers verified.");
+  const work1Done = updateWorkItemStatus(work1Candidate, "completed", at("2026-07-22T08:20:00Z"), "API and security headers verified.");
 
-  // work-item-2: running with an active frontend run and execution group.
+  // work-item-2: replicated execution with one running and one recoverable Lane.
   const work2 = updateWorkItemStatus(createWorkItem("work-item-2", "task-1", {
     title: "Polish responsive dashboard",
     objective: "Make every task legible from mobile to wide desktop.",
@@ -237,32 +198,53 @@ store.transaction((writer) => {
     assignee: "frontend",
     writeProjectIds: ["project-1"]
   }, at("2026-07-20T03:00:00Z")), "running", at("2026-07-23T06:30:00Z"));
-  const group2 = createExecutionGroup("exec-group-2", "task-1", {
-    purpose: "execution",
-    target: {
+  const effective2 = resolveEffectiveLaunch({ role: roles[0], purpose: "execution" });
+  const effective5 = resolveEffectiveLaunch({ role: roles[2], purpose: "execution" });
+  const assignment2 = createWorkItemExecutionAssignment({
+    input: "Finish responsive states and overflow handling.",
+    objective: work2.objective,
+    acceptance: work2.acceptance,
+    contextSnapshotRef: {
       schemaVersion: 1,
-      kind: "work-item",
+      id: "context-snapshot-1",
       taskId: "task-1",
-      workItemId: "work-item-2",
-      revision: 1,
-      projects: [{ projectId: "project-1", commit: COMMIT }],
-      fingerprint: "seed-group-2"
+      scope: "task",
+      sequence: 1,
+      digest: "b".repeat(64)
     },
-    roleName: "frontend"
-  }, at("2026-07-23T06:31:00Z"));
-  const work2WithGroup = attachWorkItemExecutionGroup(work2, group2, at("2026-07-23T06:32:00Z"));
-  const effective2 = resolveEffectiveLaunch({ role: roles[1], purpose: "execution" });
-  const turn2 = createTurn("turn-2", "task-1", "frontend", "resume", seedTurnInput("Finish responsive states and overflow handling.", "work-item-2"), at("2026-07-23T06:30:00Z"), {
+    taskId: "task-1",
+    workItemId: "work-item-2",
+    workItemRevision: work2.revision,
+    projects: [],
+    dependencyFacts: [{ workItemId: "work-item-1", revision: work1Done.revision }]
+  });
+  const group2 = createWorkItemExecutionGroup("exec-group-2", "task-1", assignment2, [
+    {
+      roleName: "leader",
+      effective: effective2,
+      workspace: { root: resolve(yuiHome, "workspace/task-1/lane-1"), writableProjectIds: [] },
+      currentTurnId: "turn-2"
+    },
+    {
+      roleName: "reviewer",
+      effective: effective5,
+      workspace: { root: resolve(yuiHome, "workspace/task-1/lane-2"), writableProjectIds: [] },
+      currentTurnId: "turn-5"
+    }
+  ], at("2026-07-23T06:31:00Z"));
+  const work2Running = attachWorkItemExecutionGroup(work2, group2, at("2026-07-23T06:32:00Z"));
+  const turn2 = createTurn("turn-2", "task-1", "leader", "resume", seedTurnInput(assignment2.input, "work-item-2"), at("2026-07-23T06:30:00Z"), {
     workItemId: "work-item-2",
     executionGroupId: "exec-group-2",
     executionLaneId: "exec-group-2-lane-1",
     effective: effective2
   });
-  const group2Running = updateExecutionLane(group2, "exec-group-2-lane-1", {
-    status: "running",
-    turnId: "turn-2"
-  }, at("2026-07-23T06:33:00Z"));
-  const work2Running = updateWorkItemExecutionGroup(work2WithGroup, group2Running, at("2026-07-23T06:34:00Z"));
+  const turn5 = failTurn(createTurn("turn-5", "task-1", "reviewer", "new", seedTurnInput(assignment2.input, "work-item-2"), at("2026-07-23T06:31:00Z"), {
+    workItemId: "work-item-2",
+    executionGroupId: "exec-group-2",
+    executionLaneId: "exec-group-2-lane-2",
+    effective: effective5
+  }), "runtime-failed", "Native process exited before producing a result.", at("2026-07-23T06:40:00Z"));
 
   // work-item-3: pending, blocked by dependency on work-item-2.
   const work3 = createWorkItem("work-item-3", "task-1", {
@@ -292,43 +274,18 @@ store.transaction((writer) => {
     summary: "Browser runtime was unavailable at the time."
   }, at("2026-07-20T06:00:00Z"));
 
-  // work-item-6: failed with a failed execution group lane.
+  // work-item-6: running with a failed direct main Turn ready for retry.
   const work6 = updateWorkItemStatus(createWorkItem("work-item-6", "task-6", {
     title: "Publish release artifact",
     objective: "Upload the verified build to the release channel.",
     acceptance: ["Artifact checksum matches the build"],
     assignee: "release-worker"
   }, at("2026-07-22T05:00:00Z")), "running", at("2026-07-23T04:30:00Z"));
-  const group6 = createExecutionGroup("exec-group-6", "task-6", {
-    purpose: "execution",
-    target: {
-      schemaVersion: 1,
-      kind: "work-item",
-      taskId: "task-6",
-      workItemId: "work-item-6",
-      revision: 1,
-      projects: [],
-      fingerprint: "seed-group-6"
-    },
-    roleName: "release-worker"
-  }, at("2026-07-23T04:31:00Z"));
-  const work6WithGroup = attachWorkItemExecutionGroup(work6, group6, at("2026-07-23T04:32:00Z"));
   const effective6 = resolveEffectiveLaunch({ role: roles[5], purpose: "execution" });
   const turn3 = failTurn(createTurn("turn-3", "task-6", "release-worker", "new", seedTurnInput("Publish the verified artifact.", "work-item-6"), at("2026-07-23T04:30:00Z"), {
     workItemId: "work-item-6",
-    executionGroupId: "exec-group-6",
-    executionLaneId: "exec-group-6-lane-1",
     effective: effective6
   }), "runtime-failed", "Native process exited with status 1.", at("2026-07-23T04:55:00Z"));
-  const group6Running = updateExecutionLane(group6, "exec-group-6-lane-1", {
-    status: "running",
-    turnId: "turn-3"
-  }, at("2026-07-23T04:33:00Z"));
-  const group6Failed = recordExecutionLaneResult(group6Running, "exec-group-6-lane-1", {
-    summary: "Native process exited with status 1."
-  }, "failed", at("2026-07-23T04:55:00Z"));
-  const work6Failed = updateWorkItemExecutionGroup(work6WithGroup, group6Failed, at("2026-07-23T04:56:00Z"));
-  const work6Done = updateWorkItemStatus(work6Failed, "failed", at("2026-07-23T04:57:00Z"), "Worker exited before upload completed.");
 
   // work-item-7: waiting for user input.
   const work7 = createWorkItem("work-item-7", "task-2", {
@@ -338,13 +295,14 @@ store.transaction((writer) => {
 
   // Phase 1: persist Work Items in their pre-candidate state so Turns and
   // Candidates can reference them through the storage boundary.
-  for (const item of [work1Completed, work2Running, work3, work4, work5, work6Done, work7]) {
+  for (const item of [work1, work2Running, work3, work4, work5, work6, work7]) {
     writer.saveWorkItem(item.taskId, item);
   }
 
   // Phase 2: persist Turns once their owning Work Items and ExecutionGroups exist.
   writer.saveTurn(turn1);
   writer.saveActiveTurn(turn2);
+  writer.saveTurn(turn5);
   writer.saveTurn(turn3);
 
   // task-2 Leader Turn waiting on input (no execution lineage, so no Work Item dependency).
@@ -355,10 +313,9 @@ store.transaction((writer) => {
   });
   writer.saveActiveTurn(turn4);
 
-  // Phase 3: advance work-item-1 through candidate submission, resolution, and
-  // completion in consecutive revisions (the store requires +1 per save).
+  // Phase 3: advance work-item-1 through Candidate submission and completion
+  // in consecutive revisions (the store requires +1 per save).
   writer.saveWorkItem(work1Candidate.taskId, work1Candidate);
-  writer.saveWorkItem(work1Resolved.taskId, work1Resolved);
   writer.saveWorkItem(work1Done.taskId, work1Done);
 
   // Phase 4: ReviewRound once its Candidate and source Turn exist.

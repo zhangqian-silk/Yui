@@ -412,7 +412,12 @@ function workspaceCompletionDisposition(
     }
     case "execution-lane": {
       const lane = findExecutionLane(facts, owner.executionGroupId, owner.executionLaneId);
-      if (lane !== undefined && !TERMINAL_LANE_STATUSES.has(lane.status)) return null;
+      const terminal = lane !== undefined && (
+        lane.disposition !== undefined
+          ? lane.disposition !== "open"
+          : lane.status !== undefined && TERMINAL_LANE_STATUSES.has(lane.status)
+      );
+      if (lane !== undefined && !terminal) return null;
       const value = {
         code: "execution-lane-workspace-undisposed",
         ref: ref("execution-lane", `${owner.executionGroupId}/${owner.executionLaneId}`),
@@ -431,7 +436,7 @@ function findExecutionLane(
   facts: CompletionReadinessFacts,
   groupId: string,
   laneId: string
-): { status: string } | undefined {
+): { status?: string; disposition?: string } | undefined {
   for (const item of facts.workItems) {
     const group = item.executionGroups?.find((entry) => entry.id === groupId);
     const lane = group?.lanes.find((entry) => entry.id === laneId);

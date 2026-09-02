@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import test from "node:test";
@@ -60,7 +60,8 @@ import { FileRuntimeEventInbox } from "../../dist/controller/runtimeEventInbox.j
 import { runRuntimeObservationHookCommand } from "../../dist/controller/runtimeObservationHook.js";
 import { callFileTaskController } from "../../dist/controller/clientRuntime.js";
 import { startControllerServer } from "../../dist/core/controllerServer.js";
-import { createTurn, validateTurn } from "../../dist/turn/turn.js";
+import { terminalizeExactTaskTurn } from "../../dist/lifecycle/exactTurnTerminalization.js";
+import { completeTurn, createTurn, validateTurn } from "../../dist/turn/turn.js";
 import { createTurnInput } from "../../dist/context/turnInputContract.js";
 import { processActiveRoleTurnDeliveries } from "../../dist/scheduler/activeRoleTurnDelivery.js";
 import { processOperatorInputNotifications } from "../../dist/scheduler/operatorInputNotificationProcessor.js";
@@ -70,22 +71,39 @@ import {
   processLeaderWakeups
 } from "../../dist/scheduler/leaderWakeupProcessor.js";
 import { buildTaskExecutionProjection } from "../../dist/scheduler/taskExecutionProjection.js";
+import { buildTaskObservabilityProjection } from "../../dist/scheduler/taskObservabilityProjection.js";
+import { projectWorkItemExecution } from "../../dist/execution/workItemExecutionProjection.js";
+import {
+  createWorkItemExecutionAssignment,
+  createWorkItemExecutionGroup
+} from "../../dist/execution/workItemExecution.js";
+import { projectReviewerAvailability } from "../../dist/review/reviewerAvailability.js";
 import { projectNextAction } from "../../dist/task/nextAction.js";
 import { listPublicCommandPaths } from "../../dist/cli/commandCatalog.js";
+import { runUpdate } from "../../dist/cli/updateOrchestrator.js";
 import { acquireHandoverLock, readHandoverFence } from "../../dist/release/runtimeRelease.js";
 import { SqliteTaskStore } from "../../dist/storage/sqliteStore.js";
 import * as taskStoreContract from "../../dist/storage/taskStore.js";
-import { ensureStorageSchema } from "../../dist/storage/storageSchema.js";
+import { ensureStorageSchema, StorageSchemaError } from "../../dist/storage/storageSchema.js";
 import { latestStorageVersionState } from "../../dist/storage/upgrade/recordVersions.js";
 import { initializeCurrentTaskStore } from "../../dist/storage/currentTaskStore.js";
+import { createProject } from "../../dist/repository/project.js";
+import { snapshotExecutionLaneWorkspaceSync } from "../../dist/repository/executionLaneGitSnapshot.js";
+import { FileTaskWorkspacePreparer } from "../../dist/repository/taskWorkspacePreparer.js";
+import { generateTaskWorkspaceIdentity } from "../../dist/repository/taskWorkspaceIdentity.js";
 import { SqliteTelemetryStore } from "../../dist/telemetry/sqliteTelemetryStore.js";
 import {
   activateTask,
+  bindTaskWorkspaceIdentity,
   createTask,
   startTaskExecution,
   stopTaskExecution
 } from "../../dist/task/task.js";
-import { createWorkItem, updateWorkItemStatus } from "../../dist/workItem/workItem.js";
+import {
+  attachWorkItemExecutionGroup,
+  createWorkItem,
+  updateWorkItemStatus
+} from "../../dist/workItem/workItem.js";
 import { createManagedWorkspace } from "../../dist/worktree/managedWorkspace.js";
 import { sanitizedTestEnv } from "../helpers/sanitizedEnv.mjs";
 
@@ -130,6 +148,64 @@ test("the packaged CLI starts and exposes the core workflow", () => {
   assert.equal(commands.some((command) => command.startsWith("task history")), false);
   assert.equal(commands.includes("task review rebind"), false);
   assert.equal(commands.includes("task role session switch"), false);
+});
+
+test("update quiesces the exact Controller before an adjacent storage migration", () => {
+  const calls = [];
+  const result = runUpdate({
+    stage: () => {
+      calls.push("stage");
+      return { binaryPath: "/tmp/staged-yui", version: "0.15.0" };
+    },
+    preflight: () => {
+      calls.push("preflight");
+      return { status: "migration-ready", stepCount: 3 };
+    },
+    beginControllerHandover: () => {
+      calls.push("handover");
+      return () => calls.push("release");
+    },
+    controllerStatus: () => {
+      calls.push("status");
+      return {
+        running: true,
+        pid: 42,
+        identity: {
+          executablePath: process.execPath,
+          args: ["/tmp/old-yui-controller"],
+          version: "0.14.1"
+        }
+      };
+    },
+    stopController: (_home, pid) => {
+      calls.push(`stop:${pid}`);
+      return { stopped: true, pid };
+    },
+    activateBinary: () => calls.push("activate"),
+    migrate: () => calls.push("migrate"),
+    verify: () => calls.push("verify"),
+    startController: () => calls.push("start"),
+    restoreController: () => calls.push("restore"),
+    cleanup: () => calls.push("cleanup")
+  }, { home: "/tmp/yui-update-home" });
+  assert.deepEqual(result, {
+    outcome: "updated",
+    version: "0.15.0",
+    path: "migrated"
+  });
+  assert.deepEqual(calls, [
+    "stage",
+    "preflight",
+    "handover",
+    "status",
+    "stop:42",
+    "activate",
+    "migrate",
+    "verify",
+    "start",
+    "release",
+    "cleanup"
+  ]);
 });
 
 test("Managed Codex shares the native App Server used by interactive clients", () => {
@@ -454,7 +530,7 @@ test("Turns record provider-visible input without delivery handshake state", () 
   );
   const mailbox = createWorkMailbox({ kind: "role", taskId: "task-1", roleName: role.name });
 
-  assert.equal(run.schemaVersion, 1);
+  assert.equal(run.schemaVersion, 3);
   assert.deepEqual(run.inputs[0].input.source, { type: "yui", channel: "task-dispatch" });
   assert.equal(run.inputs[0].input.directive, "Read the durable Task context and continue.");
   for (const legacyField of ["pushedAt", "deliveredAt", "deliveryReceiptId", "controlRequest"]) {
@@ -528,6 +604,40 @@ test("Provider acceptance consumes only the submitted mailbox prefix", () => {
   assert.equal(consumed.pending.requestCount, 1);
   assert.deepEqual(consumed.pending.dedupeKeys, ["message-2"]);
   assert.deepEqual(consumed.recentDedupeKeys, ["message-1"]);
+});
+
+test("a terminal Reviewer Turn signal does not reserve the next Review slot", () => {
+  const target = { kind: "role", taskId: "task-1", roleName: "reviewer" };
+  const mailbox = enqueueSignal(createWorkMailbox(target), {
+    reason: "review-requested",
+    refs: [{ type: "turn", taskId: "task-1", id: "turn-1" }],
+    occurredAt: "2026-09-02T00:00:00.000Z"
+  });
+  const availability = projectReviewerAvailability({
+    getActiveTurn: () => null,
+    listTurns: () => [{ id: "turn-1", roleName: "reviewer", status: "completed" }],
+    listReviewRounds: () => [],
+    getWorkMailbox: (candidate) => candidate.kind === "role" ? mailbox : null
+  }, "task-1", "reviewer");
+
+  assert.equal(availability.kind, "available");
+  assert.equal(projectReviewerAvailability({
+    getActiveTurn: () => null,
+    listTurns: () => [],
+    listReviewRounds: () => [],
+    getWorkMailbox: (candidate) => candidate.kind === "role" ? mailbox : null
+  }, "task-1", "reviewer").kind, "busy");
+  const processing = claimPending(mailbox, {
+    batchId: "review-delivery",
+    owner: "reviewer",
+    startedAt: "2026-09-02T00:00:01.000Z"
+  });
+  assert.equal(projectReviewerAvailability({
+    getActiveTurn: () => null,
+    listTurns: () => [{ id: "turn-1", roleName: "reviewer", status: "completed" }],
+    listReviewRounds: () => [],
+    getWorkMailbox: (candidate) => candidate.kind === "role" ? processing : null
+  }, "task-1", "reviewer").kind, "busy");
 });
 
 test("Yui and direct Turns share one Provider conversation", () => {
@@ -1322,6 +1432,526 @@ test("Task execution stop/start atomically controls scheduler admission", (t) =>
   assert.equal(store.getWorkItem(task.id, completedItem.id).status, "completed");
 });
 
+test("direct and replicated WorkItem execution converge through exact Lane retry", (t) => {
+  const home = mkdtempSync(join(tmpdir(), "yui-work-item-execution-smoke-"));
+  t.after(() => rmSync(home, { recursive: true, force: true }));
+  ensureStorageSchema(home);
+  const store = new SqliteTaskStore(home);
+  t.after(() => store.close());
+  const startedAt = new Date("2026-09-02T00:00:00.000Z");
+  const task = activateTask(createTask("task-1", "Execute WorkItems", startedAt, {
+    cwd: home
+  }), startedAt);
+  store.saveTask(task);
+  store.saveManagedWorkspace(createManagedWorkspace({
+    owner: { type: "task", taskId: task.id },
+    root: home,
+    entries: []
+  }, startedAt));
+  const binding = createRoleAgentBinding({ id: "codex", adapterId: "codex" });
+  for (const roleName of ["leader", "producer-a", "producer-b"]) {
+    store.saveRole(task.id, createRole(
+      task.id,
+      roleName,
+      [binding],
+      binding.agentId,
+      home,
+      startedAt
+    ));
+  }
+  const finish = (turn, status, now) => {
+    const result = store.transaction((tx) => terminalizeExactTaskTurn(tx, {
+      taskId: task.id,
+      roleName: turn.roleName,
+      agentId: turn.effective.agentId,
+      turnId: turn.id,
+      outcome: {
+        status,
+        summary: status === "completed" ? `${turn.roleName} completed.` : `${turn.roleName} failed.`,
+        ...(status === "failed" ? { failureReason: "runtime-failed" } : {})
+      },
+      ...(turn.executionLaneId === undefined || status === "failed"
+        ? {}
+        : {
+            reviewResult: {
+              summary: `${turn.roleName} result.`,
+              checks: [{ name: "core", outcome: "passed" }]
+            }
+          })
+    }, now));
+    assert.equal(result.disposition, "applied");
+  };
+
+  const directItem = createWorkItem("work-item-1", task.id, {
+    title: "Direct execution",
+    assignee: "leader"
+  }, startedAt);
+  store.saveWorkItem(task.id, directItem);
+  assert.throws(() => runTaskCommand(
+    ["work", "dispatch", `${task.id}/${directItem.id}`],
+    store,
+    {
+      now: () => startedAt,
+      environment: {
+        ...bareEnv,
+        YUI_SESSION_SCOPE: "task",
+        YUI_TASK_ID: task.id,
+        YUI_ROLE: "producer-a"
+      }
+    }
+  ), /matching Leader/u);
+  assert.deepEqual(store.listTurns(task.id), []);
+  runTaskCommand(
+    ["work", "dispatch", `${task.id}/${directItem.id}`],
+    store,
+    { now: () => startedAt, environment: bareEnv }
+  );
+  const directTurn = store.getActiveTurn(task.id, "leader");
+  assert.equal(directTurn.executionGroupId, undefined);
+  assert.equal(directTurn.sourceExecutionGroupId, undefined);
+  finish(directTurn, "failed", new Date("2026-09-02T00:00:30.000Z"));
+  const directProjection = projectWorkItemExecution(
+    store.getWorkItem(task.id, directItem.id),
+    store.listTurns(task.id)
+  );
+  assert.equal(directProjection.nextAction.kind, "retry-main");
+  assert.deepEqual(directProjection.nextAction.targetIds, [directTurn.id]);
+  runTaskCommand(
+    ["turn", "retry", `${task.id}/${directTurn.id}`],
+    store,
+    { now: () => new Date("2026-09-02T00:00:45.000Z"), environment: bareEnv }
+  );
+  const retriedDirect = store.getActiveTurn(task.id, "leader");
+  assert.notEqual(retriedDirect.id, directTurn.id);
+  finish(retriedDirect, "completed", new Date("2026-09-02T00:01:00.000Z"));
+
+  const groupedItem = createWorkItem("work-item-2", task.id, {
+    title: "Replicated execution",
+    assignee: "leader"
+  }, startedAt);
+  store.saveWorkItem(task.id, groupedItem);
+  const groupId = `execution-group-${store.peekNextTurnId(task.id)}`;
+  const laneWorkspaces = new Map([1, 2].map((ordinal) => {
+    const laneId = `${groupId}-lane-${ordinal}`;
+    return [laneId, createManagedWorkspace({
+      owner: {
+        type: "execution-lane",
+        taskId: task.id,
+        executionGroupId: groupId,
+        executionLaneId: laneId,
+        purpose: "execution",
+        workItemId: groupedItem.id
+      },
+      root: join(home, `lane-${ordinal}`),
+      entries: []
+    }, startedAt)];
+  }));
+  runTaskCommand([
+    "work", "dispatch", `${task.id}/${groupedItem.id}`,
+    "--lane-role", "producer-a",
+    "--lane-role", "producer-b"
+  ], store, {
+    now: () => new Date("2026-09-02T00:02:00.000Z"),
+    environment: bareEnv,
+    executionLaneWorkspaces: laneWorkspaces
+  });
+  const producerA = store.getActiveExecutionLaneTurn(task.id, groupId, `${groupId}-lane-1`);
+  const producerB = store.getActiveExecutionLaneTurn(task.id, groupId, `${groupId}-lane-2`);
+  finish(producerA, "completed", new Date("2026-09-02T00:03:00.000Z"));
+  stopTaskExecutionCommand(
+    { taskId: task.id, reason: "Exercise exact Lane recovery" },
+    store,
+    { now: () => new Date("2026-09-02T00:04:00.000Z"), environment: bareEnv }
+  );
+  assert.equal(store.getTurn(task.id, producerB.id).status, "failed");
+  assert.equal(
+    store.getWorkItem(task.id, groupedItem.id).executionGroups.at(-1).lanes[1].disposition,
+    "open"
+  );
+  startTaskExecutionCommand(task.id, store, {
+    now: () => new Date("2026-09-02T00:04:30.000Z"),
+    environment: bareEnv
+  });
+
+  const execution = buildTaskExecutionProjection(store, task.id);
+  const next = projectNextAction({
+    ...store.readNextActionFacts(task.id),
+    executionGroups: execution.executionGroups
+  });
+  assert.equal(next.kind, "retry-execution-lane");
+  assert.equal(next.recommendedCommand, `yui task turn retry ${task.id}/${producerB.id}`);
+  runTaskCommand(
+    ["turn", "retry", `${task.id}/${producerB.id}`],
+    store,
+    { now: () => new Date("2026-09-02T00:05:00.000Z"), environment: bareEnv }
+  );
+  const retriedProducer = store.getActiveExecutionLaneTurn(
+    task.id,
+    groupId,
+    `${groupId}-lane-2`
+  );
+  assert.notEqual(retriedProducer.id, producerB.id);
+  finish(retriedProducer, "completed", new Date("2026-09-02T00:06:00.000Z"));
+
+  const mainTurn = store.getActiveTurn(task.id, "leader");
+  assert.equal(mainTurn.workItemId, groupedItem.id);
+  assert.equal(mainTurn.sourceExecutionGroupId, groupId);
+  assert.equal(mainTurn.executionGroupId, undefined);
+  assert.match(mainTurn.inputs[0].input.directive, new RegExp(groupId, "u"));
+});
+
+test("Leader replicated Lanes derive from Task main without a WorkItem workspace", async (t) => {
+  const home = mkdtempSync(join(tmpdir(), "yui-leader-lane-workspace-smoke-"));
+  const workspaceRoot = mkdtempSync(join(tmpdir(), "yui-leader-lane-worktrees-"));
+  t.after(() => rmSync(home, { recursive: true, force: true }));
+  t.after(() => rmSync(workspaceRoot, { recursive: true, force: true }));
+  ensureStorageSchema(home);
+  const store = new SqliteTaskStore(home);
+  t.after(() => store.close());
+  store.saveConfig({ ...store.getConfig(), defaultWorkspace: workspaceRoot });
+  const now = new Date("2026-09-02T00:10:00.000Z");
+  const projectRoot = join(home, "project");
+  const laneRoots = [join(home, "lane-project-1"), join(home, "lane-project-2")];
+  mkdirSync(projectRoot, { recursive: true });
+  for (const laneRoot of laneRoots) mkdirSync(laneRoot, { recursive: true });
+  const project = createProject(
+    "project-1",
+    "app",
+    projectRoot,
+    { stable: "main", development: "main" },
+    now
+  );
+  store.saveProject(project);
+  const taskIdentity = generateTaskWorkspaceIdentity({
+    home: store.getHomeIdentity(),
+    taskId: "task-1",
+    now,
+    entropy: Buffer.alloc(16, 7)
+  });
+  const task = activateTask(bindTaskWorkspaceIdentity(createTask(
+    "task-1",
+    "Leader replicated execution",
+    now,
+    {
+      cwd: home,
+      projectBindings: [{ projectId: project.id, directory: "app", baseRef: "main" }]
+    }
+  ), taskIdentity, now), now);
+  store.saveTask(task);
+  const recordedBase = "a".repeat(40);
+  const currentHead = "b".repeat(40);
+  store.saveManagedWorkspace(createManagedWorkspace({
+    owner: { type: "task", taskId: task.id },
+    root: join(home, "task-main"),
+    entries: [{
+      projectId: project.id,
+      directory: "app",
+      access: "write",
+      path: projectRoot,
+      branch: "main",
+      baseRef: "main",
+      baseCommit: recordedBase
+    }]
+  }, now));
+  const item = createWorkItem("work-item-1", task.id, {
+    title: "Leader work",
+    assignee: "leader",
+    writeProjectIds: [project.id]
+  }, now);
+  store.saveWorkItem(task.id, item);
+  const binding = createRoleAgentBinding({ id: "codex", adapterId: "codex" });
+  for (const roleName of ["leader", "producer-a", "producer-b"]) {
+    store.saveRole(task.id, createRole(
+      task.id,
+      roleName,
+      [binding],
+      binding.agentId,
+      home,
+      now
+    ));
+  }
+  const ensureCalls = [];
+  const git = {
+    isClean: async () => true,
+    headRef: async () => "main",
+    inspect: async () => ({ baseCommit: currentHead }),
+    isAncestor: async (_path, ancestor, descendant) => (
+      ancestor === recordedBase && descendant === currentHead
+    ),
+    ensureWorktree: async (input) => {
+      ensureCalls.push(input);
+      return {
+        path: laneRoots[ensureCalls.length - 1],
+        branch: `yui/task-1/lane-${ensureCalls.length}`,
+        baseCommit: currentHead
+      };
+    }
+  };
+  const preparer = new FileTaskWorkspacePreparer(home, store, git, () => now);
+  const inputHeads = await preparer.snapshotExecutionLaneInputHeads(
+    store.getTaskWorkspace(task.id),
+    item.writeProjectIds
+  );
+  const groupId = `execution-group-${store.peekNextTurnId(task.id)}`;
+  const laneWorkspaces = new Map();
+  for (const ordinal of [1, 2]) {
+    const laneId = `${groupId}-lane-${ordinal}`;
+    laneWorkspaces.set(laneId, await preparer.prepareExecutionLaneWorkspace(
+      task.id,
+      groupId,
+      laneId,
+      { purpose: "execution", workItemId: item.id, inputHeads }
+    ));
+  }
+  assert.equal(store.getWorkItemWorkspace(task.id, item.id), null);
+  assert.equal(ensureCalls.length, 2);
+  assert.deepEqual(inputHeads, [{ projectId: project.id, headCommit: currentHead }]);
+  for (const [ordinal, workspace] of [...laneWorkspaces.values()].entries()) {
+    assert.equal(ensureCalls[ordinal].baseRef, currentHead);
+    assert.equal(workspace.entries[0].baseCommit, currentHead);
+    assert.equal(workspace.entries[0].access, "write");
+  }
+  runTaskCommand([
+    "work", "dispatch", `${task.id}/${item.id}`,
+    "--lane-role", "producer-a",
+    "--lane-role", "producer-b"
+  ], store, {
+    now: () => now,
+    environment: bareEnv,
+    executionLaneWorkspaces: laneWorkspaces
+  });
+  assert.deepEqual(
+    store.getWorkItem(task.id, item.id).executionGroups[0].assignment.projects,
+    [{ projectId: project.id, baseCommit: currentHead }]
+  );
+});
+
+test("producer evidence covers every writable Project and drives WorkItem observability", (t) => {
+  const home = mkdtempSync(join(tmpdir(), "yui-producer-evidence-smoke-"));
+  t.after(() => rmSync(home, { recursive: true, force: true }));
+  ensureStorageSchema(home);
+  const store = new SqliteTaskStore(home);
+  t.after(() => store.close());
+  const now = new Date("2026-09-02T00:20:00.000Z");
+  const task = activateTask(createTask("task-1", "Producer evidence", now, { cwd: home }), now);
+  store.saveTask(task);
+  const binding = createRoleAgentBinding({ id: "codex", adapterId: "codex" });
+  const roles = ["producer-a", "producer-b"].map((roleName) => createRole(
+    task.id,
+    roleName,
+    [binding],
+    binding.agentId,
+    home,
+    now
+  ));
+  for (const role of roles) store.saveRole(task.id, role);
+  const projectIds = ["project-1", "project-2"];
+  const commits = ["a".repeat(40), "b".repeat(40)];
+  const snapshotRef = {
+    schemaVersion: 1,
+    id: "context-snapshot-1",
+    taskId: task.id,
+    scope: "task",
+    sequence: 1,
+    digest: "c".repeat(64)
+  };
+
+  const prepare = (workItemId, groupId, firstTurnId, writeProjectIds = projectIds) => {
+    const item = updateWorkItemStatus(createWorkItem(workItemId, task.id, {
+      title: workItemId,
+      assignee: "producer-a",
+      writeProjectIds
+    }, now), "running", now);
+    const laneWorkspaces = roles.map((role, index) => createManagedWorkspace({
+      owner: {
+        type: "execution-lane",
+        taskId: task.id,
+        executionGroupId: groupId,
+        executionLaneId: `${groupId}-lane-${index + 1}`,
+        purpose: "execution",
+        workItemId
+      },
+      root: join(home, `${groupId}-lane-${index + 1}`),
+      entries: writeProjectIds.map((projectId) => {
+        const projectIndex = projectIds.indexOf(projectId);
+        return {
+          projectId,
+          directory: projectId,
+          access: "write",
+          path: join(home, `${groupId}-lane-${index + 1}-${projectId}`),
+          branch: `${groupId}-lane-${index + 1}`,
+          baseRef: commits[projectIndex],
+          baseCommit: commits[projectIndex]
+        };
+      })
+    }, now));
+    const effective = laneWorkspaces.map((workspace, index) => resolveEffectiveLaunch({
+      role: roles[index],
+      purpose: "execution",
+      workspace,
+      workItemWriteProjectIds: writeProjectIds
+    }));
+    const assignment = createWorkItemExecutionAssignment({
+      input: "Produce the same frozen result.",
+      objective: item.objective,
+      acceptance: item.acceptance,
+      contextSnapshotRef: snapshotRef,
+      taskId: task.id,
+      workItemId,
+      workItemRevision: item.revision,
+      projects: writeProjectIds.map((projectId) => ({
+        projectId,
+        baseCommit: commits[projectIds.indexOf(projectId)]
+      })),
+      dependencyFacts: []
+    });
+    const group = createWorkItemExecutionGroup(groupId, task.id, assignment, roles.map((role, index) => ({
+      roleName: role.name,
+      effective: effective[index],
+      workspace: { root: laneWorkspaces[index].root, writableProjectIds: writeProjectIds },
+      currentTurnId: index === 0 ? firstTurnId : `${firstTurnId}-sibling`
+    })), now);
+    const groupedItem = attachWorkItemExecutionGroup(item, group, now);
+    store.saveWorkItem(task.id, groupedItem);
+    store.saveManagedWorkspace(laneWorkspaces[0]);
+    const turn = createTurn(
+      firstTurnId,
+      task.id,
+      roles[0].name,
+      "new",
+      turnInput(firstTurnId, task.id, roles[0].name, "Produce."),
+      now,
+      {
+        workItemId,
+        purpose: "execution",
+        executionGroupId: groupId,
+        executionLaneId: `${groupId}-lane-1`,
+        workspace: laneWorkspaces[0],
+        effective: effective[0]
+      }
+    );
+    store.saveActiveExecutionLaneTurn(turn);
+    return { item: groupedItem, turn };
+  };
+
+  const incomplete = prepare("work-item-1", "execution-group-1", "turn-1");
+  const rejected = store.transaction((tx) => terminalizeExactTaskTurn(tx, {
+    taskId: task.id,
+    roleName: incomplete.turn.roleName,
+    agentId: incomplete.turn.effective.agentId,
+    turnId: incomplete.turn.id,
+    outcome: { status: "completed", summary: "Unscoped evidence only." },
+    reviewResult: {
+      checks: [{ name: "core", outcome: "passed" }],
+      evidenceCommit: commits[0]
+    }
+  }, new Date("2026-09-02T00:21:00.000Z")));
+  assert.equal(rejected.turn.status, "failed");
+  assert.equal(rejected.turn.result.failureReason, "missing-result");
+
+  const gitless = prepare("work-item-3", "execution-group-3", "turn-3", []);
+  const rejectedGitless = store.transaction((tx) => terminalizeExactTaskTurn(tx, {
+    taskId: task.id,
+    roleName: gitless.turn.roleName,
+    agentId: gitless.turn.effective.agentId,
+    turnId: gitless.turn.id,
+    outcome: { status: "completed", summary: "No validation evidence." }
+  }, new Date("2026-09-02T00:21:30.000Z")));
+  assert.equal(rejectedGitless.turn.status, "failed");
+  assert.equal(rejectedGitless.turn.result.failureReason, "missing-result");
+
+  const complete = prepare("work-item-2", "execution-group-2", "turn-2");
+  const accepted = store.transaction((tx) => terminalizeExactTaskTurn(tx, {
+    taskId: task.id,
+    roleName: complete.turn.roleName,
+    agentId: complete.turn.effective.agentId,
+    turnId: complete.turn.id,
+    outcome: { status: "completed", summary: "All Projects frozen." },
+    reviewResult: {
+      checks: [{ name: "core", outcome: "passed" }],
+      evidence: ["artifact-1", "artifact-2"],
+      findings: [{
+        id: "finding-1",
+        severity: "high",
+        summary: "Needs follow-up.",
+        status: "open"
+      }],
+      gitSnapshot: {
+        schemaVersion: 1,
+        projects: projectIds.map((projectId, index) => ({
+          projectId,
+          headCommit: commits[index],
+          branch: `execution-group-2-lane-1`
+        }))
+      }
+    }
+  }, new Date("2026-09-02T00:22:00.000Z")));
+  assert.equal(accepted.turn.status, "completed");
+  assert.deepEqual(
+    accepted.turn.result.producer.codeRefs.map(({ projectId }) => projectId),
+    projectIds
+  );
+  const storedItem = store.getWorkItem(task.id, complete.item.id);
+  const projection = buildTaskObservabilityProjection({
+    workItems: [storedItem],
+    executionGroups: [],
+    turns: store.listTurns(task.id),
+    events: []
+  }).workItems[0];
+  assert.equal(projection.evidenceCount, 2);
+  assert.equal(projection.openFindingCount, 1);
+  const unobserved = buildTaskObservabilityProjection({
+    workItems: [storedItem],
+    executionGroups: [],
+    turns: [],
+    events: []
+  }).workItems[0];
+  assert.equal(unobserved.evidenceCount, null);
+  assert.equal(unobserved.openFindingCount, null);
+
+  const snapshotPath = join(home, "actual-lane-project");
+  mkdirSync(snapshotPath, { recursive: true });
+  execFileSync("git", ["init", "--initial-branch", "lane-main"], { cwd: snapshotPath });
+  writeFileSync(join(snapshotPath, "result.txt"), "committed result\n");
+  execFileSync("git", ["add", "result.txt"], { cwd: snapshotPath });
+  execFileSync(
+    "git",
+    ["-c", "user.name=Yui Test", "-c", "user.email=yui@example.invalid", "commit", "-m", "result"],
+    { cwd: snapshotPath }
+  );
+  const headCommit = execFileSync("git", ["rev-parse", "HEAD"], {
+    cwd: snapshotPath,
+    encoding: "utf8"
+  }).trim();
+  const actualWorkspace = createManagedWorkspace({
+    owner: {
+      type: "execution-lane",
+      taskId: task.id,
+      executionGroupId: "execution-group-actual",
+      executionLaneId: "execution-group-actual-lane-1",
+      purpose: "execution",
+      workItemId: complete.item.id
+    },
+    root: join(home, "execution-group-actual-lane-1"),
+    entries: [{
+      projectId: projectIds[0],
+      directory: projectIds[0],
+      access: "write",
+      path: snapshotPath,
+      branch: "lane-main",
+      baseRef: commits[0],
+      baseCommit: commits[0]
+    }]
+  }, now);
+  store.saveManagedWorkspace(actualWorkspace);
+  assert.equal(
+    snapshotExecutionLaneWorkspaceSync(store, actualWorkspace).projects[0].headCommit,
+    headCommit
+  );
+  writeFileSync(join(snapshotPath, "dirty.txt"), "not committed\n");
+  assert.equal(snapshotExecutionLaneWorkspaceSync(store, actualWorkspace), undefined);
+});
+
 test("a packaged Controller restart inherits its direct parent's handover", (t) => {
   const home = mkdtempSync(join(tmpdir(), "yui-controller-handover-smoke-"));
   const environment = { ...bareEnv, YUI_HOME: home };
@@ -1417,6 +2047,132 @@ test("a new current Home initializes its SQLite authority exactly once", (t) => 
   } finally {
     database.close();
   }
+});
+
+test("a valid aggregate-21 Home upgrades through every adjacent record step", async (t) => {
+  const home = mkdtempSync(join(tmpdir(), "yui-aggregate-21-upgrade-smoke-"));
+  const upgradeEnvironment = { ...bareEnv, YUI_HOME: home };
+  t.after(() => {
+    try {
+      execFileSync(
+        process.execPath,
+        [join(root, "dist", "cli.js"), "controller", "stop"],
+        { cwd: root, encoding: "utf8", env: upgradeEnvironment }
+      );
+    } catch {
+      // The cleanup remains valid when the migration never started a Controller.
+    }
+    rmSync(home, { recursive: true, force: true });
+  });
+  ensureStorageSchema(home);
+  const now = new Date("2026-09-02T01:00:00.000Z");
+  const store = new SqliteTaskStore(home);
+  const task = activateTask(createTask("task-1", "Upgrade existing Home", now, { cwd: home }), now);
+  store.saveTask(task);
+  store.saveManagedWorkspace(createManagedWorkspace({
+    owner: { type: "task", taskId: task.id },
+    root: home,
+    entries: []
+  }, now));
+  const binding = createRoleAgentBinding({ id: "codex", adapterId: "codex" });
+  for (const roleName of ["leader", "producer"]) {
+    store.saveRole(task.id, createRole(task.id, roleName, [binding], binding.agentId, home, now));
+  }
+  const oldItem = createWorkItem("work-item-1", task.id, {
+    title: "Existing valid WorkItem",
+    assignee: "producer"
+  }, now);
+  store.saveWorkItem(task.id, oldItem);
+  const oldTurn = completeTurn(createTurn(
+    "turn-1",
+    task.id,
+    "leader",
+    "new",
+    turnInput("turn-1", task.id, "leader", "Existing valid Turn."),
+    now,
+    { effective: resolveEffectiveLaunch({ role: store.getRole(task.id, "leader"), purpose: "execution" }) }
+  ), "Existing result.", now);
+  store.saveTurn(oldTurn);
+  store.close();
+
+  const database = new Database(join(home, "yui.db"));
+  try {
+    for (const table of ["work_items", "turns"]) {
+      const rows = database.prepare(`SELECT rowid, payload FROM ${table}`).all();
+      for (const row of rows) {
+        const payload = JSON.parse(row.payload);
+        payload.schemaVersion = table === "work_items" ? 13 : 1;
+        database.prepare(`UPDATE ${table} SET payload = ? WHERE rowid = ?`)
+          .run(JSON.stringify(payload), row.rowid);
+      }
+    }
+  } finally {
+    database.close();
+  }
+  const manifestPath = join(home, "schema.json");
+  const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
+  manifest.aggregateSchemaVersion = 21;
+  manifest.recordVersions.workItem = 13;
+  manifest.recordVersions.turn = 1;
+  writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+
+  const preflight = JSON.parse(execFileSync(
+    process.execPath,
+    [join(root, "dist", "cli.js"), "--json", "upgrade", "--dry-run"],
+    { cwd: root, encoding: "utf8", env: upgradeEnvironment }
+  ));
+  assert.equal(preflight.ok, true);
+  assert.equal(preflight.data.outcome, "upgrade-plan");
+  assert.equal(preflight.data.report.steps.length, 3);
+  const upgraded = JSON.parse(execFileSync(
+    process.execPath,
+    [join(root, "dist", "cli.js"), "--json", "upgrade"],
+    { cwd: root, encoding: "utf8", env: upgradeEnvironment }
+  ));
+  assert.equal(upgraded.ok, true);
+  assert.equal(upgraded.data.outcome, "upgraded");
+
+  const reopened = new SqliteTaskStore(home);
+  t.after(() => reopened.close());
+  assert.equal(reopened.getWorkItem(task.id, oldItem.id).schemaVersion, 14);
+  assert.equal(reopened.getTurn(task.id, oldTurn.id).schemaVersion, 3);
+  const newItem = createWorkItem("work-item-2", task.id, {
+    title: "New work after upgrade",
+    assignee: "producer"
+  }, new Date("2026-09-02T01:01:00.000Z"));
+  reopened.saveWorkItem(task.id, newItem);
+  reopened.saveManagedWorkspace(createManagedWorkspace({
+    owner: { type: "work-item", taskId: task.id, workItemId: newItem.id },
+    root: join(home, newItem.id),
+    entries: []
+  }, new Date("2026-09-02T01:01:30.000Z")));
+  runTaskCommand(
+    ["work", "dispatch", `${task.id}/${newItem.id}`],
+    reopened,
+    { now: () => new Date("2026-09-02T01:02:00.000Z"), environment: bareEnv }
+  );
+  assert.equal(reopened.getActiveTurn(task.id, "producer").workItemId, newItem.id);
+});
+
+test("an existing SQLite Home with missing singleton rows fails closed", (t) => {
+  const home = mkdtempSync(join(tmpdir(), "yui-missing-sqlite-singletons-smoke-"));
+  t.after(() => rmSync(home, { recursive: true, force: true }));
+  ensureStorageSchema(home);
+  new SqliteTaskStore(home).close();
+  const database = new Database(join(home, "yui.db"));
+  try {
+    database.prepare("DELETE FROM home_meta WHERE id = 1").run();
+    database.prepare("DELETE FROM config WHERE id = 1").run();
+  } finally {
+    database.close();
+  }
+  assert.throws(
+    () => new SqliteTaskStore(home),
+    (error) => error instanceof StorageSchemaError
+      && error.code === "STORAGE_SCHEMA_INVALID"
+      && /home_meta/u.test(error.message)
+      && /config/u.test(error.message)
+  );
 });
 
 test("fresh SQLite telemetry persists and aggregates by Turn", async (t) => {

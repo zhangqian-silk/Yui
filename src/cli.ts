@@ -28,6 +28,7 @@ import {
 import { resolveOperatorWizardArguments } from "./cli/operatorWizard.js";
 import type { SelectionPorts } from "./cli/selectionPorts.js";
 import { runUpdateCommand } from "./cli/updateCommand.js";
+import type { ControllerIdentity } from "./cli/updateOrchestrator.js";
 import { runUpgradeCommand } from "./cli/upgradeCommand.js";
 import { formatTimestamp } from "./output/timePresentation.js";
 import { resolveTmuxBin, resolveTmuxHistoryLimit } from "./config/yuiConfig.js";
@@ -85,8 +86,7 @@ import {
   parseTaskCompletionRequest,
   preflightTaskCompletion,
   runTaskCommand,
-  normalizedExecutionLanePlan,
-  resolvedExecutionStageRetryGroup,
+  planReplicatedWorkItemLanes,
   validateTaskArchiveRequest
 } from "./commands/taskCommands.js";
 import { taskActor } from "./commands/taskActor.js";
@@ -107,6 +107,8 @@ import { createUpdatePorts } from "./cli/updatePorts.js";
 import { createReleaseWorkflowPorts } from "./release/releaseWorkflowPorts.js";
 import {
   acquireHandoverLock,
+  isForeignHandoverLockHeld,
+  isHandoverLockHeld,
   readRuntimeIdentity,
   type RuntimeIdentityReceipt
 } from "./release/runtimeRelease.js";
@@ -471,8 +473,7 @@ export async function main(): Promise<void> {
     return;
   }
   if (args[0] === "upgrade") {
-    // Admission diagnostic only: never quiesces, repairs, or switches storage.
-    const result = await runUpgradeCommand(args.slice(1), home);
+    const result = await runCoordinatedUpgradeCommand(args.slice(1), home);
     process.exitCode = result.exitCode;
     emit(result.output, false, result.data);
     return;
@@ -1169,6 +1170,7 @@ export async function main(): Promise<void> {
         throw usageError("Task work capture usage: yui task work capture <task>/<work>.");
       }
       const reference = cliWorkItemReference(workItemId, process.env);
+      taskActor(process.env, reference.taskId);
       const changeSets = await new WorkItemChangeSetManager(store).capture(
         reference.taskId,
         reference.localId,
@@ -1379,11 +1381,21 @@ export async function main(): Promise<void> {
         ? null
         : store.getWorkItem(reference.taskId, reference.localId);
       const task = item === null ? null : store.getTask(item.taskId);
+      if (item !== null && task !== null) {
+        // Authority and pure Lane-shape checks precede every physical or
+        // durable workspace preparation performed for dispatch.
+        taskActor(process.env, task.id);
+        if (item.assignee !== undefined) {
+          workItemDispatchLanePlan(resolved, store, item);
+        }
+      }
       // A rejected Candidate starts a new execution iteration. Release every
       // terminal Lane Role runtime before preparing the new Lane workspaces;
       // durable Turns, Groups, Candidates, and workspace owners remain intact.
       if (item?.status === "failed"
-        && currentWorkItemExecutionGroup(item)?.resolution !== undefined) {
+        && currentWorkItemExecutionGroup(item)?.lanes.every(
+          ({ disposition }) => disposition !== "open"
+        )) {
         await workspaceCoordinator.cleanupWorkItemRuntime(item.taskId, item.id);
       }
       // Every Task needs an authoritative runtime owner before dispatch. A
@@ -1493,8 +1505,6 @@ export async function main(): Promise<void> {
       const handoverLock = acquireHandoverLock(home);
       releaseReviewHandoverLock = handoverLock.release;
     }
-    let candidateMaterialization: Awaited<ReturnType<typeof candidateMaterializationForTaskCommand>>;
-    let candidateMaterializationCommitted = false;
     try {
       const preparedLanes = await prepareExecutionLaneWorkspacesForCommand(
         resolved,
@@ -1507,22 +1517,13 @@ export async function main(): Promise<void> {
         laneDispatchRelease = preparedLanes.release;
         laneDispatchProjectPaths = preparedLanes.projectPaths;
       }
-      candidateMaterialization = await candidateMaterializationForTaskCommand(
+      const candidateGitSnapshot = await candidateSnapshotForTaskCommand(
         resolved,
         store,
         workspacePreparer,
         process.env,
         taskFinalReviewContract
       );
-      const candidateGitSnapshot = candidateMaterialization === undefined
-        ? await candidateSnapshotForTaskCommand(
-          resolved,
-          store,
-          workspacePreparer,
-          process.env,
-          taskFinalReviewContract
-        )
-        : candidateMaterialization.snapshot;
       const directTaskMainSnapshot = await directTaskMainSnapshotForTaskCommand(
         resolved,
         store,
@@ -1569,9 +1570,6 @@ export async function main(): Promise<void> {
             : { completionPublishedTreeProof }),
           ...(workItemIntegrationProof === undefined ? {} : { workItemIntegrationProof }),
           ...(candidateGitSnapshot === undefined ? {} : { candidateGitSnapshot }),
-          ...(candidateMaterialization === undefined
-            ? {}
-            : { candidateWorkspace: candidateMaterialization.workspace ?? null }),
           ...(executionLaneWorkspaces === undefined ? {} : { executionLaneWorkspaces }),
           ...(taskWorkspaceActivation === undefined ? {} : { taskWorkspaceActivation }),
           ...(laneDispatchProjectPaths === undefined ? {} : { laneDispatchProjectPaths }),
@@ -1592,9 +1590,6 @@ export async function main(): Promise<void> {
         laneDispatchRelease();
         laneDispatchRelease = undefined;
       }
-      // The command transaction has now durably submitted the Candidate. Any
-      // later output/review handling must not roll back its Git snapshot.
-      candidateMaterializationCommitted = candidateMaterialization !== undefined;
       if (result.kind === "output") {
         const requestedRound = reviewRoundFromCommandData(result.data);
         const persistedRequestedRound = requestedRound === undefined
@@ -1847,14 +1842,7 @@ export async function main(): Promise<void> {
       }
       return;
     } catch (error) {
-      if (candidateMaterialization !== undefined && !candidateMaterializationCommitted) {
-        await workspacePreparer.restoreExecutionGroupCandidateMaterialization(
-          candidateMaterialization
-        );
-      }
-      if (!candidateMaterializationCommitted) {
-        await workspacePreparer.discardUnadoptedExecutionLaneWorkspaces(executionLaneWorkspaces);
-      }
+      await workspacePreparer.discardUnadoptedExecutionLaneWorkspaces(executionLaneWorkspaces);
       if (laneDispatchRelease !== undefined) {
         laneDispatchRelease();
         laneDispatchRelease = undefined;
@@ -1894,6 +1882,100 @@ export async function main(): Promise<void> {
     `Command is not connected to the current TaskStore command routing: ${resolved[0]}.`,
     renderCommandHelp(invocation.node, VERSION)
   );
+}
+
+/**
+ * Public execution owns the Controller lifecycle around a migration. The
+ * staged update child already runs beneath its parent's exact handover lock;
+ * dry-run and update-preflight remain strictly read-only.
+ */
+async function runCoordinatedUpgradeCommand(
+  commandArgs: readonly string[],
+  home: string
+): Promise<Awaited<ReturnType<typeof runUpgradeCommand>>> {
+  if (commandArgs.length !== 0 || inheritedUpdateHandover(home)) {
+    return runUpgradeCommand(commandArgs, home);
+  }
+
+  const plan = await runUpgradeCommand(["--dry-run"], home);
+  if (plan.data.outcome !== "upgrade-plan") {
+    const result = await runUpgradeCommand(commandArgs, home);
+    if (result.data.outcome === "already-current") {
+      await ensureFileTaskController(home, { environment: process.env });
+    }
+    return result;
+  }
+
+  const ports = createUpdatePorts(process.env);
+  const release = ports.beginControllerHandover?.(home);
+  if (release === undefined
+    || ports.controllerStatus === undefined
+    || ports.stopController === undefined) {
+    release?.();
+    throw runtimeError("Storage upgrade requires exact Controller lifecycle ownership.");
+  }
+  let stoppedIdentity: ControllerIdentity | undefined;
+  let storageChanged = false;
+  try {
+    const status = ports.controllerStatus(home);
+    if (status.running) {
+      const pid = status.pid;
+      const identity = status.identity;
+      if (typeof pid !== "number" || !Number.isSafeInteger(pid) || pid < 1
+        || identity === undefined) {
+        throw runtimeError(
+          "Storage upgrade could not authenticate the running Controller's exact identity."
+        );
+      }
+      const stopped = ports.stopController(home, pid);
+      if (stopped.stopped !== true || stopped.pid !== pid) {
+        throw runtimeError(
+          `Storage upgrade could not confirm the exact Controller stop for PID ${pid}.`
+        );
+      }
+      stoppedIdentity = identity;
+    }
+
+    const result = await runUpgradeCommand(commandArgs, home);
+    storageChanged = result.data.outcome === "upgraded" || result.data.outcome === "failed";
+    if (result.data.outcome === "upgraded" || result.data.outcome === "already-current") {
+      // From this point a replacement may exist even if readiness later fails;
+      // never restore the captured owner across unknown replacement ownership.
+      storageChanged = true;
+      await ensureFileTaskController(home, {
+        environment: process.env,
+        handoverOwnerPid: process.pid
+      });
+    } else if (stoppedIdentity !== undefined && result.data.outcome === "blocked") {
+      ports.restoreController?.(home, stoppedIdentity);
+      stoppedIdentity = undefined;
+    }
+    return result;
+  } catch (error) {
+    if (!storageChanged && stoppedIdentity !== undefined) {
+      try {
+        ports.restoreController?.(home, stoppedIdentity);
+      } catch (restoreError) {
+        throw runtimeError(
+          `Storage upgrade failed before mutation, and the captured Controller could not be restored: ${runtimeFailureMessage(restoreError)}`
+        );
+      }
+    }
+    throw error;
+  } finally {
+    release();
+  }
+}
+
+function inheritedUpdateHandover(home: string): boolean {
+  const rawOwner = process.env.YUI_UPDATE_HANDOVER_OWNER_PID;
+  if (rawOwner === undefined) return false;
+  const ownerPid = Number(rawOwner);
+  return Number.isSafeInteger(ownerPid)
+    && ownerPid > 0
+    && ownerPid === process.ppid
+    && isHandoverLockHeld(home)
+    && !isForeignHandoverLockHeld(home, ownerPid);
 }
 
 function explicitReleaseActivationDriver(): string | null {
@@ -2278,60 +2360,7 @@ async function candidateSnapshotForTaskCommand(
     }
     return preparer.snapshotCandidateWorkspace(workspace);
   }
-  if (args[1] === "work" && args[2] === "group" && args[3] === "resolve"
-    && args[4] !== undefined) {
-    // The grouped accept path snapshots only after all selected Lane outputs
-    // have been merged by candidateMaterializationForTaskCommand.
-    return undefined;
-  }
   return undefined;
-}
-
-async function candidateMaterializationForTaskCommand(
-  args: readonly string[],
-  store: TaskStore,
-  preparer: FileTaskWorkspacePreparer,
-  environment: NodeJS.ProcessEnv,
-  taskFinalReviewContract?: TaskFinalReviewContract
-): Promise<Awaited<ReturnType<FileTaskWorkspacePreparer["materializeExecutionGroupCandidate"]>> | undefined> {
-  if (args[0] !== "task" || args[1] !== "work" || args[2] !== "group"
-    || args[3] !== "resolve" || args[4] === undefined
-    || !args.includes("--decision")
-    || args[args.indexOf("--decision") + 1] !== "accept") return undefined;
-  const reference = cliWorkItemReference(args[4], environment);
-  const item = store.getWorkItem(reference.taskId, reference.localId);
-  const group = item === null || item === undefined
-    ? undefined
-    : currentWorkItemExecutionGroup(item);
-  if (item === null || item === undefined || group === undefined) return undefined;
-  if (group.stage !== undefined && group.stage.stage !== "resolve") return undefined;
-  // Early termination first stops never-started spend. Active stragglers are
-  // deliberately retained, so the command records that stop and leaves the
-  // group unresolved. Do not merge Lane output into the WorkItem Candidate
-  // until those active Lanes settle and the Leader resolves the group again.
-  if (args.includes("--early-stop")
-    && group.lanes.some(({ status }) => status === "running")) return undefined;
-  const selected = args.flatMap((value, index) => value === "--lane" && args[index + 1] !== undefined ? [args[index + 1]!] : []);
-  const materializedLaneIds = selected.length === 0
-    ? group.lanes
-      .filter((lane) => lane.status === "completed")
-      .map(({ id }) => id)
-    : selected;
-  if (group.stage?.convergence !== undefined
-    && group.stage.stage === "resolve"
-    && materializedLaneIds.length !== 1) {
-    throw usageError("Candidate convergence Resolve must select exactly one Lane before materialization.");
-  }
-  try {
-    return await preparer.materializeExecutionGroupCandidate(
-      item.taskId,
-      item.id,
-      group.id,
-      materializedLaneIds
-    );
-  } catch (error) {
-    throw usageError(error instanceof Error ? error.message : String(error));
-  }
 }
 
 async function prepareExecutionLaneWorkspacesForCommand(
@@ -2340,111 +2369,82 @@ async function prepareExecutionLaneWorkspacesForCommand(
   preparer: FileTaskWorkspacePreparer,
   environment: NodeJS.ProcessEnv
 ): Promise<PreparedExecutionLaneWorkspaces | undefined> {
-  const isDispatch = args[0] === "task" && args[1] === "work" && args[2] === "dispatch" && args[3] !== undefined;
-  const isRetry = args[0] === "task" && args[1] === "turn" && args[2] === "retry" && args[3] !== undefined;
-  if (!isDispatch && !isRetry) return undefined;
-  const itemRef = isDispatch
-    ? cliWorkItemReference(args[3]!, environment)
-    : null;
-  const item = itemRef === null
-    ? (() => {
-        const runRef = cliTaskRecordReference(args[3]!, "turn", environment);
-        const run = store.getTurn(runRef.taskId, runRef.localId);
-        return run?.workItemId === undefined ? null : store.getWorkItem(run.taskId, run.workItemId);
-      })()
-    : store.getWorkItem(itemRef.taskId, itemRef.localId);
-  if (item === null) return undefined;
-  const retryRun = isRetry
-    ? store.getTurn(item.taskId, cliTaskRecordReference(args[3]!, "turn", environment).localId)
-    : null;
-  const currentGroup = currentWorkItemExecutionGroup(item);
-  const group = retryRun?.executionGroupId === undefined
-    ? (isDispatch && currentGroup?.resolution !== undefined ? undefined : currentGroup)
-    : workItemExecutionGroupById(item, retryRun.executionGroupId);
+  const isDispatch = args[0] === "task"
+    && args[1] === "work"
+    && args[2] === "dispatch"
+    && args[3] !== undefined;
+  if (!isDispatch) return undefined;
+  const itemRef = cliWorkItemReference(args[3]!, environment);
+  const item = store.getWorkItem(itemRef.taskId, itemRef.localId);
+  if (item === null || item.assignee === undefined) return undefined;
+  const plan = workItemDispatchLanePlan(args, store, item);
+  if (plan.roles.length === 0) return undefined;
+  for (const roleName of plan.roles) {
+    if (store.getRole(item.taskId, roleName) === null) {
+      throw usageError(`Task Role not found: ${item.taskId}/${roleName}.`);
+    }
+    if (store.getActiveTurn(item.taskId, roleName) !== null) {
+      throw usageError(`${item.taskId}/${roleName} already has an active turn.`);
+    }
+  }
+  const held = preparer.acquireTaskProjectMaintenanceLocks(item.taskId);
+  const map = new Map<string, import("./worktree/managedWorkspace.js").ManagedWorkspace>();
+  try {
+    const projectPaths = new Map<string, string>();
+    for (const { projectId } of held.current.projectBindings) {
+      const project = store.getProject(projectId);
+      if (project === null) throw new Error(`Project not found: ${projectId}.`);
+      projectPaths.set(projectId, project.path);
+    }
+    const source = item.assignee === "leader"
+      ? store.getTaskWorkspace(item.taskId)
+      : store.getWorkItemWorkspace(item.taskId, item.id);
+    if (source === null) {
+      throw usageError(`Execution Lane source workspace is not ready: ${item.id}.`);
+    }
+    const inputHeads = await preparer.snapshotExecutionLaneInputHeads(
+      source,
+      item.writeProjectIds
+    );
+    for (const laneId of plan.laneIds) {
+      map.set(laneId, await preparer.prepareExecutionLaneWorkspace(
+        item.taskId,
+        plan.groupId,
+        laneId,
+        { purpose: "execution", workItemId: item.id, inputHeads },
+        { current: held.current }
+      ));
+    }
+    return { workspaces: map, release: held.release, projectPaths };
+  } catch (error) {
+    await preparer.discardUnadoptedExecutionLaneWorkspaces(map);
+    held.release();
+    throw error;
+  }
+}
+
+function workItemDispatchLanePlan(
+  args: readonly string[],
+  store: TaskStore,
+  item: WorkItem
+): Readonly<ReturnType<typeof planReplicatedWorkItemLanes> & { groupId: string }> {
+  if (item.assignee === undefined) {
+    throw usageError(`Work Item has no Task Role assignee: ${item.id}.`);
+  }
   const roles = args.flatMap((value, index) => (
     value === "--lane-role" && args[index + 1] !== undefined
       ? [args[index + 1]!]
       : []
   ));
-  const requestedStrategy = (() => {
-    const index = args.indexOf("--strategy");
-    const value = index < 0 ? undefined : args[index + 1];
-    if (value === undefined) return undefined;
-    const fixed = /^fixed:([1-9]\d*)$/u.exec(value);
-    if (fixed !== null) return { mode: "fixed" as const, count: Number(fixed[1]) };
-    const adaptive = /^adaptive:([1-9]\d*)$/u.exec(value);
-    if (adaptive !== null) return { mode: "adaptive" as const, max: Number(adaptive[1]) };
-    throw usageError(`Invalid execution strategy: ${value}.`);
-  })();
-  const retryLaneId = isRetry
-    ? store.getTurn(item.taskId, cliTaskRecordReference(args[3]!, "turn", environment).localId)?.executionLaneId
-    : undefined;
-  const plan = normalizedExecutionLanePlan({
-    assignee: item.assignee ?? "",
-    requestedRoles: roles,
-    requestedStrategy,
-    existingGroup: group === undefined ? undefined : group,
-    resolvedRetryGroup: isDispatch
-      ? resolvedExecutionStageRetryGroup(currentGroup)
-      : undefined,
-    status: item.status,
-    nextGroupId: `execution-group-${store.peekNextTurnId(item.taskId)}`,
-    retryLaneId,
-    phase: isRetry ? "retry" : "dispatch"
-  });
-  const laneRoles = plan.roles;
-  if (!isRetry && laneRoles.length === 0) {
-    throw usageError("At least one --lane-role is required when expanding an ExecutionGroup.");
-  }
-  if (group !== undefined && requestedStrategy !== undefined) {
-    const same = group.strategy.mode === requestedStrategy.mode
-      && (group.strategy.mode === "fixed"
-        ? requestedStrategy.mode === "fixed" && group.strategy.count === requestedStrategy.count
-        : requestedStrategy.mode === "adaptive" && group.strategy.max === requestedStrategy.max);
-    if (!same) throw usageError(`ExecutionGroup strategy is frozen: ${group.id}.`);
-  }
-  const laneCount = plan.requestedCount;
-  const adaptive = plan.strategy.mode === "adaptive";
-  const needsIsolation = adaptive || laneCount > 1 || (group?.lanes.length ?? 0) > 1;
-  if (!needsIsolation) return undefined;
-  const groupId = group?.id ?? `execution-group-${store.peekNextTurnId(item.taskId)}`;
-  const laneIds = plan.laneIds;
-  // A new Group's Lanes are not yet durable, so their worktrees would be
-  // unadopted between preparation and the dispatch transaction. Hold ONE
-  // per-Project maintenance fence across both, so a project migrate cannot
-  // switch the catalog in that gap and strand a Lane on the external
-  // checkout. An existing Group's Lanes are adopted inside their own fence,
-  // so no outer fence is held.
-  const held = group === undefined
-    ? preparer.acquireTaskProjectMaintenanceLocks(item.taskId)
-    : undefined;
-  const map = new Map<string, import("./worktree/managedWorkspace.js").ManagedWorkspace>();
-  try {
-    let projectPaths: ReadonlyMap<string, string> | undefined;
-    if (held !== undefined) {
-      const paths = new Map<string, string>();
-      for (const { projectId } of held.current.projectBindings) {
-        const project = store.getProject(projectId);
-        if (project === null) throw new Error(`Project not found: ${projectId}.`);
-        paths.set(projectId, project.path);
-      }
-      projectPaths = paths;
-    }
-    for (const laneId of laneIds.filter((value) => value.length > 0)) {
-      map.set(laneId, await preparer.prepareExecutionLaneWorkspace(item.taskId, groupId, laneId, {
-        purpose: "execution",
-        workItemId: item.id
-      }, held === undefined ? undefined : { current: held.current }));
-    }
-    return { workspaces: map, release: held?.release, projectPaths };
-  } catch (error) {
-    // Compensate (discard unadopted Lane worktrees) BEFORE releasing the
-    // fence: a concurrent project migrate must not switch the catalog while
-    // external-backed worktrees are still identifiable for removal.
-    await preparer.discardUnadoptedExecutionLaneWorkspaces(map);
-    if (held !== undefined) held.release();
-    throw error;
-  }
+  const groupId = `execution-group-${store.peekNextTurnId(item.taskId)}`;
+  return {
+    groupId,
+    ...planReplicatedWorkItemLanes(
+      item.assignee,
+      roles,
+      groupId
+    )
+  };
 }
 
 /**

@@ -13,7 +13,9 @@ import {
 import { reconcileReviewFindingsAfterReview } from "../review/reviewFindingLedger.js";
 import {
   completeTurn,
+  createProducerTurnResult,
   failTurn,
+  type ProducerTurnResult,
   type Turn,
   type TurnProviderResult
 } from "../turn/turn.js";
@@ -22,6 +24,8 @@ import {
   resolveExecutionGroup,
   type ExecutionLaneGitSnapshot
 } from "../execution/executionGroup.js";
+import { updateWorkItemExecutionLane } from "../execution/workItemExecution.js";
+import { reconcileWorkItemMainTurns } from "../execution/workItemMainTurn.js";
 import {
   isRuntimeLaunchReservation,
   runtimeLifecycleTarget
@@ -183,6 +187,7 @@ export function terminalizeExactTurnReviewRound(
     turn: Turn;
     outcome: Readonly<{ status: "completed" | "failed"; summary: string }>;
     reviewResult?: Readonly<{
+      summary?: string;
       report?: string;
       checks?: readonly ReviewCheck[];
       findings?: readonly import("../execution/executionGroup.js").ExecutionFinding[];
@@ -303,6 +308,7 @@ export type ExactTurnTerminalizationInput = Readonly<{
     provider?: TurnProviderResult;
   }>;
   reviewResult?: Readonly<{
+    summary?: string;
     report?: string;
     checks?: readonly ReviewCheck[];
     findings?: readonly import("../execution/executionGroup.js").ExecutionFinding[];
@@ -401,7 +407,7 @@ export function retireExactActiveTurn(
     turnId: input.turnId,
     ...(input.nativeSessionId === undefined ? {} : { nativeSessionId: input.nativeSessionId }),
     ...(input.launchId === undefined ? {} : { launchId: input.launchId }),
-    settleFailedExecutionGroup: true,
+    ...(current.purpose === "review" ? { settleFailedExecutionGroup: true } : {}),
     outcome: { status: "failed", summary: input.reason, failureReason: "missing-result" }
   };
   const session = sessions?.sessions[input.agentId];
@@ -485,12 +491,50 @@ export function terminalizeExactTaskTurn(
     return obsolete(turn, reviewRoundTerminalization.reason ?? "review-round-mismatch");
   }
 
-  const terminal = input.outcome.status === "completed"
-    ? completeTurn(turn, input.outcome.summary, now, input.outcome.provider)
+  const producer = input.outcome.status === "completed"
+    && turn.purpose === "execution"
+    && turn.workItemId !== undefined
+    && turn.executionGroupId !== undefined
+    && turn.executionLaneId !== undefined
+    ? createProducerTurnResult({
+        summary: input.reviewResult?.summary ?? input.outcome.summary,
+        ...(input.reviewResult?.report === undefined
+          ? {}
+          : { report: input.reviewResult.report }),
+        ...(input.reviewResult?.checks === undefined
+          ? {}
+          : { checks: input.reviewResult.checks }),
+        ...(input.reviewResult?.findings === undefined
+          ? {}
+          : { findings: input.reviewResult.findings }),
+        ...(input.reviewResult?.evidence === undefined
+          ? {}
+          : { evidence: input.reviewResult.evidence }),
+        ...(input.reviewResult?.evidenceCommit === undefined
+          ? {}
+          : { evidenceCommit: input.reviewResult.evidenceCommit }),
+        ...(input.reviewResult?.gitSnapshot === undefined
+          ? {}
+          : {
+              projectCodeRefs: input.reviewResult.gitSnapshot.projects.map((project) => ({
+                projectId: project.projectId,
+                commit: project.headCommit
+              }))
+            })
+      })
+    : undefined;
+  const incompleteProducer = producer !== undefined
+    && (producer.checks.length === 0
+      || (turn.effective.writeProjectIds.length > 0
+        && !producerCoversWriteProjects(producer, turn.effective.writeProjectIds)));
+  const terminal = input.outcome.status === "completed" && !incompleteProducer
+    ? completeTurn(turn, input.outcome.summary, now, input.outcome.provider, producer)
     : failTurn(
         turn,
-        input.outcome.failureReason ?? "runtime-failed",
-        input.outcome.summary,
+        incompleteProducer ? "missing-result" : input.outcome.failureReason ?? "runtime-failed",
+        incompleteProducer
+          ? "Producer result is missing an immutable code reference or validation check."
+          : input.outcome.summary,
         now,
         input.outcome.provider
       );
@@ -503,35 +547,15 @@ export function terminalizeExactTaskTurn(
       ? undefined
       : workItemExecutionGroupById(item, turn.executionGroupId);
     if (item !== null && group !== undefined) {
-      let grouped = recordExecutionLaneResult(
-        group,
-        turn.executionLaneId,
-      {
-        summary: input.outcome.summary,
-        ...(input.reviewResult?.report === undefined ? {} : { report: input.reviewResult.report }),
-        ...(input.reviewResult?.checks === undefined ? {} : { checks: input.reviewResult.checks }),
-        ...(input.reviewResult?.findings === undefined ? {} : { findings: input.reviewResult.findings }),
-        ...(input.reviewResult?.evidence === undefined ? {} : { evidence: input.reviewResult.evidence }),
-        ...(input.reviewResult?.evidenceCommit === undefined ? {} : { evidenceCommit: input.reviewResult.evidenceCommit }),
-        ...(input.reviewResult?.gitSnapshot === undefined ? {} : { gitSnapshot: input.reviewResult.gitSnapshot })
-      },
-        input.outcome.status,
-        now
-      );
-      if (input.settleFailedExecutionGroup === true
-        && input.outcome.status === "failed"
-        && grouped.resolution === undefined
-        && grouped.lanes.every((lane) => (
-          lane.status === "completed"
-          || lane.status === "failed"
-          || lane.status === "skipped"
-        ))) {
-        grouped = resolveExecutionGroup(grouped, {
-          decision: "blocked",
-          summary: input.outcome.summary
+      if (terminal.status === "completed" || input.settleFailedExecutionGroup === true) {
+        const grouped = updateWorkItemExecutionLane(group, turn.executionLaneId, {
+          currentTurnId: turn.id,
+          ...(terminal.status === "completed"
+            ? { successfulTurnId: turn.id, disposition: "succeeded" as const }
+            : { disposition: "failed" as const })
         }, now);
+        store.saveWorkItem(input.taskId, updateWorkItemExecutionGroup(item, grouped, now));
       }
-      store.saveWorkItem(input.taskId, updateWorkItemExecutionGroup(item, grouped, now));
     }
   }
   store.saveTurn(terminal);
@@ -552,7 +576,21 @@ export function terminalizeExactTaskTurn(
     store.clearActiveTurn(input.taskId, input.roleName);
   }
   settleLaunchReservation(store, sessions, input);
+  reconcileWorkItemMainTurns(store, input.taskId, now);
   return { disposition: "applied", turn: terminal };
+}
+
+function producerCoversWriteProjects(
+  producer: ProducerTurnResult,
+  writeProjectIds: readonly string[]
+): boolean {
+  const expected = [...new Set(writeProjectIds)].sort();
+  const observed = producer.codeRefs.flatMap(({ projectId }) => (
+    projectId === undefined ? [] : [projectId]
+  ));
+  return observed.length === expected.length
+    && new Set(observed).size === observed.length
+    && [...observed].sort().every((projectId, index) => projectId === expected[index]);
 }
 
 function settleLaunchReservation(

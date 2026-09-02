@@ -306,47 +306,32 @@ yui task work isolate <task-id>/<work-item-id>
 yui task work dispatch <task-id>/<work-item-id> --input "完成实现并运行聚焦测试"
 ```
 
-派发默认仍为 `single`。Leader 可在全新 WorkItem 上显式开启有界多路探索；每个
-接受的阶段按 `Plan → Generate → Compare → Synthesize → Verify → Resolve`
-推进，只有接受后的 Resolve 阶段会物化既有的单一 Candidate：
+不传 `--lane-role` 时，assignee 直接在 WorkItem 主工作区执行。若要让多个生产者
+基于完全相同的冻结 Assignment 独立执行，必须传入至少两个不同的 Task Role；
+单个 Role、重复 Role 或 assignee 本身都会被拒绝：
 
 ```sh
 yui task work dispatch <task-id>/<work-item-id> \
-  --mode parallel-diverse --max-rounds 2 --stage-max-attempts 2 \
-  --strategy fixed:2 --lane-role critic \
-  --stage-max-tokens 240000 --stage-max-tool-calls 200 \
-  --stage-max-seconds 1800 --stage-quorum 2
-yui task work group resolve <task-id>/<work-item-id> \
-  --decision accept --summary "Plan 证据充分"
+  --input "完成实现并运行聚焦测试" \
+  --lane-role producer-a --lane-role producer-b
 ```
 
-每个阶段都是新的不可变 ExecutionGroup；其 ContextSnapshot 与选中的父 Lane
-结果都以持久引用衔接。`retry` 在阶段尝试预算内重做当前阶段，而 Resolve 上的
-`retry` 才进入下一轮，并受最大轮次约束。
+Lane 是可恢复的逻辑槽。成功 Lane 指向不可变的 Producer Turn 结果；Turn 失败时
+Lane 仍保持 open，并显示为 `needs-attention`。Leader 对精确失败 Turn 执行重试或
+显式结算：
 
-每个新阶段还会冻结一份 Resource Broker 契约：token、工具调用和墙钟预算，
-quorum 与 deadline，straggler 窗口，以及继续增加 Lane 所需的最低边际价值。
-省略这些参数时使用独立的执行成本默认值与 runtime-health 时间窗；同一阶段的 retry
-累计原有花费并共享绝对 deadline。执行、Lane retry 和 Reviewer panel 准入统一核算
-Home、Task、WorkItem、Group、Provider、Agent 和模型层级的活动 Lane；容量不足的
-Lane 会耐久保留为 pending，不会把整个 Group 判失败。容量释放或 deadline 到达会沿
-既有 actionability 路径唤醒 Leader，重跑同一 dispatch 即按冻结输入继续。释放的
-容量优先留给最早且当前可准入的等待 Lane；受 Provider 或 Agent 限制的队首
-不会阻塞独立资源域继续推进。Provider 限流仍沿用既有的原地重试窗口，不会扩散成
-兄弟 Lane 失败。
+```sh
+yui task turn retry <task-id>/<failed-turn-id>
+yui task turn settle <task-id>/<failed-turn-id>
+```
 
-Leader 可在接受 Group 时增加 `--early-stop <0-100>`。只有 quorum 已满足且 T5 的
-Verify/Resolve 证据证明验收充分时，Yui 才允许提前终止；它只跳过从未启动的 Lane，
-运行中的 straggler 会被报告并保留，不会因为省费被自动杀死。证据不足时，预算或
-deadline 耗尽会把阶段留给 Leader 决议，绝不会把薄证据转换成成功。
-
-新建探索历史还会冻结结构化候选收敛契约。Yui 将当前阶段的精确 JSON 形状追加到
-每个 Lane assignment，并在 Leader 推进前校验入选报告：Compare 必须显式划分
-重复簇，并以直接来源、可执行检查或冻结产物支持每条入选路线；Synthesize 对调研
-使用 claim/evidence 表、对架构使用决策矩阵、对代码只选择一个冻结 Git snapshot。
-Verify 必须使用与入选 Synthesize 作者不同的 Role。只有逐条验收证据完整时才能得到
-`passed` 并由 Resolve 接受 Candidate；显式 gap 只能形成 `next-round`，再通过有界的
-Resolve `retry` 继续。票数和衍生分析可以作为报告上下文，但不能替代直接证据。
+Yui 会等待所有 Lane 结算。至少两个 Producer 成功结果才会为 WorkItem assignee
+幂等创建一个主 Turn；成功数不足时本次 WorkItem 尝试失败，不会降级使用单个结果。
+主 Turn 重试继续引用同一来源 Group，也不会重跑成功 Lane。只有成功的主 Turn 能
+形成 Review 与 Integration 使用的 Candidate。`task work show`、`task work list`、
+Task context 和 Web 控制室从相同持久事实推导执行形态、恢复目标、综合资格、主 Turn、
+Candidate 溯源、下一步及责任人。缺失事实保持 `unknown` 或 `unobserved`；token、
+耗时和工具调用只读展示，不参与调度、恢复或生命周期决策。
 
 每个 Agent binding 只有一套 adapter-specific 权限枚举配置：`default` 遵循
 provider 默认行为；`bypass` 编译 provider 支持的 bypass flag；`configured`

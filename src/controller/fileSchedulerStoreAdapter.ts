@@ -172,6 +172,7 @@ import {
 } from "../runtime/runtimeObservation.js";
 import { projectRuntimeTaskEvents } from "../runtime/runtimeProjection.js";
 import { contextSnapshotRef } from "../context/contextSnapshot.js";
+import { snapshotExecutionLaneWorkspaceSync } from "../repository/executionLaneGitSnapshot.js";
 import {
   contextSnapshotDeltaRefIds,
   freezeTurnContextSnapshot
@@ -219,7 +220,8 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
   constructor(
     readonly store: TaskStore,
     private readonly telemetry: SchedulerTelemetry | null = null,
-    private readonly drivers: AgentDriverRegistry = builtinAgentDriverRegistry()
+    private readonly drivers: AgentDriverRegistry = builtinAgentDriverRegistry(),
+    private readonly snapshotExecutionLaneWorkspace = snapshotExecutionLaneWorkspaceSync
   ) {}
 
   freezeLeaderContextSnapshot(taskId: string, roleName: string, now: Date) {
@@ -1547,9 +1549,9 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
    * the Leader wakeup. A terminal job without its wakeup enqueued is a lost
    * wakeup, so the two writes commit together or not at all.
    *
-   * f6: The wakeup targets the Leader role mailbox (not the Task mailbox)
-   * and also queues a pending wakeup so processLeaderWakeups dispatches
-   * the Leader Turn with the exact job-finished reason.
+   * f6: The wakeup targets the Leader role mailbox (not the Task mailbox).
+   * That mailbox is also the PendingWakeup authority consumed by
+   * processLeaderWakeups, so the signal must be enqueued exactly once.
    */
   transitionDurableJob(
     taskId: string,
@@ -1571,7 +1573,6 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
           now,
           [...wakeup.refs]
         );
-        queueLeaderWakeup(store, taskId, wakeup.reason, now);
       }
       return next;
     });
@@ -2472,6 +2473,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
           try {
             const parsed = parseReviewResultReport(input.summary);
             reviewResult = {
+              summary: parsed.summary,
               report: parsed.report,
               checks: parsed.checks,
               ...(parsed.findings === undefined ? {} : { findings: parsed.findings }),
@@ -2487,7 +2489,17 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
                 : { deltaReasoning: parsed.deltaReasoning })
             };
           } catch {
-            reviewResult = { report: input.summary, checks: [] };
+            reviewResult = { summary: input.summary, report: input.summary, checks: [] };
+          }
+        }
+        if (observedTurn.purpose === "execution"
+          && observedTurn.executionGroupId !== undefined
+          && observedTurn.executionLaneId !== undefined
+          && observedTurn.workspace !== undefined
+          && providerStatus === "completed") {
+          const gitSnapshot = this.snapshotExecutionLaneWorkspace(store, observedTurn.workspace);
+          if (gitSnapshot !== undefined) {
+            reviewResult = { ...(reviewResult ?? {}), gitSnapshot };
           }
         }
         const terminalized = terminalizeExactTaskTurn(store, {
@@ -2541,7 +2553,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
         );
         store.saveEvent(input.taskId, event);
         if (terminalTurn.roleName !== "leader"
-          && (providerStatus !== "completed" || !providerGoalContinues(binding.goal))) {
+          && (terminalTurn.status !== "completed" || !providerGoalContinues(binding.goal))) {
           routeRoleEvent(
             store,
             event,

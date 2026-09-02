@@ -14,7 +14,10 @@ import {
   type ExecutionGroupSummary
 } from "../execution/executionGroup.js";
 import type { ExecutionGroupHealthSummary } from "../execution/executionHealth.js";
-import { currentWorkItemExecutionGroup } from "../workItem/workItem.js";
+import {
+  projectWorkItemExecution,
+  type WorkItemExecutionProjection
+} from "../execution/workItemExecutionProjection.js";
 import { operationalTaskRecords } from "../task/taskRecordRetirement.js";
 import { projectReviewDecision } from "../review/reviewDecision.js";
 import type { TaskReviewCandidate } from "../review/reviewRound.js";
@@ -364,12 +367,7 @@ export function runTaskContextCommand(
               : [renderWorkItemObservability(
                   observability.workItems.find(({ workItemId }) => workItemId === item.id)!
                 )]),
-            ...(currentWorkItemExecutionGroup(item) === undefined
-              ? []
-              : renderExecutionGroup(
-                  currentWorkItemExecutionGroup(item)!,
-                  executionGroupsById.get(currentWorkItemExecutionGroup(item)!.id)
-                )),
+            ...renderWorkItemExecution(projectWorkItemExecution(item, turns, roleSessionSets)),
             ...(item.acceptance.length === 0
               ? []
               : [`    Acceptance: ${item.acceptance.map(compactText).join("; ")}`]),
@@ -755,6 +753,24 @@ function renderExecutionGroup(
   ];
 }
 
+function renderWorkItemExecution(projection: WorkItemExecutionProjection): string[] {
+  return [
+    `    WorkItem execution [${projection.shape}]${projection.groupId === undefined ? "" : `: ${projection.groupId}`}`,
+    ...projection.lanes.map((lane) => (
+      `      Lane ${lane.laneId} (#${lane.ordinal}, ${lane.roleName}) [${lane.status}]: `
+      + `turn=${lane.currentTurnId ?? "unknown"}; session=${lane.session}; `
+      + `retry=${lane.retryTurnId ?? "none"}; settle=${lane.settleTurnId ?? "none"}`
+    )),
+    `      Synthesis: ${projection.synthesis.status} (${projection.synthesis.successfulLaneCount}/${projection.synthesis.requiredSuccessfulLaneCount} successful)`,
+    `      Main Turn: ${projection.mainTurn.turnId ?? "unobserved"} [${projection.mainTurn.status}]; session=${projection.mainTurn.session}`,
+    `      Candidate source: ${projection.candidate.candidateId ?? "none"} [${projection.candidate.status}]; main=${projection.candidate.mainTurnId ?? "unobserved"}`,
+    ...(projection.candidate.sourceExecutionGroupId === undefined
+      ? []
+      : [`      Provenance: ${projection.candidate.mainTurnId ?? "unobserved"} -> ${projection.candidate.sourceExecutionGroupId} -> ${projection.candidate.successfulLaneTurns.map(({ laneId, successfulTurnId }) => `${laneId} -> ${successfulTurnId}`).join(", ") || "unobserved"}`]),
+    `      Next: ${projection.nextAction.kind}; owner=${projection.nextAction.owners.join(", ") || "none"}; target=${projection.nextAction.targetIds.join(", ") || "none"}`
+  ];
+}
+
 function resourceUsageLabel(
   used: number,
   remaining: number | undefined,
@@ -767,8 +783,5 @@ function resourceUsageLabel(
 function renderWorkItemObservability(
   item: WorkItemObservabilityProjection
 ): string {
-  const stages = item.stages.map((stage) => (
-    `${stage.stage ?? "single"}${stage.round === undefined ? "" : `#${stage.round}`}${stage.stageAttempt === undefined ? "" : `/a${stage.stageAttempt}`}`
-  )).join(", ");
-  return `    Observability: stages=${stages || "none"}; tokens=${item.cost.tokens}; tools=${item.cost.toolCalls}; wall=${item.cost.wallClockSeconds}s; retries=${item.cost.retryCount}; snapshots=${item.context.snapshotCount}; evidence=${item.evidenceCount}; open-findings=${item.openFindingCount}; compression=${item.context.compressionStatus}`;
+  return `    Observability (read-only): tokens=${item.cost.tokensObservable ? item.cost.tokens : "unobserved"}; tools=${item.cost.toolCallsObservable ? item.cost.toolCalls : "unobserved"}; wall=${item.cost.wallClockSeconds}s; retries=${item.cost.retryCount}; snapshots=${item.context.snapshotCount}; evidence=${item.evidenceCount ?? "unobserved"}; open-findings=${item.openFindingCount ?? "unobserved"}; compression=${item.context.compressionStatus}`;
 }
