@@ -1682,7 +1682,8 @@ test("Leader replicated Lanes derive from Task main without a WorkItem workspace
       ensureCalls.push(input);
       return {
         path: laneRoots[ensureCalls.length - 1],
-        branch: `yui/task-1/lane-${ensureCalls.length}`
+        branch: `yui/task-1/lane-${ensureCalls.length}`,
+        baseCommit: currentHead
       };
     }
   };

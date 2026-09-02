@@ -1176,6 +1176,9 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
             roleName: managedWorktreeName(owner),
             baseRef: inputHead
           });
+          if (physical.baseCommit !== inputHead) {
+            throw new Error(`Execution Lane physical input head changed: ${executionLaneId}/${project.id}.`);
+          }
           prepared.push({
             project,
             entry: {
