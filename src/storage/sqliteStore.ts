@@ -146,7 +146,7 @@ import {
   TELEMETRY_KEEP_PER_GENERATION,
   TELEMETRY_TURN_CAP
 } from "./sqliteSchema.js";
-import { inspectStorageSchema } from "./storageSchema.js";
+import { inspectStorageSchema, StorageSchemaError } from "./storageSchema.js";
 
 /** Options for {@link SqliteTaskStore}. */
 export type SqliteTaskStoreOptions = Readonly<{
@@ -263,6 +263,10 @@ export class SqliteTaskStore implements TaskStore {
     mkdirSync(rootDir, { recursive: true, mode: 0o700 });
     const filename = _options.databaseFilename ?? "yui.db";
     const databasePath = join(rootDir, filename);
+    // Remember whether the database file existed before this connection opened
+    // it. A store that creates the file is bootstrapping a fresh database and
+    // may seed its singleton rows; a store that opens an existing file missing
+    // those rows has found corruption, not a bootstrap opportunity.
     const databaseExisted = existsSync(databasePath);
     this.#db = new Database(databasePath);
     try {
@@ -280,8 +284,7 @@ export class SqliteTaskStore implements TaskStore {
         version: schema.currentVersion,
         checksum: schema.currentChecksum
       };
-      this.#seedHomeMeta();
-      this.#seedConfig();
+      this.#ensureSeedRows(databaseExisted);
     } catch (error) {
       this.#db.close();
       throw error;
@@ -301,6 +304,35 @@ export class SqliteTaskStore implements TaskStore {
   databaseHandle(): Database.Database { return this.#db; }
 
   // -- transaction primitives -------------------------------------------------
+
+  /**
+   * Guarantee the `home_meta` and `config` singleton rows exist.
+   *
+   * A fresh database created by this connection is bootstrapped with defaults.
+   * An existing database that is missing either row is corrupt —
+   * truncated, partially migrated, or hand-edited — and must fail closed
+   * instead of silently masking the damage with fresh defaults (Issue 01
+   * cross-issue handoff: INSERT OR IGNORE could hide migration corruption).
+   */
+  #ensureSeedRows(databaseExisted: boolean): void {
+    const hasHomeMeta = this.#db.prepare("SELECT 1 FROM home_meta WHERE id = 1").get() !== undefined;
+    const hasConfig = this.#db.prepare("SELECT 1 FROM config WHERE id = 1").get() !== undefined;
+    if (hasHomeMeta && hasConfig) return;
+    if (databaseExisted) {
+      const missing = [
+        !hasHomeMeta ? "home_meta" : null,
+        !hasConfig ? "config" : null
+      ].filter((value): value is string => value !== null).join(", ");
+      throw new StorageSchemaError(
+        "STORAGE_SCHEMA_INVALID",
+        `SQLite database is corrupt: required singleton row(s) missing (${missing}). `
+        + "The database may be truncated or partially migrated. Restore yui.db from a "
+        + "backup, or preserve this Home for diagnosis and initialize a new Home."
+      );
+    }
+    if (!hasHomeMeta) this.#seedHomeMeta();
+    if (!hasConfig) this.#seedConfig();
+  }
 
   #seedHomeMeta(): void {
     const now = new Date().toISOString();
@@ -2519,6 +2551,21 @@ export class SqliteTaskStore implements TaskStore {
         `INSERT INTO messages (task_id, message_id, seq, payload, created_at) VALUES (?, ?, ?, ?, ?)`
       ).run(taskId, message.id, seq, this.#json(message), message.createdAt);
       this.#observeHighWater(taskId, "message", seq);
+    });
+  }
+
+  updateMessage(taskId: string, message: TaskMessage): void {
+    if (message.taskId !== taskId) {
+      throw new StorageRecordError(`Message belongs to another Task: ${message.taskId}`);
+    }
+    this.#requireTask(taskId);
+    this.#mutate(() => {
+      const result = this.#db.prepare(
+        `UPDATE messages SET payload = ? WHERE task_id = ? AND message_id = ?`
+      ).run(this.#json(message), taskId, message.id);
+      if (result.changes !== 1) {
+        throw new StorageRecordError(`Message does not exist: ${taskId}/${message.id}`);
+      }
     });
   }
 

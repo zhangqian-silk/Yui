@@ -58,6 +58,8 @@ import { runControllerSchedulerPass } from "../../dist/controller/controller.js"
 import { createAsyncRuntimeObserver } from "../../dist/controller/runtimeEventProcessor.js";
 import { FileRuntimeEventInbox } from "../../dist/controller/runtimeEventInbox.js";
 import { runRuntimeObservationHookCommand } from "../../dist/controller/runtimeObservationHook.js";
+import { callFileTaskController } from "../../dist/controller/clientRuntime.js";
+import { startControllerServer } from "../../dist/core/controllerServer.js";
 import { createTurn, validateTurn } from "../../dist/turn/turn.js";
 import { createTurnInput } from "../../dist/context/turnInputContract.js";
 import { processActiveRoleTurnDeliveries } from "../../dist/scheduler/activeRoleTurnDelivery.js";
@@ -70,7 +72,7 @@ import {
 import { buildTaskExecutionProjection } from "../../dist/scheduler/taskExecutionProjection.js";
 import { projectNextAction } from "../../dist/task/nextAction.js";
 import { listPublicCommandPaths } from "../../dist/cli/commandCatalog.js";
-import { acquireHandoverLock } from "../../dist/release/runtimeRelease.js";
+import { acquireHandoverLock, readHandoverFence } from "../../dist/release/runtimeRelease.js";
 import { SqliteTaskStore } from "../../dist/storage/sqliteStore.js";
 import * as taskStoreContract from "../../dist/storage/taskStore.js";
 import { ensureStorageSchema } from "../../dist/storage/storageSchema.js";
@@ -1351,6 +1353,34 @@ test("a packaged Controller restart inherits its direct parent's handover", (t) 
   assert.equal(restarted.ok, true);
   assert.equal(restarted.data.restarted, true);
   assert.ok(Number.isInteger(restarted.data.pid) && restarted.data.pid > 0);
+});
+
+test("Controller begin-handover accepts a null fromReleaseId", async (t) => {
+  const home = mkdtempSync(join(tmpdir(), "yui-controller-null-handover-smoke-"));
+  t.after(() => rmSync(home, { recursive: true, force: true }));
+  ensureStorageSchema(home);
+  new SqliteTaskStore(home).close();
+  const controller = await startControllerServer(home, undefined, undefined, {
+    release: null,
+    storageBackend: "sqlite",
+    workerEnabled: false
+  });
+  try {
+    const handoverId = "handover-null-from-release";
+    const toReleaseId = `0.14.2-${"a".repeat(64)}`;
+    const result = await callFileTaskController(home, "controller.begin-handover", {
+      handoverId,
+      fromReleaseId: null,
+      toReleaseId
+    });
+    assert.equal(result.handoverId, handoverId);
+    assert.equal(result.phase, "fenced");
+    assert.equal(readHandoverFence(home).fromReleaseId, null);
+    await callFileTaskController(home, "controller.rollback-handover", { handoverId });
+  } finally {
+    await controller.close();
+    await controller.closed;
+  }
 });
 
 test("production storage exposes only the current contract", () => {

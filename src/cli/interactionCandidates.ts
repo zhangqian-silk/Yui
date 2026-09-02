@@ -130,6 +130,13 @@ export async function getSelectionCandidates(
         ["id", "title", "createdAt"]
       );
     }
+    case "messages":
+      return entities(
+        "message",
+        "Select Task message",
+        qualifyTaskRecords(await listAllMessages(ports)),
+        ["qualifiedId", "kind", "createdAt", "body"]
+      );
     case "task-events": {
       const taskId = dependencyValue(selector, args);
       if (taskId === undefined) return null;
@@ -209,6 +216,15 @@ async function listAllWorkItems(ports: SelectionPorts): Promise<Entity[]> {
   const groups = await Promise.all(tasks.flatMap((task) => {
     const taskId = stringField(task, "id");
     return taskId === undefined ? [] : [list(ports, "task.work.list", { taskId })];
+  }));
+  return groups.flat();
+}
+
+async function listAllMessages(ports: SelectionPorts): Promise<Entity[]> {
+  const tasks = await list(ports, "task.list", {});
+  const groups = await Promise.all(tasks.flatMap((task) => {
+    const taskId = stringField(task, "id");
+    return taskId === undefined ? [] : [list(ports, "task.message.list", { taskId })];
   }));
   return groups.flat();
 }

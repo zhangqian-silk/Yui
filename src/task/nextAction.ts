@@ -43,6 +43,7 @@ import {
 import type { TaskEvent } from "../event/taskEvent.js";
 import type { ReviewConfig } from "../review/reviewConfig.js";
 import type { Task } from "./task.js";
+import { draftWorkItemDependencyIssue } from "./draftPlan.js";
 import {
   currentWorkItemCandidate,
   currentWorkItemExecutionGroup,
@@ -146,6 +147,7 @@ const OPEN_WORK_ITEM_STATUSES = new Set(["pending", "running", "awaiting_accepta
 
 export function projectNextAction(facts: NextActionFacts): NextAction {
   const { task } = facts;
+  const deliveryWorkItems = facts.workItems.filter(({ status }) => status !== "retired");
   if (task.status !== "active" && task.status !== "draft") {
     return buildAction(facts, {
       kind: "complete-task",
@@ -215,6 +217,48 @@ export function projectNextAction(facts: NextActionFacts): NextAction {
   }
 
   if (task.status === "draft") {
+    const dependencyIssue = draftWorkItemDependencyIssue(facts.workItems);
+    if (dependencyIssue !== undefined) {
+      const refs = [
+        ref("work-item", dependencyIssue.workItemId),
+        ref("work-item", dependencyIssue.dependencyId)
+      ];
+      return buildAction(facts, {
+        kind: "repair-protocol-inconsistency",
+        reason: dependencyIssue.kind === "cycle"
+          ? `Draft Work Item dependency cycle includes ${dependencyIssue.workItemId}/${dependencyIssue.dependencyId}. Edit the Draft before activation.`
+          : `Draft Work Item ${dependencyIssue.workItemId} depends on ${dependencyIssue.dependencyId}, which is missing or retired. Edit the Draft before activation.`,
+        refs,
+        conflicts: refs,
+        preconditions: [
+          {
+            fact: `Draft dependency ${dependencyIssue.dependencyId} is valid`,
+            satisfied: false,
+            ref: refs[1]
+          }
+        ],
+        recommendedCommand:
+          `yui task work edit ${task.id}/${dependencyIssue.workItemId} --clear-dependencies`
+      });
+    }
+    const draftWork = selectOpenWorkItem(facts.workItems);
+    if (draftWork.kind === "blocked") {
+      const refs = [
+        ref("work-item", draftWork.itemId),
+        ref("work-item", draftWork.blockedBy)
+      ];
+      return buildAction(facts, {
+        kind: "repair-protocol-inconsistency",
+        reason: `Draft Work Item ${draftWork.itemId} depends on ${draftWork.blockedBy}, which is missing, retired, or not completed. Edit the Draft before activation.`,
+        refs,
+        conflicts: refs,
+        preconditions: [
+          { fact: `Draft dependency ${draftWork.blockedBy} is valid`, satisfied: false, ref: refs[1] }
+        ],
+        recommendedCommand:
+          `yui task work edit ${task.id}/${draftWork.itemId} --clear-dependencies`
+      });
+    }
     return buildAction(facts, {
       kind: "implement-current-work-item",
       reason: `Task ${task.id} is still a Draft; activate it before dispatching, integrating, reviewing, or completing work.`,
@@ -459,7 +503,7 @@ export function projectNextAction(facts: NextActionFacts): NextAction {
     });
   }
 
-  if (facts.workItems.length === 0
+  if (deliveryWorkItems.length === 0
     && !taskFinalReviewRequired(facts)
     && !facts.reviewRounds.some((round) => (
       (round.scope ?? "work-item") === "task"
@@ -705,18 +749,18 @@ export function projectNextAction(facts: NextActionFacts): NextAction {
     const reviewerRole = taskFinalReviewRole(facts);
     return buildAction(facts, {
       kind: "request-final-review",
-      reason: facts.workItems.length === 0
+      reason: deliveryWorkItems.length === 0
         ? "This Task already owns a final-Review obligation; completion must prepare or resume a Review of its frozen Task head."
         : "All WorkItems are integrated but no valid Task-final Review attests the frozen Task result.",
       refs: [ref("task", task.id)],
-      preconditions: facts.workItems.length === 0
+      preconditions: deliveryWorkItems.length === 0
         ? [{ fact: "Valid established Task-final Review at the direct head", satisfied: false }]
         : [
             { fact: "All Work Items are terminal", satisfied: true },
             { fact: "Every governing ChangeSet is settled", satisfied: true },
             { fact: "Valid Task-final Review at the integrated head", satisfied: false }
           ],
-      recommendedCommand: facts.workItems.length === 0
+      recommendedCommand: deliveryWorkItems.length === 0
         ? `yui task complete ${task.id} --summary-file -`
         : `yui task review request ${task.id} --role ${reviewerRole ?? "<reviewer-role>"}`
     });
@@ -739,7 +783,7 @@ export function projectNextAction(facts: NextActionFacts): NextAction {
     : [];
   return buildAction(facts, {
     kind: "complete-task",
-    reason: facts.workItems.length === 0
+    reason: deliveryWorkItems.length === 0
       ? "The Leader-owned Task result and its established obligations are ready; complete it without creating successor work."
       : "Every independent delivery unit is integrated; complete the Task instead of creating successor work.",
     refs: [ref("task", task.id)],
@@ -747,7 +791,7 @@ export function projectNextAction(facts: NextActionFacts): NextAction {
       { fact: "All Work Items are terminal", satisfied: true },
       ...(task.projectBindings.length === 0
         ? []
-        : facts.workItems.length === 0
+        : deliveryWorkItems.length === 0
           ? [{ fact: "Task main is clean, committed, and verified", satisfied: false }]
           : [
             { fact: "Every governing ChangeSet is settled", satisfied: true },
@@ -1336,7 +1380,9 @@ function hasValidFinalReview(facts: NextActionFacts): boolean {
           .filter((changeSet) => attempt.changeSetIds.includes(changeSet.id))
           .map((changeSet) => changeSet.headCommit))
   );
-  if (integratedHeads.size === 0) return facts.workItems.length === 0;
+  if (integratedHeads.size === 0) {
+    return facts.workItems.every(({ status }) => status === "retired");
+  }
   for (const head of integratedHeads) {
     if (!reviewedCommits.has(head)) return false;
   }

@@ -37,6 +37,11 @@ export type TaskMessageContext = Readonly<{
   wakePolicy?: "leader" | "none";
 }>;
 
+export type TaskMessageDraftUpdate = Readonly<{
+  body: string;
+  wakePolicy?: "leader" | "none";
+}>;
+
 export function createTaskMessage(
   id: string,
   taskId: string,
@@ -71,6 +76,26 @@ export function createTaskMessage(
 
 export function taskMessageAuthorLabel(author: TaskMessageAuthor): string {
   return author.type === "role" ? author.roleName : author.type;
+}
+
+/** Replace only the mutable content of a Draft user/operator Message. */
+export function updateDraftTaskMessage(
+  message: TaskMessage,
+  update: TaskMessageDraftUpdate
+): TaskMessage {
+  validateTaskMessage(message);
+  if (message.kind !== "user" && message.kind !== "operator") {
+    throw new Error(`Only user/operator Task Messages can be updated: ${message.id}.`);
+  }
+  const updated: TaskMessage = {
+    ...message,
+    body: requireBody(update.body),
+    ...(update.wakePolicy === undefined
+      ? {}
+      : { wakePolicy: update.wakePolicy })
+  };
+  validateTaskMessage(updated);
+  return updated;
 }
 
 export function validateTaskMessage(message: TaskMessage): void {

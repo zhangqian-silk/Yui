@@ -379,6 +379,7 @@ export type TaskStore = {
   ): void;
   nextMessageId(taskId: string): string;
   saveMessage(taskId: string, message: TaskMessage): void;
+  updateMessage(taskId: string, message: TaskMessage): void;
   listMessages(taskId: string): TaskMessage[];
   nextInputRequestId(taskId: string): string;
   saveInputRequest(taskId: string, request: InputRequest): void;

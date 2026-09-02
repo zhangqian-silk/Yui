@@ -462,7 +462,7 @@ const taskChildren: readonly NodeInput[] = [
   {
     name: "message",
     summary: "Manage durable Task messages.",
-    sections: [{ id: "manage", title: "Commands", entries: ["send", "list", "retire"] }],
+    sections: [{ id: "manage", title: "Commands", entries: ["send", "list", "update", "retire"] }],
     children: [
       {
         name: "send",
@@ -479,6 +479,16 @@ const taskChildren: readonly NodeInput[] = [
         summary: "List Task messages.",
         usage: "yui task message list <id> [--after <timestamp>] [--limit <n>]",
         options: ["--after", "--limit"]
+      },
+      {
+        name: "update",
+        summary: "Replace the mutable body and wake policy of a Draft user/operator Message.",
+        usage: "yui task message update <task>/<message> (<body>|--body-file <path|->) [--wake-policy leader|none]",
+        options: ["--body-file", "--wake-policy"],
+        optionValues: {
+          "--wake-policy": ["leader", "none"]
+        },
+        fileOptions: ["--body-file"]
       },
       {
         name: "retire",
@@ -693,7 +703,7 @@ const taskChildren: readonly NodeInput[] = [
       id: "manage",
       title: "Commands",
       entries: [
-        "create", "list", "show", "update", "scope", "dispatch", "isolate", "capture", "cleanup",
+        "create", "list", "show", "edit", "update", "scope", "dispatch", "isolate", "capture", "cleanup",
         "review", "group", "accept", "reject", "retire"
       ]
     }],
@@ -706,6 +716,16 @@ const taskChildren: readonly NodeInput[] = [
       },
       { name: "list", summary: "List work items for a Task.", usage: "yui task work list <task>" },
       { name: "show", summary: "Show one Work Item.", usage: "yui task work show <work>" },
+      {
+        name: "edit",
+        summary: "Replace mutable definition fields on an execution-free Draft WorkItem.",
+        usage: "yui task work edit <task>/<work> [--title <text>] [--objective <text>] [--accept <criterion> ...|--clear-acceptance] [--after <work> ...|--clear-dependencies] [--project <project> ...|--clear-projects] [--base-ref <project>=<ref> ...|--clear-base-refs] [--role <name>|--clear-role]",
+        options: [
+          "--title", "--objective", "--accept", "--clear-acceptance",
+          "--after", "--clear-dependencies", "--project", "--clear-projects",
+          "--base-ref", "--clear-base-refs", "--role", "--clear-role"
+        ]
+      },
       {
         name: "update",
         summary: "Update a work item's state.",

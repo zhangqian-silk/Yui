@@ -137,6 +137,7 @@ export function runTaskContextCommand(
   const timeZone = store.getConfig().timeZone;
   const displayedActiveDecisions = activeDecisions.slice(-RECENT_RECORD_LIMIT);
   const displayedWorkItems = currentAndRecentWorkItems(workItems);
+  const currentWorkItems = workItems.filter(({ status }) => status !== "retired");
   const displayedOpenInputRequests = openInputRequests.slice(-RECENT_RECORD_LIMIT);
   const displayedResolvedInputRequests = resolvedInputRequests.slice(-RECENT_RECORD_LIMIT);
   const displayedActiveTurns = execution.activeTurns;
@@ -231,12 +232,12 @@ export function runTaskContextCommand(
           } writable / ${workspace.entries.length} Projects)`
         ))),
     `Type: ${task.type ?? "unspecified"}`,
-    `Execution topology: ${workItems.length === 0
+    `Execution topology: ${currentWorkItems.length === 0
       ? "Leader-owned Task main"
-      : `${workItems.length} independently owned WorkItem(s), integrated on Task main`}`,
+      : `${currentWorkItems.length} independently owned WorkItem(s), integrated on Task main`}`,
     `Completion evidence: ${task.projectBindings.length === 0
       ? "no Project evidence required"
-      : workItems.length === 0
+      : currentWorkItems.length === 0
         ? "clean committed Task main required"
         : "each delivered WorkItem requires a ChangeSet and committed Integration"}`,
     `Global review: ${reviewConfig === null
