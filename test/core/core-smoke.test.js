@@ -60,6 +60,7 @@ import { FileRuntimeEventInbox } from "../../dist/controller/runtimeEventInbox.j
 import { runRuntimeObservationHookCommand } from "../../dist/controller/runtimeObservationHook.js";
 import { callFileTaskController } from "../../dist/controller/clientRuntime.js";
 import { startControllerServer } from "../../dist/core/controllerServer.js";
+import { terminalizeExactTaskTurn } from "../../dist/lifecycle/exactTurnTerminalization.js";
 import { createTurn, validateTurn } from "../../dist/turn/turn.js";
 import { createTurnInput } from "../../dist/context/turnInputContract.js";
 import { processActiveRoleTurnDeliveries } from "../../dist/scheduler/activeRoleTurnDelivery.js";
@@ -1320,6 +1321,160 @@ test("Task execution stop/start atomically controls scheduler admission", (t) =>
   assert.equal(store.getTurn(task.id, disposableRun.id).status, "active");
   assert.equal(store.getActiveTurn(task.id, leader.name).id, disposableRun.id);
   assert.equal(store.getWorkItem(task.id, completedItem.id).status, "completed");
+});
+
+test("direct and replicated WorkItem execution converge through exact Lane retry", (t) => {
+  const home = mkdtempSync(join(tmpdir(), "yui-work-item-execution-smoke-"));
+  t.after(() => rmSync(home, { recursive: true, force: true }));
+  ensureStorageSchema(home);
+  const store = new SqliteTaskStore(home);
+  t.after(() => store.close());
+  const startedAt = new Date("2026-09-02T00:00:00.000Z");
+  const task = activateTask(createTask("task-1", "Execute WorkItems", startedAt, {
+    cwd: home
+  }), startedAt);
+  store.saveTask(task);
+  store.saveManagedWorkspace(createManagedWorkspace({
+    owner: { type: "task", taskId: task.id },
+    root: home,
+    entries: []
+  }, startedAt));
+  const binding = createRoleAgentBinding({ id: "codex", adapterId: "codex" });
+  for (const roleName of ["leader", "producer-a", "producer-b"]) {
+    store.saveRole(task.id, createRole(
+      task.id,
+      roleName,
+      [binding],
+      binding.agentId,
+      home,
+      startedAt
+    ));
+  }
+  const finish = (turn, status, now) => {
+    const result = store.transaction((tx) => terminalizeExactTaskTurn(tx, {
+      taskId: task.id,
+      roleName: turn.roleName,
+      agentId: turn.effective.agentId,
+      turnId: turn.id,
+      outcome: {
+        status,
+        summary: status === "completed" ? `${turn.roleName} completed.` : `${turn.roleName} failed.`,
+        ...(status === "failed" ? { failureReason: "runtime-failed" } : {})
+      },
+      ...(turn.executionLaneId === undefined || status === "failed"
+        ? {}
+        : {
+            reviewResult: {
+              summary: `${turn.roleName} result.`,
+              checks: [{ name: "core", outcome: "passed" }]
+            }
+          })
+    }, now));
+    assert.equal(result.disposition, "applied");
+  };
+
+  const directItem = createWorkItem("work-item-1", task.id, {
+    title: "Direct execution",
+    assignee: "leader"
+  }, startedAt);
+  store.saveWorkItem(task.id, directItem);
+  assert.throws(() => runTaskCommand(
+    ["work", "dispatch", `${task.id}/${directItem.id}`],
+    store,
+    {
+      now: () => startedAt,
+      environment: {
+        ...bareEnv,
+        YUI_SESSION_SCOPE: "task",
+        YUI_TASK_ID: task.id,
+        YUI_ROLE: "producer-a"
+      }
+    }
+  ), /matching Leader/u);
+  assert.deepEqual(store.listTurns(task.id), []);
+  runTaskCommand(
+    ["work", "dispatch", `${task.id}/${directItem.id}`],
+    store,
+    { now: () => startedAt, environment: bareEnv }
+  );
+  const directTurn = store.getActiveTurn(task.id, "leader");
+  assert.equal(directTurn.executionGroupId, undefined);
+  assert.equal(directTurn.sourceExecutionGroupId, undefined);
+  finish(directTurn, "completed", new Date("2026-09-02T00:01:00.000Z"));
+
+  const groupedItem = createWorkItem("work-item-2", task.id, {
+    title: "Replicated execution",
+    assignee: "leader"
+  }, startedAt);
+  store.saveWorkItem(task.id, groupedItem);
+  const groupId = `execution-group-${store.peekNextTurnId(task.id)}`;
+  const laneWorkspaces = new Map([1, 2].map((ordinal) => {
+    const laneId = `${groupId}-lane-${ordinal}`;
+    return [laneId, createManagedWorkspace({
+      owner: {
+        type: "execution-lane",
+        taskId: task.id,
+        executionGroupId: groupId,
+        executionLaneId: laneId,
+        purpose: "execution",
+        workItemId: groupedItem.id
+      },
+      root: join(home, `lane-${ordinal}`),
+      entries: []
+    }, startedAt)];
+  }));
+  runTaskCommand([
+    "work", "dispatch", `${task.id}/${groupedItem.id}`,
+    "--lane-role", "producer-a",
+    "--lane-role", "producer-b"
+  ], store, {
+    now: () => new Date("2026-09-02T00:02:00.000Z"),
+    environment: bareEnv,
+    executionLaneWorkspaces: laneWorkspaces
+  });
+  const producerA = store.getActiveExecutionLaneTurn(task.id, groupId, `${groupId}-lane-1`);
+  const producerB = store.getActiveExecutionLaneTurn(task.id, groupId, `${groupId}-lane-2`);
+  finish(producerA, "completed", new Date("2026-09-02T00:03:00.000Z"));
+  stopTaskExecutionCommand(
+    { taskId: task.id, reason: "Exercise exact Lane recovery" },
+    store,
+    { now: () => new Date("2026-09-02T00:04:00.000Z"), environment: bareEnv }
+  );
+  assert.equal(store.getTurn(task.id, producerB.id).status, "failed");
+  assert.equal(
+    store.getWorkItem(task.id, groupedItem.id).executionGroups.at(-1).lanes[1].disposition,
+    "open"
+  );
+  startTaskExecutionCommand(task.id, store, {
+    now: () => new Date("2026-09-02T00:04:30.000Z"),
+    environment: bareEnv
+  });
+
+  const execution = buildTaskExecutionProjection(store, task.id);
+  const next = projectNextAction({
+    ...store.readNextActionFacts(task.id),
+    executionGroups: execution.executionGroups
+  });
+  assert.equal(next.kind, "retry-execution-lane");
+  assert.equal(next.recommendedCommand, `yui task turn retry ${task.id}/${producerB.id}`);
+  runTaskCommand(
+    ["turn", "retry", `${task.id}/${producerB.id}`],
+    store,
+    { now: () => new Date("2026-09-02T00:05:00.000Z"), environment: bareEnv }
+  );
+  const retriedProducer = store.getActiveExecutionLaneTurn(
+    task.id,
+    groupId,
+    `${groupId}-lane-2`
+  );
+  assert.notEqual(retriedProducer.id, producerB.id);
+  finish(retriedProducer, "completed", new Date("2026-09-02T00:06:00.000Z"));
+
+  const mainTurn = store.getActiveTurn(task.id, "leader");
+  assert.equal(mainTurn.workItemId, groupedItem.id);
+  assert.equal(mainTurn.sourceExecutionGroupId, groupId);
+  assert.equal(mainTurn.executionGroupId, undefined);
+  assert.match(mainTurn.inputs[0].input.directive, new RegExp(groupId, "u"));
 });
 
 test("a packaged Controller restart inherits its direct parent's handover", (t) => {

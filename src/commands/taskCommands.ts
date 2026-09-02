@@ -2767,6 +2767,7 @@ function dispatchWork(
   const dispatch = store.transaction((tx) => {
     const item = requireWorkItem(tx, parsed.positionals[0], options);
     const task = requireTask(tx, item.taskId);
+    taskActor(tx, options, task.id);
     if (task.status !== "active") throw usageError(inactiveTaskMessage(task, "dispatch"));
     if (item.assignee === undefined) {
       throw usageError(
@@ -2878,6 +2879,11 @@ function dispatchWork(
       return { kind: "direct" as const, turns: [withContext] };
     }
     const groupId = `execution-group-${tx.peekNextTurnId(task.id)}`;
+    if (workItemForDispatch !== item) {
+      // Freeze the Assignment against the retried WorkItem revision. The
+      // aggregate transaction rolls this back if a later precondition fails.
+      tx.saveWorkItem(task.id, workItemForDispatch);
+    }
     const assignmentContext = contextSnapshotRef(freezeWorkItemExecutionAssignmentContextSnapshot(tx, {
       taskId: task.id,
       workItemId: item.id,

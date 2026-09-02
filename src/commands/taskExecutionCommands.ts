@@ -1,6 +1,5 @@
 import { createTaskEvent } from "../event/taskEvent.js";
 import { recordExecutionLaneResult } from "../execution/executionGroup.js";
-import { updateWorkItemExecutionLane } from "../execution/workItemExecution.js";
 import { usageError } from "../errors/cliError.js";
 import { requestDurableJobCancel } from "../job/durableJob.js";
 import { finishReviewRound, updateReviewExecutionGroup } from "../review/reviewRound.js";
@@ -12,10 +11,6 @@ import {
   stopTaskExecution,
   type TaskCompletedBy
 } from "../task/task.js";
-import {
-  updateWorkItemExecutionGroup,
-  workItemExecutionGroupById
-} from "../workItem/workItem.js";
 import { taskActor } from "./taskActor.js";
 
 export type TaskExecutionStopRequest = Readonly<{
@@ -258,32 +253,11 @@ function failExecutionAttempts(
   now: Date
 ): void {
   const summary = `Task execution stopped: ${reason}`;
-  const workItems = new Map(store.listWorkItems(taskId).map((item) => [item.id, item]));
   const reviewRounds = new Map(store.listReviewRounds(taskId).map((round) => [round.id, round]));
   const affectedReviewRoundIds = new Set<string>();
 
   for (const turn of turns) {
     if (turn.executionGroupId === undefined || turn.executionLaneId === undefined) continue;
-    if (turn.workItemId !== undefined) {
-      const item = workItems.get(turn.workItemId);
-      const group = item === undefined
-        ? undefined
-        : workItemExecutionGroupById(item, turn.executionGroupId);
-      const lane = group?.lanes.find(({ id }) => id === turn.executionLaneId);
-      if (item !== undefined && group !== undefined && lane !== undefined
-        && item.currentExecutionGroupId === group.id
-        && lane.disposition === "open") {
-        const updated = updateWorkItemExecutionGroup(
-          item,
-          updateWorkItemExecutionLane(group, lane.id, {
-            currentTurnId: turn.id,
-            disposition: "failed"
-          }, now),
-          now
-        );
-        workItems.set(item.id, updated);
-      }
-    }
     if (turn.reviewRoundId !== undefined) {
       affectedReviewRoundIds.add(turn.reviewRoundId);
       const round = reviewRounds.get(turn.reviewRoundId);
@@ -301,12 +275,6 @@ function failExecutionAttempts(
     }
   }
 
-  for (const item of workItems.values()) {
-    const original = store.getWorkItem(item.taskId, item.id);
-    if (original !== null && original.revision !== item.revision) {
-      store.saveWorkItem(item.taskId, item);
-    }
-  }
   for (const reviewRoundId of affectedReviewRoundIds) {
     const round = reviewRounds.get(reviewRoundId)!;
     const original = store.getReviewRound(round.taskId, round.id);

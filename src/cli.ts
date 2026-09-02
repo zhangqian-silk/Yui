@@ -228,7 +228,8 @@ import { isAcceptedTaskReviewBaseline } from "./review/reviewAcceptance.js";
 import { NodeGitWorkspace } from "./repository/gitWorkspace.js";
 import {
   currentWorkItemExecutionGroup,
-  workItemExecutionGroupById
+  workItemExecutionGroupById,
+  type WorkItem
 } from "./workItem/workItem.js";
 
 const VERSION = YUI_VERSION;
@@ -1376,6 +1377,14 @@ export async function main(): Promise<void> {
         ? null
         : store.getWorkItem(reference.taskId, reference.localId);
       const task = item === null ? null : store.getTask(item.taskId);
+      if (item !== null && task !== null) {
+        // Authority and pure Lane-shape checks precede every physical or
+        // durable workspace preparation performed for dispatch.
+        taskActor(process.env, task.id);
+        if (item.assignee !== undefined) {
+          workItemDispatchLanePlan(resolved, store, item);
+        }
+      }
       // A rejected Candidate starts a new execution iteration. Release every
       // terminal Lane Role runtime before preparing the new Lane workspaces;
       // durable Turns, Groups, Candidates, and workspace owners remain intact.
@@ -2248,13 +2257,7 @@ async function prepareExecutionLaneWorkspacesForCommand(
   const itemRef = cliWorkItemReference(args[3]!, environment);
   const item = store.getWorkItem(itemRef.taskId, itemRef.localId);
   if (item === null || item.assignee === undefined) return undefined;
-  const roles = args.flatMap((value, index) => (
-    value === "--lane-role" && args[index + 1] !== undefined
-      ? [args[index + 1]!]
-      : []
-  ));
-  const groupId = `execution-group-${store.peekNextTurnId(item.taskId)}`;
-  const plan = planReplicatedWorkItemLanes(item.assignee, roles, groupId);
+  const plan = workItemDispatchLanePlan(args, store, item);
   if (plan.roles.length === 0) return undefined;
   for (const roleName of plan.roles) {
     if (store.getRole(item.taskId, roleName) === null) {
@@ -2276,7 +2279,7 @@ async function prepareExecutionLaneWorkspacesForCommand(
     for (const laneId of plan.laneIds) {
       map.set(laneId, await preparer.prepareExecutionLaneWorkspace(
         item.taskId,
-        groupId,
+        plan.groupId,
         laneId,
         { purpose: "execution", workItemId: item.id },
         { current: held.current }
@@ -2288,6 +2291,30 @@ async function prepareExecutionLaneWorkspacesForCommand(
     held.release();
     throw error;
   }
+}
+
+function workItemDispatchLanePlan(
+  args: readonly string[],
+  store: TaskStore,
+  item: WorkItem
+): Readonly<ReturnType<typeof planReplicatedWorkItemLanes> & { groupId: string }> {
+  if (item.assignee === undefined) {
+    throw usageError(`Work Item has no Task Role assignee: ${item.id}.`);
+  }
+  const roles = args.flatMap((value, index) => (
+    value === "--lane-role" && args[index + 1] !== undefined
+      ? [args[index + 1]!]
+      : []
+  ));
+  const groupId = `execution-group-${store.peekNextTurnId(item.taskId)}`;
+  return {
+    groupId,
+    ...planReplicatedWorkItemLanes(
+      item.assignee,
+      roles,
+      groupId
+    )
+  };
 }
 
 /**
