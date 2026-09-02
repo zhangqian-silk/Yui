@@ -2097,11 +2097,13 @@ test("a valid aggregate-21 Home upgrades through every adjacent record step", as
 
   const database = new Database(join(home, "yui.db"));
   try {
-    for (const table of ["work_items", "turns"]) {
+    for (const table of ["work_items", "turns", "task_records"]) {
       const rows = database.prepare(`SELECT rowid, payload FROM ${table}`).all();
       for (const row of rows) {
         const payload = JSON.parse(row.payload);
-        payload.schemaVersion = table === "work_items" ? 13 : 1;
+        payload.schemaVersion = table === "work_items"
+          ? 13
+          : table === "turns" ? 1 : 6;
         database.prepare(`UPDATE ${table} SET payload = ? WHERE rowid = ?`)
           .run(JSON.stringify(payload), row.rowid);
       }
@@ -2114,6 +2116,8 @@ test("a valid aggregate-21 Home upgrades through every adjacent record step", as
   manifest.aggregateSchemaVersion = 21;
   manifest.recordVersions.workItem = 13;
   manifest.recordVersions.turn = 1;
+  manifest.recordVersions.task = 6;
+  manifest.recordVersions.integrationAttempt = 5;
   writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
 
   const preflight = JSON.parse(execFileSync(
@@ -2123,7 +2127,7 @@ test("a valid aggregate-21 Home upgrades through every adjacent record step", as
   ));
   assert.equal(preflight.ok, true);
   assert.equal(preflight.data.outcome, "upgrade-plan");
-  assert.equal(preflight.data.report.steps.length, 3);
+  assert.equal(preflight.data.report.steps.length, 5);
   const upgraded = JSON.parse(execFileSync(
     process.execPath,
     [join(root, "dist", "cli.js"), "--json", "upgrade"],
@@ -2136,6 +2140,7 @@ test("a valid aggregate-21 Home upgrades through every adjacent record step", as
   t.after(() => reopened.close());
   assert.equal(reopened.getWorkItem(task.id, oldItem.id).schemaVersion, 14);
   assert.equal(reopened.getTurn(task.id, oldTurn.id).schemaVersion, 3);
+  assert.equal(reopened.getTask(task.id).schemaVersion, 7);
   const newItem = createWorkItem("work-item-2", task.id, {
     title: "New work after upgrade",
     assignee: "producer"

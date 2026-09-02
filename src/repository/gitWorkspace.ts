@@ -158,13 +158,11 @@ export interface GitWorkspacePort {
     remoteUrl: string;
     stableRef: string;
   }>): Promise<GitWorkspaceRefresh>;
-  /** Optional because older test doubles and non-delivery callers do not
-   * participate in Task completion remote reconciliation. */
-  mergeRemoteIntoWorktree?(input: Readonly<{
-    repositoryPath: string;
+  /** Resolve a remote branch without consulting or mutating a local checkout. */
+  resolveRemoteHead(input: Readonly<{
     remoteUrl: string;
     branch: string;
-  }>): Promise<GitWorkspaceRefresh>;
+  }>): Promise<GitRemoteHead>;
   fetchRemoteHeadIntoWorktree?(input: Readonly<{
     repositoryPath: string;
     remoteUrl: string;
@@ -179,6 +177,8 @@ export interface GitWorkspacePort {
     remoteUrl: string;
     destination: string;
     branch?: string;
+    /** Optional local branch name for an independently owned clone. */
+    localBranch?: string;
   }>): Promise<GitRepositoryInspection>;
   ensureLocalBranch(
     repositoryPath: string,
@@ -415,75 +415,6 @@ export class NodeGitWorkspace implements GitWorkspacePort {
     return { branch, commit };
   }
 
-  /**
-   * Merge a remote Project baseline into a clean, managed worktree.  The
-   * fetch is performed from that worktree and the stable checkout is never
-   * touched.  Fast-forward updates are preferred; a diverged baseline gets a
-   * deterministic merge commit so the caller can run its normal Integration
-   * checks and CAS the target ref.
-   */
-  async mergeRemoteIntoWorktree(input: Readonly<{
-    repositoryPath: string;
-    remoteUrl: string;
-    branch: string;
-  }>): Promise<GitWorkspaceRefresh> {
-    const initial = await this.inspect(input.repositoryPath, "HEAD");
-    if (!await this.isClean(initial.root)) {
-      throw new Error("Managed Task/Integration worktree must be clean before remote merge.");
-    }
-    const fetched = await this.#fetchRemoteHeadIntoWorktree(input);
-    const fetchedCommit = fetched.commit;
-    const fetchedRef = fetched.fetchedRef;
-    try {
-      if (fetchedCommit === initial.baseCommit) {
-        return { fromCommit: initial.baseCommit, toCommit: fetchedCommit, changed: false };
-      }
-      if (await gitSucceeds([
-        "-C", initial.root,
-        "merge-base", "--is-ancestor", fetchedCommit, initial.baseCommit
-      ])) {
-        // The Task already contains the current remote baseline.
-        return { fromCommit: initial.baseCommit, toCommit: initial.baseCommit, changed: false };
-      }
-      if (await gitSucceeds([
-        "-C", initial.root,
-        "merge-base", "--is-ancestor", initial.baseCommit, fetchedCommit
-      ])) {
-        await git(["-C", initial.root, "merge", "--ff-only", "--no-edit", fetchedRef]);
-      } else {
-        try {
-          await git([
-            "-C", initial.root,
-            "-c", "user.name=Yui",
-            "-c", "user.email=yui@local",
-            "merge", "--no-edit", "--no-ff", fetchedRef
-          ]);
-        } catch (error) {
-          const affected = (await git([
-            "-C", initial.root,
-            "diff", "--name-only", "--diff-filter=U"
-          ])).trim().split("\n").filter(Boolean);
-          const suffix = affected.length === 0 ? "" : ` (${affected.join(", ")})`;
-          throw new RemoteBaselineConflictError(
-            affected,
-            `Remote baseline merge conflicts in managed worktree${suffix}; resolve it in the Integration workspace.`,
-            { cause: error }
-          );
-        }
-      }
-      const mergedCommit = (await gitLine([
-        "-C", initial.root,
-        "rev-parse", "--verify", "--end-of-options", "HEAD^{commit}"
-      ])).toLowerCase();
-      if (!await this.isClean(initial.root)) {
-        throw new Error("Remote baseline merge left the managed worktree dirty.");
-      }
-      return { fromCommit: initial.baseCommit, toCommit: mergedCommit, changed: true };
-    } finally {
-      await gitSucceeds(["-C", initial.root, "update-ref", "-d", fetchedRef]);
-    }
-  }
-
   /** Fetch a remote branch into a managed worktree without changing HEAD. */
   async fetchRemoteHeadIntoWorktree(input: Readonly<{
     repositoryPath: string;
@@ -644,6 +575,7 @@ export class NodeGitWorkspace implements GitWorkspacePort {
     remoteUrl: string;
     destination: string;
     branch?: string;
+    localBranch?: string;
   }>): Promise<GitRepositoryInspection> {
     const remote = safeRemote(input.remoteUrl);
     const destination = resolve(requireText(input.destination, "Project destination"));
@@ -660,6 +592,13 @@ export class NodeGitWorkspace implements GitWorkspacePort {
         remote,
         destination
       ]);
+      if (input.localBranch !== undefined) {
+        const localBranch = safeRef(input.localBranch);
+        if (!await gitSucceeds(["check-ref-format", "--branch", localBranch])) {
+          throw new Error(`Local clone branch is invalid: ${localBranch}.`);
+        }
+        await git(["-C", destination, "branch", "-M", "--", localBranch]);
+      }
     } catch (error) {
       await rm(destination, { recursive: true, force: true });
       throw error;

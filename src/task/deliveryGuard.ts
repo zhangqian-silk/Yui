@@ -30,7 +30,8 @@ export type DeliveryGuardIntent =
   | {
       kind: "integration-start";
       projectId: string;
-      changeSetIds: readonly string[];
+      workItemId: string;
+      resultCommit: string;
     }
   | {
       kind: "review-request";
@@ -153,28 +154,27 @@ function detectIntegrationDuplicates(
   facts: NextActionFacts,
   intent: Extract<DeliveryGuardIntent, { kind: "integration-start" }>
 ): readonly DeliveryDuplicate[] {
-  const wanted = new Set(intent.changeSetIds);
   const duplicates: DeliveryDuplicate[] = [];
   for (const attempt of facts.integrations) {
     if (attempt.projectId !== intent.projectId) continue;
-    const existing = new Set(attempt.changeSetIds);
-    const sameSet = existing.size === wanted.size
-      && [...wanted].every((id) => existing.has(id));
+    const sameSource = attempt.source.kind === "work-item"
+      && attempt.source.workItemId === intent.workItemId
+      && attempt.source.resultCommit === intent.resultCommit;
     const ref = { kind: "integration-attempt", id: attempt.id } as const;
-    if (sameSet && attempt.status === "committed") {
+    if (sameSource && attempt.status === "committed") {
       duplicates.push({
         severity: "exact",
-        reason: `Integration ${attempt.id} already committed this exact ChangeSet set`,
+        reason: `Integration ${attempt.id} already committed this exact WorkItem result`,
         refs: [ref],
         reuseCommand: `yui task integration show ${facts.task.id}/${attempt.id}`
       });
       continue;
     }
-    if (sameSet
+    if (sameSource
       && (attempt.status === "running" || attempt.status === "validating")) {
       duplicates.push({
         severity: "suspected",
-        reason: `Integration ${attempt.id} is already ${attempt.status} for this exact ChangeSet set`,
+        reason: `Integration ${attempt.id} is already ${attempt.status} for this WorkItem result`,
         refs: [ref],
         reuseCommand: `yui task integration show ${facts.task.id}/${attempt.id}`
       });

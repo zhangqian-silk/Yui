@@ -3409,39 +3409,15 @@ function assertWorkItemIntegrationProof(
     if (projectProof === undefined || projectProof.baseCommit !== entry.baseCommit) {
       throw usageError(`WorkItem integration verification is stale: ${workItemId}.`);
     }
-    const latestChangeSet = store.listChangeSets(workspace.owner.taskId)
-      .filter((changeSet) => (
-        changeSet.workItemId === workItemId
-        && changeSet.projectId === entry.projectId
-      ))
-      .sort((left, right) => (
-        left.createdAt.localeCompare(right.createdAt)
-        || left.id.localeCompare(right.id)
-      ))
-      .at(-1);
-    if (projectProof.headCommit === entry.baseCommit) {
-      if (projectProof.changeSetId !== undefined || latestChangeSet !== undefined) {
-        throw usageError(`WorkItem integration verification is stale: ${workItemId}.`);
-      }
-      continue;
-    }
-    if (
-      projectProof.changeSetId === undefined
-      || latestChangeSet?.id !== projectProof.changeSetId
-      || latestChangeSet.baseCommit !== entry.baseCommit
-      || latestChangeSet.headCommit !== projectProof.headCommit
-      || latestChangeSet.branch !== entry.branch
-    ) {
-      throw usageError(
-        `WorkItem integration verification is stale: ${workItemId}.`
-      );
-    }
     if (!store.listIntegrationAttempts(workspace.owner.taskId).some((integration) => (
       integration.status === "committed"
       && integration.projectId === entry.projectId
-      && integration.changeSetIds.includes(projectProof.changeSetId!)
+      && integration.source.kind === "work-item"
+      && integration.source.workItemId === workItemId
+      && integration.source.startCommit === projectProof.baseCommit
+      && integration.source.resultCommit === projectProof.headCommit
     ))) {
-      throw usageError(`Work Item ChangeSet is not integrated: ${projectProof.changeSetId}.`);
+      throw usageError(`Work Item result is not integrated: ${workItemId}/${entry.projectId}.`);
     }
   }
 }
@@ -4479,15 +4455,6 @@ function forceFreshTaskReviewRound(
       );
     }
 
-    const provenance = taskReviewProvenance(tx, task, options);
-    if (!isSameTaskReviewCandidate(source.taskCandidate, provenance.candidate)) {
-      throw usageError(
-        `Final ReviewRound ${source.id} freezes a candidate that is no longer the current Task candidate.`
-      );
-    }
-    const producerCollision = taskReviewProducerCollision(provenance, source.reviewerRoleName);
-    if (producerCollision !== null) throw usageError(producerCollision);
-
     const taskRounds = reviewRoundsByIdentity(tx.listReviewRounds(task.id)
       .filter((entry) => (entry.scope ?? "work-item") === "task"));
     const sourceIndex = taskRounds.findIndex(({ id }) => id === source.id);
@@ -4746,23 +4713,6 @@ function retryFailedTaskReviewRound(
     const taskFinalContract = taskFinalReviewContractForMutation(tx, task.id, options);
     if (!sameTaskFinalReviewContract(round.taskFinalReviewContract, taskFinalContract)) {
       throw usageError(`Task final-review contract does not match ReviewRound ${round.id}.`);
-    }
-
-    // Re-read the exact current Task heads and producer roles before touching
-    // any record. A moved head or reviewer collision fails closed with the old
-    // failed Round byte-for-byte unchanged.
-    const provenance = taskReviewProvenance(tx, task, options);
-    if (!isSameTaskReviewCandidate(round.taskCandidate, provenance.candidate)) {
-      throw usageError(
-        `Final ReviewRound ${round.id} freezes a candidate that is no longer the current Task candidate.`
-      );
-    }
-    const producerCollision = taskReviewProducerCollision(
-      provenance,
-      round.reviewerRoleName
-    );
-    if (producerCollision !== null) {
-      throw usageError(producerCollision);
     }
 
     const reviewerRounds = reviewRoundsByIdentity(tx.listReviewRounds(task.id));
@@ -5728,19 +5678,13 @@ function actualTaskReviewCandidateForMutation(
     throw usageError(`Actual Task Project heads do not match bound Projects: ${task.id}.`);
   }
   const projects = actual.projects.map(({ projectId, commit }) => {
-    const committed = latestCommittedIntegration(store, task.id, projectId);
-    if (committed !== undefined) {
-      if (committed.candidateCommit === undefined) {
-        throw dataError(
-          `Committed Integration has no candidate commit: ${task.id}/${committed.id}.`
-        );
-      }
-      if (commit !== committed.candidateCommit) {
-        throw usageError(
-          `Project ${projectId} actual Task head ${commit} does not match latest committed `
-          + `Integration ${committed.id}/${committed.candidateCommit}.`
-        );
-      }
+    const binding = task.projectBindings.find((entry) => entry.projectId === projectId);
+    if (binding?.currentCommit === undefined || binding.currentCommit !== commit) {
+      throw usageError(
+        `Project ${projectId} actual Task head ${commit} does not match Task currentCommit ${
+          binding?.currentCommit ?? "missing"
+        }.`
+      );
     }
     return { projectId, commit };
   });
@@ -5767,10 +5711,9 @@ function taskReviewProducerCollision(
 
 /**
  * Resolve the complete frozen Task-final provenance from the physical head of
- * every bound Project. Where a Project has a committed Integration, that head
- * must match its latest numeric Task-local Integration and the Integration's
- * ChangeSets contribute producer Roles. A bound context Project without an
- * Integration is still frozen, but contributes no producer.
+ * every bound Project. Where a Project has a committed Integration, its
+ * WorkItem source contributes producer Roles. A bound context Project without
+ * an Integration is still frozen, but contributes no producer.
  *
  * When `expected` is supplied this is also the final dispatch compare-and-swap
  * fence: every bound Project must still point at the exact frozen physical
@@ -5821,51 +5764,42 @@ function taskReviewProvenance(
     const lineage = committedAttempts.slice(0, headIndex + 1)
       .filter(({ targetRef }) => targetRef === head.targetRef);
     for (const committed of lineage) {
-      if (committed.changeSetIds.length === 0) {
+      if (committed.source.kind !== "work-item") continue;
+      const source = committed.source;
+      const item = store.getWorkItem(task.id, source.workItemId);
+      if (item === null) {
         throw dataError(
-          `Committed Integration ${committed.id} has no ChangeSet provenance for Project ${projectId}.`
+          `Committed Integration producer WorkItem is unavailable: `
+          + `${committed.id}/${source.workItemId}.`
         );
       }
-      for (const changeSetId of committed.changeSetIds) {
-        const changeSet = store.getChangeSet(task.id, changeSetId);
-        if (changeSet === null || changeSet.projectId !== projectId) {
-          throw dataError(
-            `Committed Integration ChangeSet provenance is invalid: `
-            + `${committed.id}/${changeSetId}.`
-          );
-        }
-        assertTaskReviewChangeSetProvenance(task, projectId, committed.id, changeSet);
-        const item = store.getWorkItem(task.id, changeSet.workItemId);
-        if (item === null) {
-          throw dataError(
-            `Committed Integration producer WorkItem is unavailable: `
-            + `${changeSet.id}/${changeSet.workItemId}.`
-          );
-        }
-        if (item.assignee !== undefined) recordProducer(item.assignee, item.id);
-        if (item.candidates.length === 0) {
-          throw dataError(
-            `Committed producer WorkItem has no Candidate: ${item.id}.`
-          );
-        }
-        for (const itemCandidate of item.candidates) {
-          if (itemCandidate.source.type === "direct") {
-            recordProducer(LEADER_ROLE, item.id);
-            continue;
-          }
-          const sourceRun = store.getTurn(task.id, itemCandidate.source.turnId);
-          if (sourceRun === null
-            || sourceRun.workItemId !== item.id
-            || sourceRun.purpose !== "execution"
-            || sourceRun.status !== "completed") {
-            throw dataError(
-              `Committed producer Candidate Turn is unavailable: `
-              + `${item.id}/${itemCandidate.source.turnId}.`
-            );
-          }
-          recordProducer(sourceRun.roleName, item.id);
-        }
+      const sourceCandidate = [...item.candidates].reverse().find((candidate) => (
+        candidate.gitSnapshot?.projects.some((project) => (
+          project.projectId === projectId
+          && project.commit === source.resultCommit
+        ))
+      ));
+      if (sourceCandidate === undefined) {
+        throw dataError(
+          `Committed Integration result provenance is invalid: ${committed.id}/${item.id}.`
+        );
       }
+      if (item.assignee !== undefined) recordProducer(item.assignee, item.id);
+      if (sourceCandidate.source.type === "direct") {
+        recordProducer(LEADER_ROLE, item.id);
+        continue;
+      }
+      const sourceRun = store.getTurn(task.id, sourceCandidate.source.turnId);
+      if (sourceRun === null
+        || sourceRun.workItemId !== item.id
+        || sourceRun.purpose !== "execution"
+        || sourceRun.status !== "completed") {
+        throw dataError(
+          `Committed producer Candidate Turn is unavailable: `
+          + `${item.id}/${sourceCandidate.source.turnId}.`
+        );
+      }
+      recordProducer(sourceRun.roleName, item.id);
     }
   }
   return { candidate, producerRoles, producerWorkItemIds };
@@ -6020,7 +5954,6 @@ function prepareFinalTaskReview(
   const establishedRound = taskRounds.at(-1);
   const config = taskFinalReviewConfig(taskFinalContract);
 
-  const taskCandidate = taskReviewProvenance(store, task, options).candidate;
   const latest = establishedRound;
   if (latest?.status === "running") {
     throw usageError(`Final Task Review is still active: ${latest.id}/${latest.status}.`);
@@ -6031,11 +5964,15 @@ function prepareFinalTaskReview(
       task,
       latest,
       config,
-      taskCandidate,
+      latest.taskCandidate!,
       taskFinalContract,
       options
     );
   }
+  if (taskRounds.some((round) => isAcceptedTaskReviewBaseline(store, round))) {
+    return null;
+  }
+  const taskCandidate = taskReviewProvenance(store, task, options).candidate;
   if (latest !== undefined && isSameTaskReviewCandidate(latest.taskCandidate, taskCandidate)) {
     // A terminal round for the same immutable heads is already the final
     // review evidence. Do not create duplicate rounds on repeated completion
@@ -6085,11 +6022,6 @@ function resumablePendingFinalTaskReview(
       `Pending final ReviewRound already records Reviewer Turn ${round.reviewerTurnId}: ${round.id}.`
     );
   }
-  if (!isSameTaskReviewCandidate(round.taskCandidate, taskCandidate)) {
-    throw usageError(
-      `Final ReviewRound ${round.id} freezes a candidate that is no longer the current Task candidate.`
-    );
-  }
   assertNoConflictingTaskReviewRound(
     store.listReviewRounds(task.id),
     round.id,
@@ -6103,11 +6035,6 @@ function resumablePendingFinalTaskReview(
     throw usageError(`Reviewer Role already has an active Turn: ${reviewer.name}.`);
   }
   assertPendingFinalReviewWorkspaceEvidence(store, task, round);
-  const provenance = taskReviewProvenance(store, task, options, taskCandidate);
-  const producerCollision = taskReviewProducerCollision(provenance, reviewer.name);
-  if (producerCollision !== null) {
-    throw usageError(producerCollision);
-  }
   return round;
 }
 

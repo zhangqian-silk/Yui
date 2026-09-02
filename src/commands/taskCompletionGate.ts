@@ -2,12 +2,10 @@ import { isDeepStrictEqual } from "node:util";
 import { usageError } from "../errors/cliError.js";
 import {
   GitIntegrationService,
-  type IntegrationJobPort,
-  type RemoteBaseline
+  type IntegrationJobPort
 } from "../integration/gitIntegrationService.js";
 import {
-  createIntegrationAttempt,
-  type IntegrationAttempt
+  createIntegrationAttempt
 } from "../integration/integrationAttempt.js";
 import {
   NodeGitWorkspace,
@@ -272,17 +270,16 @@ type RemotePlan = Readonly<{
   entry: WorkspaceProjectEntry;
   remote: GitRemoteHead;
   currentCommit: string;
-  previousIntegration: IntegrationAttempt;
+  taskBaseCommit: string;
 }>;
 
 /**
  * Reconcile configured remote baselines before a Task completion attempt.
  *
  * Remote resolution and fetches happen from the Task's managed worktree.  A
- * moved remote is represented by a new Integration Attempt that reuses the
- * already integrated ChangeSets, runs the existing Project checks, and lets
- * the normal target CAS advance the Task branch.  Stable Project checkouts
- * are never refreshed or otherwise mutated here.
+ * moved remote is represented by a normal upstream Integration Attempt. The
+ * normal check and CAS path advances only the Task clone; stable Project
+ * checkouts are never refreshed or otherwise mutated here.
  */
 export async function reconcileTaskRemoteBaselines(
   taskId: string,
@@ -292,28 +289,15 @@ export async function reconcileTaskRemoteBaselines(
 ): Promise<readonly RemoteReconciliation[]> {
   const task = store.getTask(taskId);
   if (task === null) throw usageError(`Task not found: ${taskId}.`);
-  // The delivery contract opts Project-backed Tasks into committed
-  // Integration evidence.  Metadata-only Tasks retain their existing local
-  // completion semantics and have no remote baseline to reconcile here.
-  if (task.projectBindings.length === 0
-    || !store.listIntegrationAttempts(task.id).some(({ status }) => status === "committed")) {
+  if (task.projectBindings.length === 0) {
     return [];
   }
   const workspace = requireTaskWorkspace(store, task);
   const git = options.git ?? new NodeGitWorkspace();
-  if (git.fetchRemoteHeadIntoWorktree === undefined
-    || git.mergeRemoteIntoWorktree === undefined) {
+  if (git.fetchRemoteHeadIntoWorktree === undefined) {
     throw usageError(
       `Task ${task.id} cannot verify remote baselines: managed Git workspace support is unavailable.`
     );
-  }
-
-  // A completed Task-final Review that exactly covers the current frozen heads
-  // is the final review evidence.  Do not reconcile the remote after a clean
-  // review, as merging a moved remote would change the reviewed head and
-  // invalidate the review.
-  if (await hasCompletedTaskFinalReviewForCurrentCandidate(store, task, workspace, git)) {
-    return [];
   }
 
   const plans: RemotePlan[] = [];
@@ -330,73 +314,50 @@ export async function reconcileTaskRemoteBaselines(
       );
     }
     const currentCommit = (await git.inspect(entry.path, "HEAD")).baseCommit;
-    const previousIntegration = latestCommittedIntegration(store, task.id, project.id);
-    // A completed Task-final Review for the exact current head freezes the
-    // Task baseline: the delivery has been reviewed and approved, so the
-    // completion gate must not merge remote changes that would invalidate
-    // the review evidence.
-    if (hasFrozenTaskBaseline(store, task.id, project.id, currentCommit)) {
-      continue;
-    }
-    // Let the existing exact-head Task-final gate report local post-
-    // Integration drift before attempting any network operation.  This keeps
-    // completion read-only for an already-invalid candidate and preserves its
-    // precise recovery guidance.
-    if (previousIntegration !== undefined
-      && previousIntegration.candidateCommit !== currentCommit) {
-      continue;
+    if (binding.currentCommit !== currentCommit || binding.baseCommit === undefined) {
+      throw usageError(
+        `Project ${project.id} Task commit record does not match its authoritative main clone.`
+      );
     }
     const remote = await fetchRemote(git, entry, project);
     if (remote.commit === currentCommit) continue;
     if (await git.isAncestor(entry.path, remote.commit, currentCommit)) continue;
 
-    if (previousIntegration === undefined) {
-      throw usageError(
-        `Project ${project.id} remote target moved to ${remote.commit}, but no committed `
-        + "Integration can establish a safe Task baseline."
-      );
-    }
-    if (previousIntegration.candidateCommit !== currentCommit) {
-      throw usageError(
-        `Project ${project.id} Task head ${currentCommit} does not match its latest committed `
-        + `Integration ${previousIntegration.id}; settle that drift before remote reconciliation.`
-      );
-    }
     if (!await git.isClean(entry.path)) {
       throw usageError(
         `Project ${project.id} managed Task workspace is dirty; commit or clean it before remote reconciliation.`
       );
     }
-    plans.push({ project, entry, remote, currentCommit, previousIntegration });
+    plans.push({
+      project,
+      entry,
+      remote,
+      currentCommit,
+      taskBaseCommit: binding.baseCommit
+    });
   }
 
   const reconciled: RemoteReconciliation[] = [];
   for (const plan of plans) {
     const attempt = store.transaction((tx) => {
-      // Re-check the frozen baseline inside the transaction: a Task-final
-      // Review may have completed during the async remote fetch, freezing
-      // the head after the initial check.  Creating a new Integration here
-      // would move the reviewed head and invalidate the review evidence.
-      if (hasFrozenTaskBaseline(tx, task.id, plan.project.id, plan.currentCommit)) {
-        return null;
-      }
       const created = createIntegrationAttempt({
         id: tx.nextIntegrationAttemptId(task.id),
         taskId: task.id,
         projectId: plan.project.id,
         targetRef: plan.entry.branch,
-        expectedHead: plan.currentCommit,
-        changeSetIds: plan.previousIntegration.changeSetIds,
-        checkCommands: plan.previousIntegration.checkCommands
+        beforeCommit: plan.currentCommit,
+        source: {
+          kind: "upstream",
+          branch: plan.remote.branch,
+          remoteCommit: plan.remote.commit,
+          taskBaseCommit: plan.taskBaseCommit,
+          strategy: "rebase"
+        },
+        checkCommands: []
       }, options.now?.() ?? new Date());
       tx.saveIntegrationAttempt(task.id, created);
       return created;
     });
-    if (attempt === null) continue;
-    const baseline: RemoteBaseline = {
-      remoteUrl: plan.project.remoteUrl!,
-      branch: plan.remote.branch
-    };
     const result = await new GitIntegrationService(
       home,
       store,
@@ -405,7 +366,7 @@ export async function reconcileTaskRemoteBaselines(
       options.environment,
       undefined,
       options.jobPort
-    ).integrate(task.id, attempt.id, { remoteBaseline: baseline });
+    ).integrate(task.id, attempt.id);
     // rr6/f3: A moved remote with non-empty checks spawns a DurableJob. This
     // is a pending completion outcome, not a failure: name the exact
     // Integration and Job and the exact continuation command (mirroring the
@@ -464,67 +425,4 @@ function requireTaskWorkspace(store: TaskStore, task: Task): ManagedWorkspace {
     throw usageError(`Task ${task.id} has no authoritative managed main workspace.`);
   }
   return workspace;
-}
-
-/**
- * Check whether an accepted Task-final ReviewRound is completed and its
- * immutable candidate exactly matches the current actual heads for every
- * Project in the Task.  When this holds, the reviewed head is the final
- * head and remote reconciliation must not change it.
- */
-async function hasCompletedTaskFinalReviewForCurrentCandidate(
-  store: TaskStore,
-  task: Task,
-  workspace: ManagedWorkspace,
-  git: GitWorkspacePort
-): Promise<boolean> {
-  const actualProjects: Array<Readonly<{ projectId: string; commit: string }>> = [];
-  for (const binding of task.projectBindings) {
-    const entry = workspaceProjectEntry(workspace, binding.projectId);
-    if (entry === undefined || entry.access !== "write") return false;
-    const actualHead = (await git.inspect(entry.path, "HEAD")).baseCommit;
-    actualProjects.push({ projectId: binding.projectId, commit: actualHead });
-  }
-  const actualCandidate: TaskReviewCandidate = {
-    schemaVersion: 1,
-    projects: actualProjects
-  };
-  return acceptedTaskFinalReviews(store, task.id).some((round) => (
-    round.taskCandidate !== undefined
-    && sameTaskCandidate(round.taskCandidate, actualCandidate)
-  ));
-}
-
-function latestCommittedIntegration(
-  store: TaskStore,
-  taskId: string,
-  projectId: string
-): IntegrationAttempt | undefined {
-  return store.listIntegrationAttempts(taskId)
-    .filter((attempt) => attempt.projectId === projectId && attempt.status === "committed")
-    .sort((left, right) => left.id.localeCompare(right.id, undefined, { numeric: true }))
-    .at(-1);
-}
-
-/**
- * A Task baseline is frozen when a completed (clean) Task-final ReviewRound
- * reviewed the exact current head for the given Project.  Once frozen, the
- * completion gate skips remote baseline reconciliation to prevent merging
- * unreviewed remote changes into the approved delivery.
- */
-function hasFrozenTaskBaseline(
-  store: TaskStore,
-  taskId: string,
-  projectId: string,
-  currentCommit: string
-): boolean {
-  return store.listReviewRounds(taskId)
-    .some((round) => (
-      (round.scope ?? "work-item") === "task"
-      && isAcceptedTaskReviewBaseline(store, round)
-      && round.taskCandidate !== undefined
-      && round.taskCandidate.projects.some((entry) => (
-        entry.projectId === projectId && entry.commit === currentCommit
-      ))
-    ));
 }

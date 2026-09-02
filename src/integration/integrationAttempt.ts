@@ -1,5 +1,4 @@
 import {
-  normalizedUniqueIdentities,
   normalizedUniqueText,
   requireIdentity,
   requireText,
@@ -32,14 +31,43 @@ export type ResolutionDecision = Readonly<{
   decidedAt: string;
 }>;
 
+export type WorkItemIntegrationStrategy =
+  | "ff"
+  | "cherry-pick"
+  | "merge"
+  | "manual";
+
+export type IntegrationSource =
+  | Readonly<{
+      kind: "work-item";
+      workItemId: string;
+      startCommit: string;
+      resultCommit: string;
+      strategy: WorkItemIntegrationStrategy;
+    }>
+  | Readonly<{
+      kind: "upstream";
+      branch: string;
+      remoteCommit: string;
+      taskBaseCommit: string;
+      strategy: "rebase";
+    }>
+  | Readonly<{
+      /** Pre-v6 audit provenance; never accepted for a new Integration. */
+      kind: "historical-change-sets";
+      changeSetIds: readonly string[];
+    }>;
+
 export type IntegrationAttempt = Readonly<{
-  schemaVersion: 5;
+  schemaVersion: 6;
   id: string;
   taskId: string;
   projectId: string;
   targetRef: string;
-  expectedHead: string;
-  changeSetIds: readonly string[];
+  source: IntegrationSource;
+  beforeCommit: string;
+  afterCommit?: string;
+  summary?: string;
   checkCommands: readonly string[];
   candidateCommit?: string;
   /**
@@ -69,7 +97,7 @@ export type IntegrationAttempt = Readonly<{
 export function createIntegrationAttempt(
   input: Readonly<Pick<
     IntegrationAttempt,
-    "id" | "taskId" | "projectId" | "targetRef" | "expectedHead" | "changeSetIds"
+    "id" | "taskId" | "projectId" | "targetRef" | "source" | "beforeCommit"
   > & Partial<Pick<
     IntegrationAttempt,
     "checkCommands"
@@ -78,13 +106,13 @@ export function createIntegrationAttempt(
 ): IntegrationAttempt {
   const timestamp = now.toISOString();
   return validateIntegrationAttempt({
-    schemaVersion: 5,
+    schemaVersion: 6,
     id: input.id,
     taskId: input.taskId,
     projectId: input.projectId,
     targetRef: input.targetRef,
-    expectedHead: input.expectedHead,
-    changeSetIds: [...input.changeSetIds],
+    source: input.source,
+    beforeCommit: input.beforeCommit,
     checkCommands: normalizedUniqueText(input.checkCommands ?? [], "Integration check command"),
     status: "running",
     createdAt: timestamp,
@@ -186,7 +214,7 @@ export function updateIntegrationAttempt(
   patch: Readonly<Partial<Pick<
     IntegrationAttempt,
     "candidateCommit" | "status" | "conflict" | "checks"
-    | "gatePlanDigest" | "gateToolchainDigest"
+    | "gatePlanDigest" | "gateToolchainDigest" | "afterCommit" | "summary"
   >>>,
   now: Date
 ): IntegrationAttempt {
@@ -237,8 +265,8 @@ export function supersedeIntegration(
 }
 
 export function validateIntegrationAttempt(attempt: IntegrationAttempt): IntegrationAttempt {
-  if (attempt.schemaVersion !== 5) {
-    throw new Error("IntegrationAttempt must use schemaVersion 5.");
+  if (attempt.schemaVersion !== 6) {
+    throw new Error("IntegrationAttempt must use schemaVersion 6.");
   }
   validateTaskRecordReference({
     taskId: attempt.taskId,
@@ -246,17 +274,22 @@ export function validateIntegrationAttempt(attempt: IntegrationAttempt): Integra
   }, "integrationAttempt");
   requireIdentity(attempt.projectId, "Project id");
   requireText(attempt.targetRef, "Integration target ref");
-  requireCommit(attempt.expectedHead, "Integration expected head");
-  normalizedUniqueIdentities(attempt.changeSetIds, "ChangeSet id");
-  for (const changeSetId of attempt.changeSetIds) {
-    validateTaskRecordReference({ taskId: attempt.taskId, localId: changeSetId }, "changeSet");
-  }
+  requireCommit(attempt.beforeCommit, "Integration before commit");
+  validateIntegrationSource(attempt.taskId, attempt.source);
   normalizedUniqueText(attempt.checkCommands, "Integration check command");
-  if (attempt.changeSetIds.length === 0) {
-    throw new Error("IntegrationAttempt requires at least one ChangeSet.");
-  }
   if (attempt.candidateCommit !== undefined) {
     requireCommit(attempt.candidateCommit, "Integration candidate commit");
+  }
+  if (attempt.afterCommit !== undefined) {
+    requireCommit(attempt.afterCommit, "Integration after commit");
+  }
+  if (attempt.summary !== undefined) requireText(attempt.summary, "Integration summary");
+  if (attempt.status === "committed") {
+    requireCommit(attempt.afterCommit ?? "", "Committed Integration after commit");
+    requireText(attempt.summary ?? "", "Committed Integration summary");
+    if (attempt.candidateCommit !== attempt.afterCommit) {
+      throw new Error("Committed Integration candidate and afterCommit must match.");
+    }
   }
   if (attempt.jobId !== undefined) {
     validateTaskRecordReference(
@@ -296,6 +329,49 @@ export function validateIntegrationAttempt(attempt: IntegrationAttempt): Integra
     requireTimestamp(attempt.endedAt ?? "", "Integration Attempt endedAt");
   }
   return attempt;
+}
+
+function validateIntegrationSource(taskId: string, source: IntegrationSource): void {
+  if (typeof source !== "object" || source === null) {
+    throw new Error("Integration source is required.");
+  }
+  if (source.kind === "work-item") {
+    validateTaskRecordReference(
+      { taskId, localId: source.workItemId },
+      "workItem"
+    );
+    requireCommit(source.startCommit, "WorkItem Integration start commit");
+    requireCommit(source.resultCommit, "WorkItem Integration result commit");
+    if (!["ff", "cherry-pick", "merge", "manual"].includes(source.strategy)) {
+      throw new Error(`WorkItem Integration strategy is invalid: ${String(source.strategy)}.`);
+    }
+    return;
+  }
+  if (source.kind === "upstream") {
+    requireText(source.branch, "Upstream branch");
+    requireCommit(source.remoteCommit, "Upstream remote commit");
+    requireCommit(source.taskBaseCommit, "Upstream Task base commit");
+    const strategy = (source as Readonly<{ strategy?: unknown }>).strategy;
+    if (strategy !== "rebase") {
+      throw new Error(`Upstream Integration strategy is invalid: ${String(strategy)}.`);
+    }
+    return;
+  }
+  if (source.kind === "historical-change-sets") {
+    if (!Array.isArray(source.changeSetIds) || source.changeSetIds.length === 0) {
+      throw new Error("Historical Integration source requires ChangeSet ids.");
+    }
+    const seen = new Set<string>();
+    for (const changeSetId of source.changeSetIds) {
+      validateTaskRecordReference({ taskId, localId: changeSetId }, "changeSet");
+      if (seen.has(changeSetId)) {
+        throw new Error(`Historical Integration ChangeSet is duplicated: ${changeSetId}.`);
+      }
+      seen.add(changeSetId);
+    }
+    return;
+  }
+  throw new Error("Integration source is invalid.");
 }
 
 function normalizeConflictReport(report: ConflictReport): ConflictReport {

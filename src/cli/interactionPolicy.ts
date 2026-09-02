@@ -565,15 +565,21 @@ export const INTERACTION_POLICIES: readonly InteractionPolicy[] = Object.freeze(
     selectors: [
       { argumentIndex: 3, entity: "task", provider: "tasks", actionTarget: true },
       {
-        option: "--change-set",
+        option: "--work-item",
         requiredOption: true,
-        entity: "change-set",
-        provider: "change-sets",
+        entity: "work-item",
+        provider: "work-items",
         dependsOn: 3,
         actionTarget: false
       }
     ],
-    trailingOptions: { "--change-set": "value", "--target": "value", "--check": "value" }
+    trailingOptions: {
+      "--work-item": "value",
+      "--strategy": "value",
+      "--project": "value",
+      "--target": "value",
+      "--check": "value"
+    }
   },
   {
     commandPath: ["task", "integration", "list"],
