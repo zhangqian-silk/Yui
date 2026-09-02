@@ -77,13 +77,17 @@ import {
   type OperatorSessionControl
 } from "./commands/operatorCommands.js";
 import { runProjectCommand } from "./commands/projectCommands.js";
-import { runProfileCommand } from "./commands/profileCommands.js";
+import {
+  previewProfileAgentConfigurationMutation,
+  runProfileCommand
+} from "./commands/profileCommands.js";
 import {
   assertWorkItemDependenciesCompletedForCommand,
   dispatchPreparedReviewRound,
   failPendingReviewRound,
   preserveReviewRoundWorkspace,
   parseTaskCompletionRequest,
+  previewTaskRoleAgentConfigurationMutation,
   preflightTaskCompletion,
   runTaskCommand,
   planReplicatedWorkItemLanes,
@@ -192,9 +196,14 @@ import { TmuxManager } from "./tmux/tmuxManager.js";
 import { WorkItemChangeSetManager } from "./workspace/workItemChangeSetManager.js";
 import { parseWebCommandOptions, startYuiWebServer } from "./web/webServer.js";
 import {
-  AgentConfigurationCatalogService
+  AgentConfigurationCatalogService,
+  validateAgentLaunchConfiguration
 } from "./executor/agentConfigurationCatalog.js";
 import type { RoleAgentConfig } from "./executor/agentAdapter.js";
+import {
+  resolveAgentProfileView
+} from "./profile/agentProfileRuntime.js";
+import type { AgentProfile } from "./profile/agentProfile.js";
 import { TmuxWebTerminalService } from "./web/tmuxWebTerminal.js";
 import {
   listOperatorSessions,
@@ -756,7 +765,11 @@ export async function main(): Promise<void> {
     emit("Cancelled.");
     return;
   }
-  await preflightAgentConfigurationMutation(resolved, store, catalogs);
+  const validateAgentConfiguration = await preflightAgentConfigurationMutation(
+    resolved,
+    store,
+    catalogs
+  );
 
   const executor = new NodeCommandExecutor();
   const tmux = new TmuxManager(
@@ -930,7 +943,12 @@ export async function main(): Promise<void> {
       return;
     }
     if (domain === "profile") {
-      const result = runProfileCommand(resolved.slice(2), store);
+      const result = runProfileCommand(
+        resolved.slice(2),
+        store,
+        () => new Date(),
+        validateAgentConfiguration === undefined ? {} : { validateAgentConfiguration }
+      );
       emit(result.output, false, result.data);
       return;
     }
@@ -1580,7 +1598,10 @@ export async function main(): Promise<void> {
           ...(deltaRecheckPreflight === undefined
             ? {}
             : { deltaRecheckPreflight }),
-          ...(taskRetirementProof === undefined ? {} : { taskRetirementProof })
+          ...(taskRetirementProof === undefined ? {} : { taskRetirementProof }),
+          ...(validateAgentConfiguration === undefined
+            ? {}
+            : { validateAgentConfiguration })
         }
       );
       // The dispatch transaction has now adopted (or rejected) the prepared
@@ -2976,7 +2997,76 @@ function selectionPorts(
   };
 }
 
+type AgentConfigurationMutation = Readonly<{
+  agentId: string;
+  config: RoleAgentConfig;
+  cwd: string;
+}>;
+
+type AgentConfigurationMutationValidator = (
+  input: AgentConfigurationMutation
+) => void;
+
 async function preflightAgentConfigurationMutation(
+  commandArgs: readonly string[],
+  store: TaskStore,
+  catalogs: AgentConfigurationCatalogService
+): Promise<AgentConfigurationMutationValidator | undefined> {
+  const mutation = profileAgentConfigurationMutation(commandArgs, store)
+    ?? taskRoleAgentConfigurationMutation(commandArgs, store);
+  if (mutation === undefined) {
+    await warmLegacyRoleConfigurationMutation(commandArgs, store, catalogs);
+    return undefined;
+  }
+  const agent = store.getConfiguredAgent(mutation.agentId);
+  if (agent === null) throw agentNotFound(mutation.agentId);
+  const resolved = await catalogs.resolve({
+    agent,
+    cwd: mutation.cwd,
+    config: mutation.config
+  });
+  try {
+    validateAgentLaunchConfiguration(resolved.catalog, mutation.config);
+  } catch (error) {
+    throw usageError(error instanceof Error ? error.message : String(error));
+  }
+  return (candidate) => {
+    if (
+      candidate.agentId !== mutation.agentId
+      || resolve(candidate.cwd) !== resolve(mutation.cwd)
+      || !isDeepStrictEqual(candidate.config, mutation.config)
+    ) {
+      throw usageError(
+        "Agent configuration changed after capability preflight; retry the command."
+      );
+    }
+    try {
+      validateAgentLaunchConfiguration(resolved.catalog, candidate.config);
+    } catch (error) {
+      throw usageError(error instanceof Error ? error.message : String(error));
+    }
+  };
+}
+
+function profileAgentConfigurationMutation(
+  args: readonly string[],
+  store: TaskStore
+): AgentConfigurationMutation | undefined {
+  return args[0] === "config" && args[1] === "profile"
+    ? previewProfileAgentConfigurationMutation(args.slice(2), store)
+    : undefined;
+}
+
+function taskRoleAgentConfigurationMutation(
+  args: readonly string[],
+  store: TaskStore
+): AgentConfigurationMutation | undefined {
+  return args[0] === "task"
+    ? previewTaskRoleAgentConfigurationMutation(args.slice(1), store)
+    : undefined;
+}
+
+async function warmLegacyRoleConfigurationMutation(
   commandArgs: readonly string[],
   store: TaskStore,
   catalogs: AgentConfigurationCatalogService
@@ -3050,8 +3140,12 @@ function selectionCall(
       });
     }
     case "config.get": return store.getConfig();
-    case "profile.list": return store.listAgentProfiles();
-    case "profile.show": return store.getAgentProfile(String(params.id ?? ""));
+    case "profile.list": return store.listAgentProfiles().map((profile) =>
+      profileSelectionRecord(profile, store));
+    case "profile.show": {
+      const profile = store.getAgentProfile(String(params.id ?? ""));
+      return profile === null ? null : profileSelectionRecord(profile, store);
+    }
     case "role.list": return store.listGlobalRoles();
     case "role.show": return store.getGlobalRole(String(params.name ?? ""));
     case "project.list": return callOptional(reader, "listProjects");
@@ -3082,6 +3176,29 @@ function selectionCall(
     case "jobs.list": return callOptional(reader, "listJobs");
     default: return [];
   }
+}
+
+function profileSelectionRecord(
+  profile: AgentProfile,
+  store: TaskStore
+): Readonly<Record<string, unknown>> {
+  const view = resolveAgentProfileView(profile, store);
+  return {
+    ...view.profile,
+    runtimeSource: view.runtime.source,
+    ...(view.runtime.source === "global-worker"
+      ? { workerRevision: view.runtime.workerRevision }
+      : {}),
+    effectiveRuntime: view.runtime,
+    ...(view.runtime.status === "resolved"
+      ? {
+          agentId: view.runtime.binding.agentId,
+          adapterId: view.runtime.binding.adapterId,
+          model: view.runtime.binding.config.model,
+          effort: view.runtime.binding.config.effort
+        }
+      : {})
+  };
 }
 
 function presentSelectionTimes(value: unknown, store: TaskStore): unknown {

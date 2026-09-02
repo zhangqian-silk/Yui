@@ -16,6 +16,7 @@ import type {
   GlobalRoleSessionSet,
   TaskRoleSessionSet
 } from "../executor/agentExecutor.js";
+import type { AgentProfile } from "../profile/agentProfile.js";
 import type { GlobalRole, TaskRole } from "../role/role.js";
 import {
   hasRuntimeLifecycleWork,
@@ -41,6 +42,7 @@ export type AgentCommandTransactionStore = Readonly<{
   listConfiguredAgents(): ConfiguredAgentRecord[];
   getConfiguredAgent(id: string): ConfiguredAgentRecord | null;
   removeConfiguredAgent(id: string): boolean;
+  listAgentProfiles(): AgentProfile[];
   getConfig(): Readonly<{ defaultAgent?: string; defaultWorkspace?: string }>;
   listGlobalRoles(): GlobalRole[];
   listGlobalRoleSessionSets(): GlobalRoleSessionSet[];
@@ -185,6 +187,13 @@ function updateAgent(args: string[], store: AgentCommandStore): string {
       );
     }
     if (changes.adapter) {
+      const profile = findAgentProfileReference(tx, id);
+      if (profile !== null) {
+        throw usageError(
+          `Agent ${id} adapter cannot change because Agent Profile ${profile.id} references it. `
+          + "Update that explicit Profile or create a new Agent ID instead."
+        );
+      }
       const binding = findRoleBindingReference(tx, id);
       if (binding !== null) {
         throw usageError(
@@ -227,6 +236,13 @@ function removeAgent(args: string[], store: AgentCommandStore): string {
       throw usageError(
         `Agent ${id} cannot be removed because ${describeReference(binding)} references it. `
         + "Migrate or remove that Role binding before removing this Agent."
+      );
+    }
+    const profile = findAgentProfileReference(tx, id);
+    if (profile !== null) {
+      throw usageError(
+        `Agent ${id} cannot be removed because Agent Profile ${profile.id} references it. `
+        + "Update, inherit, or remove that Profile first."
       );
     }
     const session = findNonStoppedSessionReference(tx, id);
@@ -333,6 +349,15 @@ function findRoleBindingReference(
     }
   }
   return null;
+}
+
+function findAgentProfileReference(
+  store: AgentCommandTransactionStore,
+  agentId: string
+): AgentProfile | null {
+  return store.listAgentProfiles().find((profile) =>
+    profile.runtime.source === "explicit" && profile.runtime.agentId === agentId
+  ) ?? null;
 }
 
 function findNonStoppedSessionReference(

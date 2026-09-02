@@ -17,7 +17,7 @@ Yui 不把 Agent 的判断固化成确定性的工作流引擎。核心只负责
 ## 核心模型
 
 - `WorkItem`：唯一的有界工作单元，保存目标、验收条件、依赖、状态和精简结果。
-- `WorkerProfile`：可复用且与 provider 无关的行为模板，保存指令、Skill、访问要求及可选 model/effort hint。
+- `WorkerProfile`：可复用的 Worker 模板，分别保存可移植行为与继承或显式指定的 Agent runtime。
 - `TaskRole`：Task 内可修改的 Worker 实例，可绑定多个 Agent，并分别保存运行配置。
 - `Turn`：Task Role 的一次受管派发与结果交付。
 - `ChangeSet`：隔离 WorkItem 当前 HEAD 的不可变 Git 结果。
@@ -33,8 +33,14 @@ Agent 对话内创建 native subagent，或交给 Task Role Turn。Yui
 worker  explorer  implementer  reviewer
 ```
 
-Profile 不绑定 Agent，也不持有 Session 或 workspace。把 Yui Agent Profile 应用到 Task Role 时，会把 instructions、Skills、访问意图以及可选 model/effort 复制到该 Role 的 active Agent binding；显式 Role 参数可以继续覆盖这些值。它与 Codex 通过 `--profile` 选择的原生 config profile 不是一回事。Operator、Leader
-与 Task Role 是运行时 Role。
+Profile 的 runtime 要么动态继承当前全局 Worker active binding，要么显式指定
+一个 Agent 及可选 model/effort；adapter 始终由 Agent 配置派生。`profile list`
+和 `profile show` 会展示当前有效 Agent，以及继承时的 Worker launch revision，
+但不会因此改写 Profile 或增加其 revision。Profile 本身不持有 Session 或
+workspace。把 Yui Agent Profile 应用到新 Task Role 时，会冻结完整解析后的
+binding，以及 instructions、Skills 和访问意图；之后 Profile 或全局 Worker
+变更不会反向改写已有 Task Role。它与 Codex 通过 `--profile` 选择的原生 config
+profile 不是一回事。Operator、Leader 与 Task Role 是运行时 Role。
 
 ## 环境要求
 
@@ -293,10 +299,11 @@ Task/WorkItem 模型，不增加额外任务类型。
 `--last` 可直接恢复最近一条；新建会话不会伪装成 resume 选项，必须显式使用
 `operator new`，并把原对话保留在历史中。
 
-从已配置的全局 Worker 创建 Task Role，应用 Profile 并派发 WorkItem：
+从 Profile 当前解析出的 runtime 创建 Task Role 并派发 WorkItem：
 
 ```sh
 yui config role show worker
+yui config profile show implementer
 yui task role add <task-id> implementer --profile implementer
 yui task role show <task-id> implementer
 
@@ -339,10 +346,14 @@ provider 默认行为；`bypass` 编译 provider 支持的 bypass flag；`config
 `mode`、`allowedTools` 与 `disallowedTools`。provider 权限与 Profile 行为意图、
 Project 写入授权彼此独立：普通写入只由精确 WorkItem 范围和匹配的 managed
 workspace 授权。任意非 Leader
-Task Role 在创建时不传 `--agent`，都会复制全局 Worker Role 的完整 Agent
-bindings，Leader 无需重新拼接 model、effort 和权限。创建回执与
-`task context` 分别记录 Profile intent、精确可写 Project 与实际 permission strategy。显式
-`--agent` 属于 Task 专用覆盖，必须在派发前补全并回读配置。
+Task Role 在创建时同时不传 `--profile` 和 `--agent`，会复制全局 Worker Role
+的完整 Agent bindings，Leader 无需重新拼接 model、effort 和权限。传
+`--profile` 时会冻结该 Profile 当前解析出的完整 binding。创建时的 model、
+effort、权限和其他 Agent 设置必须与 `--agent` 同时提供，以便在任何持久化前
+完成能力校验并原子写入一套完整 binding。更新 Task Role 时，不传 `--agent`
+会更新 active binding；传入 `--agent` 则只更新指定 binding 而不激活它，只有
+`task role bind` 会切换 active Agent。创建回执与 `task context` 分别记录
+Profile intent、精确可写 Project 与实际 permission strategy。
 
 ReviewRound 从冻结 Candidate SHA 创建独立的可写 worktree。只有 exact
 ReviewRound owner、reviewRoundId、冻结 base 与 workspace 全部匹配时，才获得
@@ -380,11 +391,13 @@ yui config profile show reviewer
 subagent 的创建与结果返回完全由 Leader 当前 Agent 的 native child 能力
 完成，没有 `yui ... subagent` 命令。Leader 必须选择并读取一个显式
 Worker Profile；没有合适的专用 Profile 时使用 `worker`。child brief
-需要包含 Profile revision、instructions、Skills、访问边界、验证要求及
-当前 runtime 支持的 model/effort hint。
+需要包含 Profile revision、instructions、Skills、访问边界、验证要求，并把
+Profile 当前解析出的 Agent/model/effort 仅作为上下文。
 
 native subagent 继承 Leader Agent、凭据和对话上下文，忽略 Task Role 的
-Agent bindings。Leader 审查返回结果后，在 WorkItem summary 中登记真实
+Agent bindings；Profile 的 runtime 选择只控制 Task Role 物化。只有当 Profile
+解析到同一个 Agent 且 native child API 支持时，才应用其中的 model/effort，
+否则继承实际 runtime。Leader 审查返回结果后，在 WorkItem summary 中登记真实
 执行信息：
 
 ```sh

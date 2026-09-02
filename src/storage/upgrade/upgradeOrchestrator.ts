@@ -2,6 +2,16 @@ import { existsSync } from "node:fs";
 import { join } from "node:path";
 import Database from "better-sqlite3";
 
+import {
+  validateConfiguredAgent,
+  type ConfiguredAgent
+} from "../../agent/agent.js";
+import {
+  migrateAgentProfileV2ToV3,
+  validateAgentProfile,
+  type AgentProfileV2
+} from "../../profile/agentProfile.js";
+import { validateGlobalRole, type GlobalRole } from "../../role/role.js";
 import { validateTurn } from "../../turn/turn.js";
 import { validateWorkItem } from "../../workItem/workItem.js";
 import { validateExecutionGroup } from "../../execution/executionGroup.js";
@@ -20,7 +30,7 @@ const FIRST_SUPPORTED_AGGREGATE_VERSION = 21;
 export type StorageUpgradeStep = Readonly<{
   fromAggregate: number;
   toAggregate: number;
-  recordKind: "workItem" | "turn";
+  recordKind: "workItem" | "turn" | "agentProfile";
   fromRecordVersion: number;
   toRecordVersion: number;
 }>;
@@ -251,7 +261,8 @@ function migrationPlan(
   const all: readonly StorageUpgradeStep[] = [
     { fromAggregate: 21, toAggregate: 22, recordKind: "workItem", fromRecordVersion: 13, toRecordVersion: 14 },
     { fromAggregate: 22, toAggregate: 23, recordKind: "turn", fromRecordVersion: 1, toRecordVersion: 2 },
-    { fromAggregate: 23, toAggregate: 24, recordKind: "turn", fromRecordVersion: 2, toRecordVersion: 3 }
+    { fromAggregate: 23, toAggregate: 24, recordKind: "turn", fromRecordVersion: 2, toRecordVersion: 3 },
+    { fromAggregate: 24, toAggregate: 25, recordKind: "agentProfile", fromRecordVersion: 2, toRecordVersion: 3 }
   ];
   return all.filter(({ fromAggregate }) => fromAggregate >= manifest.aggregateSchemaVersion);
 }
@@ -267,6 +278,7 @@ function recordVersionsMatchAggregate(
   if (aggregate <= 21) expected.workItem = 13;
   if (aggregate <= 22) expected.turn = 1;
   else if (aggregate === 23) expected.turn = 2;
+  if (aggregate <= 24) expected.agentProfile = 2;
   const actualKinds = Object.keys(actual).sort();
   const expectedKinds = Object.keys(expected).sort();
   return actualKinds.length === expectedKinds.length
@@ -299,6 +311,15 @@ function validateMigrationDatabase(home: string, manifest: ParsedStorageManifest
         throw new Error(`Turn payload version ${String(turn.schemaVersion)} does not match its manifest.`);
       }
     }
+    const expectedProfile = manifest.aggregateSchemaVersion <= 24 ? 2 : 3;
+    for (const { payload } of database.prepare("SELECT payload FROM agent_profiles").all() as { payload: string }[]) {
+      const profile = jsonRecord(payload, "AgentProfile");
+      if (![expectedProfile, 3].includes(profile.schemaVersion as number)) {
+        throw new Error(
+          `AgentProfile payload version ${String(profile.schemaVersion)} does not match its manifest.`
+        );
+      }
+    }
   } finally {
     database.close();
   }
@@ -316,6 +337,7 @@ function applyMigration(home: string, manifest: ParsedStorageManifest, now: Date
       if (manifest.aggregateSchemaVersion <= 21) migrateWorkItems13To14(database, now);
       if (manifest.aggregateSchemaVersion <= 22) migrateTurns(database, 1, 2);
       if (manifest.aggregateSchemaVersion <= 23) migrateTurns(database, 2, 3);
+      if (manifest.aggregateSchemaVersion <= 24) migrateAgentProfiles2To3(database);
     }).immediate();
   } finally {
     database.close();
@@ -426,6 +448,70 @@ function migrateTurns(database: Database.Database, from: number, to: number): vo
   }
 }
 
+function migrateAgentProfiles2To3(database: Database.Database): void {
+  const rows = database.prepare("SELECT id, payload FROM agent_profiles").all() as {
+    id: string;
+    payload: string;
+  }[];
+  const needsWorker = rows.some(({ payload }) => {
+    const profile = jsonRecord(payload, "AgentProfile");
+    return profile.schemaVersion === 2
+      && (profile.model !== undefined || profile.effort !== undefined);
+  });
+  const worker = needsWorker ? migrationGlobalWorker(database) : undefined;
+  for (const row of rows) {
+    const profile = jsonRecord(row.payload, "AgentProfile");
+    if (profile.schemaVersion === 3) continue;
+    if (profile.schemaVersion !== 2) {
+      throw new Error(
+        `AgentProfile ${row.id} cannot migrate from version ${String(profile.schemaVersion)}.`
+      );
+    }
+    const migrated = migrateAgentProfileV2ToV3(
+      profile as AgentProfileV2,
+      worker
+    );
+    database.prepare("UPDATE agent_profiles SET payload = ? WHERE id = ?")
+      .run(JSON.stringify(migrated), row.id);
+  }
+}
+
+function migrationGlobalWorker(
+  database: Database.Database
+): Readonly<{ activeAgentId: string }> {
+  const row = database.prepare("SELECT payload FROM global_roles WHERE name = 'worker'")
+    .get() as { payload?: unknown } | undefined;
+  if (typeof row?.payload !== "string") {
+    throw new Error(
+      "AgentProfile migration requires Global Role worker for legacy model or effort values."
+    );
+  }
+  const worker = validateGlobalRole(
+    jsonRecord(row.payload, "Global Role worker") as GlobalRole
+  );
+  const binding = worker.agentBindings[worker.activeAgentId];
+  if (binding === undefined) {
+    throw new Error(
+      `AgentProfile migration Global Role worker active Agent is not bound: ${worker.activeAgentId}.`
+    );
+  }
+  const agentRow = database.prepare("SELECT payload FROM configured_agents WHERE id = ?")
+    .get(binding.agentId) as { payload?: unknown } | undefined;
+  if (typeof agentRow?.payload !== "string") {
+    throw new Error(
+      `AgentProfile migration Global Role worker Agent is not configured: ${binding.agentId}.`
+    );
+  }
+  const agent = jsonRecord(agentRow.payload, "Configured Agent");
+  validateConfiguredAgent(agent as ConfiguredAgent);
+  if (agent.adapterId !== binding.adapterId) {
+    throw new Error(
+      `AgentProfile migration Global Role worker Agent adapter does not match its binding: ${binding.agentId}.`
+    );
+  }
+  return { activeAgentId: worker.activeAgentId };
+}
+
 function assertDatabaseHealthy(database: Database.Database): void {
   const quick = database.pragma("quick_check") as { quick_check?: string }[];
   if (quick.length !== 1 || quick[0]?.quick_check !== "ok") {
@@ -448,6 +534,7 @@ function validateCurrentStore(home: string): void {
   const store = new SqliteTaskStore(home);
   try {
     store.getConfig();
+    for (const profile of store.listAgentProfiles()) validateAgentProfile(profile);
     for (const taskId of store.listTasks().map(({ id }) => id)) {
       for (const item of store.listWorkItems(taskId)) validateWorkItem(item);
       for (const turn of store.listTurns(taskId)) validateTurn(turn);

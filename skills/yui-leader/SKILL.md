@@ -427,20 +427,22 @@ yui task work update <work-id> running
 yui config profile show <worker|explorer|implementer|reviewer|profile-id>
 ```
 
-Read the selected Profile and incorporate all applicable portable constraints
-into the child brief:
+Read the selected Profile and incorporate all applicable portable behavior
+constraints into the child brief:
 
 - WorkItem objective, acceptance criteria, dependencies, and context reads;
 - Profile revision, description, instructions, and required Skills;
 - Profile read/write behavior intent and exact allowed workspace;
 - requested validation and evidence;
-- optional model and effort hints.
+- its runtime source and effective Agent/model/effort as context only.
 
 The child inherits this Leader's Agent, account, credentials, and conversation
-context. Ignore all Task Role Agent bindings. Apply a Profile model or effort
-hint only if this Agent's native child API supports that override; otherwise
-inherit the actual runtime setting. Never claim a model that cannot be
-confirmed.
+context. An Agent Profile's runtime selection governs Task Role materialization,
+not native subagent creation. Ignore a different explicit Profile Agent and all
+Task Role Agent bindings. If the Profile resolves to this same Agent, apply its
+model or effort only when the native child API supports that override;
+otherwise inherit the actual runtime setting. Never claim a model that cannot
+be confirmed.
 
 Create and communicate with children through the native Agent tools. Yui does
 not create, address, resume, or terminate those children; it observes their
@@ -473,9 +475,8 @@ lifecycle is required, use a Task Role instead.
 
 ## Dispatch a Task Role Turn
 
-A Task Role is a mutable Task-bound Worker instance. Apply a provider-neutral
-Profile snapshot, then bind one or more Agents with independent runtime
-settings:
+A Task Role is a mutable Task-bound Worker instance. Applying a Profile freezes
+its portable behavior and fully resolved runtime binding:
 
 ```sh
 yui task role add <task-id> <role> \
@@ -485,14 +486,20 @@ yui task work create <task-id> "<outcome>" --role <role>
 yui task work dispatch <work-id> --input "<execution brief>"
 ```
 
-The Profile is not linked to an Agent. Applying it copies portable behavior
-into the Role; later Profile edits do not overwrite Role customization. Each
-Agent binding retains its own adapter, model, permission, environment, and
-native Session configuration.
+An inherited Profile resolves the current Global Worker active binding; an
+explicit Profile resolves its named Agent plus model and effort. Applying it
+copies that complete binding and portable behavior into the Role. Later
+Profile or Global Worker edits do not overwrite Role customization. Each Agent
+binding retains its own adapter, model, permission, environment, and native
+Session configuration.
 
-Add a non-Leader Task Role without `--agent` so Yui copies the configured global
-Worker Role's complete bindings, regardless of the Task Role name. The Profile
-still defines portable behavior; Worker defines runtime Agent configuration.
+Without `--profile` or `--agent`, a non-Leader Task Role copies the configured
+Global Worker Role's complete bindings, regardless of the Task Role name.
+When `--agent` is present, any model, effort, permission, or other Agent
+settings form one explicit binding; those settings are invalid without
+`--agent` during Role creation. On Role update, Agent settings without
+`--agent` target the active binding; with `--agent`, they target that binding
+without switching it. Use `task role bind` as the only active-Agent switch.
 Before dispatch, inspect `task role show`; if Agent, model, effort, Profile, or
 workspace scope is missing or inconsistent, do not dispatch or guess it.
 

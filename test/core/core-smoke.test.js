@@ -39,6 +39,7 @@ import {
   createRole,
   createRoleAgentBinding
 } from "../../dist/role/role.js";
+import { createAgentProfile } from "../../dist/profile/agentProfile.js";
 import { materializeSessionBootstrap } from "../../dist/context/sessionBootstrapManifest.js";
 import { builtinAgentDriverRegistry } from "../../dist/runtime/builtinAgentDrivers.js";
 import { serializeAgentErrorRaw, standardAgentError } from "../../dist/runtime/agentError.js";
@@ -2069,6 +2070,31 @@ test("a valid aggregate-21 Home upgrades through every adjacent record step", as
   const store = new SqliteTaskStore(home);
   const task = activateTask(createTask("task-1", "Upgrade existing Home", now, { cwd: home }), now);
   store.saveTask(task);
+  const configuredAgent = createConfiguredAgent("codex", "codex", "codex", [], [], now);
+  store.saveConfiguredAgent(configuredAgent);
+  const workerBinding = createRoleAgentBinding(configuredAgent, {
+    adapterId: "codex",
+    permission: { strategy: "bypass" },
+    model: "legacy-model",
+    effort: "high"
+  });
+  store.saveGlobalRole(createGlobalRole(
+    "worker",
+    [workerBinding],
+    workerBinding.agentId,
+    home,
+    now
+  ));
+  const legacyProfile = createAgentProfile({
+    id: "legacy-explicit-profile",
+    runtime: {
+      source: "explicit",
+      agentId: configuredAgent.id,
+      model: "legacy-model",
+      effort: "high"
+    }
+  }, now);
+  store.saveAgentProfile(legacyProfile);
   store.saveManagedWorkspace(createManagedWorkspace({
     owner: { type: "task", taskId: task.id },
     root: home,
@@ -2106,6 +2132,16 @@ test("a valid aggregate-21 Home upgrades through every adjacent record step", as
           .run(JSON.stringify(payload), row.rowid);
       }
     }
+    const profileRows = database.prepare("SELECT rowid, payload FROM agent_profiles").all();
+    for (const row of profileRows) {
+      const payload = JSON.parse(row.payload);
+      payload.schemaVersion = 2;
+      payload.model = payload.runtime.model;
+      payload.effort = payload.runtime.effort;
+      delete payload.runtime;
+      database.prepare("UPDATE agent_profiles SET payload = ? WHERE rowid = ?")
+        .run(JSON.stringify(payload), row.rowid);
+    }
   } finally {
     database.close();
   }
@@ -2114,6 +2150,7 @@ test("a valid aggregate-21 Home upgrades through every adjacent record step", as
   manifest.aggregateSchemaVersion = 21;
   manifest.recordVersions.workItem = 13;
   manifest.recordVersions.turn = 1;
+  manifest.recordVersions.agentProfile = 2;
   writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
 
   const preflight = JSON.parse(execFileSync(
@@ -2123,7 +2160,7 @@ test("a valid aggregate-21 Home upgrades through every adjacent record step", as
   ));
   assert.equal(preflight.ok, true);
   assert.equal(preflight.data.outcome, "upgrade-plan");
-  assert.equal(preflight.data.report.steps.length, 3);
+  assert.equal(preflight.data.report.steps.length, 4);
   const upgraded = JSON.parse(execFileSync(
     process.execPath,
     [join(root, "dist", "cli.js"), "--json", "upgrade"],
@@ -2136,6 +2173,12 @@ test("a valid aggregate-21 Home upgrades through every adjacent record step", as
   t.after(() => reopened.close());
   assert.equal(reopened.getWorkItem(task.id, oldItem.id).schemaVersion, 14);
   assert.equal(reopened.getTurn(task.id, oldTurn.id).schemaVersion, 3);
+  assert.deepEqual(reopened.getAgentProfile(legacyProfile.id).runtime, {
+    source: "explicit",
+    agentId: configuredAgent.id,
+    model: "legacy-model",
+    effort: "high"
+  });
   const newItem = createWorkItem("work-item-2", task.id, {
     title: "New work after upgrade",
     assignee: "producer"

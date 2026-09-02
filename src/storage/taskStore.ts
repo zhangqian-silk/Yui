@@ -88,7 +88,7 @@ export const CURRENT_CONFIG_SCHEMA_VERSION = 6 as const;
 /** Current SQLite payload-family versions owned by this storage boundary. */
 export const CURRENT_CONFIGURED_AGENT_SCHEMA_VERSION = 2 as const;
 export const CURRENT_PROJECT_SCHEMA_VERSION = 5 as const;
-export const CURRENT_AGENT_PROFILE_SCHEMA_VERSION = 2 as const;
+export const CURRENT_AGENT_PROFILE_SCHEMA_VERSION = 3 as const;
 export const CURRENT_GLOBAL_ROLE_SCHEMA_VERSION = 3 as const;
 export const CURRENT_GLOBAL_ROLE_SESSION_SET_SCHEMA_VERSION = 4 as const;
 export const CURRENT_TASK_SCHEMA_VERSION = 6 as const;

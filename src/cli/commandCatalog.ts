@@ -224,7 +224,8 @@ const roleAgentClearOptions = [
   "--clear-search", "--clear-agent-config"
 ] as const;
 const agentProfileOptions = [
-  "--description", "--instructions", "--skill", "--model", "--effort"
+  "--description", "--instructions", "--skill",
+  "--agent", "--model", "--effort", "--inherit-worker"
 ] as const;
 const agentProfileClearOptions = [
   "--clear-description", "--clear-instructions", "--clear-skills",
@@ -298,8 +299,8 @@ const globalSessionChildren: readonly NodeInput[] = [
 const profileChildren: readonly NodeInput[] = [
   {
     name: "add",
-    summary: "Add a reusable Agent Profile.",
-    usage: "yui config profile add <id> [--access <read|write>] [Profile settings]",
+    summary: "Add a reusable Agent Profile that inherits Worker runtime or selects one explicit Agent.",
+    usage: "yui config profile add <id> [--access <read|write>] [--inherit-worker | --agent <id> [--model <model>] [--effort <effort>]] [Profile settings]",
     options: ["--access", ...agentProfileOptions],
     optionValues: { "--access": ["read", "write"] }
   },
@@ -307,8 +308,8 @@ const profileChildren: readonly NodeInput[] = [
   { name: "show", summary: "Show one Agent Profile.", usage: "yui config profile show <id>" },
   {
     name: "update",
-    summary: "Update an Agent Profile.",
-    usage: "yui config profile update <id> [--access <read|write>] [Profile settings]",
+    summary: "Update an Agent Profile's behavior or runtime source.",
+    usage: "yui config profile update <id> [--access <read|write>] [--inherit-worker | [--agent <id>] [--model <model>|--clear-model] [--effort <effort>|--clear-effort]] [Profile settings]",
     options: ["--access", ...agentProfileOptions, ...agentProfileClearOptions],
     optionValues: { "--access": ["read", "write"] }
   },
@@ -637,8 +638,8 @@ const taskChildren: readonly NodeInput[] = [
     children: [
       {
         name: "add",
-        summary: "Add a Role to a Task.",
-        usage: "yui task role add <task> <name> [--profile <id>] [--agent <id>] [Role and Agent settings]",
+        summary: "Add a Task Role from a frozen Profile/Worker runtime or one explicit Agent.",
+        usage: "yui task role add <task> <name> [--profile <id>] [--agent <id> [Agent settings]] [Role settings]",
         options: ["--profile", "--agent", ...roleProfileOptions, ...roleAgentOptions],
         optionValues: roleAgentOptionValues
       },
@@ -651,8 +652,8 @@ const taskChildren: readonly NodeInput[] = [
       { name: "show", summary: "Show one Task Role.", usage: "yui task role show <task> <role>" },
       {
         name: "update",
-        summary: "Update a Task Role.",
-        usage: "yui task role update <task> <role> [Role and Agent settings]",
+        summary: "Update a Task Role; Agent settings target the named or active binding without switching it.",
+        usage: "yui task role update <task> <role> [--profile <id>] [--agent <id>] [Role and Agent settings]",
         options: ["--profile", "--agent", ...roleProfileOptions, ...roleAgentOptions,
           ...roleProfileClearOptions, ...roleAgentClearOptions],
         optionValues: roleAgentOptionValues

@@ -140,20 +140,19 @@ async function addTaskRole(
   if (named === undefined) return { kind: "cancelled", args: withTask };
   if (hasExplicitAddSettings(named, 5)) return { kind: "resolved", args: named };
 
-  const roleName = named[4] ?? "";
-  const [globalRoleValue, agents] = await Promise.all([
-    Promise.resolve(ports.call("role.show", { name: roleName })),
+  const [workerRoleValue, agents] = await Promise.all([
+    Promise.resolve(ports.call("role.show", { name: "worker" })),
     loadAgentSelection(ports)
   ]);
-  const globalRole = asRole(globalRoleValue);
+  const workerRole = asRole(workerRoleValue);
   const explicitAgent = optionValue(named, "--agent");
-  if (globalRole !== undefined && explicitAgent === undefined) {
+  if (workerRole !== undefined && explicitAgent === undefined) {
     const source = await choose(
       "Create Task Role from",
       [
         {
           value: "copy",
-          cells: ["Copy existing Global Role", `Active Agent: ${globalRole.activeAgentId}`]
+          cells: ["Copy Global Worker", `Active Agent: ${workerRole.activeAgentId}`]
         },
         {
           value: "agent",

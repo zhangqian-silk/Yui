@@ -16,5 +16,5 @@
  */
 export const CURRENT_STORAGE_LAYOUT_VERSION = 8;
 
-/** Aggregate 24 persists Turn v3 WorkItem main-Group provenance. */
-export const CURRENT_AGGREGATE_SCHEMA_VERSION = 24;
+/** Aggregate 25 migrates AgentProfile v2 runtime hints to the v3 runtime union. */
+export const CURRENT_AGGREGATE_SCHEMA_VERSION = 25;
