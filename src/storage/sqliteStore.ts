@@ -327,7 +327,7 @@ export class SqliteTaskStore implements TaskStore {
         "STORAGE_SCHEMA_INVALID",
         `SQLite database is corrupt: required singleton row(s) missing (${missing}). `
         + "The database may be truncated or partially migrated. Restore yui.db from a "
-        + "backup, or re-run `yui upgrade` to rebuild it from state.json."
+        + "backup, or preserve this Home for diagnosis and initialize a new Home."
       );
     }
     if (!hasHomeMeta) this.#seedHomeMeta();

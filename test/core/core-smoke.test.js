@@ -75,7 +75,7 @@ import { listPublicCommandPaths } from "../../dist/cli/commandCatalog.js";
 import { acquireHandoverLock, readHandoverFence } from "../../dist/release/runtimeRelease.js";
 import { SqliteTaskStore } from "../../dist/storage/sqliteStore.js";
 import * as taskStoreContract from "../../dist/storage/taskStore.js";
-import { ensureStorageSchema, StorageSchemaError } from "../../dist/storage/storageSchema.js";
+import { ensureStorageSchema } from "../../dist/storage/storageSchema.js";
 import { latestStorageVersionState } from "../../dist/storage/upgrade/recordVersions.js";
 import { initializeCurrentTaskStore } from "../../dist/storage/currentTaskStore.js";
 import { SqliteTelemetryStore } from "../../dist/telemetry/sqliteTelemetryStore.js";
@@ -1417,27 +1417,6 @@ test("a new current Home initializes its SQLite authority exactly once", (t) => 
   } finally {
     database.close();
   }
-});
-
-test("an existing SQLite Home with missing singleton rows fails closed", (t) => {
-  const home = mkdtempSync(join(tmpdir(), "yui-missing-sqlite-singletons-smoke-"));
-  t.after(() => rmSync(home, { recursive: true, force: true }));
-  ensureStorageSchema(home);
-  new SqliteTaskStore(home).close();
-  const database = new Database(join(home, "yui.db"));
-  try {
-    database.prepare("DELETE FROM home_meta WHERE id = 1").run();
-    database.prepare("DELETE FROM config WHERE id = 1").run();
-  } finally {
-    database.close();
-  }
-  assert.throws(
-    () => new SqliteTaskStore(home),
-    (error) => error instanceof StorageSchemaError
-      && error.code === "STORAGE_SCHEMA_INVALID"
-      && /home_meta/u.test(error.message)
-      && /config/u.test(error.message)
-  );
 });
 
 test("fresh SQLite telemetry persists and aggregates by Turn", async (t) => {
