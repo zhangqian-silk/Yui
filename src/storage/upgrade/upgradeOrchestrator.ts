@@ -2,6 +2,16 @@ import { existsSync } from "node:fs";
 import { join } from "node:path";
 import Database from "better-sqlite3";
 
+import {
+  validateConfiguredAgent,
+  type ConfiguredAgent
+} from "../../agent/agent.js";
+import {
+  migrateAgentProfileV2ToV3,
+  validateAgentProfile,
+  type AgentProfileV2
+} from "../../profile/agentProfile.js";
+import { validateGlobalRole, type GlobalRole } from "../../role/role.js";
 import { validateTurn } from "../../turn/turn.js";
 import { validateWorkItem } from "../../workItem/workItem.js";
 import { validateTask } from "../../task/task.js";
@@ -14,6 +24,7 @@ import {
   writeCurrentStorageManifest,
   type ParsedStorageManifest
 } from "../storageSchema.js";
+import { validateYuiConfig, type YuiConfig } from "../taskStore.js";
 import type { StorageVersionState } from "./recordVersions.js";
 
 const CURRENT_DATABASE_FILENAME = "yui.db";
@@ -22,7 +33,7 @@ const FIRST_SUPPORTED_AGGREGATE_VERSION = 21;
 export type StorageUpgradeStep = Readonly<{
   fromAggregate: number;
   toAggregate: number;
-  recordKind: "workItem" | "turn" | "task" | "integrationAttempt";
+  recordKind: "workItem" | "turn" | "task" | "integrationAttempt" | "agentProfile";
   fromRecordVersion: number;
   toRecordVersion: number;
 }>;
@@ -255,7 +266,8 @@ function migrationPlan(
     { fromAggregate: 22, toAggregate: 23, recordKind: "turn", fromRecordVersion: 1, toRecordVersion: 2 },
     { fromAggregate: 23, toAggregate: 24, recordKind: "turn", fromRecordVersion: 2, toRecordVersion: 3 },
     { fromAggregate: 24, toAggregate: 25, recordKind: "task", fromRecordVersion: 6, toRecordVersion: 7 },
-    { fromAggregate: 25, toAggregate: 26, recordKind: "integrationAttempt", fromRecordVersion: 5, toRecordVersion: 6 }
+    { fromAggregate: 25, toAggregate: 26, recordKind: "integrationAttempt", fromRecordVersion: 5, toRecordVersion: 6 },
+    { fromAggregate: 26, toAggregate: 27, recordKind: "agentProfile", fromRecordVersion: 2, toRecordVersion: 3 }
   ];
   return all.filter(({ fromAggregate }) => fromAggregate >= manifest.aggregateSchemaVersion);
 }
@@ -273,6 +285,7 @@ function recordVersionsMatchAggregate(
   else if (aggregate === 23) expected.turn = 2;
   if (aggregate <= 24) expected.task = 6;
   if (aggregate <= 25) expected.integrationAttempt = 5;
+  if (aggregate <= 26) expected.agentProfile = 2;
   const actualKinds = Object.keys(actual).sort();
   const expectedKinds = Object.keys(expected).sort();
   return actualKinds.length === expectedKinds.length
@@ -321,6 +334,15 @@ function validateMigrationDatabase(home: string, manifest: ParsedStorageManifest
         );
       }
     }
+    const expectedProfile = manifest.aggregateSchemaVersion <= 26 ? 2 : 3;
+    for (const { payload } of database.prepare("SELECT payload FROM agent_profiles").all() as { payload: string }[]) {
+      const profile = jsonRecord(payload, "AgentProfile");
+      if (![expectedProfile, 3].includes(profile.schemaVersion as number)) {
+        throw new Error(
+          `AgentProfile payload version ${String(profile.schemaVersion)} does not match its manifest.`
+        );
+      }
+    }
   } finally {
     database.close();
   }
@@ -340,6 +362,7 @@ function applyMigration(home: string, manifest: ParsedStorageManifest, now: Date
       if (manifest.aggregateSchemaVersion <= 23) migrateTurns(database, 2, 3);
       if (manifest.aggregateSchemaVersion <= 24) migrateTasks6To7(database);
       if (manifest.aggregateSchemaVersion <= 25) migrateIntegrations5To6(database, now);
+      if (manifest.aggregateSchemaVersion <= 26) migrateAgentProfiles2To3(database);
     }).immediate();
   } finally {
     database.close();
@@ -448,6 +471,107 @@ function migrateTurns(database: Database.Database, from: number, to: number): vo
       "UPDATE turns SET payload = ? WHERE task_id = ? AND turn_id = ?"
     ).run(JSON.stringify(migrated), row.task_id, row.turn_id);
   }
+}
+
+function migrateAgentProfiles2To3(database: Database.Database): void {
+  const rows = database.prepare("SELECT id, payload FROM agent_profiles").all() as {
+    id: string;
+    payload: string;
+  }[];
+  const needsRuntimeAgent = rows.some(({ payload }) => {
+    const profile = jsonRecord(payload, "AgentProfile");
+    return profile.schemaVersion === 2
+      && (profile.model !== undefined || profile.effort !== undefined);
+  });
+  const runtimeAgent = needsRuntimeAgent
+    ? migrationProfileRuntimeAgent(database)
+    : undefined;
+  for (const row of rows) {
+    const profile = jsonRecord(row.payload, "AgentProfile");
+    if (profile.schemaVersion === 3) continue;
+    if (profile.schemaVersion !== 2) {
+      throw new Error(
+        `AgentProfile ${row.id} cannot migrate from version ${String(profile.schemaVersion)}.`
+      );
+    }
+    const migrated = migrateAgentProfileV2ToV3(
+      profile as AgentProfileV2,
+      runtimeAgent
+    );
+    database.prepare("UPDATE agent_profiles SET payload = ? WHERE id = ?")
+      .run(JSON.stringify(migrated), row.id);
+  }
+}
+
+function migrationProfileRuntimeAgent(
+  database: Database.Database
+): Readonly<{ agentId: string }> {
+  const row = database.prepare("SELECT payload FROM global_roles WHERE name = 'worker'")
+    .get() as { payload?: unknown } | undefined;
+  if (typeof row?.payload === "string") {
+    const worker = validateGlobalRole(
+      jsonRecord(row.payload, "Global Role worker") as GlobalRole
+    );
+    const binding = worker.agentBindings[worker.activeAgentId];
+    if (binding === undefined) {
+      throw new Error(
+        `AgentProfile migration Global Role worker active Agent is not bound: ${worker.activeAgentId}.`
+      );
+    }
+    const agent = migrationConfiguredAgent(database, binding.agentId, "Global Role worker");
+    if (agent.adapterId !== binding.adapterId) {
+      throw new Error(
+        `AgentProfile migration Global Role worker Agent adapter does not match its binding: `
+        + `${binding.agentId}.`
+      );
+    }
+    return { agentId: worker.activeAgentId };
+  }
+
+  const configRow = database.prepare("SELECT payload FROM config WHERE id = 1")
+    .get() as { payload?: unknown } | undefined;
+  if (typeof configRow?.payload !== "string") {
+    throw new Error("AgentProfile migration requires the Yui config singleton.");
+  }
+  const config = jsonRecord(configRow.payload, "Yui config") as YuiConfig;
+  validateYuiConfig(config);
+  if (config.defaultAgent === undefined) {
+    const configuredAgents = database.prepare(
+      "SELECT id FROM configured_agents ORDER BY id"
+    ).all() as { id: string }[];
+    if (configuredAgents.length === 1) {
+      const agent = migrationConfiguredAgent(
+        database,
+        configuredAgents[0].id,
+        "sole configured"
+      );
+      return { agentId: agent.id };
+    }
+    throw new Error(
+      "AgentProfile migration requires Global Role worker, config.defaultAgent, "
+      + "or exactly one configured Agent for legacy model or effort values; "
+      + `found ${configuredAgents.length} configured Agents.`
+    );
+  }
+  migrationConfiguredAgent(database, config.defaultAgent, "config.defaultAgent");
+  return { agentId: config.defaultAgent };
+}
+
+function migrationConfiguredAgent(
+  database: Database.Database,
+  agentId: string,
+  source: string
+): ConfiguredAgent {
+  const agentRow = database.prepare("SELECT payload FROM configured_agents WHERE id = ?")
+    .get(agentId) as { payload?: unknown } | undefined;
+  if (typeof agentRow?.payload !== "string") {
+    throw new Error(
+      `AgentProfile migration ${source} Agent is not configured: ${agentId}.`
+    );
+  }
+  const agent = jsonRecord(agentRow.payload, "Configured Agent");
+  validateConfiguredAgent(agent as ConfiguredAgent);
+  return agent as ConfiguredAgent;
 }
 
 function migrateTasks6To7(database: Database.Database): void {
@@ -636,6 +760,7 @@ function validateCurrentStore(home: string): void {
   const store = new SqliteTaskStore(home);
   try {
     store.getConfig();
+    for (const profile of store.listAgentProfiles()) validateAgentProfile(profile);
     for (const taskId of store.listTasks().map(({ id }) => id)) {
       for (const item of store.listWorkItems(taskId)) validateWorkItem(item);
       for (const turn of store.listTurns(taskId)) validateTurn(turn);

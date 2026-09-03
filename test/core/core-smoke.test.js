@@ -34,13 +34,17 @@ import {
   startTaskExecutionCommand,
   stopTaskExecutionCommand
 } from "../../dist/commands/taskExecutionCommands.js";
+import {
+  previewTaskRoleAgentConfigurationMutation,
+  runTaskCommand
+} from "../../dist/commands/taskCommands.js";
 import { upsertTaskPublication } from "../../dist/commands/taskPublicationCommands.js";
-import { runTaskCommand } from "../../dist/commands/taskCommands.js";
 import {
   createGlobalRole,
   createRole,
   createRoleAgentBinding
 } from "../../dist/role/role.js";
+import { createAgentProfile } from "../../dist/profile/agentProfile.js";
 import { materializeSessionBootstrap } from "../../dist/context/sessionBootstrapManifest.js";
 import { builtinAgentDriverRegistry } from "../../dist/runtime/builtinAgentDrivers.js";
 import { serializeAgentErrorRaw, standardAgentError } from "../../dist/runtime/agentError.js";
@@ -2193,6 +2197,246 @@ test("a new current Home initializes its SQLite authority exactly once", (t) => 
   }
 });
 
+test("Task Role Profiles preserve runtime and portable behavior across add and update", (t) => {
+  const home = mkdtempSync(join(tmpdir(), "yui-task-role-profile-update-smoke-"));
+  t.after(() => rmSync(home, { recursive: true, force: true }));
+  ensureStorageSchema(home);
+  const store = new SqliteTaskStore(home);
+  t.after(() => store.close());
+  const now = new Date("2026-09-03T06:10:00.000Z");
+  const task = activateTask(createTask("task-1", "Update one Role binding", now, {
+    cwd: home
+  }), now);
+  store.saveTask(task);
+  const codex = createConfiguredAgent("codex", "codex", "codex", [], [], now);
+  const claude = createConfiguredAgent("claude", "claude", "claude", [], [], now);
+  store.saveConfiguredAgent(codex);
+  store.saveConfiguredAgent(claude);
+  const workerBinding = createRoleAgentBinding(codex, {
+    adapterId: "codex",
+    permission: {
+      strategy: "configured",
+      sandbox: "workspace-write",
+      approval: "on-request"
+    },
+    model: "worker-model",
+    effort: "medium",
+    search: true
+  });
+  store.saveGlobalRole(createGlobalRole(
+    "worker",
+    [workerBinding],
+    workerBinding.agentId,
+    home,
+    now
+  ));
+  const codexProfile = createAgentProfile({
+    id: "profile-codex",
+    runtime: {
+      source: "explicit",
+      agentId: codex.id,
+      model: "profile-model",
+      effort: "high"
+    }
+  }, now);
+  const claudeProfile = createAgentProfile({
+    id: "profile-claude",
+    runtime: {
+      source: "explicit",
+      agentId: claude.id,
+      model: "claude-model"
+    }
+  }, now);
+  const inheritedProfile = createAgentProfile({
+    id: "profile-inherited",
+    defaultAccess: "write",
+    description: "Portable inherited behavior",
+    runtime: { source: "global-worker" }
+  }, now);
+  store.saveAgentProfile(codexProfile);
+  store.saveAgentProfile(claudeProfile);
+  store.saveAgentProfile(inheritedProfile);
+  const role = createRole(
+    task.id,
+    "runner",
+    [workerBinding],
+    workerBinding.agentId,
+    home,
+    now
+  );
+  store.saveRole(task.id, role);
+
+  const addWithProfileRuntime = [
+    "role", "add", task.id, "profile-runner",
+    "--profile", codexProfile.id,
+    "--agent", codex.id,
+    "--effort", "low"
+  ];
+  assert.deepEqual(
+    previewTaskRoleAgentConfigurationMutation(addWithProfileRuntime, store),
+    {
+      agentId: codex.id,
+      config: {
+        ...workerBinding.config,
+        model: "profile-model",
+        effort: "low"
+      },
+      cwd: home
+    }
+  );
+  runTaskCommand(addWithProfileRuntime, store, {
+    now: () => new Date("2026-09-03T06:10:05.000Z"),
+    environment: bareEnv
+  });
+  const added = store.getRole(task.id, "profile-runner");
+  assert.equal(added.activeAgentId, codex.id);
+  assert.deepEqual(added.agentBindings[codex.id].config, {
+    ...workerBinding.config,
+    model: "profile-model",
+    effort: "low"
+  });
+
+  const implicitOtherAgent = [
+    "role", "update", task.id, role.name, "--profile", claudeProfile.id
+  ];
+  assert.throws(
+    () => previewTaskRoleAgentConfigurationMutation(implicitOtherAgent, store),
+    /Agent Profile profile-claude resolves to Agent claude.*active Agent codex.*--agent claude/u
+  );
+  assert.throws(
+    () => runTaskCommand(implicitOtherAgent, store, {
+      now: () => new Date("2026-09-03T06:10:10.000Z"),
+      environment: bareEnv
+    }),
+    /Agent Profile profile-claude resolves to Agent claude.*active Agent codex.*--agent claude/u
+  );
+  assert.deepEqual(store.getRole(task.id, role.name), role);
+
+  const mergeProfileRuntime = [
+    "role", "update", task.id, role.name,
+    "--profile", codexProfile.id,
+    "--agent", codex.id,
+    "--effort", "low"
+  ];
+  assert.deepEqual(
+    previewTaskRoleAgentConfigurationMutation(mergeProfileRuntime, store),
+    {
+      agentId: codex.id,
+      config: {
+        ...workerBinding.config,
+        model: "profile-model",
+        effort: "low"
+      },
+      cwd: home
+    }
+  );
+  runTaskCommand(mergeProfileRuntime, store, {
+    now: () => new Date("2026-09-03T06:10:20.000Z"),
+    environment: bareEnv
+  });
+  assert.equal(store.getRole(task.id, role.name).activeAgentId, codex.id);
+  assert.deepEqual(
+    store.getRole(task.id, role.name).agentBindings[codex.id].config,
+    {
+      ...workerBinding.config,
+      model: "profile-model",
+      effort: "low"
+    }
+  );
+
+  const updateInactiveBinding = [
+    "role", "update", task.id, role.name,
+    "--profile", claudeProfile.id,
+    "--agent", claude.id
+  ];
+  assert.deepEqual(
+    previewTaskRoleAgentConfigurationMutation(updateInactiveBinding, store),
+    {
+      agentId: claude.id,
+      config: {
+        adapterId: "claude",
+        permission: { strategy: "bypass" },
+        model: "claude-model"
+      },
+      cwd: home
+    }
+  );
+  runTaskCommand(updateInactiveBinding, store, {
+    now: () => new Date("2026-09-03T06:10:30.000Z"),
+    environment: bareEnv
+  });
+  const updated = store.getRole(task.id, role.name);
+  assert.equal(updated.activeAgentId, codex.id);
+  assert.deepEqual(updated.agentBindings[claude.id].config, {
+    adapterId: "claude",
+    permission: { strategy: "bypass" },
+    model: "claude-model"
+  });
+
+  const claudeBinding = createRoleAgentBinding(claude, {
+    adapterId: "claude",
+    permission: {
+      strategy: "configured",
+      mode: "acceptEdits"
+    },
+    model: "existing-claude-model",
+    effort: "medium"
+  });
+  const portableRole = createRole(
+    task.id,
+    "portable",
+    [claudeBinding],
+    claude.id,
+    home,
+    now
+  );
+  store.saveRole(task.id, portableRole);
+  const applyInheritedBehavior = [
+    "role", "update", task.id, portableRole.name,
+    "--profile", inheritedProfile.id
+  ];
+  assert.equal(
+    previewTaskRoleAgentConfigurationMutation(applyInheritedBehavior, store),
+    undefined
+  );
+  runTaskCommand(applyInheritedBehavior, store, {
+    now: () => new Date("2026-09-03T06:10:40.000Z"),
+    environment: bareEnv
+  });
+  const portableUpdated = store.getRole(task.id, portableRole.name);
+  assert.equal(portableUpdated.activeAgentId, claude.id);
+  assert.deepEqual(portableUpdated.agentBindings, portableRole.agentBindings);
+  assert.equal(portableUpdated.description, "Portable inherited behavior");
+  assert.equal(portableUpdated.defaultAccess, "write");
+
+  const claudeWorkerBinding = createRoleAgentBinding(claude, {
+    adapterId: "claude",
+    permission: { strategy: "bypass" },
+    model: "worker-claude-model",
+    effort: "max"
+  });
+  store.saveGlobalRole(createGlobalRole(
+    "worker",
+    [workerBinding, claudeWorkerBinding],
+    claude.id,
+    home,
+    new Date("2026-09-03T06:10:50.000Z")
+  ));
+  runTaskCommand(
+    ["role", "add", task.id, "dormant-worker-profile", "--profile", codexProfile.id],
+    store,
+    { now: () => new Date("2026-09-03T06:11:00.000Z"), environment: bareEnv }
+  );
+  assert.deepEqual(
+    store.getRole(task.id, "dormant-worker-profile").agentBindings[codex.id].config,
+    {
+      ...workerBinding.config,
+      model: "profile-model",
+      effort: "high"
+    }
+  );
+});
+
 test("a valid aggregate-21 Home upgrades through every adjacent record step", async (t) => {
   const home = mkdtempSync(join(tmpdir(), "yui-aggregate-21-upgrade-smoke-"));
   const upgradeEnvironment = { ...bareEnv, YUI_HOME: home };
@@ -2232,6 +2476,39 @@ test("a valid aggregate-21 Home upgrades through every adjacent record step", as
     now
   ), now);
   store.saveTask(task);
+  const configuredAgent = createConfiguredAgent("codex", "codex", "codex", [], [], now);
+  store.saveConfiguredAgent(configuredAgent);
+  const sharedDirectory = join(home, "shared");
+  mkdirSync(sharedDirectory, { recursive: true });
+  const workerBinding = createRoleAgentBinding(configuredAgent, {
+    adapterId: "codex",
+    permission: {
+      strategy: "configured",
+      sandbox: "workspace-write",
+      approval: "on-request"
+    },
+    model: "legacy-model",
+    effort: "high",
+    search: true,
+    additionalDirectories: [sharedDirectory]
+  });
+  store.saveGlobalRole(createGlobalRole(
+    "worker",
+    [workerBinding],
+    workerBinding.agentId,
+    home,
+    now
+  ));
+  const legacyProfile = createAgentProfile({
+    id: "legacy-explicit-profile",
+    runtime: {
+      source: "explicit",
+      agentId: configuredAgent.id,
+      model: "legacy-model",
+      effort: "high"
+    }
+  }, now);
+  store.saveAgentProfile(legacyProfile);
   store.saveManagedWorkspace(createManagedWorkspace({
     owner: { type: "task", taskId: task.id },
     root: home,
@@ -2306,6 +2583,16 @@ test("a valid aggregate-21 Home upgrades through every adjacent record step", as
           .run(JSON.stringify(payload), row.rowid);
       }
     }
+    const profileRows = database.prepare("SELECT rowid, payload FROM agent_profiles").all();
+    for (const row of profileRows) {
+      const payload = JSON.parse(row.payload);
+      payload.schemaVersion = 2;
+      payload.model = payload.runtime.model;
+      payload.effort = payload.runtime.effort;
+      delete payload.runtime;
+      database.prepare("UPDATE agent_profiles SET payload = ? WHERE rowid = ?")
+        .run(JSON.stringify(payload), row.rowid);
+    }
     const integrationRows = database.prepare(
       "SELECT rowid, payload FROM integration_attempts"
     ).all();
@@ -2331,6 +2618,7 @@ test("a valid aggregate-21 Home upgrades through every adjacent record step", as
   manifest.recordVersions.turn = 1;
   manifest.recordVersions.task = 6;
   manifest.recordVersions.integrationAttempt = 5;
+  manifest.recordVersions.agentProfile = 2;
   writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
 
   const preflight = JSON.parse(execFileSync(
@@ -2340,7 +2628,7 @@ test("a valid aggregate-21 Home upgrades through every adjacent record step", as
   ));
   assert.equal(preflight.ok, true);
   assert.equal(preflight.data.outcome, "upgrade-plan");
-  assert.equal(preflight.data.report.steps.length, 5);
+  assert.equal(preflight.data.report.steps.length, 6);
   const upgraded = JSON.parse(execFileSync(
     process.execPath,
     [join(root, "dist", "cli.js"), "--json", "upgrade"],
@@ -2358,6 +2646,21 @@ test("a valid aggregate-21 Home upgrades through every adjacent record step", as
   assert.equal(
     reopened.getTask(task.id).projectBindings[0].currentCommit,
     latestIntegrationCommit
+  );
+  assert.deepEqual(reopened.getAgentProfile(legacyProfile.id).runtime, {
+    source: "explicit",
+    agentId: configuredAgent.id,
+    model: "legacy-model",
+    effort: "high"
+  });
+  runTaskCommand(
+    ["role", "add", task.id, "migrated-profile-role", "--profile", legacyProfile.id],
+    reopened,
+    { now: () => new Date("2026-09-02T01:00:30.000Z"), environment: bareEnv }
+  );
+  assert.deepEqual(
+    reopened.getRole(task.id, "migrated-profile-role").agentBindings[configuredAgent.id].config,
+    workerBinding.config
   );
   const newItem = createWorkItem("work-item-2", task.id, {
     title: "New work after upgrade",
@@ -2384,6 +2687,68 @@ test("a valid aggregate-21 Home upgrades through every adjacent record step", as
     { now: () => new Date("2026-09-02T01:02:00.000Z"), environment: bareEnv }
   );
   assert.equal(reopened.getActiveTurn(task.id, "producer").workItemId, newItem.id);
+});
+
+test("aggregate-24 Profile hints migrate through the sole configured Agent without Worker", (t) => {
+  const home = mkdtempSync(join(tmpdir(), "yui-aggregate-24-profile-upgrade-smoke-"));
+  const upgradeEnvironment = { ...bareEnv, YUI_HOME: home };
+  t.after(() => rmSync(home, { recursive: true, force: true }));
+  ensureStorageSchema(home);
+  const now = new Date("2026-09-03T08:15:00.000Z");
+  const store = new SqliteTaskStore(home);
+  const configuredAgent = createConfiguredAgent("codex", "codex", "codex", [], [], now);
+  store.saveConfiguredAgent(configuredAgent);
+  const legacyProfile = createAgentProfile({
+    id: "workerless-legacy-profile",
+    runtime: {
+      source: "explicit",
+      agentId: configuredAgent.id,
+      model: "legacy-model",
+      effort: "high"
+    }
+  }, now);
+  store.saveAgentProfile(legacyProfile);
+  store.close();
+
+  const database = new Database(join(home, "yui.db"));
+  try {
+    const row = database.prepare(
+      "SELECT payload FROM agent_profiles WHERE id = ?"
+    ).get(legacyProfile.id);
+    const payload = JSON.parse(row.payload);
+    payload.schemaVersion = 2;
+    payload.model = payload.runtime.model;
+    payload.effort = payload.runtime.effort;
+    delete payload.runtime;
+    database.prepare("UPDATE agent_profiles SET payload = ? WHERE id = ?")
+      .run(JSON.stringify(payload), legacyProfile.id);
+  } finally {
+    database.close();
+  }
+  const manifestPath = join(home, "schema.json");
+  const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
+  manifest.aggregateSchemaVersion = 24;
+  manifest.recordVersions.task = 6;
+  manifest.recordVersions.integrationAttempt = 5;
+  manifest.recordVersions.agentProfile = 2;
+  writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+
+  const upgraded = JSON.parse(execFileSync(
+    process.execPath,
+    [join(root, "dist", "cli.js"), "--json", "upgrade"],
+    { cwd: root, encoding: "utf8", env: upgradeEnvironment }
+  ));
+  assert.equal(upgraded.ok, true);
+  assert.equal(upgraded.data.outcome, "upgraded");
+  const reopened = new SqliteTaskStore(home);
+  t.after(() => reopened.close());
+  assert.equal(reopened.getGlobalRole("worker"), null);
+  assert.deepEqual(reopened.getAgentProfile(legacyProfile.id).runtime, {
+    source: "explicit",
+    agentId: configuredAgent.id,
+    model: "legacy-model",
+    effort: "high"
+  });
 });
 
 test("an existing SQLite Home with missing singleton rows fails closed", (t) => {

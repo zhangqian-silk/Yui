@@ -127,13 +127,47 @@ path (including an explicit `0->1` introduction for a new family) and re-test to
 convergence.
 
 Yui provides four reusable Worker Profile definitions through
-`yui config profile reset`; minimum setup leaves them unconfigured:
+`yui config profile reset`; minimum setup makes each one inherit the current
+Global Worker runtime:
 
 ```text
 worker  explorer  implementer  reviewer
 ```
 
-Profiles are versioned, provider-neutral Worker behavior templates. They hold portable prompt instructions, Skills, access expectations, and optional model and effort selections, but do not bind an Agent or own a Session or workspace. A Task Role is the Task-bound Worker instance: applying a Yui Agent Profile copies the behavior plus model/effort into that Role's active Agent binding; explicit Role options may override the copied values. This is separate from a Codex native config profile selected with `--profile`.
+Profiles are versioned Worker templates with two independent parts: portable
+behavior (prompt instructions, Skills, and access intent) and runtime intent.
+Runtime either follows the current Global Worker binding dynamically, or names
+one explicit Agent with optional model and effort. `profile list` and `profile
+show` resolve the effective Agent from current configuration and display the
+Global Worker launch revision when inherited; that read does not rewrite or
+revise the Profile. Profiles do not own Sessions or workspaces.
+When an explicit Profile's Agent has a Global Worker binding, active or
+dormant, its other binding settings come from that binding; an unbound Agent
+uses provider defaults. A Worker binding referenced this way cannot be unbound
+until the Profile is updated, changed to inheritance, or removed. The Profile
+still owns model and effort, and omitting either means the provider default
+rather than the Worker's value.
+
+Creating a Task Role from a Profile freezes the Profile behavior and its fully
+resolved runtime binding into the Role. Later Profile or Global Worker changes
+do not rewrite existing Task Roles. On `task role add`, model, effort, and
+other Agent settings require `--agent` so Yui can validate and persist one
+complete explicit binding atomically. When `--profile` and `--agent` are both
+present during creation, the Agent must match the Profile's resolved Agent;
+the Profile runtime remains the base binding and explicit Agent settings
+override corresponding fields. On `task role update`, omitted `--agent`
+updates the active binding, while a provided `--agent` updates that binding
+without activating it; only `task role bind` switches the active Agent. An
+explicit Profile must resolve to that update target, where its runtime is the
+base binding and explicit Agent settings override corresponding fields. An
+inherited Worker Profile used by itself may update portable Role behavior
+without retargeting a differently bound Agent; if `--agent` or Agent settings
+are also present, its currently resolved Worker Agent must match the target.
+Applying a Profile replaces the portable fields owned by AgentProfile
+(`defaultAccess`, description, instructions, skills, and access-derived
+constraints); explicit Role options in the same command apply afterward.
+This Yui Agent Profile is separate from a Codex native config profile also
+named `--profile`.
 
 ## Quick start
 
@@ -472,11 +506,12 @@ resumes the newest entry directly. Starting a conversation is never a resume
 choice: the explicit `operator new` command starts a clean conversation and
 preserves the previous one in history.
 
-Create a Task-bound Worker instance from the configured global Worker, apply a
-Profile, and dispatch a WorkItem:
+Create a Task-bound Worker instance from a Profile's resolved runtime and
+dispatch a WorkItem:
 
 ```sh
 yui config role show worker
+yui config profile show implementer
 yui task role add <task-id> implementer --profile implementer
 yui task role show <task-id> implementer
 

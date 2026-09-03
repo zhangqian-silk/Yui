@@ -16,5 +16,5 @@
  */
 export const CURRENT_STORAGE_LAYOUT_VERSION = 8;
 
-/** Aggregate 26 persists Task v7 commits and IntegrationAttempt v6 sources. */
-export const CURRENT_AGGREGATE_SCHEMA_VERSION = 26;
+/** Aggregate 27 migrates AgentProfile v2 after Task and Integration source migrations. */
+export const CURRENT_AGGREGATE_SCHEMA_VERSION = 27;
