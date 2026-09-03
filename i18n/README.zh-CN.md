@@ -353,12 +353,16 @@ Task Role 在创建时同时不传 `--profile` 和 `--agent`，会复制全局 W
 的完整 Agent bindings，Leader 无需重新拼接 model、effort 和权限。传
 `--profile` 时会冻结该 Profile 当前解析出的完整 binding。创建时的 model、
 effort、权限和其他 Agent 设置必须与 `--agent` 同时提供，以便在任何持久化前
-完成能力校验并原子写入一套完整 binding。更新 Task Role 时，不传 `--agent`
-会更新 active binding；传入 `--agent` 则只更新指定 binding 而不激活它，只有
-`task role bind` 会切换 active Agent。更新时如果传入 `--profile`，该 Profile
-解析出的 Agent 必须与更新目标一致；Profile runtime 作为基础 binding，显式
-Agent 设置覆盖对应字段。创建回执与 `task context` 分别记录 Profile intent、
-精确可写 Project 与实际 permission strategy。
+完成能力校验并原子写入一套完整 binding。创建时同时传入 `--profile` 与
+`--agent`，Agent 必须与 Profile 当前解析出的 Agent 一致；Profile runtime
+仍作为基础 binding，显式 Agent 设置覆盖对应字段。更新 Task Role 时，不传
+`--agent` 会更新 active binding；传入 `--agent` 则只更新指定 binding 而不
+激活它，只有 `task role bind` 会切换 active Agent。显式 Profile 必须解析到
+该更新目标，其 runtime 作为基础 binding，显式 Agent 设置覆盖对应字段。单独
+使用继承 Worker 的 Profile 时，可以只更新可移植 Role 行为，而不重新定向绑定
+到其他 Agent 的 Role；若同时传入 `--agent` 或 Agent 设置，其当前解析出的
+Worker Agent 必须与更新目标一致。创建回执与 `task context` 分别记录 Profile
+intent、精确可写 Project 与实际 permission strategy。
 
 ReviewRound 从冻结 Candidate SHA 创建独立的可写 worktree。只有 exact
 ReviewRound owner、reviewRoundId、冻结 base 与 workspace 全部匹配时，才获得

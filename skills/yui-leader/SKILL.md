@@ -499,12 +499,17 @@ Without `--profile` or `--agent`, a non-Leader Task Role copies the configured
 Global Worker Role's complete bindings, regardless of the Task Role name.
 When `--agent` is present, any model, effort, permission, or other Agent
 settings form one explicit binding; those settings are invalid without
-`--agent` during Role creation. On Role update, Agent settings without
-`--agent` target the active binding; with `--agent`, they target that binding
-without switching it. A Profile used during update must resolve to that same
-target Agent; its runtime is the base binding and explicit Agent settings
-override corresponding fields. Use `task role bind` as the only active-Agent
-switch.
+`--agent` during Role creation. If creation combines `--profile` and `--agent`,
+the Agent must match the Profile's resolved Agent; Profile runtime is the base
+binding and explicit Agent settings override corresponding fields. On Role
+update, Agent settings without `--agent` target the active binding; with
+`--agent`, they target that binding without switching it. An explicit Profile
+used during update must resolve to that same target Agent; its runtime is the
+base binding and explicit Agent settings override corresponding fields. An
+inherited Worker Profile used alone may update portable behavior without
+retargeting a Role bound to another Agent; when `--agent` or Agent settings are
+also present, its current Worker Agent must match the target. Use only the
+`task role bind` command to switch the active Agent.
 Before dispatch, inspect `task role show`; if Agent, model, effort, Profile, or
 workspace scope is missing or inconsistent, do not dispatch or guess it.
 

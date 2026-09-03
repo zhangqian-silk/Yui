@@ -150,13 +150,19 @@ Creating a Task Role from a Profile freezes the Profile behavior and its fully
 resolved runtime binding into the Role. Later Profile or Global Worker changes
 do not rewrite existing Task Roles. On `task role add`, model, effort, and
 other Agent settings require `--agent` so Yui can validate and persist one
-complete explicit binding atomically. On `task role update`, omitted `--agent`
+complete explicit binding atomically. When `--profile` and `--agent` are both
+present during creation, the Agent must match the Profile's resolved Agent;
+the Profile runtime remains the base binding and explicit Agent settings
+override corresponding fields. On `task role update`, omitted `--agent`
 updates the active binding, while a provided `--agent` updates that binding
-without activating it; only `task role bind` switches the active Agent. When
-`--profile` is present, its resolved Agent must match that update target. The
-Profile runtime is the base binding, and explicit Agent settings override its
-corresponding fields. This Yui Agent Profile is separate from a Codex native
-config profile also named `--profile`.
+without activating it; only `task role bind` switches the active Agent. An
+explicit Profile must resolve to that update target, where its runtime is the
+base binding and explicit Agent settings override corresponding fields. An
+inherited Worker Profile used by itself may update portable Role behavior
+without retargeting a differently bound Agent; if `--agent` or Agent settings
+are also present, its currently resolved Worker Agent must match the target.
+This Yui Agent Profile is separate from a Codex native config profile also
+named `--profile`.
 
 ## Quick start
 

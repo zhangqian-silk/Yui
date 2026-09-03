@@ -2053,7 +2053,7 @@ test("a new current Home initializes its SQLite authority exactly once", (t) => 
   }
 });
 
-test("Task Role Profile updates target one binding without switching the active Agent", (t) => {
+test("Task Role Profiles preserve runtime and portable behavior across add and update", (t) => {
   const home = mkdtempSync(join(tmpdir(), "yui-task-role-profile-update-smoke-"));
   t.after(() => rmSync(home, { recursive: true, force: true }));
   ensureStorageSchema(home);
@@ -2103,8 +2103,15 @@ test("Task Role Profile updates target one binding without switching the active 
       model: "claude-model"
     }
   }, now);
+  const inheritedProfile = createAgentProfile({
+    id: "profile-inherited",
+    defaultAccess: "write",
+    description: "Portable inherited behavior",
+    runtime: { source: "global-worker" }
+  }, now);
   store.saveAgentProfile(codexProfile);
   store.saveAgentProfile(claudeProfile);
+  store.saveAgentProfile(inheritedProfile);
   const role = createRole(
     task.id,
     "runner",
@@ -2114,6 +2121,36 @@ test("Task Role Profile updates target one binding without switching the active 
     now
   );
   store.saveRole(task.id, role);
+
+  const addWithProfileRuntime = [
+    "role", "add", task.id, "profile-runner",
+    "--profile", codexProfile.id,
+    "--agent", codex.id,
+    "--effort", "low"
+  ];
+  assert.deepEqual(
+    previewTaskRoleAgentConfigurationMutation(addWithProfileRuntime, store),
+    {
+      agentId: codex.id,
+      config: {
+        ...workerBinding.config,
+        model: "profile-model",
+        effort: "low"
+      },
+      cwd: home
+    }
+  );
+  runTaskCommand(addWithProfileRuntime, store, {
+    now: () => new Date("2026-09-03T06:10:05.000Z"),
+    environment: bareEnv
+  });
+  const added = store.getRole(task.id, "profile-runner");
+  assert.equal(added.activeAgentId, codex.id);
+  assert.deepEqual(added.agentBindings[codex.id].config, {
+    ...workerBinding.config,
+    model: "profile-model",
+    effort: "low"
+  });
 
   const implicitOtherAgent = [
     "role", "update", task.id, role.name, "--profile", claudeProfile.id
@@ -2191,6 +2228,42 @@ test("Task Role Profile updates target one binding without switching the active 
     permission: { strategy: "bypass" },
     model: "claude-model"
   });
+
+  const claudeBinding = createRoleAgentBinding(claude, {
+    adapterId: "claude",
+    permission: {
+      strategy: "configured",
+      mode: "acceptEdits"
+    },
+    model: "existing-claude-model",
+    effort: "medium"
+  });
+  const portableRole = createRole(
+    task.id,
+    "portable",
+    [claudeBinding],
+    claude.id,
+    home,
+    now
+  );
+  store.saveRole(task.id, portableRole);
+  const applyInheritedBehavior = [
+    "role", "update", task.id, portableRole.name,
+    "--profile", inheritedProfile.id
+  ];
+  assert.equal(
+    previewTaskRoleAgentConfigurationMutation(applyInheritedBehavior, store),
+    undefined
+  );
+  runTaskCommand(applyInheritedBehavior, store, {
+    now: () => new Date("2026-09-03T06:10:40.000Z"),
+    environment: bareEnv
+  });
+  const portableUpdated = store.getRole(task.id, portableRole.name);
+  assert.equal(portableUpdated.activeAgentId, claude.id);
+  assert.deepEqual(portableUpdated.agentBindings, portableRole.agentBindings);
+  assert.equal(portableUpdated.description, "Portable inherited behavior");
+  assert.equal(portableUpdated.defaultAccess, "write");
 });
 
 test("a valid aggregate-21 Home upgrades through every adjacent record step", async (t) => {
