@@ -16,5 +16,5 @@
  */
 export const CURRENT_STORAGE_LAYOUT_VERSION = 8;
 
-/** Aggregate 26 unifies Review direct/replicated execution and Turn main-Group provenance. */
-export const CURRENT_AGGREGATE_SCHEMA_VERSION = 26;
+/** Aggregate 29 unifies Review execution after Task, Integration, and AgentProfile migrations. */
+export const CURRENT_AGGREGATE_SCHEMA_VERSION = 29;

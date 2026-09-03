@@ -196,7 +196,8 @@ export const INTERACTION_POLICIES: readonly InteractionPolicy[] = Object.freeze(
     selectors: [],
     trailingOptions: {
       "--description": "value", "--instructions": "value",
-      "--skill": "value", "--model": "value", "--effort": "value", "--access": "value"
+      "--skill": "value", "--agent": "value", "--model": "value",
+      "--effort": "value", "--access": "value", "--inherit-worker": "flag"
     }
   },
   ...["show", "update", "remove"].map((command): InteractionPolicy => ({
@@ -212,8 +213,11 @@ export const INTERACTION_POLICIES: readonly InteractionPolicy[] = Object.freeze(
           trailingOptions: {
             "--description": "option-like-value",
             "--instructions": "option-like-value", "--skill": "value",
+            "--agent": "value", "--inherit-worker": "flag",
             "--model": "option-like-value", "--effort": "option-like-value",
-            "--access": "value"
+            "--access": "value", "--clear-description": "flag",
+            "--clear-instructions": "flag", "--clear-skills": "flag",
+            "--clear-model": "flag", "--clear-effort": "flag"
           }
         }
       : {}),
@@ -258,8 +262,12 @@ export const INTERACTION_POLICIES: readonly InteractionPolicy[] = Object.freeze(
     trailingOptions: { "--all": "flag", "--verbose": "flag" }
   },
   {
+    ...taskTarget("remote-delivery"),
+    trailingOptions: { "--json": "flag" }
+  },
+  {
     ...taskTarget("archive", 2, ["completed", "retired"]),
-    trailingOptions: { "--integrated": "flag", "--abandon": "flag" },
+    trailingOptions: { "--integrated": "flag", "--abandon": "flag", "--force": "flag" },
     confirmation: { action: "Archive task", targetArgumentIndex: 2 }
   },
   taskTarget("reconcile"),
@@ -565,15 +573,21 @@ export const INTERACTION_POLICIES: readonly InteractionPolicy[] = Object.freeze(
     selectors: [
       { argumentIndex: 3, entity: "task", provider: "tasks", actionTarget: true },
       {
-        option: "--change-set",
+        option: "--work-item",
         requiredOption: true,
-        entity: "change-set",
-        provider: "change-sets",
+        entity: "work-item",
+        provider: "work-items",
         dependsOn: 3,
         actionTarget: false
       }
     ],
-    trailingOptions: { "--change-set": "value", "--target": "value", "--check": "value" }
+    trailingOptions: {
+      "--work-item": "value",
+      "--strategy": "value",
+      "--project": "value",
+      "--target": "value",
+      "--check": "value"
+    }
   },
   {
     commandPath: ["task", "integration", "list"],

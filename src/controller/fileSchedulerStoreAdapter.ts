@@ -2810,7 +2810,8 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
               bound,
               input,
               now,
-              replacementBasis ?? undefined
+              replacementBasis
+                ?? terminalProviderReplacementBasis(bound, input, run.mode)
             );
             store.saveTaskRoleSessionSet(withProvider);
             completeRuntimeHookReservation(
@@ -2826,10 +2827,13 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
           const currentSession = current?.sessions[input.fence.agentId];
           if (current !== null && current !== undefined
             && currentSession?.nativeSessionId === input.fence.nativeSessionId) {
-            const run = store.getTurn(input.fence.taskId!, input.fence.turnId!);
+            const run = input.fence.turnId === undefined
+              ? null
+              : store.getTurn(input.fence.taskId!, input.fence.turnId);
             const replacementBasis = run === null
               ? undefined
-              : terminalSessionReplacementBasis(current, input, run);
+              : terminalSessionReplacementBasis(current, input, run)
+                ?? terminalProviderReplacementBasis(current, input, run.mode);
             if (current.providerBinding !== null
               && currentProviderConversation(current.providerBinding).conversationId
                 !== (input.fence.conversationId ?? input.fence.nativeSessionId)
@@ -4269,6 +4273,32 @@ function bindOrSupersedeProviderRuntime(
     }),
     now
   );
+}
+
+function terminalProviderReplacementBasis(
+  sessions: TaskRoleSessionSet,
+  input: RuntimeObservation,
+  mode: Turn["mode"]
+): "terminal-session" | undefined {
+  if (mode !== "new" || sessions.providerBinding === null) return undefined;
+  if (sessions.providerBinding.providerNamespace !== input.fence.driverId
+    || sessions.providerBinding.accountScope !== input.fence.agentId) {
+    return undefined;
+  }
+  const current = sessions.sessions[input.fence.agentId];
+  if (current === undefined
+    || current.status !== "active"
+    || current.nativeSessionId !== input.fence.nativeSessionId
+    || current.launchId !== input.fence.launchId) {
+    return undefined;
+  }
+  const replaced = [...(sessions.history ?? [])].reverse().find((session) => (
+    session.agentId === current.agentId
+    && session.adapterId === current.adapterId
+    && session.status === "ended"
+    && session.nativeSessionId !== current.nativeSessionId
+  ));
+  return replaced === undefined ? undefined : "terminal-session";
 }
 
 function settleStructuredProviderTurn(

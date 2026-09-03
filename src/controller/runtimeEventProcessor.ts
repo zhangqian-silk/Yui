@@ -121,20 +121,9 @@ export interface AsyncRuntimeEventProcessorPort {
   drainAsync(now: Date): Promise<RuntimeEventDrainResult>;
 }
 
-export type TaskRuntimeAppliedInput = Readonly<{
-  taskId: string;
-  roleName: string;
-  agentId: string;
-  adapterId: string;
-  launchId?: string;
-  nativeSessionId: string;
-  turnId?: string;
-}>;
-
 export type FileRuntimeEventProcessorOptions = Readonly<{
   /** Runtime-observation Driver catalog used to resolve Driver/adapter identity. */
   drivers?: AgentDriverRegistry;
-  onTaskRuntimeApplied?: (input: TaskRuntimeAppliedInput) => void;
   /** Maximum folded representatives in one state transaction. */
   maxEventsPerDrain?: number;
 }>;
@@ -155,7 +144,6 @@ export type RuntimeProgressCoalescingInstrumentation = Readonly<{
 type FoldedRuntimeEvent = Readonly<{
   candidate: CoalescedRuntimeEvent;
   outcome: "applied" | "deferred" | "obsolete";
-  notifyTaskRuntime: boolean;
 }>;
 
 const DEFAULT_MAX_RUNTIME_EVENTS_PER_DRAIN = 64;
@@ -296,16 +284,7 @@ export class FileRuntimeEventProcessor implements RuntimeEventProcessorPort {
       // converges without re-processing. No state change to apply.
       this.applyDurableJobTerminal(event);
     }
-    return {
-      candidate,
-      outcome,
-      notifyTaskRuntime: outcome === "applied" && (
-        (event.type === "runtime-observation" && event.scope === "task"
-          && ["session.started", "session.ready", "turn.accepted", "turn.completed"]
-            .includes(event.observation.kind))
-        || (event.type === "native-turn-completed" && event.scope === "task")
-      )
-    };
+    return { candidate, outcome };
   }
 
   private applyRuntimeObservation(
@@ -336,37 +315,6 @@ export class FileRuntimeEventProcessor implements RuntimeEventProcessorPort {
           acknowledged
         );
         return undefined;
-      }
-      if (folded.notifyTaskRuntime) {
-        const event = candidate.event;
-        if (event.scope === "task"
-          && event.taskId !== undefined
-          && event.type !== "durable-job-terminal") {
-          if (event.type === "runtime-observation") {
-            const fence = event.observation.fence;
-            if (fence.taskId !== undefined && fence.nativeSessionId !== undefined) {
-              this.options.onTaskRuntimeApplied?.({
-                taskId: fence.taskId,
-                roleName: fence.roleName,
-                agentId: fence.agentId,
-                adapterId: this.drivers.require(fence.driverId).adapterId,
-                launchId: fence.launchId,
-                nativeSessionId: fence.nativeSessionId,
-                ...(fence.turnId === undefined ? {} : { turnId: fence.turnId })
-              });
-            }
-          } else if (event.type === "native-turn-completed") {
-            this.options.onTaskRuntimeApplied?.({
-              taskId: event.taskId,
-              roleName: event.roleName,
-              agentId: event.agentId,
-              adapterId: event.adapterId,
-              ...(event.launchId === undefined ? {} : { launchId: event.launchId }),
-              nativeSessionId: event.nativeSessionId,
-              ...(event.turnId === undefined ? {} : { turnId: event.turnId })
-            });
-          }
-        }
       }
       this.acknowledge(candidate.representedEventIds, acknowledged);
       return undefined;
@@ -923,22 +871,6 @@ export class AsyncRuntimeEventProcessor {
     }
     const outcome = (await this.observer.observeRuntimeObservation?.(event.observation, now))
       ?? "obsolete";
-    const fence = event.observation.fence;
-    if (outcome === "applied"
-      && fence.taskId !== undefined
-      && fence.nativeSessionId !== undefined
-      && ["session.started", "session.ready", "turn.accepted", "turn.completed"]
-        .includes(event.observation.kind)) {
-      this.options.onTaskRuntimeApplied?.({
-        taskId: fence.taskId,
-        roleName: fence.roleName,
-        agentId: fence.agentId,
-        adapterId: this.drivers.require(fence.driverId).adapterId,
-        launchId: fence.launchId,
-        nativeSessionId: fence.nativeSessionId,
-        ...(fence.turnId === undefined ? {} : { turnId: fence.turnId })
-      });
-    }
     return outcome;
   }
 
@@ -980,15 +912,6 @@ export class AsyncRuntimeEventProcessor {
         await this.recordObsolete(event, "runtime-cleanup-or-stopped-session", now);
         return "obsolete";
       }
-      this.options.onTaskRuntimeApplied?.({
-        taskId: event.taskId!,
-        roleName: event.roleName,
-        agentId: event.agentId,
-        adapterId: event.adapterId,
-        ...(event.launchId === undefined ? {} : { launchId: event.launchId }),
-        nativeSessionId: event.nativeSessionId,
-        ...(event.turnId === undefined ? {} : { turnId: event.turnId })
-      });
       return "applied";
     }
     const input: GlobalRuntimeTurnCompleted = {

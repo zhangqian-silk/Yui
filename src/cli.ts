@@ -77,18 +77,29 @@ import {
   type OperatorSessionControl
 } from "./commands/operatorCommands.js";
 import { runProjectCommand } from "./commands/projectCommands.js";
-import { runProfileCommand } from "./commands/profileCommands.js";
+import {
+  previewProfileAgentConfigurationMutation,
+  runProfileCommand
+} from "./commands/profileCommands.js";
 import {
   assertWorkItemDependenciesCompletedForCommand,
   dispatchPreparedReviewRound,
   failPendingReviewRound,
   preserveReviewRoundWorkspace,
   parseTaskCompletionRequest,
+  previewTaskRoleAgentConfigurationMutation,
   preflightTaskCompletion,
   runTaskCommand,
   planReplicatedWorkItemLanes,
   validateTaskArchiveRequest
 } from "./commands/taskCommands.js";
+import {
+  assertTaskRemoteDeliveryIntegrated,
+  createTaskRemoteDeliveryProof,
+  type TaskRemoteDeliveryProof
+} from "./commands/taskRemoteDeliveryCommand.js";
+import { runTaskPublicationVerifyCommand } from "./commands/taskPublicationVerifyCommand.js";
+import { createGitHubCliPublicationVerifier } from "./external/githubPublicationVerifier.js";
 import { taskActor } from "./commands/taskActor.js";
 import {
   parseTaskExecutionStartRequest,
@@ -190,11 +201,17 @@ import { runSetupCommand, validateSetupInvocation } from "./setup/setupCommand.j
 import { NodeCommandExecutor } from "./tmux/commandExecutor.js";
 import { TmuxManager } from "./tmux/tmuxManager.js";
 import { WorkItemChangeSetManager } from "./workspace/workItemChangeSetManager.js";
+import { workspaceProjectEntry } from "./worktree/managedWorkspace.js";
 import { parseWebCommandOptions, startYuiWebServer } from "./web/webServer.js";
 import {
-  AgentConfigurationCatalogService
+  AgentConfigurationCatalogService,
+  validateAgentLaunchConfiguration
 } from "./executor/agentConfigurationCatalog.js";
 import type { RoleAgentConfig } from "./executor/agentAdapter.js";
+import {
+  resolveAgentProfileView
+} from "./profile/agentProfileRuntime.js";
+import type { AgentProfile } from "./profile/agentProfile.js";
 import { TmuxWebTerminalService } from "./web/tmuxWebTerminal.js";
 import {
   listOperatorSessions,
@@ -204,11 +221,8 @@ import { YUI_VERSION, yuiVersionIdentity } from "./version.js";
 import { SqliteSchemaMigrationError } from "./storage/sqliteSchema.js";
 import {
   YUI_CONTROL_PLANE_DESCRIPTOR,
-  YUI_TASK_RUNTIME_DESCRIPTOR,
   assertCompatibleControlPlanePreflight,
   assertExactControlPlanePreflight,
-  assertExactTaskRuntimeEnvironment,
-  assertExactTaskRuntimeState,
   exactControlPlaneDigest,
   extractExactControlArgument,
   createExactControlPlaneDescriptor,
@@ -216,10 +230,13 @@ import {
   type ExactControlPlaneDescriptor
 } from "./runtime/exactControlPlane.js";
 import {
+  requireManagedTaskCaller,
+  type ManagedTaskCaller
+} from "./runtime/managedCaller.js";
+import {
   readSessionBootstrapManifest,
   refreshManagedSessionCliWrappers
 } from "./context/sessionBootstrapManifest.js";
-import { builtinAgentDriverRegistry } from "./runtime/builtinAgentDrivers.js";
 import {
   createTaskFinalReviewContract,
   extractTaskFinalReviewRequest,
@@ -280,8 +297,7 @@ export async function main(): Promise<void> {
   const routedForFence = args.length === 0 ? undefined : routeInvocation(args);
   const managedInvocation = process.env.YUI_SESSION_SCOPE === "task"
     || process.env.YUI_SESSION_SCOPE === "global"
-    || process.env[YUI_CONTROL_PLANE_DESCRIPTOR] !== undefined
-    || process.env[YUI_TASK_RUNTIME_DESCRIPTOR] !== undefined;
+    || process.env[YUI_CONTROL_PLANE_DESCRIPTOR] !== undefined;
   const homeFreeInvocation = args.length === 0
     || (args[0] === "version" && args.length === 1)
     || routedForFence?.kind === "help"
@@ -756,7 +772,11 @@ export async function main(): Promise<void> {
     emit("Cancelled.");
     return;
   }
-  await preflightAgentConfigurationMutation(resolved, store, catalogs);
+  const validateAgentConfiguration = await preflightAgentConfigurationMutation(
+    resolved,
+    store,
+    catalogs
+  );
 
   const executor = new NodeCommandExecutor();
   const tmux = new TmuxManager(
@@ -930,7 +950,12 @@ export async function main(): Promise<void> {
       return;
     }
     if (domain === "profile") {
-      const result = runProfileCommand(resolved.slice(2), store);
+      const result = runProfileCommand(
+        resolved.slice(2),
+        store,
+        () => new Date(),
+        validateAgentConfiguration === undefined ? {} : { validateAgentConfiguration }
+      );
       emit(result.output, false, result.data);
       return;
     }
@@ -1084,6 +1109,28 @@ export async function main(): Promise<void> {
     }
     if (resolved[1] === "change-set") {
       const result = await runTaskChangeSetCommand(resolved.slice(2), store);
+      emit(result.output, false, result.data);
+      return;
+    }
+    if (resolved[1] === "publication" && resolved[2] === "verify") {
+      const result = await runTaskPublicationVerifyCommand(
+        resolved.slice(3),
+        store,
+        {
+          verifiers: {
+            github: createGitHubCliPublicationVerifier({
+              environmentPath: process.env.PATH
+            })
+          },
+          candidateForTask: async (taskId) => {
+            const status = store.getTask(taskId)?.status;
+            return status === "active" || status === "retired"
+              ? snapshotActualTaskReviewCandidate(taskId, store, workspacePreparer)
+              : null;
+          },
+          environment: process.env
+        }
+      );
       emit(result.output, false, result.data);
       return;
     }
@@ -1311,15 +1358,38 @@ export async function main(): Promise<void> {
       });
       return;
     }
+    let archiveRemoteDeliveryProof: TaskRemoteDeliveryProof | undefined;
+    let archiveTaskReviewCandidate: TaskReviewCandidate | undefined;
     if (resolved[1] === "archive") {
-      const { taskId, disposition } = validateTaskArchiveRequest(
+      const { taskId, disposition, forceUnverified } = validateTaskArchiveRequest(
         resolved.slice(2),
         store,
-        { runtime, environment: process.env, yuiHome: home }
+        {
+          runtime,
+          environment: process.env,
+          yuiHome: home
+        }
       );
       const task = store.getTask(taskId);
       if (task === null) throw new Error(`Task disappeared after archive validation: ${taskId}.`);
       if (task.status !== "archived") {
+        if (disposition === "integrated") {
+          archiveTaskReviewCandidate = await actualTaskReviewCandidateForTaskCommand(
+            resolved,
+            store,
+            workspacePreparer,
+            process.env
+          );
+          archiveRemoteDeliveryProof = createTaskRemoteDeliveryProof(
+            store,
+            task,
+            archiveTaskReviewCandidate ?? null
+          );
+          assertTaskRemoteDeliveryIntegrated(
+            archiveRemoteDeliveryProof.delivery,
+            { forceUnverified }
+          );
+        }
         const workItemIds = store.listManagedWorkspaces(task.id)
           .flatMap(({ owner }) => owner.type === "work-item" ? [owner.workItemId] : []);
         for (const workItemId of workItemIds) {
@@ -1447,7 +1517,9 @@ export async function main(): Promise<void> {
       return;
     }
     if (resolved[1] === "upstream") {
-      const result = await runTaskUpstreamCommand(resolved.slice(2), store);
+      const result = await runTaskUpstreamCommand(resolved.slice(2), store, home, {
+        environment: process.env
+      });
       emit(result.output, false, result.data);
       return;
     }
@@ -1489,12 +1561,23 @@ export async function main(): Promise<void> {
         // Keep completion offline by default. An explicit refresh is the only
         // path that may fetch and reconcile a moved remote baseline.
         if (refreshRemote) {
-          await reconcileTaskRemoteBaselines(
+          const reconciled = await reconcileTaskRemoteBaselines(
             resolved[2],
             store,
             home,
             { environment: process.env, jobPort: createControllerIntegrationJobPort(home, { environment: process.env }) }
           );
+          if (reconciled.length > 0) {
+            const updates = reconciled.map((entry) => (
+              `${entry.projectId}: ${entry.fromCommit} -> ${entry.toCommit} `
+              + `(Integration ${entry.integrationId})`
+            )).join("; ");
+            throw usageError(
+              `Remote baseline reconciliation advanced Task ${resolved[2]} (${updates}). `
+              + "The Task remains active so the Leader can inspect the new authoritative head, "
+              + "decide how prior Review evidence applies, and retry task complete."
+            );
+          }
         }
       }
     }
@@ -1531,12 +1614,14 @@ export async function main(): Promise<void> {
         process.env,
         taskFinalReviewContract
       );
-      const actualTaskReviewCandidate = await actualTaskReviewCandidateForTaskCommand(
-        resolved,
-        store,
-        workspacePreparer,
-        process.env
-      );
+      const actualTaskReviewCandidate = archiveRemoteDeliveryProof === undefined
+        ? await actualTaskReviewCandidateForTaskCommand(
+          resolved,
+          store,
+          workspacePreparer,
+          process.env
+        )
+        : archiveTaskReviewCandidate;
       const deltaRecheckPreflight = await deltaRecheckPreflightForTaskCommand(
         resolved.slice(1),
         store,
@@ -1577,10 +1662,16 @@ export async function main(): Promise<void> {
           ...(actualTaskReviewCandidate === undefined
             ? {}
             : { actualTaskReviewCandidate }),
+          ...(archiveRemoteDeliveryProof === undefined
+            ? {}
+            : { archiveRemoteDeliveryProof }),
           ...(deltaRecheckPreflight === undefined
             ? {}
             : { deltaRecheckPreflight }),
-          ...(taskRetirementProof === undefined ? {} : { taskRetirementProof })
+          ...(taskRetirementProof === undefined ? {} : { taskRetirementProof }),
+          ...(validateAgentConfiguration === undefined
+            ? {}
+            : { validateAgentConfiguration })
         }
       );
       // The dispatch transaction has now adopted (or rejected) the prepared
@@ -2016,11 +2107,10 @@ async function preflightManagedTaskControlPlane(): Promise<ManagedTaskControlPla
     throw new Error(taskFinalReviewInvocation.error);
   }
   const serializedControl = process.env[YUI_CONTROL_PLANE_DESCRIPTOR];
-  const serializedRuntime = process.env[YUI_TASK_RUNTIME_DESCRIPTOR];
-  const exactAgentRuntime = serializedControl !== undefined || serializedRuntime !== undefined;
+  const exactAgentRuntime = serializedControl !== undefined;
   if (process.env.YUI_SESSION_SCOPE === "task" && !exactAgentRuntime) {
     throw new Error(
-      "Exact control-plane invocation requires both frozen descriptors in a managed Task runtime."
+      "Exact control-plane invocation requires its frozen descriptor in a managed Task runtime."
     );
   }
   if (!exactAgentRuntime) {
@@ -2038,7 +2128,7 @@ async function preflightManagedTaskControlPlane(): Promise<ManagedTaskControlPla
   if (process.env.YUI_SESSION_SCOPE !== "task") {
     throw new Error("Exact Task control-plane invocation requires a managed Task runtime.");
   }
-  if (serializedControl === undefined || serializedRuntime === undefined) {
+  if (serializedControl === undefined) {
     throw new Error("Exact control-plane invocation is required for this managed Task runtime.");
   }
   const control = parseExactControlPlaneDescriptor(serializedControl);
@@ -2076,25 +2166,16 @@ async function preflightManagedTaskControlPlane(): Promise<ManagedTaskControlPla
     commandControl = control;
     digest = frozenDigest;
   }
-  const runtime = assertExactTaskRuntimeEnvironment(
-    serializedRuntime,
-    process.env,
-    frozenDigest,
-    control.yuiHome
-  );
-  const runtimeDriverCallback = args[0] === "internal"
-    && args[1] === "runtime-hook"
-    && process.env.YUI_DRIVER_ID !== undefined
-    ? builtinAgentDriverRegistry().require(process.env.YUI_DRIVER_ID)
-    : undefined;
   const verifiedStore = openCurrentTaskStore(control.yuiHome);
-  // Runtime Hooks have their own event-aware fence, including the valid case
-  // where a Provider terminal arrives after its Yui Turn has completed and a
-  // later wake is pending. Ordinary managed commands still require the exact
-  // current mutable runtime before routing.
-  if (runtimeDriverCallback === undefined) {
-    assertExactTaskRuntimeState(runtime, verifiedStore);
-  }
+  // One authority for "may this process act as this Task Role?". Yui's own
+  // internal callbacks run in the Host process and authenticate through the
+  // exact control-plane digest verified above; an Agent command proves it is
+  // the Role's current runtime with its per-Session caller key. Nothing here
+  // gates on the current Turn: which Turn is active is durable state that the
+  // command needing it reads, never a fact frozen into a process environment.
+  const runtime: ManagedTaskCaller | undefined = internalCallback
+    ? undefined
+    : requireManagedTaskCaller(verifiedStore, process.env);
   const request = taskFinalReviewInvocation.request;
   if (request === undefined) {
     return {
@@ -2103,7 +2184,7 @@ async function preflightManagedTaskControlPlane(): Promise<ManagedTaskControlPla
       verifiedStore
     };
   }
-  if (runtime.roleName !== "leader") {
+  if (runtime === undefined || runtime.roleName !== "leader") {
     throw new Error("Only the exact Task Leader invocation may establish a final-review contract.");
   }
   if (request.taskId !== runtime.taskId) {
@@ -2581,12 +2662,22 @@ async function actualTaskReviewCandidateForTaskCommand(
       && (round.scope ?? "work-item") === "task") {
       taskId = reference.taskId;
     }
-  } else if ((args[1] === "context" || args[1] === "next-action")
+  } else if (args[1] === "archive"
+    && args[2] !== undefined
+    && args.includes("--integrated")) {
+    taskId = store.getTask(args[2])?.id;
+  } else if ((
+    args[1] === "show"
+    || args[1] === "context"
+    || args[1] === "next-action"
+    || args[1] === "remote-delivery"
+  )
     && args[2] !== undefined) {
     taskId = store.getTask(args[2])?.id;
     decisionSupportRead = true;
   }
-  if (taskId === undefined || store.getTask(taskId)?.status !== "active") return undefined;
+  const status = taskId === undefined ? undefined : store.getTask(taskId)?.status;
+  if (taskId === undefined || (status !== "active" && status !== "retired")) return undefined;
   try {
     return await snapshotActualTaskReviewCandidate(taskId, store, preparer);
   } catch (error) {
@@ -2605,6 +2696,9 @@ async function snapshotActualTaskReviewCandidate(
   if (task.projectBindings.length === 0) {
     throw usageError(`Final Task Review requires a Project-backed Task: ${task.id}.`);
   }
+  // Reconcile the durable currentCommit facts from the authoritative Task
+  // clones before freezing a completion/review candidate.
+  await preparer.prepareTaskWorkspace(task.id);
   const workspace = store.getTaskWorkspace(task.id);
   if (workspace === null
     || workspace.owner.type !== "task"
@@ -2670,12 +2764,18 @@ async function deltaRecheckPreflightForTaskCommand(
     );
   }
   const repositoryPaths: Record<string, string> = {};
+  const taskWorkspace = store.getTaskWorkspace(task.id);
+  if (taskWorkspace === null || taskWorkspace.owner.type !== "task") {
+    throw usageError(`Task has no authoritative main workspace: ${task.id}.`);
+  }
   for (const candidateProject of actualTaskReviewCandidate.projects) {
-    const project = store.getProject(candidateProject.projectId);
-    if (project === null) {
-      throw usageError(`Delta-recheck Project not found: ${candidateProject.projectId}.`);
+    const entry = workspaceProjectEntry(taskWorkspace, candidateProject.projectId);
+    if (entry === undefined) {
+      throw usageError(
+        `Delta-recheck Task workspace Project not found: ${candidateProject.projectId}.`
+      );
     }
-    repositoryPaths[candidateProject.projectId] = project.path;
+    repositoryPaths[candidateProject.projectId] = entry.path;
   }
   const assessment = await assessDeltaRecheck({
     repositoryPaths,
@@ -2975,7 +3075,76 @@ function selectionPorts(
   };
 }
 
+type AgentConfigurationMutation = Readonly<{
+  agentId: string;
+  config: RoleAgentConfig;
+  cwd: string;
+}>;
+
+type AgentConfigurationMutationValidator = (
+  input: AgentConfigurationMutation
+) => void;
+
 async function preflightAgentConfigurationMutation(
+  commandArgs: readonly string[],
+  store: TaskStore,
+  catalogs: AgentConfigurationCatalogService
+): Promise<AgentConfigurationMutationValidator | undefined> {
+  const mutation = profileAgentConfigurationMutation(commandArgs, store)
+    ?? taskRoleAgentConfigurationMutation(commandArgs, store);
+  if (mutation === undefined) {
+    await warmLegacyRoleConfigurationMutation(commandArgs, store, catalogs);
+    return undefined;
+  }
+  const agent = store.getConfiguredAgent(mutation.agentId);
+  if (agent === null) throw agentNotFound(mutation.agentId);
+  const resolved = await catalogs.resolve({
+    agent,
+    cwd: mutation.cwd,
+    config: mutation.config
+  });
+  try {
+    validateAgentLaunchConfiguration(resolved.catalog, mutation.config);
+  } catch (error) {
+    throw usageError(error instanceof Error ? error.message : String(error));
+  }
+  return (candidate) => {
+    if (
+      candidate.agentId !== mutation.agentId
+      || resolve(candidate.cwd) !== resolve(mutation.cwd)
+      || !isDeepStrictEqual(candidate.config, mutation.config)
+    ) {
+      throw usageError(
+        "Agent configuration changed after capability preflight; retry the command."
+      );
+    }
+    try {
+      validateAgentLaunchConfiguration(resolved.catalog, candidate.config);
+    } catch (error) {
+      throw usageError(error instanceof Error ? error.message : String(error));
+    }
+  };
+}
+
+function profileAgentConfigurationMutation(
+  args: readonly string[],
+  store: TaskStore
+): AgentConfigurationMutation | undefined {
+  return args[0] === "config" && args[1] === "profile"
+    ? previewProfileAgentConfigurationMutation(args.slice(2), store)
+    : undefined;
+}
+
+function taskRoleAgentConfigurationMutation(
+  args: readonly string[],
+  store: TaskStore
+): AgentConfigurationMutation | undefined {
+  return args[0] === "task"
+    ? previewTaskRoleAgentConfigurationMutation(args.slice(1), store)
+    : undefined;
+}
+
+async function warmLegacyRoleConfigurationMutation(
   commandArgs: readonly string[],
   store: TaskStore,
   catalogs: AgentConfigurationCatalogService
@@ -3049,8 +3218,12 @@ function selectionCall(
       });
     }
     case "config.get": return store.getConfig();
-    case "profile.list": return store.listAgentProfiles();
-    case "profile.show": return store.getAgentProfile(String(params.id ?? ""));
+    case "profile.list": return store.listAgentProfiles().map((profile) =>
+      profileSelectionRecord(profile, store));
+    case "profile.show": {
+      const profile = store.getAgentProfile(String(params.id ?? ""));
+      return profile === null ? null : profileSelectionRecord(profile, store);
+    }
     case "role.list": return store.listGlobalRoles();
     case "role.show": return store.getGlobalRole(String(params.name ?? ""));
     case "project.list": return callOptional(reader, "listProjects");
@@ -3081,6 +3254,29 @@ function selectionCall(
     case "jobs.list": return callOptional(reader, "listJobs");
     default: return [];
   }
+}
+
+function profileSelectionRecord(
+  profile: AgentProfile,
+  store: TaskStore
+): Readonly<Record<string, unknown>> {
+  const view = resolveAgentProfileView(profile, store);
+  return {
+    ...view.profile,
+    runtimeSource: view.runtime.source,
+    ...(view.runtime.source === "global-worker"
+      ? { workerRevision: view.runtime.workerRevision }
+      : {}),
+    effectiveRuntime: view.runtime,
+    ...(view.runtime.status === "resolved"
+      ? {
+          agentId: view.runtime.binding.agentId,
+          adapterId: view.runtime.binding.adapterId,
+          model: view.runtime.binding.config.model,
+          effort: view.runtime.binding.config.effort
+        }
+      : {})
+  };
 }
 
 function presentSelectionTimes(value: unknown, store: TaskStore): unknown {

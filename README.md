@@ -127,13 +127,47 @@ path (including an explicit `0->1` introduction for a new family) and re-test to
 convergence.
 
 Yui provides four reusable Worker Profile definitions through
-`yui config profile reset`; minimum setup leaves them unconfigured:
+`yui config profile reset`; minimum setup makes each one inherit the current
+Global Worker runtime:
 
 ```text
 worker  explorer  implementer  reviewer
 ```
 
-Profiles are versioned, provider-neutral Worker behavior templates. They hold portable prompt instructions, Skills, access expectations, and optional model and effort selections, but do not bind an Agent or own a Session or workspace. A Task Role is the Task-bound Worker instance: applying a Yui Agent Profile copies the behavior plus model/effort into that Role's active Agent binding; explicit Role options may override the copied values. This is separate from a Codex native config profile selected with `--profile`.
+Profiles are versioned Worker templates with two independent parts: portable
+behavior (prompt instructions, Skills, and access intent) and runtime intent.
+Runtime either follows the current Global Worker binding dynamically, or names
+one explicit Agent with optional model and effort. `profile list` and `profile
+show` resolve the effective Agent from current configuration and display the
+Global Worker launch revision when inherited; that read does not rewrite or
+revise the Profile. Profiles do not own Sessions or workspaces.
+When an explicit Profile's Agent has a Global Worker binding, active or
+dormant, its other binding settings come from that binding; an unbound Agent
+uses provider defaults. A Worker binding referenced this way cannot be unbound
+until the Profile is updated, changed to inheritance, or removed. The Profile
+still owns model and effort, and omitting either means the provider default
+rather than the Worker's value.
+
+Creating a Task Role from a Profile freezes the Profile behavior and its fully
+resolved runtime binding into the Role. Later Profile or Global Worker changes
+do not rewrite existing Task Roles. On `task role add`, model, effort, and
+other Agent settings require `--agent` so Yui can validate and persist one
+complete explicit binding atomically. When `--profile` and `--agent` are both
+present during creation, the Agent must match the Profile's resolved Agent;
+the Profile runtime remains the base binding and explicit Agent settings
+override corresponding fields. On `task role update`, omitted `--agent`
+updates the active binding, while a provided `--agent` updates that binding
+without activating it; only `task role bind` switches the active Agent. An
+explicit Profile must resolve to that update target, where its runtime is the
+base binding and explicit Agent settings override corresponding fields. An
+inherited Worker Profile used by itself may update portable Role behavior
+without retargeting a differently bound Agent; if `--agent` or Agent settings
+are also present, its currently resolved Worker Agent must match the target.
+Applying a Profile replaces the portable fields owned by AgentProfile
+(`defaultAccess`, description, instructions, skills, and access-derived
+constraints); explicit Role options in the same command apply afterward.
+This Yui Agent Profile is separate from a Codex native config profile also
+named `--profile`.
 
 ## Quick start
 
@@ -182,10 +216,10 @@ small enough to deliver on Task main or large enough for independently owned Wor
 one substantial requirement for one Worker, not a development step, test run,
 review finding, or local fix. Multiple WorkItems are useful only when distinct
 Workers can advance meaningful requirements independently. A WorkItem's
-governing Candidate defines its delivery obligation: its current ChangeSets
-must reach committed Integration or an explicit superseded queue disposition
-before Task-final Review or completion. Older Candidate and ChangeSet records
-remain audit evidence without keeping the Task open.
+governing Candidate defines its delivery obligation: each writable Project's
+exact start and result commits must be represented by a committed Integration
+before Task-final Review or completion. Older Candidate, ChangeSet, and queue
+records remain audit evidence without keeping the Task open.
 
 `project refresh` is the explicit network operation for a stable Project checkout. It fetches the
 configured stable branch directly from the Project remote URL and advances only through a clean,
@@ -436,19 +470,18 @@ yui task work isolate <task-id>/<work-item-id>
 yui task work reject <task-id>/<work-item-id> \
   --summary "Write scope expanded; continue in the refreshed workspace."
 yui task work dispatch <task-id>/<work-item-id>
-yui task work capture <task-id>/<work-item-id>
-yui task integration start <task-id> --project backend \
-  --change-set <backend-change-set-id> --check "<validation command>"
+yui task integration start <task-id> --work-item <work-item-id> \
+  --project backend --strategy cherry-pick --check "<validation command>"
 yui task integration cleanup <task-id>/<integration-id>
 yui task work cleanup <task-id>/<work-item-id> --integrated
 ```
 
-`capture` records one immutable ChangeSet per modified Project. Repeat capture
-at the same HEAD reuses the record; a repaired HEAD produces a new candidate.
-Integration remains a single-Project Git transaction, so the Leader integrates
-each Project independently. Acceptance succeeds only after every modified
-Project's latest candidate is integrated. Yui refuses integrated cleanup while
-any result remains unintegrated. Use `--abandon` only for deliberate discard.
+The WorkItem Candidate records its exact start and result commits. Integration
+remains a single-Project Git transaction, so the Leader integrates each Project
+independently and chooses fast-forward, cherry-pick, merge, or manual
+application. Acceptance succeeds only after every writable Project result has
+a committed Integration, including an explicit successful no-op when the
+result is already represented. Use `--abandon` only for deliberate discard.
 Dirty worktrees are retained. Native Agent Sessions may be scoped to their
 launch directory, so Yui retires a stopped Role Session whenever the Role moves
 between Task main and an isolated WorkItem worktree. The next dispatch starts a
@@ -497,11 +530,12 @@ resumes the newest entry directly. Starting a conversation is never a resume
 choice: the explicit `operator new` command starts a clean conversation and
 preserves the previous one in history.
 
-Create a Task-bound Worker instance from the configured global Worker, apply a
-Profile, and dispatch a WorkItem:
+Create a Task-bound Worker instance from a Profile's resolved runtime and
+dispatch a WorkItem:
 
 ```sh
 yui config role show worker
+yui config profile show implementer
 yui task role add <task-id> implementer --profile implementer
 yui task role show <task-id> implementer
 
@@ -625,7 +659,8 @@ still matches:
 
 ```sh
 yui task integration start <task-id> \
-  --change-set <change-set-id> \
+  --work-item <work-item-id> \
+  --strategy cherry-pick \
   --check "npm test"
 ```
 
@@ -705,6 +740,76 @@ yui task context <task-id>
 
 Use the narrower `task work`, `task message`, `task turn`, and Task Knowledge commands when you need one collection or record.
 
+Record a Task's confirmed PR/MR delivery state with one idempotent command:
+
+```sh
+yui task publication upsert <task-id> --project <project> \
+  --provider github --repository <owner/name> --kind pull-request --id <number> \
+  --url <url> --state open --reported
+```
+
+The required provider/repository/external ID selects the current Publication.
+The first upsert creates it. Later upserts inherit omitted metadata and omitted
+merge evidence only while the full evidence context remains unchanged. That
+context is the local commit, PR/MR state, remote commit, evidence text, and
+merge time. If any explicitly supplied context value differs, omitted
+verification resets to `reported` and omitted merge-evidence fields are
+cleared; changing the local commit without an explicit state also resets the
+Publication to `open`. Resupplying identical values remains idempotent. Each
+semantic change appends a new immutable record linked to the previous version,
+while identical input creates no event. `list`, `show`, and `task context`
+retain the complete history. This records facts already known to the caller;
+it does not query a provider or replace Review, Integration, or Task completion
+gates.
+
+Verify one current GitHub Publication against the real PR state:
+
+```sh
+yui task publication verify <task-id>/<publication-id>
+```
+
+Verification is an explicit external read. The first implementation invokes a
+trusted, PATH-pinned local `gh` executable and reuses its authentication; Yui
+does not store a GitHub token. The command requires the current unsuperseded
+Publication to record the exact Task delivery head, then requires GitHub to
+report the same PR head as merged and to return a remote merge commit. It
+rechecks the Task head and Publication after the remote call before appending a
+new immutable `verified` record. Missing `gh`, unavailable authentication,
+ambiguous provider output, open/closed PRs, moved heads, and concurrent local
+changes fail without recording verification. GitLab verification is not
+implemented in this first version.
+
+Query whether every delivered Project head is represented by a current merged
+Publication:
+
+```sh
+yui task remote-delivery <task-id>
+yui task remote-delivery <task-id> --json
+```
+
+This is a read-only derived projection, not a Task status or writable `merged`
+flag. Active and reopened Tasks use the current clean Task-main heads and mark
+them provisional; completed and archived Tasks use the latest frozen
+`task.completed` heads. For each Project, Yui reports the expected local
+commit, the matching current unsuperseded Publication, PR/MR state,
+verification, and remote commit. Aggregate coverage is `none`, `unavailable`,
+`pending`, `partial`, or `merged`, with independent `allMerged` and
+`allVerified` values.
+Only a current Publication whose `localCommit` exactly matches the expected
+head and whose state is `merged` contributes merged coverage. Missing commits,
+open/closed records, stale heads, and superseded Publications never imply
+remote delivery. Projects whose Task head equals their managed base need no
+Publication. `task show`, `task context`, `task next-action`, and the Web detail
+projection use this same selector.
+`Archive --integrated coverage` requires both `allMerged=true` and
+`allVerified=true`.
+
+When a valid older completed Task has no frozen completion heads, Yui reports
+`unavailable` and keeps integrated archive fail-closed. Reopen and complete the
+Task again to record exact heads, then retry archive. Yui does not guess the
+missing head from a Publication or worktree, and `--force` never overrides
+missing head evidence.
+
 When the requested outcome is finished, complete the Task to stop automatic Leader wakes without deleting its sessions or Task main worktree:
 
 ```sh
@@ -744,9 +849,17 @@ worktrees are non-blocking completion advisories, but they must be settled
 before archive. Every isolated WorkItem worktree is explicitly cleaned as
 integrated or abandoned; that cleanup also removes its managed branch. Archive
 requires `--integrated` or `--abandon` to state the Task main outcome and is
-allowed only after Task main is clean. It removes managed worktrees but retains
-Task and WorkItem records. The Task main branch is retained as a recovery
-artifact instead of being silently deleted.
+allowed only after Task main is clean. `--integrated` additionally requires
+remote-delivery `allMerged=true` and `allVerified=true`; Task completion or a
+reported merge alone is never treated as verified remote delivery. When every
+exact Task head is merged but one or more Publications remain `reported`, the
+command identifies those Publications and refuses archive. An explicitly
+authorized `task archive <task-id> --integrated --force` may override only that
+verification gap and records the override in the archive event; it never
+bypasses missing, stale, open, or closed merge evidence. An intentional
+non-merge uses the existing explicit `--abandon` path. Archive removes managed
+worktrees but retains Task and WorkItem records. The Task main branch is
+retained as a recovery artifact instead of being silently deleted.
 Task lifecycle completion/selection only suggests valid source states: Draft for activate, active for complete, and completed for reopen.
 
 ## Sessions and tmux

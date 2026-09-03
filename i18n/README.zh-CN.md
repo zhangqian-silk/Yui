@@ -17,7 +17,7 @@ Yui 不把 Agent 的判断固化成确定性的工作流引擎。核心只负责
 ## 核心模型
 
 - `WorkItem`：唯一的有界工作单元，保存目标、验收条件、依赖、状态和精简结果。
-- `WorkerProfile`：可复用且与 provider 无关的行为模板，保存指令、Skill、访问要求及可选 model/effort hint。
+- `WorkerProfile`：可复用的 Worker 模板，分别保存可移植行为与继承或显式指定的 Agent runtime。
 - `TaskRole`：Task 内可修改的 Worker 实例，可绑定多个 Agent，并分别保存运行配置。
 - `Turn`：Task Role 的一次受管派发与结果交付。
 - `ChangeSet`：隔离 WorkItem 当前 HEAD 的不可变 Git 结果。
@@ -33,8 +33,19 @@ Agent 对话内创建 native subagent，或交给 Task Role Turn。Yui
 worker  explorer  implementer  reviewer
 ```
 
-Profile 不绑定 Agent，也不持有 Session 或 workspace。把 Yui Agent Profile 应用到 Task Role 时，会把 instructions、Skills、访问意图以及可选 model/effort 复制到该 Role 的 active Agent binding；显式 Role 参数可以继续覆盖这些值。它与 Codex 通过 `--profile` 选择的原生 config profile 不是一回事。Operator、Leader
-与 Task Role 是运行时 Role。
+Profile 的 runtime 要么动态继承当前全局 Worker active binding，要么显式指定
+一个 Agent 及可选 model/effort；adapter 始终由 Agent 配置派生。`profile list`
+和 `profile show` 会展示当前有效 Agent，以及继承时的 Worker launch revision，
+但不会因此改写 Profile 或增加其 revision。Profile 本身不持有 Session 或
+workspace。显式 Profile 指向的 Agent 只要在全局 Worker 中存在 binding（无论
+active 还是 dormant），其余 binding 配置就取自该 binding；未绑定的 Agent
+使用 Provider 默认值。被显式 Profile 这样引用的 Worker binding，必须先更新
+Profile、改为继承或删除 Profile 后才能解绑。model/effort 仍由 Profile 自身
+决定，省略即表示 Provider 默认值，而不是 Worker 中的值。把 Yui Agent Profile
+应用到新 Task Role 时，会冻结完整解析后的
+binding，以及 instructions、Skills 和访问意图；之后 Profile 或全局 Worker
+变更不会反向改写已有 Task Role。它与 Codex 通过 `--profile` 选择的原生 config
+profile 不是一回事。Operator、Leader 与 Task Role 是运行时 Role。
 
 ## 环境要求
 
@@ -309,10 +320,11 @@ Task/WorkItem 模型，不增加额外任务类型。
 `--last` 可直接恢复最近一条；新建会话不会伪装成 resume 选项，必须显式使用
 `operator new`，并把原对话保留在历史中。
 
-从已配置的全局 Worker 创建 Task Role，应用 Profile 并派发 WorkItem：
+从 Profile 当前解析出的 runtime 创建 Task Role 并派发 WorkItem：
 
 ```sh
 yui config role show worker
+yui config profile show implementer
 yui task role add <task-id> implementer --profile implementer
 yui task role show <task-id> implementer
 
@@ -355,10 +367,22 @@ provider 默认行为；`bypass` 编译 provider 支持的 bypass flag；`config
 `mode`、`allowedTools` 与 `disallowedTools`。provider 权限与 Profile 行为意图、
 Project 写入授权彼此独立：普通写入只由精确 WorkItem 范围和匹配的 managed
 workspace 授权。任意非 Leader
-Task Role 在创建时不传 `--agent`，都会复制全局 Worker Role 的完整 Agent
-bindings，Leader 无需重新拼接 model、effort 和权限。创建回执与
-`task context` 分别记录 Profile intent、精确可写 Project 与实际 permission strategy。显式
-`--agent` 属于 Task 专用覆盖，必须在派发前补全并回读配置。
+Task Role 在创建时同时不传 `--profile` 和 `--agent`，会复制全局 Worker Role
+的完整 Agent bindings，Leader 无需重新拼接 model、effort 和权限。传
+`--profile` 时会冻结该 Profile 当前解析出的完整 binding。创建时的 model、
+effort、权限和其他 Agent 设置必须与 `--agent` 同时提供，以便在任何持久化前
+完成能力校验并原子写入一套完整 binding。创建时同时传入 `--profile` 与
+`--agent`，Agent 必须与 Profile 当前解析出的 Agent 一致；Profile runtime
+仍作为基础 binding，显式 Agent 设置覆盖对应字段。更新 Task Role 时，不传
+`--agent` 会更新 active binding；传入 `--agent` 则只更新指定 binding 而不
+激活它，只有 `task role bind` 会切换 active Agent。显式 Profile 必须解析到
+该更新目标，其 runtime 作为基础 binding，显式 Agent 设置覆盖对应字段。单独
+使用继承 Worker 的 Profile 时，可以只更新可移植 Role 行为，而不重新定向绑定
+到其他 Agent 的 Role；若同时传入 `--agent` 或 Agent 设置，其当前解析出的
+Worker Agent 必须与更新目标一致。创建回执与 `task context` 分别记录 Profile
+intent、精确可写 Project 与实际 permission strategy。应用 Profile 会替换
+AgentProfile 所拥有的可移植字段（`defaultAccess`、description、instructions、
+skills 及由 access 派生的 constraints）；同一命令中的显式 Role 选项随后覆盖。
 
 ReviewRound 从冻结 Candidate SHA 创建独立的可写 worktree。只有 exact
 ReviewRound owner、reviewRoundId、冻结 base 与 workspace 全部匹配时，才获得
@@ -396,11 +420,13 @@ yui config profile show reviewer
 subagent 的创建与结果返回完全由 Leader 当前 Agent 的 native child 能力
 完成，没有 `yui ... subagent` 命令。Leader 必须选择并读取一个显式
 Worker Profile；没有合适的专用 Profile 时使用 `worker`。child brief
-需要包含 Profile revision、instructions、Skills、访问边界、验证要求及
-当前 runtime 支持的 model/effort hint。
+需要包含 Profile revision、instructions、Skills、访问边界、验证要求，并把
+Profile 当前解析出的 Agent/model/effort 仅作为上下文。
 
 native subagent 继承 Leader Agent、凭据和对话上下文，忽略 Task Role 的
-Agent bindings。Leader 审查返回结果后，在 WorkItem summary 中登记真实
+Agent bindings；Profile 的 runtime 选择只控制 Task Role 物化。只有当 Profile
+解析到同一个 Agent 且 native child API 支持时，才应用其中的 model/effort，
+否则继承实际 runtime。Leader 审查返回结果后，在 WorkItem summary 中登记真实
 执行信息：
 
 ```sh
@@ -496,6 +522,64 @@ yui task context <task-id>
 
 需要查看单个集合或记录时，再使用 `task work`、`task message`、`task turn` 和 Task Knowledge 下的细分命令。
 
+使用一个幂等命令记录 Task 已确认的 PR/MR 外部交付状态：
+
+```sh
+yui task publication upsert <task-id> --project <project> \
+  --provider github --repository <owner/name> --kind pull-request --id <number> \
+  --url <url> --state open --reported
+```
+
+必需的 provider/repository/external ID 会定位当前 Publication。首次 upsert
+创建记录。后续 upsert 会继承未指定的元数据；只有完整证据上下文不变时才继承未指定的
+合入证据。证据上下文包括 local commit、PR/MR state、remote commit、evidence 文本
+和 mergedAt。任一显式提供的上下文值真正变化时，未显式提供的 verification 会重置为
+`reported`，未重新提供的合入证据字段会清除；仅改变 local commit 且未显式提供 state
+时还会把 Publication 重置为 `open`。重复提供相同值仍保持幂等。只有语义发生变化时才
+追加新的不可变记录，并由 Yui 自动关联上一版本；相同输入不会新增事件。`list`、`show`
+和 `task context` 继续保留完整历史。该命令只记录调用方已经掌握的事实，不会自行查询
+Provider，也不替代 Review、Integration 或 Task completion 门禁。
+
+可针对当前 GitHub Publication 查询真实 PR 状态并记录验证结果：
+
+```sh
+yui task publication verify <task-id>/<publication-id>
+```
+
+验证是一次显式的外部读取。一期调用 PATH 中已固定绝对路径的可信本地 `gh`，复用
+`gh` 自己的认证，Yui 不保存 GitHub token。命令先要求当前未 supersede
+Publication 的 local commit 精确等于 Task 交付 head，再要求 GitHub 返回相同的
+PR head、真实 merged 状态和远端合入 commit。远端调用结束后还会重新核对 Task head
+与 Publication，全部不变才追加新的不可变 `verified` 记录。缺少 `gh`、认证不可用、
+Provider 输出不明确、PR 仍 open/closed、head 已移动或本地权威并发变化时都不会写入
+verified。一期不支持 GitLab 远端验证。
+
+可查询每个已交付 Project head 是否都有当前 merged Publication 覆盖：
+
+```sh
+yui task remote-delivery <task-id>
+yui task remote-delivery <task-id> --json
+```
+
+这是只读派生投影，不是新的 Task 状态，也不存在可单独写入的 `merged` 标志。
+active 或 reopened Task 使用当前干净的 Task main heads，并明确标记为 provisional；
+completed 或 archived Task 使用最近一次 `task.completed` 冻结的 heads。每个 Project
+都会展示预期 local commit、匹配的当前未 supersede Publication、PR/MR state、
+verification 与 remote commit。聚合状态为 `none`、`unavailable`、`pending`、
+`partial` 或 `merged`，并分别暴露 `allMerged` 与 `allVerified`。只有
+`localCommit` 精确匹配
+预期 head 且 state 为 `merged` 的当前 Publication 才贡献 merged 覆盖；缺 commit、
+open/closed、陈旧 head 与已 supersede 记录都不会被推断为已合入。Task head 与
+managed base 相同的 Project 不需要 Publication。`task show`、`task context`、
+`task next-action` 和 Web detail 共用同一个 selector。
+`Archive --integrated coverage` 同时要求 `allMerged=true` 和
+`allVerified=true`。
+
+有效旧版本 completed Task 如果没有冻结的 completion heads，Yui 会报告
+`unavailable`，并继续对 integrated archive fail closed。先 reopen，再重新 complete
+以记录精确 heads，之后重试 archive。Yui 不会从 Publication 或 worktree 猜测缺失的
+head，`--force` 也不能绕过缺失 head 证据。
+
 完成目标后，可将 Task 标记为 completed，从而停止自动唤醒，同时保留 session 和 Task main worktree：
 
 ```sh
@@ -507,9 +591,15 @@ completed Task 在显式 reopen 前会拒绝消息、派发、进入 session、�
 Turn 交付。终态 WorkItem、Review、Integration 与 Lane worktree 会作为非阻塞的
 completion advisory 返回，但必须在 archive 前处理。每个隔离 WorkItem worktree
 仍需显式标记 integrated 或 abandoned，清理时也会删除其受管分支；archive 还必须
-通过 `--integrated` 或 `--abandon` 明确 Task main 的处理结果，之后才会停止
-session 并清理干净的 Task main。Task 与 WorkItem 记录都会保留，Task main 分支
-作为恢复信息保留，不会被静默删除。
+通过 `--integrated` 或 `--abandon` 明确 Task main 的处理结果。`--integrated`
+还要求 remote-delivery 的 `allMerged=true` 与 `allVerified=true`；Task
+completion 或只有 reported 的 merge 都不等同于已验证远端交付。如果所有精确
+Task head 都已合入但仍有 Publication 是 `reported`，archive 会列出这些记录并拒绝。
+只有获得明确授权后，`task archive <task-id> --integrated --force` 才能仅覆盖这一
+verification 缺口，并在归档事件中记录 override；它不能绕过缺失、陈旧、open 或
+closed 的合入证据。有意不合入时继续使用显式 `--abandon` 路径。之后 archive 才会
+停止 session 并清理干净的 Task main。Task 与 WorkItem 记录都会保留，Task main
+分支作为恢复信息保留，不会被静默删除。
 Task 生命周期的交互选择只展示有效来源状态：activate 只展示 Draft，complete 只展示 active，reopen 只展示 completed。
 
 ## Session 与 tmux

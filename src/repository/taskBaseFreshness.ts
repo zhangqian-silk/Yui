@@ -313,6 +313,7 @@ async function resolveBaseCommit(
   entry: ReturnType<typeof workspaceProjectEntry>
 ): Promise<string> {
   if (entry?.baseCommit !== undefined) return entry.baseCommit;
+  if (binding.baseCommit !== undefined) return binding.baseCommit;
   if (COMMIT_PATTERN.test(binding.baseRef)) return binding.baseRef.toLowerCase();
   return (await git.inspect(project.path, binding.baseRef)).baseCommit;
 }
@@ -354,7 +355,7 @@ async function resolveTracked(
     }
   }
   const tracking = await git.inspectRemoteTracking({
-    repositoryPath: project.path,
+    repositoryPath: workspacePath,
     remoteUrl: project.remoteUrl,
     branch: project.developmentBranch
   });

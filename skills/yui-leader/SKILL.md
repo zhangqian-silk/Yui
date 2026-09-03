@@ -171,6 +171,57 @@ a Message only for a new semantic conclusion with value to another reader, and
 create an InputRequest only for a real user choice, authorization, or
 unavailable external fact that blocks progress.
 
+## Record confirmed publication state
+
+When you create, reuse, close, reopen, or merge a Task's PR/MR, or receive a
+result that confirms one of those state changes, update the Task's Publication
+with `task publication upsert` before ending the same work stage:
+
+```sh
+yui task publication upsert <task> --project <project> \
+  --provider github --repository <owner/name> --kind pull-request --id <number> \
+  --url <url> --state open --reported
+```
+
+Write only the repository identity, URL, state, and commit or merge evidence
+already available to you. Omitted metadata inherits the current record.
+Omitted verification and merge evidence inherit only while the complete
+evidence context is unchanged: local commit, state, remote commit, evidence,
+and `mergedAt`. Changing any explicitly supplied context value resets omitted
+verification to `reported` and clears omitted merge-evidence fields; changing
+only the local commit also defaults the Publication to `open`. For a reported
+merge, include the exact local commit, remote commit, `mergedAt`, and evidence
+when available.
+When you execute an authorized GitHub PR merge yourself, immediately upsert
+that merge result and run
+`yui task publication verify <task>/<publication>` before ending the same work
+stage. The verifier queries the exact GitHub PR through local `gh`, checks its
+head against the Task delivery head, and appends the verified superseding
+record. If either synchronization or verification fails, preserve and report
+the failure rather than claiming verified delivery. Do not run provider
+verification merely to refresh state when the current authorization does not
+cover that real external resource. Publication is external delivery evidence
+only: it does not replace Candidate capture, Review, Integration, acceptance,
+or Task completion gates.
+
+When deciding or reporting whether all Task code is merged, read
+`yui task remote-delivery <task>` instead of equating `completed` with merged.
+The projection compares the current Task-main heads (provisional while active
+or reopened) or the latest frozen completion heads with current unsuperseded
+Publications. A Project contributes `allMerged` only when the Publication
+records that exact local head in state `merged`; `allVerified` remains a
+separate stronger fact. Reopening and adding a commit therefore makes old merge
+evidence stale until Publication is upserted for the new head. Archive
+`--integrated` requires both exact merged and verified coverage. If every head
+is merged but a Publication is still reported, run its explicit verification
+before proposing archive. `--integrated --force` may override only that
+verification gap and requires explicit user authorization for the exact Task;
+it never overrides missing, stale, open, or closed merge evidence. Deliberate
+non-merge uses the existing explicit `--abandon` path.
+If an older completed Task lacks frozen completion heads, reopen and complete
+it again to record them; never infer the missing head from a Publication or
+worktree.
+
 ## Lead with judgment
 
 - `yui task next-action <task-id>` is decision support, not an autopilot. It
@@ -435,20 +486,22 @@ yui task work update <work-id> running
 yui config profile show <worker|explorer|implementer|reviewer|profile-id>
 ```
 
-Read the selected Profile and incorporate all applicable portable constraints
-into the child brief:
+Read the selected Profile and incorporate all applicable portable behavior
+constraints into the child brief:
 
 - WorkItem objective, acceptance criteria, dependencies, and context reads;
 - Profile revision, description, instructions, and required Skills;
 - Profile read/write behavior intent and exact allowed workspace;
 - requested validation and evidence;
-- optional model and effort hints.
+- its runtime source and effective Agent/model/effort as context only.
 
 The child inherits this Leader's Agent, account, credentials, and conversation
-context. Ignore all Task Role Agent bindings. Apply a Profile model or effort
-hint only if this Agent's native child API supports that override; otherwise
-inherit the actual runtime setting. Never claim a model that cannot be
-confirmed.
+context. An Agent Profile's runtime selection governs Task Role materialization,
+not native subagent creation. Ignore a different explicit Profile Agent and all
+Task Role Agent bindings. If the Profile resolves to this same Agent, apply its
+model or effort only when the native child API supports that override;
+otherwise inherit the actual runtime setting. Never claim a model that cannot
+be confirmed.
 
 Create and communicate with children through the native Agent tools. Yui does
 not create, address, resume, or terminate those children; it observes their
@@ -481,9 +534,8 @@ lifecycle is required, use a Task Role instead.
 
 ## Dispatch a Task Role Turn
 
-A Task Role is a mutable Task-bound Worker instance. Apply a provider-neutral
-Profile snapshot, then bind one or more Agents with independent runtime
-settings:
+A Task Role is a mutable Task-bound Worker instance. Applying a Profile freezes
+its portable behavior and fully resolved runtime binding:
 
 ```sh
 yui task role add <task-id> <role> \
@@ -493,14 +545,34 @@ yui task work create <task-id> "<outcome>" --role <role>
 yui task work dispatch <work-id> --input "<execution brief>"
 ```
 
-The Profile is not linked to an Agent. Applying it copies portable behavior
-into the Role; later Profile edits do not overwrite Role customization. Each
-Agent binding retains its own adapter, model, permission, environment, and
-native Session configuration.
+An inherited Profile resolves the current Global Worker active binding. An
+explicit Profile with a matching Worker binding preserves that binding's
+non-model settings whether it is active or dormant; an unbound Agent starts
+from provider defaults. The matching Worker binding cannot be unbound while
+the Profile references it. The Profile then applies its own model and effort,
+where omission means the provider default. Applying it copies that complete
+binding and portable behavior into the Role. Later Profile or Global Worker
+edits do not overwrite Role customization. Each Agent binding retains its own
+adapter, model, permission, environment, and native Session configuration.
+Profile application replaces the portable fields owned by AgentProfile
+(`defaultAccess`, description, instructions, skills, and access-derived
+constraints); explicit Role options in the same command apply afterward.
 
-Add a non-Leader Task Role without `--agent` so Yui copies the configured global
-Worker Role's complete bindings, regardless of the Task Role name. The Profile
-still defines portable behavior; Worker defines runtime Agent configuration.
+Without `--profile` or `--agent`, a non-Leader Task Role copies the configured
+Global Worker Role's complete bindings, regardless of the Task Role name.
+When `--agent` is present, any model, effort, permission, or other Agent
+settings form one explicit binding; those settings are invalid without
+`--agent` during Role creation. If creation combines `--profile` and `--agent`,
+the Agent must match the Profile's resolved Agent; Profile runtime is the base
+binding and explicit Agent settings override corresponding fields. On Role
+update, Agent settings without `--agent` target the active binding; with
+`--agent`, they target that binding without switching it. An explicit Profile
+used during update must resolve to that same target Agent; its runtime is the
+base binding and explicit Agent settings override corresponding fields. An
+inherited Worker Profile used alone may update portable behavior without
+retargeting a Role bound to another Agent; when `--agent` or Agent settings are
+also present, its current Worker Agent must match the target. Use only the
+`task role bind` command to switch the active Agent.
 Before dispatch, inspect `task role show`; if Agent, model, effort, Profile, or
 workspace scope is missing or inconsistent, do not dispatch or guess it.
 

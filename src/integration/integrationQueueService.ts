@@ -315,10 +315,14 @@ export async function enqueueIntegrationQueueEntry(
     throw new Error(`Task main worktree is not ready; reconcile the Task first: ${task.id}.`);
   }
   const canonicalTargetRef = canonicalizeTargetRef(targetRef);
-  const targetHead = (await git.inspect(project.path, exactBranchRef(canonicalTargetRef))).baseCommit;
+  const repositoryPath = taskMainRepositoryPath(input.store, task.id, project.id);
+  const targetHead = (await git.inspect(
+    repositoryPath,
+    exactBranchRef(canonicalTargetRef)
+  )).baseCommit;
   let equivalent = await findEquivalentCommit(
     git,
-    project.path,
+    repositoryPath,
     changeSet.headCommit,
     targetHead,
     changeSet.baseCommit
@@ -327,7 +331,7 @@ export async function enqueueIntegrationQueueEntry(
     // The identical change may already have landed through another commit
     // while the target also moved on with unrelated work: the whole-tree
     // check misses it, but the touched paths already agree.
-    equivalent = await findContainedChangeSet(git, project.path, changeSet, targetHead);
+    equivalent = await findContainedChangeSet(git, repositoryPath, changeSet, targetHead);
   }
   return input.store.transactionAsync(async (tx) => {
     const duplicate = findActiveQueueDuplicate(
@@ -386,7 +390,10 @@ export async function enqueueIntegrationQueueEntry(
     // proof if it moved.
     let effectiveTargetHead = targetHead;
     if (equivalent !== null) {
-      effectiveTargetHead = (await git.inspect(project.path, exactBranchRef(canonicalTargetRef))).baseCommit;
+      effectiveTargetHead = (await git.inspect(
+        repositoryPath,
+        exactBranchRef(canonicalTargetRef)
+      )).baseCommit;
       if (effectiveTargetHead !== targetHead) {
         equivalent = null;
       } else {
@@ -394,7 +401,10 @@ export async function enqueueIntegrationQueueEntry(
         // advance the target during the call, so the returned head may
         // already be stale.  Verify with a second read; if it moved, the
         // convergence proof is stale and the entry must queue.
-        const verifiedHead = (await git.inspect(project.path, exactBranchRef(canonicalTargetRef))).baseCommit;
+        const verifiedHead = (await git.inspect(
+          repositoryPath,
+          exactBranchRef(canonicalTargetRef)
+        )).baseCommit;
         if (verifiedHead !== effectiveTargetHead) {
           equivalent = null;
           effectiveTargetHead = verifiedHead;
@@ -448,11 +458,22 @@ export async function enqueueIntegrationQueueEntry(
         taskId: task.id,
         projectId: input.projectId,
         targetRef: canonicalTargetRef,
-        expectedHead: effectiveTargetHead,
-        changeSetIds: [input.changeSetId],
+        beforeCommit: effectiveTargetHead,
+        source: {
+          kind: "work-item",
+          workItemId: changeSet.workItemId,
+          startCommit: changeSet.baseCommit,
+          resultCommit: changeSet.headCommit,
+          strategy: "cherry-pick"
+        },
         checkCommands: []
       }, now()),
-      { status: "committed", candidateCommit: effectiveTargetHead },
+      {
+        status: "committed",
+        candidateCommit: effectiveTargetHead,
+        afterCommit: effectiveTargetHead,
+        summary: `WorkItem ${changeSet.workItemId} result was already represented; Task head was unchanged.`
+      },
       now()
     );
     const convergedEntry = createConvergedIntegrationQueueEntry({
@@ -468,7 +489,11 @@ export async function enqueueIntegrationQueueEntry(
       integrationAttemptId: attempt.id
     }, now());
     try {
-      await git.assertRefAt(project.path, exactBranchRef(canonicalTargetRef), effectiveTargetHead);
+      await git.assertRefAt(
+        repositoryPath,
+        exactBranchRef(canonicalTargetRef),
+        effectiveTargetHead
+      );
     } catch {
       const queuedEntry = createIntegrationQueueEntry({
         id,
@@ -649,14 +674,18 @@ export async function processIntegrationQueue(
     if (candidate === undefined) break;
     const project = store.getProject(candidate.projectId);
     if (project === null) throw new Error(`Project not found: ${candidate.projectId}.`);
-    const targetBefore = (await git.inspect(project.path, exactBranchRef(candidate.targetRef))).baseCommit;
+    const repositoryPath = taskMainRepositoryPath(store, task.id, project.id);
+    const targetBefore = (await git.inspect(
+      repositoryPath,
+      exactBranchRef(candidate.targetRef)
+    )).baseCommit;
     // Evidence fence: a validated entry's reusable evidence only covers the
     // exact target head it was validated against.  An out-of-band target
     // advance (another Task) that touches the entry's paths, or whose impact
     // cannot be proven, invalidates the evidence: requeue and run its checks.
     if (candidate.status === "validated"
       && await evidenceTargetAdvanced(
-        git, project.path, candidate, targetBefore, store, task.id
+        git, repositoryPath, candidate, targetBefore, store, task.id
       )) {
       store.transaction((tx) => {
         assertTaskActive(tx, task.id);
@@ -690,8 +719,8 @@ export async function processIntegrationQueue(
       // entered retry (or whose latest Candidate no longer matches) must not
       // advance the target.  Mark it conflicted so the Leader can supersede
       // or re-enqueue a fresh ChangeSet.
+      const changeSet = tx.getChangeSet(task.id, current.changeSetId);
       try {
-        const changeSet = tx.getChangeSet(task.id, current.changeSetId);
         if (changeSet === null) {
           throw new Error(`ChangeSet not found: ${current.changeSetId}.`);
         }
@@ -706,13 +735,22 @@ export async function processIntegrationQueue(
         ));
         return { skipped: true as const };
       }
+      if (changeSet === null) {
+        throw new Error(`ChangeSet not found after validation: ${current.changeSetId}.`);
+      }
       const attempt = createIntegrationAttempt({
         id: tx.nextIntegrationAttemptId(task.id),
         taskId: task.id,
         projectId: current.projectId,
         targetRef: current.targetRef,
-        expectedHead: targetBefore,
-        changeSetIds: [current.changeSetId],
+        beforeCommit: targetBefore,
+        source: {
+          kind: "work-item",
+          workItemId: changeSet.workItemId,
+          startCommit: changeSet.baseCommit,
+          resultCommit: changeSet.headCommit,
+          strategy: "cherry-pick"
+        },
         checkCommands: current.status === "validated" ? [] : current.checkCommands
       }, now());
       tx.saveIntegrationAttempt(task.id, attempt);
@@ -745,10 +783,14 @@ export async function processIntegrationQueue(
       return entry;
     });
     if (result.status === "committed") {
-      const project = store.getProject(settled.projectId);
-      if (project !== null) {
-        await recomputeAffectedPaths(store, task.id, settled, project.path, git, now);
-      }
+      await recomputeAffectedPaths(
+        store,
+        task.id,
+        settled,
+        taskMainRepositoryPath(store, task.id, settled.projectId),
+        git,
+        now
+      );
     }
     processed.push({ entry: settled, attempt: result.attempt, result });
   }
@@ -905,10 +947,14 @@ export async function reconcileIntegrationQueueEntry(
     tx.saveIntegrationQueueEntry(taskId, settled);
     return settled;
   });
-  const project = store.getProject(committed.projectId);
-  if (project !== null) {
-    await recomputeAffectedPaths(store, taskId, committed, project.path, git, now);
-  }
+  await recomputeAffectedPaths(
+    store,
+    taskId,
+    committed,
+    taskMainRepositoryPath(store, taskId, committed.projectId),
+    git,
+    now
+  );
   return committed;
 }
 
@@ -1030,10 +1076,14 @@ async function reconcileTerminalAttempts(
       // Crash window: the settle marked this entry committed but died before
       // recomputing downstream affectedPaths.  Replay that update idempotently
       // so waiting entries regain their overlap evidence.
-      const project = store.getProject(entry.projectId);
-      if (project !== null) {
-        await recomputeAffectedPaths(store, taskId, entry, project.path, git, now);
-      }
+      await recomputeAffectedPaths(
+        store,
+        taskId,
+        entry,
+        taskMainRepositoryPath(store, taskId, entry.projectId),
+        git,
+        now
+      );
       continue;
     }
     if (entry.status !== "conflicted" && entry.status !== "running") continue;
@@ -1046,10 +1096,14 @@ async function reconcileTerminalAttempts(
         now()
       );
       store.saveIntegrationQueueEntry(taskId, committed);
-      const project = store.getProject(committed.projectId);
-      if (project !== null) {
-        await recomputeAffectedPaths(store, taskId, committed, project.path, git, now);
-      }
+      await recomputeAffectedPaths(
+        store,
+        taskId,
+        committed,
+        taskMainRepositoryPath(store, taskId, committed.projectId),
+        git,
+        now
+      );
       continue;
     }
     // Crash window: the Attempt persisted a terminal failed/blocked outcome
@@ -1198,4 +1252,20 @@ function taskMainBranch(
   const mainWorkspace = store.getTaskWorkspace(taskId);
   if (mainWorkspace === null) return undefined;
   return workspaceProjectEntry(mainWorkspace, projectId)?.branch;
+}
+
+function taskMainRepositoryPath(
+  store: TaskStore,
+  taskId: string,
+  projectId: string
+): string {
+  const mainWorkspace = store.getTaskWorkspace(taskId);
+  if (mainWorkspace === null || mainWorkspace.owner.type !== "task") {
+    throw new Error(`Task has no authoritative main workspace: ${taskId}.`);
+  }
+  const entry = workspaceProjectEntry(mainWorkspace, projectId);
+  if (entry === undefined) {
+    throw new Error(`Task main workspace has no Project: ${taskId}/${projectId}.`);
+  }
+  return entry.path;
 }

@@ -1,5 +1,5 @@
 import type { ConfiguredAgent } from "../agent/agent.js";
-import { createHash, randomUUID } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
 import { createTurnInput } from "../context/turnInputContract.js";
 import {
@@ -89,7 +89,8 @@ import {
   unbindRoleAgent,
   updateRole,
   type GlobalRole,
-  type Role
+  type Role,
+  type RoleAgentBinding
 } from "../role/role.js";
 import {
   createTurn,
@@ -143,6 +144,13 @@ import { createDecision, supersedeDecision } from "../decision/decision.js";
 import { createMilestone } from "../milestone/milestone.js";
 import { runPublicationCommand } from "./taskPublicationCommands.js";
 import {
+  assertTaskRemoteDeliveryProof,
+  type TaskRemoteDeliveryProof,
+  projectTaskRemoteDeliveryFromStore,
+  renderTaskRemoteDelivery,
+  runTaskRemoteDeliveryCommand
+} from "./taskRemoteDeliveryCommand.js";
+import {
   enqueueWork,
   requireCompleteWorkExecution,
   settleExactWorkExecution
@@ -186,9 +194,12 @@ import {
 } from "../task/completionReadiness.js";
 import type { TaskStore } from "../storage/taskStore.js";
 import type { AgentProfile } from "../profile/agentProfile.js";
+import {
+  requireResolvedAgentProfileRuntime,
+  type ResolvedAgentProfileRuntime
+} from "../profile/agentProfileRuntime.js";
 import { assertProjectActive, resolveProject, type Project } from "../repository/project.js";
 import type { TaskWorkspaceActivation } from "../repository/taskWorkspacePreparer.js";
-import type { ChangeSet } from "../integration/changeSet.js";
 import type { TmuxRolePaneState } from "../tmux/tmuxManager.js";
 import {
   currentWorkItemCandidate,
@@ -259,7 +270,8 @@ import {
   parseRoleOptions,
   patchRoleAgentBinding,
   roleOptionSpecs,
-  roleProfilePatch
+  roleProfilePatch,
+  type ParsedRoleOptions
 } from "./roleConfiguration.js";
 import {
   hasRoleLaunchContextOptions,
@@ -293,6 +305,7 @@ import {
   taskLocalActor as resolveTaskLocalActor,
   taskLeaderActionTurnId
 } from "./taskActor.js";
+import { currentManagedRuntime } from "../runtime/managedCaller.js";
 import { enqueueOperatorEvent } from "../scheduler/operatorEvent.js";
 import { queueLeaderWakeup } from "../scheduler/wakeupQueue.js";
 import { renderWakeReason, wakeReason } from "../scheduler/wakeReason.js";
@@ -442,6 +455,12 @@ export type TaskWorkflowRuntimePort = Readonly<{
 
 export type TaskWorkflowStore = TaskStore;
 
+export type TaskRoleAgentConfigurationMutation = Readonly<{
+  agentId: string;
+  config: RoleAgentConfig;
+  cwd: string;
+}>;
+
 export type TaskCommandOptions = Readonly<{
   runtime?: TaskWorkflowRuntimePort;
   now?: () => Date;
@@ -473,11 +492,106 @@ export type TaskCommandOptions = Readonly<{
   /** Verified under the release handover lock by the exact global Operator CLI. */
   /** Physical Task-main heads verified by the CLI immediately before command execution. */
   actualTaskReviewCandidate?: TaskReviewCandidate;
+  /** CLI-frozen remote merge coverage checked before destructive archive cleanup. */
+  archiveRemoteDeliveryProof?: TaskRemoteDeliveryProof;
   /** Issue 07: CLI-verified delta-recheck assessment for `task review request --delta-recheck`. */
   deltaRecheckPreflight?: DeltaRecheckPreflight;
   /** Issue 07: per-Project diff text for a delta-recheck dispatch, digest-verified. */
   deltaRecheckDiff?: Readonly<Record<string, string>>;
+  /** CLI-prepared capability validation; throws before a Role mutation persists. */
+  validateAgentConfiguration?: (
+    input: Readonly<{
+      agentId: string;
+      config: RoleAgentConfig;
+      cwd: string;
+    }>
+  ) => void;
 }>;
+
+/**
+ * Resolve the exact Task Role binding a CLI command would write, without
+ * mutating Task state. The CLI uses this to complete live/cache/fallback
+ * capability validation before the command transaction begins.
+ */
+export function previewTaskRoleAgentConfigurationMutation(
+  args: readonly string[],
+  store: TaskWorkflowStore
+): TaskRoleAgentConfigurationMutation | undefined {
+  if (args[0] !== "role") return undefined;
+  if (args[1] === "add") {
+    const usage = "Task role add usage: yui task role add <task> <name> [Role and Agent settings].";
+    const [taskId, roleName, ...tail] = args.slice(2);
+    if (taskId === undefined || roleName === undefined
+      || taskId.startsWith("--") || roleName.startsWith("--")) {
+      throw usageError("Task id and Role name are required.", usage);
+    }
+    const parsed = parseRoleOptions(tail, new Map([
+      ...roleOptionSpecs({ update: false, includeAgent: true }),
+      ["--profile", "value" as const]
+    ]), usage);
+    const agentId = parsed.one("--agent")?.trim();
+    if (parsed.has("--agent") && (agentId === undefined || agentId.length === 0)) {
+      throw usageError("--agent is required.", usage);
+    }
+    if (hasAgentConfigOptions(parsed) && agentId === undefined) {
+      throw usageError(
+        "Task role add Agent settings require --agent so a complete binding is validated atomically.",
+        usage
+      );
+    }
+    const task = requireTask(store, taskId);
+    const cwd = task.cwd ?? store.getConfig().defaultWorkspace ?? process.cwd();
+    const profileId = parsed.one("--profile");
+    const bindingUpdate = resolveTaskRoleAgentBindingAdd(
+      parsed,
+      profileId === undefined ? undefined : requireAgentProfile(store, profileId),
+      store
+    );
+    if (bindingUpdate !== undefined) {
+      return {
+        agentId: bindingUpdate.agentId,
+        config: bindingUpdate.binding.config,
+        cwd
+      };
+    }
+    const worker = store.getGlobalRole("worker");
+    if (worker === null) return undefined;
+    const binding = worker.agentBindings[worker.activeAgentId];
+    return binding === undefined
+      ? undefined
+      : { agentId: binding.agentId, config: binding.config, cwd };
+  }
+  if (args[1] === "update") {
+    const usage = "Task role update usage: yui task role update <task> <role> [Role and Agent settings].";
+    const [taskId, roleName, ...tail] = args.slice(2);
+    if (taskId === undefined || roleName === undefined
+      || taskId.startsWith("--") || roleName.startsWith("--")) {
+      throw usageError("Task id and Role name are required.", usage);
+    }
+    const parsed = parseRoleOptions(tail, new Map([
+      ...roleOptionSpecs({ update: true, includeAgent: true }),
+      ["--profile", "value" as const]
+    ]), usage);
+    if (parsed.has("--agent") && (parsed.one("--agent")?.trim().length ?? 0) === 0) {
+      throw usageError("--agent is required.", usage);
+    }
+    const role = requireRole(store, taskId, roleName);
+    const profileId = parsed.one("--profile");
+    const bindingUpdate = resolveTaskRoleAgentBindingUpdate(
+      parsed,
+      role,
+      profileId === undefined ? undefined : requireAgentProfile(store, profileId),
+      store
+    );
+    if (bindingUpdate === undefined) return undefined;
+    return {
+      agentId: bindingUpdate.agentId,
+      config: bindingUpdate.binding.config,
+      cwd: role.workspace
+    };
+  }
+  return undefined;
+}
 
 export type TaskCompletionPreflight = Readonly<{
   task: Task;
@@ -614,13 +728,22 @@ export function runTaskCommand(
     case "create": return createTaskCommand(rest, store, options);
     case "update": return output(updateTaskCommand(rest, store, options));
     case "list": return listTaskCommand(rest, store);
-    case "show": return showTaskCommand(rest, store);
+    case "show": return showTaskCommand(
+      rest,
+      store,
+      options.actualTaskReviewCandidate ?? null
+    );
     case "context": return runTaskContextCommand(
       rest,
       store,
       options.actualTaskReviewCandidate ?? null
     );
     case "next-action": return runTaskNextActionCommand(
+      rest,
+      store,
+      options.actualTaskReviewCandidate ?? null
+    );
+    case "remote-delivery": return runTaskRemoteDeliveryCommand(
       rest,
       store,
       options.actualTaskReviewCandidate ?? null
@@ -1048,7 +1171,11 @@ function listTaskCommand(args: string[], store: TaskWorkflowStore): TaskCommandE
   return output(rendered, snapshot.result);
 }
 
-function showTaskCommand(args: string[], store: TaskWorkflowStore): TaskCommandExecution {
+function showTaskCommand(
+  args: string[],
+  store: TaskWorkflowStore,
+  currentTaskCandidate: TaskReviewCandidate | null
+): TaskCommandExecution {
   const [taskId] = args;
   exactPositionals(args, 1, "Task show usage: yui task show <id>.");
   const task = requireTask(store, taskId);
@@ -1062,6 +1189,11 @@ function showTaskCommand(args: string[], store: TaskWorkflowStore): TaskCommandE
   const changeSets = store.listChangeSets(task.id);
   const integrations = store.listIntegrationAttempts(task.id);
   const publications = store.listPublicationReferences(task.id);
+  const remoteDelivery = projectTaskRemoteDeliveryFromStore(
+    store,
+    task,
+    currentTaskCandidate
+  );
   const verifiedMergedPublications = publications.filter((reference) => (
     reference.state === "merged" && reference.verification === "verified"
   )).length;
@@ -1122,11 +1254,17 @@ function showTaskCommand(args: string[], store: TaskWorkflowStore): TaskCommandE
     `ChangeSets: ${counts.changeSets}`,
     `Integration Attempts: ${counts.integrations}`,
     `Publication references: ${counts.publications} (${verifiedMergedPublications} verified merged)`,
+    renderTaskRemoteDelivery(remoteDelivery).trimEnd(),
     `Open inputs: ${counts.openInputs}`,
     `Created: ${presentTime(task.createdAt, timeZone)}`,
     `Updated: ${presentTime(task.updatedAt, timeZone)}`
   ].join("\n").concat("\n");
-  return output(rendered, { task, counts, hasBrief: brief !== null });
+  return output(rendered, {
+    task,
+    counts,
+    hasBrief: brief !== null,
+    remoteDelivery
+  });
 }
 
 function activateTaskCommand(
@@ -1257,16 +1395,28 @@ function completeTaskCommand(
         tree: publishedTreeProof.tree
       }, now);
     }
+    const taskWorkspace = readinessFacts.managedWorkspaces.find((workspace) => (
+      workspace.owner.type === "task"
+      && workspace.owner.taskId === task.id
+    ));
+    const completedProjectHeads = actualTaskCandidate === undefined
+      ? undefined
+      : formatProjectCommits(actualTaskCandidate.projects);
+    const completedProjectBases = taskWorkspace === undefined
+      ? undefined
+      : formatProjectCommits(taskWorkspace.entries.map(({ projectId, baseCommit }) => ({
+        projectId,
+        commit: baseCommit
+      })));
     const terminalEvent = recordTaskEvent(tx, task.id, "task.completed", {
       by: actor,
       summary,
-      ...(actualTaskCandidate === undefined
+      ...(completedProjectHeads === undefined
         ? {}
-        : {
-            projectHeads: actualTaskCandidate.projects
-              .map(({ projectId, commit }) => `${projectId}@${commit}`)
-              .join(",")
-          }),
+        : { projectHeads: completedProjectHeads }),
+      ...(completedProjectBases === undefined
+        ? {}
+        : { projectBases: completedProjectBases }),
       ...(readiness.advisories.length === 0
         ? {}
         : { cleanupAdvisories: String(readiness.advisories.length) })
@@ -1360,6 +1510,14 @@ function archiveTaskCommand(
       && task.status !== "retired") {
       throw usageError(`Task ${task.id} must be completed or retired before it can be archived.`);
     }
+    const remoteDelivery = request.disposition === "integrated"
+      ? assertTaskRemoteDeliveryProof(
+        tx,
+        task,
+        options.archiveRemoteDeliveryProof,
+        { forceUnverified: request.forceUnverified }
+      )
+      : undefined;
     assertNoOpenInputRequests(tx, task.id, "archiving the Task");
     const unresolvedIntegration = tx.listIntegrationAttempts(task.id).find((integration) => (
       integration.status === "running"
@@ -1410,9 +1568,37 @@ function archiveTaskCommand(
     for (const role of tx.listRoles(task.id)) {
       tx.removeWorkMailbox(roleMailbox(task.id, role.name));
     }
+    const remoteProjectHeads = remoteDelivery === undefined
+      ? undefined
+      : formatProjectCommits(
+        remoteDelivery.projects.map(({ projectId, expectedLocalCommit }) => ({
+          projectId,
+          commit: expectedLocalCommit
+        }))
+      );
+    const remoteProjectBases = remoteDelivery === undefined
+      ? undefined
+      : formatProjectCommits(
+        remoteDelivery.projects.map(({ projectId, baseCommit }) => ({
+          projectId,
+          commit: baseCommit
+        }))
+      );
     recordTaskEvent(tx, task.id, "task.archived", {
       by: actor,
-      workspaceDisposition: request.disposition
+      workspaceDisposition: request.disposition,
+      ...(remoteDelivery === undefined
+        ? {}
+        : {
+            mergeCoverage: remoteDelivery.status,
+            allMerged: String(remoteDelivery.allMerged),
+            allVerified: String(remoteDelivery.allVerified),
+            ...(request.forceUnverified && !remoteDelivery.allVerified
+              ? { verificationOverride: "true" }
+              : {})
+          }),
+      ...(remoteProjectHeads === undefined ? {} : { projectHeads: remoteProjectHeads }),
+      ...(remoteProjectBases === undefined ? {} : { projectBases: remoteProjectBases })
     }, now);
     enqueueWork(tx, taskMailbox(task.id), "task-archived", now, [taskRef(task.id)]);
     return { task: archived, changed: true } as const;
@@ -1593,22 +1779,50 @@ function assertTaskRetirementProof(
 
 export function parseTaskArchiveArguments(
   args: readonly string[]
-): Readonly<{ taskId: string; disposition: "integrated" | "abandoned" }> {
-  const usage = "Task archive usage: yui task archive <id> (--integrated|--abandon).";
-  if (args.length !== 2 || !["--integrated", "--abandon"].includes(args[1] ?? "")) {
+): Readonly<{
+  taskId: string;
+  disposition: "integrated" | "abandoned";
+  forceUnverified: boolean;
+}> {
+  const usage = "Task archive usage: "
+    + "yui task archive <id> (--integrated [--force]|--abandon).";
+  const taskId = args[0]?.trim();
+  const flags = args.slice(1);
+  if (taskId === undefined
+    || taskId.length === 0
+    || flags.some((flag, index) => (
+      !["--integrated", "--abandon", "--force"].includes(flag)
+      || flags.indexOf(flag) !== index
+    ))) {
+    throw usageError(usage);
+  }
+  const integrated = flags.includes("--integrated");
+  const abandoned = flags.includes("--abandon");
+  const forceUnverified = flags.includes("--force");
+  if (integrated === abandoned || (forceUnverified && !integrated)) {
     throw usageError(usage);
   }
   return {
-    taskId: args[0]!,
-    disposition: args[1] === "--integrated" ? "integrated" : "abandoned"
+    taskId,
+    disposition: integrated ? "integrated" : "abandoned",
+    forceUnverified
   };
+}
+
+function formatProjectCommits(
+  projects: readonly Readonly<{ projectId: string; commit: string | null }>[]
+): string | undefined {
+  const values = projects.flatMap(({ projectId, commit }) => (
+    commit === null ? [] : [`${projectId}@${commit}`]
+  ));
+  return values.length === 0 ? undefined : values.join(",");
 }
 
 export function validateTaskArchiveRequest(
   args: readonly string[],
   store: TaskWorkflowStore,
   options: TaskCommandOptions = {}
-): Readonly<{ taskId: string; disposition: "integrated" | "abandoned" }> {
+): ReturnType<typeof parseTaskArchiveArguments> {
   const request = parseTaskArchiveArguments(args);
   const task = requireTask(store, request.taskId);
   taskActor(store, options, task.id);
@@ -2068,6 +2282,12 @@ function addTaskRole(
   if (parsed.has("--agent") && (agentId === undefined || agentId.length === 0)) {
     throw usageError("--agent is required.", usage);
   }
+  if (hasAgentConfigOptions(parsed) && agentId === undefined) {
+    throw usageError(
+      "Task role add Agent settings require --agent so a complete binding is validated atomically.",
+      usage
+    );
+  }
   const now = clock(options);
   const result = store.transaction((tx) => {
     const task = requireTask(tx, taskId);
@@ -2080,31 +2300,32 @@ function addTaskRole(
     }, "creation");
     if (roleName === LEADER_ROLE) throw usageError("The Task leader role already exists.");
     if (tx.getRole(task.id, roleName) !== null) throw usageError(`Role already exists: ${roleName}.`);
-    let created = createTaskRole(tx, task, roleName, agentId, now);
     const profileId = parsed.one("--profile");
-    if (profileId !== undefined) {
-      created = applyWorkerAgentProfile(created, requireAgentProfile(tx, profileId), now);
+    const agentProfile = profileId === undefined
+      ? undefined
+      : requireAgentProfile(tx, profileId);
+    const bindingUpdate = resolveTaskRoleAgentBindingAdd(parsed, agentProfile, tx);
+    let created = bindingUpdate === undefined
+      ? createTaskRole(tx, task, roleName, undefined, now)
+      : createTaskRoleFromAgentBinding(tx, task, roleName, bindingUpdate.binding, now);
+    if (agentProfile !== undefined) {
+      created = applyWorkerAgentProfileBehavior(created, agentProfile, now);
     }
-    const profile = roleProfilePatch(parsed);
-    if (Object.keys(profile).length > 0) created = updateRole(created, profile, now);
-    if (hasAgentConfigOptions(parsed)) {
-      const targetAgentId = agentId || created.activeAgentId;
-      const binding = created.agentBindings[targetAgentId];
-      if (binding === undefined) throw usageError(`Role Agent is not bound: ${targetAgentId}.`);
-      created = updateRole(created, {
-        agentBindings: {
-          ...created.agentBindings,
-          [targetAgentId]: patchRoleAgentBinding(binding, parsed)
-        }
-      }, now);
-    }
+    const rolePatch = roleProfilePatch(parsed);
+    if (Object.keys(rolePatch).length > 0) created = updateRole(created, rolePatch, now);
+    validateTaskRoleAgentBinding(created, created.activeAgentId, options);
     validateConfiguredRoleSkills(options.yuiHome, created.skills ?? []);
     tx.saveRole(task.id, created);
     enqueueWork(tx, taskMailbox(task.id), "role-added", now, [taskRef(task.id)]);
     const binding = created.agentBindings[created.activeAgentId];
+    const runtimeSource = profileId !== undefined
+      ? `Agent Profile ${profileId}`
+      : agentId !== undefined
+        ? `Explicit Agent ${agentId}`
+        : "Global Role worker";
     recordTaskEvent(tx, task.id, "role.added", {
       role: created.name,
-      runtimeSource: agentId === undefined ? "Global Role worker" : `Explicit Agent ${agentId}`,
+      runtimeSource,
       agent: `${created.activeAgentId}/${binding.adapterId}`,
       model: binding.config.model ?? "CLI default",
       effort: binding.config.effort ?? "CLI default",
@@ -2114,9 +2335,15 @@ function addTaskRole(
     return { role: created, binding };
   });
   notifyMailbox(options.runtime, taskMailbox(result.role.taskId), result.role.taskId);
+  const profileId = parsed.one("--profile");
+  const runtimeSource = profileId !== undefined
+    ? `Agent Profile ${profileId}`
+    : agentId !== undefined
+      ? `Explicit Agent ${agentId}`
+      : "Global Role worker";
   return [
     `Added role ${result.role.name} to ${result.role.taskId}`,
-    `Runtime source: ${agentId === undefined ? "Global Role worker" : `Explicit Agent ${agentId}`}`,
+    `Runtime source: ${runtimeSource}`,
     `Agent: ${result.role.activeAgentId}/${result.binding.adapterId}`,
     `Model: ${result.binding.config.model ?? "CLI default"}; effort: ${result.binding.config.effort ?? "CLI default"}; permission: ${result.binding.config.permission.strategy}`,
     "Next: create a WorkItem and start this Role when it has assigned work."
@@ -2230,21 +2457,32 @@ function updateTaskRole(
       }, "desired launch configuration update");
     }
     const profileId = parsed.one("--profile");
-    const withProfile = profileId === undefined
+    const agentProfile = profileId === undefined
+      ? undefined
+      : requireAgentProfile(tx, profileId);
+    const bindingUpdate = resolveTaskRoleAgentBindingUpdate(
+      parsed,
+      role,
+      agentProfile,
+      tx
+    );
+    const withProfileBehavior = agentProfile === undefined
       ? role
-      : applyWorkerAgentProfile(role, requireAgentProfile(tx, profileId), now);
-    let bindings = withProfile.agentBindings;
-    if (changesAgentConfig) {
-      const agentId = parsed.one("--agent")?.trim() || withProfile.activeAgentId;
-      const agent = requireAgent(tx, agentId);
-      const binding = bindings[agentId]
-        ?? createRoleAgentBinding({ id: agent.id, adapterId: agent.adapterId });
-      bindings = { ...bindings, [agentId]: patchRoleAgentBinding(binding, parsed) };
-    }
-    const next = updateRole(withProfile, {
-      ...(bindings === withProfile.agentBindings ? {} : { agentBindings: bindings }),
+      : applyWorkerAgentProfileBehavior(role, agentProfile, now);
+    const withBinding = bindingUpdate === undefined
+      ? withProfileBehavior
+      : updateRole(withProfileBehavior, {
+        agentBindings: {
+          ...withProfileBehavior.agentBindings,
+          [bindingUpdate.agentId]: bindingUpdate.binding
+        }
+      }, now);
+    const next = updateRole(withBinding, {
       ...roleProfilePatch(parsed)
     }, now);
+    if (bindingUpdate !== undefined) {
+      validateTaskRoleAgentBinding(next, bindingUpdate.agentId, options);
+    }
     if (changesLaunchContext) {
       validateConfiguredRoleSkills(options.yuiHome, next.skills ?? []);
     }
@@ -3408,39 +3646,15 @@ function assertWorkItemIntegrationProof(
     if (projectProof === undefined || projectProof.baseCommit !== entry.baseCommit) {
       throw usageError(`WorkItem integration verification is stale: ${workItemId}.`);
     }
-    const latestChangeSet = store.listChangeSets(workspace.owner.taskId)
-      .filter((changeSet) => (
-        changeSet.workItemId === workItemId
-        && changeSet.projectId === entry.projectId
-      ))
-      .sort((left, right) => (
-        left.createdAt.localeCompare(right.createdAt)
-        || left.id.localeCompare(right.id)
-      ))
-      .at(-1);
-    if (projectProof.headCommit === entry.baseCommit) {
-      if (projectProof.changeSetId !== undefined || latestChangeSet !== undefined) {
-        throw usageError(`WorkItem integration verification is stale: ${workItemId}.`);
-      }
-      continue;
-    }
-    if (
-      projectProof.changeSetId === undefined
-      || latestChangeSet?.id !== projectProof.changeSetId
-      || latestChangeSet.baseCommit !== entry.baseCommit
-      || latestChangeSet.headCommit !== projectProof.headCommit
-      || latestChangeSet.branch !== entry.branch
-    ) {
-      throw usageError(
-        `WorkItem integration verification is stale: ${workItemId}.`
-      );
-    }
     if (!store.listIntegrationAttempts(workspace.owner.taskId).some((integration) => (
       integration.status === "committed"
       && integration.projectId === entry.projectId
-      && integration.changeSetIds.includes(projectProof.changeSetId!)
+      && integration.source.kind === "work-item"
+      && integration.source.workItemId === workItemId
+      && integration.source.startCommit === projectProof.baseCommit
+      && integration.source.resultCommit === projectProof.headCommit
     ))) {
-      throw usageError(`Work Item ChangeSet is not integrated: ${projectProof.changeSetId}.`);
+      throw usageError(`Work Item result is not integrated: ${workItemId}/${entry.projectId}.`);
     }
   }
 }
@@ -3914,7 +4128,7 @@ function disposeReviewFindingCommand(
     const command: ReviewFindingDispositionCommand = {
       disposition,
       by: actor === "leader"
-        ? taskLeaderActionTurnId(tx, task.id, options.environment, options.yuiHome) ?? actor
+        ? taskLeaderActionTurnId(tx, task.id, options.environment) ?? actor
         : actor,
       ...(parsed.options.get("--note") === undefined ? {} : { note: parsed.options.get("--note")! }),
       ...(parsed.options.get("--work-item") === undefined ? {} : { workItemId: parsed.options.get("--work-item")! }),
@@ -4368,15 +4582,6 @@ function forceFreshTaskReviewRound(
       );
     }
 
-    const provenance = taskReviewProvenance(tx, task, options);
-    if (!isSameTaskReviewCandidate(source.taskCandidate, provenance.candidate)) {
-      throw usageError(
-        `Final ReviewRound ${source.id} freezes a candidate that is no longer the current Task candidate.`
-      );
-    }
-    const producerCollision = taskReviewProducerCollision(provenance, source.reviewerRoleName);
-    if (producerCollision !== null) throw usageError(producerCollision);
-
     const taskRounds = reviewRoundsByIdentity(tx.listReviewRounds(task.id)
       .filter((entry) => (entry.scope ?? "work-item") === "task"));
     const sourceIndex = taskRounds.findIndex(({ id }) => id === source.id);
@@ -4628,23 +4833,6 @@ function retryFailedTaskReviewRound(
     const taskFinalContract = taskFinalReviewContractForMutation(tx, task.id, options);
     if (!sameTaskFinalReviewContract(round.taskFinalReviewContract, taskFinalContract)) {
       throw usageError(`Task final-review contract does not match ReviewRound ${round.id}.`);
-    }
-
-    // Re-read the exact current Task heads and producer roles before touching
-    // any record. A moved head or reviewer collision fails closed with the old
-    // failed Round byte-for-byte unchanged.
-    const provenance = taskReviewProvenance(tx, task, options);
-    if (!isSameTaskReviewCandidate(round.taskCandidate, provenance.candidate)) {
-      throw usageError(
-        `Final ReviewRound ${round.id} freezes a candidate that is no longer the current Task candidate.`
-      );
-    }
-    const producerCollision = taskReviewProducerCollision(
-      provenance,
-      round.reviewerRoleName
-    );
-    if (producerCollision !== null) {
-      throw usageError(producerCollision);
     }
 
     const reviewerRounds = reviewRoundsByIdentity(tx.listReviewRounds(task.id));
@@ -4975,7 +5163,7 @@ function retireTurn(
     }
     if (run.status === "active") {
       if (actor === "leader"
-        && taskLeaderActionTurnId(tx, task.id, options.environment, options.yuiHome) === run.id) {
+        && taskLeaderActionTurnId(tx, task.id, options.environment) === run.id) {
         throw usageError("A Task Leader cannot retire its own current authority Turn.", usage);
       }
       const expectedProgressAt = requiredOption(
@@ -5115,6 +5303,17 @@ function parseTurnContextReference(value: string): { taskId: string; turnId: str
   return { taskId, turnId };
 }
 
+/**
+ * A Turn Context Pack is information the Role's own runtime reads in order to
+ * work. Authorization is therefore scope-shaped, not schedule-shaped: the
+ * caller must be the current runtime of the Task Role that owns the Turn,
+ * proven by its per-Session caller key against durable state.
+ *
+ * It deliberately does not require the Turn to still be the active one. An
+ * Agent whose Turn has advanced must still be able to read the context it was
+ * given; losing read access to its own Role's history is what forces an
+ * otherwise healthy Agent to stop and escalate to a human.
+ */
 function authorizeTurnContext(
   store: TaskWorkflowStore,
   taskId: string,
@@ -5123,31 +5322,16 @@ function authorizeTurnContext(
 ): void {
   const managed = environment?.YUI_SESSION_SCOPE !== undefined
     || environment?.YUI_TASK_ID !== undefined
-    || environment?.YUI_ROLE !== undefined
-    || environment?.YUI_TURN_ID !== undefined;
+    || environment?.YUI_ROLE !== undefined;
   if (!managed) return;
   const run = store.getTurn(taskId, turnId);
-  const active = run === null ? null : store.getActiveTurn(taskId, run.roleName);
-  if (environment?.YUI_SESSION_SCOPE !== "task"
-    || environment.YUI_TASK_ID !== taskId
-    || run === null
-    || environment.YUI_ROLE !== run.roleName
-    || environment.YUI_AGENT_ID !== run.effective.agentId
-    || environment.YUI_ADAPTER_ID !== run.effective.adapterId
-    || run.status !== "active"
-    || active?.id !== turnId) {
+  if (run === null) {
     throw usageError(`Turn Context access is not authorized: ${taskId}/${turnId}.`);
   }
-  const callerKey = environment.YUI_JOB_CALLER_KEY;
-  const expectedCallerKeyHash = store.getJobCallerKeyHash(
-    taskId,
-    run.roleName,
-    run.effective.agentId
-  );
-  if (callerKey === undefined
-    || expectedCallerKeyHash === null
-    || createHash("sha256").update(callerKey).digest("hex") !== expectedCallerKeyHash) {
-    throw usageError(`Turn Context caller key is not authorized: ${taskId}/${turnId}.`);
+  if (currentManagedRuntime(store, environment, taskId, run.roleName) === undefined) {
+    throw usageError(
+      `Turn Context access requires the current runtime of ${taskId}/${run.roleName}.`
+    );
   }
 }
 
@@ -5706,19 +5890,13 @@ function actualTaskReviewCandidateForMutation(
     throw usageError(`Actual Task Project heads do not match bound Projects: ${task.id}.`);
   }
   const projects = actual.projects.map(({ projectId, commit }) => {
-    const committed = latestCommittedIntegration(store, task.id, projectId);
-    if (committed !== undefined) {
-      if (committed.candidateCommit === undefined) {
-        throw dataError(
-          `Committed Integration has no candidate commit: ${task.id}/${committed.id}.`
-        );
-      }
-      if (commit !== committed.candidateCommit) {
-        throw usageError(
-          `Project ${projectId} actual Task head ${commit} does not match latest committed `
-          + `Integration ${committed.id}/${committed.candidateCommit}.`
-        );
-      }
+    const binding = task.projectBindings.find((entry) => entry.projectId === projectId);
+    if (binding?.currentCommit === undefined || binding.currentCommit !== commit) {
+      throw usageError(
+        `Project ${projectId} actual Task head ${commit} does not match Task currentCommit ${
+          binding?.currentCommit ?? "missing"
+        }.`
+      );
     }
     return { projectId, commit };
   });
@@ -5745,10 +5923,9 @@ function taskReviewProducerCollision(
 
 /**
  * Resolve the complete frozen Task-final provenance from the physical head of
- * every bound Project. Where a Project has a committed Integration, that head
- * must match its latest numeric Task-local Integration and the Integration's
- * ChangeSets contribute producer Roles. A bound context Project without an
- * Integration is still frozen, but contributes no producer.
+ * every bound Project. Where a Project has a committed Integration, its
+ * WorkItem source contributes producer Roles. A bound context Project without
+ * an Integration is still frozen, but contributes no producer.
  *
  * When `expected` is supplied this is also the final dispatch compare-and-swap
  * fence: every bound Project must still point at the exact frozen physical
@@ -5799,68 +5976,59 @@ function taskReviewProvenance(
     const lineage = committedAttempts.slice(0, headIndex + 1)
       .filter(({ targetRef }) => targetRef === head.targetRef);
     for (const committed of lineage) {
-      if (committed.changeSetIds.length === 0) {
+      if (committed.source.kind !== "work-item") continue;
+      const source = committed.source;
+      const item = store.getWorkItem(task.id, source.workItemId);
+      if (item === null) {
         throw dataError(
-          `Committed Integration ${committed.id} has no ChangeSet provenance for Project ${projectId}.`
+          `Committed Integration producer WorkItem is unavailable: `
+          + `${committed.id}/${source.workItemId}.`
         );
       }
-      for (const changeSetId of committed.changeSetIds) {
-        const changeSet = store.getChangeSet(task.id, changeSetId);
-        if (changeSet === null || changeSet.projectId !== projectId) {
+      const sourceCandidate = [...item.candidates].reverse().find((candidate) => (
+        candidate.gitSnapshot?.projects.some((project) => (
+          project.projectId === projectId
+          && project.commit === source.resultCommit
+        ))
+      ));
+      if (sourceCandidate === undefined) {
+        throw dataError(
+          `Committed Integration result provenance is invalid: ${committed.id}/${item.id}.`
+        );
+      }
+      if (item.assignee !== undefined) recordProducer(item.assignee, item.id);
+      if (sourceCandidate.source.type === "direct") {
+        recordProducer(LEADER_ROLE, item.id);
+        continue;
+      }
+      const sourceRun = store.getTurn(task.id, sourceCandidate.source.turnId);
+      if (sourceRun === null
+        || sourceRun.workItemId !== item.id
+        || sourceRun.purpose !== "execution"
+        || sourceRun.status !== "completed") {
+        throw dataError(
+          `Committed producer Candidate Turn is unavailable: `
+          + `${item.id}/${sourceCandidate.source.turnId}.`
+        );
+      }
+      recordProducer(sourceRun.roleName, item.id);
+      if (sourceRun.sourceExecutionGroupId !== undefined) {
+        const executionGroup = workItemExecutionGroupById(
+          item,
+          sourceRun.sourceExecutionGroupId
+        );
+        if (executionGroup === undefined) {
           throw dataError(
-            `Committed Integration ChangeSet provenance is invalid: `
-            + `${committed.id}/${changeSetId}.`
+            `Committed producer ExecutionGroup is unavailable: `
+            + `${item.id}/${sourceRun.sourceExecutionGroupId}.`
           );
         }
-        assertTaskReviewChangeSetProvenance(task, projectId, committed.id, changeSet);
-        const item = store.getWorkItem(task.id, changeSet.workItemId);
-        if (item === null) {
-          throw dataError(
-            `Committed Integration producer WorkItem is unavailable: `
-            + `${changeSet.id}/${changeSet.workItemId}.`
-          );
-        }
-        if (item.assignee !== undefined) recordProducer(item.assignee, item.id);
-        if (item.candidates.length === 0) {
-          throw dataError(
-            `Committed producer WorkItem has no Candidate: ${item.id}.`
-          );
-        }
-        for (const itemCandidate of item.candidates) {
-          if (itemCandidate.source.type === "direct") {
-            recordProducer(LEADER_ROLE, item.id);
-            continue;
-          }
-          const sourceRun = store.getTurn(task.id, itemCandidate.source.turnId);
-          if (sourceRun === null
-            || sourceRun.workItemId !== item.id
-            || sourceRun.purpose !== "execution"
-            || sourceRun.status !== "completed") {
-            throw dataError(
-              `Committed producer Candidate Turn is unavailable: `
-              + `${item.id}/${itemCandidate.source.turnId}.`
-            );
-          }
-          recordProducer(sourceRun.roleName, item.id);
-          if (sourceRun.sourceExecutionGroupId !== undefined) {
-            const executionGroup = workItemExecutionGroupById(
-              item,
-              sourceRun.sourceExecutionGroupId
-            );
-            if (executionGroup === undefined) {
-              throw dataError(
-                `Committed producer ExecutionGroup is unavailable: `
-                + `${item.id}/${sourceRun.sourceExecutionGroupId}.`
-              );
-            }
-            for (const producer of successfulWorkItemSynthesisProducers(
-              store,
-              item,
-              executionGroup
-            )) {
-              recordProducer(producer.roleName, item.id);
-            }
-          }
+        for (const producer of successfulWorkItemSynthesisProducers(
+          store,
+          item,
+          executionGroup
+        )) {
+          recordProducer(producer.roleName, item.id);
         }
       }
     }
@@ -5882,24 +6050,6 @@ function latestCommittedIntegration(
       left.id.localeCompare(right.id, undefined, { numeric: true })
     ))
     .at(-1);
-}
-
-function assertTaskReviewChangeSetProvenance(
-  task: Task,
-  projectId: string,
-  integrationId: string,
-  changeSet: ChangeSet
-): void {
-  if (changeSet.taskId !== task.id) {
-    throw dataError(
-      `Committed Integration ChangeSet provenance is invalid: ${integrationId}/${changeSet.id}.`
-    );
-  }
-  if (changeSet.projectId !== projectId) {
-    throw dataError(
-      `Committed Integration ChangeSet provenance is invalid: ${integrationId}/${changeSet.id}.`
-    );
-  }
 }
 
 function isSameTaskReviewCandidate(
@@ -6017,7 +6167,6 @@ function prepareFinalTaskReview(
   const establishedRound = taskRounds.at(-1);
   const config = taskFinalReviewConfig(taskFinalContract);
 
-  const taskCandidate = taskReviewProvenance(store, task, options).candidate;
   const latest = establishedRound;
   if (latest?.status === "running") {
     throw usageError(`Final Task Review is still active: ${latest.id}/${latest.status}.`);
@@ -6028,11 +6177,15 @@ function prepareFinalTaskReview(
       task,
       latest,
       config,
-      taskCandidate,
+      latest.taskCandidate!,
       taskFinalContract,
       options
     );
   }
+  if (taskRounds.some((round) => isAcceptedTaskReviewBaseline(store, round))) {
+    return null;
+  }
+  const taskCandidate = taskReviewProvenance(store, task, options).candidate;
   if (latest !== undefined && isSameTaskReviewCandidate(latest.taskCandidate, taskCandidate)) {
     // A terminal round for the same immutable heads is already the final
     // review evidence. Do not create duplicate rounds on repeated completion
@@ -6082,11 +6235,6 @@ function resumablePendingFinalTaskReview(
       `Pending final ReviewRound already records Reviewer Turn ${round.reviewerTurnId}: ${round.id}.`
     );
   }
-  if (!isSameTaskReviewCandidate(round.taskCandidate, taskCandidate)) {
-    throw usageError(
-      `Final ReviewRound ${round.id} freezes a candidate that is no longer the current Task candidate.`
-    );
-  }
   assertNoConflictingTaskReviewRound(
     store.listReviewRounds(task.id),
     round.id,
@@ -6100,11 +6248,6 @@ function resumablePendingFinalTaskReview(
     throw usageError(`Reviewer Role already has an active Turn: ${reviewer.name}.`);
   }
   assertPendingFinalReviewWorkspaceEvidence(store, task, round);
-  const provenance = taskReviewProvenance(store, task, options, taskCandidate);
-  const producerCollision = taskReviewProducerCollision(provenance, reviewer.name);
-  if (producerCollision !== null) {
-    throw usageError(producerCollision);
-  }
   return round;
 }
 
@@ -7318,6 +7461,111 @@ function requireAgentProfile(store: TaskWorkflowStore, id: string): AgentProfile
   return profile;
 }
 
+function createTaskRoleFromAgentBinding(
+  store: TaskWorkflowStore,
+  task: Task,
+  roleName: string,
+  binding: RoleAgentBinding,
+  now: Date
+): Role {
+  const workspace = task.cwd ?? store.getConfig().defaultWorkspace ?? process.cwd();
+  return createRole(
+    task.id,
+    roleName,
+    [binding],
+    binding.agentId,
+    workspace,
+    now
+  );
+}
+
+function resolvedAgentProfileRuntime(
+  profile: AgentProfile,
+  store: TaskWorkflowStore
+): Extract<ResolvedAgentProfileRuntime, { status: "resolved" }> {
+  try {
+    return requireResolvedAgentProfileRuntime(profile, store);
+  } catch (error) {
+    throw usageError(error instanceof Error ? error.message : String(error));
+  }
+}
+
+type TaskRoleAgentBindingUpdate = Readonly<{
+  agentId: string;
+  binding: RoleAgentBinding;
+}>;
+
+function resolveTaskRoleAgentBindingAdd(
+  parsed: ParsedRoleOptions,
+  profile: AgentProfile | undefined,
+  store: TaskWorkflowStore
+): TaskRoleAgentBindingUpdate | undefined {
+  const explicitAgentId = parsed.one("--agent")?.trim();
+  let binding: RoleAgentBinding;
+  if (profile !== undefined) {
+    const profileRuntime = resolvedAgentProfileRuntime(profile, store);
+    if (explicitAgentId !== undefined
+      && profileRuntime.binding.agentId !== explicitAgentId) {
+      throw usageError(
+        `Agent Profile ${profile.id} resolves to Agent ${profileRuntime.binding.agentId}, `
+        + `but Task Role creation targets --agent ${explicitAgentId}. Use --agent `
+        + `${profileRuntime.binding.agentId}, or omit --profile to create an explicit binding.`
+      );
+    }
+    binding = profileRuntime.binding;
+  } else {
+    if (explicitAgentId === undefined) return undefined;
+    const agent = requireAgent(store, explicitAgentId);
+    binding = createRoleAgentBinding({ id: agent.id, adapterId: agent.adapterId });
+  }
+  if (hasAgentConfigOptions(parsed)) {
+    binding = patchRoleAgentBinding(binding, parsed);
+  }
+  return { agentId: binding.agentId, binding };
+}
+
+function resolveTaskRoleAgentBindingUpdate(
+  parsed: ParsedRoleOptions,
+  role: Role,
+  profile: AgentProfile | undefined,
+  store: TaskWorkflowStore
+): TaskRoleAgentBindingUpdate | undefined {
+  const changesAgentConfig = hasAgentConfigOptions(parsed);
+  const explicitAgentId = parsed.one("--agent")?.trim();
+  const targetAgentId = explicitAgentId || role.activeAgentId;
+
+  if (profile?.runtime.source === "global-worker"
+    && explicitAgentId === undefined
+    && !changesAgentConfig) {
+    return undefined;
+  }
+
+  let binding: RoleAgentBinding;
+  if (profile !== undefined) {
+    const profileRuntime = resolvedAgentProfileRuntime(profile, store);
+    if (profileRuntime.binding.agentId !== targetAgentId) {
+      const target = explicitAgentId === undefined
+        ? `active Agent ${role.activeAgentId}`
+        : `--agent ${explicitAgentId}`;
+      throw usageError(
+        `Agent Profile ${profile.id} resolves to Agent ${profileRuntime.binding.agentId}, `
+        + `but Task Role update targets ${target}. Use --agent ${profileRuntime.binding.agentId} `
+        + "to update that binding, or task role bind to activate it."
+      );
+    }
+    binding = profileRuntime.binding;
+  } else {
+    if (!changesAgentConfig) return undefined;
+    const agent = requireAgent(store, targetAgentId);
+    binding = role.agentBindings[targetAgentId]
+      ?? createRoleAgentBinding({ id: agent.id, adapterId: agent.adapterId });
+  }
+  if (changesAgentConfig) {
+    binding = patchRoleAgentBinding(binding, parsed);
+  }
+  return { agentId: targetAgentId, binding };
+}
+
 function workerProfileRolePatch(profile: AgentProfile) {
   return {
     defaultAccess: profile.defaultAccess,
@@ -7330,24 +7578,26 @@ function workerProfileRolePatch(profile: AgentProfile) {
   };
 }
 
-function applyWorkerAgentProfile(role: Role, profile: AgentProfile, now: Date): Role {
-  const binding = activeRoleAgentBinding(role);
-  const config = structuredClone(binding.config) as unknown as Record<string, unknown>;
-  if (profile.model === undefined) delete config.model;
-  else config.model = profile.model;
-  if (profile.effort === undefined) delete config.effort;
-  else config.effort = profile.effort;
-  const profiledBinding = createRoleAgentBinding({
-    id: binding.agentId,
-    adapterId: binding.adapterId
-  }, config as unknown as RoleAgentConfig);
-  return updateRole(role, {
-    ...workerProfileRolePatch(profile),
-    agentBindings: {
-      ...role.agentBindings,
-      [binding.agentId]: profiledBinding
-    }
-  }, now);
+function applyWorkerAgentProfileBehavior(
+  role: Role,
+  profile: AgentProfile,
+  now: Date
+): Role {
+  return updateRole(role, workerProfileRolePatch(profile), now);
+}
+
+function validateTaskRoleAgentBinding(
+  role: Role,
+  agentId: string,
+  options: TaskCommandOptions
+): void {
+  const binding = role.agentBindings[agentId];
+  if (binding === undefined) throw usageError(`Role Agent is not bound: ${agentId}.`);
+  options.validateAgentConfiguration?.({
+    agentId,
+    config: binding.config,
+    cwd: role.workspace
+  });
 }
 
 function appendMessage(
@@ -7389,8 +7639,7 @@ function leaderActionEventPayload(
   const turnId = taskLeaderActionTurnId(
     store,
     taskId,
-    options.environment,
-    options.yuiHome
+    options.environment
   );
   return turnId === undefined ? {} : { leaderTurnId: turnId };
 }
@@ -7616,12 +7865,12 @@ function assertTaskExecutionEnabled(task: Task, action: string): void {
 function taskActor(
   store: Pick<
     TaskWorkflowStore,
-    "getRole" | "getActiveTurn" | "getTaskRoleSessionSet"
+    "getRole" | "getActiveTurn" | "getJobCallerKeyHash"
   >,
   options: TaskCommandOptions,
   taskId: string
 ) {
-  return resolveTaskLocalActor(store, options.environment, taskId, options.yuiHome);
+  return resolveTaskLocalActor(store, options.environment, taskId);
 }
 
 function inactiveTaskMessage(task: Task, action: string): string {

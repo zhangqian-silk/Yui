@@ -7,6 +7,59 @@ import {
   type WorkItemCandidate
 } from "../workItem/workItem.js";
 
+export type WorkItemProjectDelivery = Readonly<{
+  workItemId: string;
+  projectId: string;
+  startCommit: string;
+  resultCommit: string;
+}>;
+
+/**
+ * Resolve the exact Git boundary produced by the Candidate that currently
+ * governs a WorkItem. Read-only context Projects are not delivery sources.
+ */
+export function governingWorkItemDeliveries(
+  workItems: readonly WorkItem[]
+): readonly WorkItemProjectDelivery[] {
+  return workItems.flatMap((item) => {
+    const candidate = governingWorkItemCandidate(item);
+    if (candidate?.workspace === undefined || candidate.gitSnapshot === undefined) return [];
+    const results = new Map(
+      candidate.gitSnapshot.projects.map(({ projectId, commit }) => [projectId, commit])
+    );
+    return candidate.workspace.entries
+      .filter(({ access }) => access === "write")
+      .map((entry) => {
+        const resultCommit = results.get(entry.projectId);
+        if (resultCommit === undefined) {
+          throw new Error(
+            `WorkItem Candidate result is missing Project ${item.id}/${entry.projectId}.`
+          );
+        }
+        return {
+          workItemId: item.id,
+          projectId: entry.projectId,
+          startCommit: entry.baseCommit,
+          resultCommit
+        };
+      });
+  });
+}
+
+export function workItemDeliverySettled(
+  delivery: WorkItemProjectDelivery,
+  integrations: readonly IntegrationAttempt[]
+): boolean {
+  return integrations.some((attempt) => (
+    attempt.status === "committed"
+    && attempt.projectId === delivery.projectId
+    && attempt.source.kind === "work-item"
+    && attempt.source.workItemId === delivery.workItemId
+    && attempt.source.startCommit === delivery.startCommit
+    && attempt.source.resultCommit === delivery.resultCommit
+  ));
+}
+
 /**
  * Delivery obligations follow the Candidate that currently governs each
  * WorkItem. Older Candidates and their ChangeSets remain audit evidence, but
@@ -40,7 +93,11 @@ export function changeSetDeliverySettled(
   queueEntries: readonly IntegrationQueueEntry[] = []
 ): boolean {
   if (integrations.some((attempt) => (
-    attempt.status === "committed" && attempt.changeSetIds.includes(changeSet.id)
+    attempt.status === "committed"
+    && attempt.projectId === changeSet.projectId
+    && attempt.source.kind === "work-item"
+    && attempt.source.workItemId === changeSet.workItemId
+    && attempt.source.resultCommit === changeSet.headCommit
   ))) return true;
   const latestQueueEntry = queueEntries
     .filter((entry) => entry.changeSetId === changeSet.id)
@@ -71,12 +128,11 @@ export function latestGoverningQueueEntries(
  * may still be writing remain blockers regardless of Candidate history.
  */
 export function integrationAttemptRequiresSettlement(
-  attempt: IntegrationAttempt,
-  changeSets: readonly ChangeSet[]
+  attempt: IntegrationAttempt
 ): boolean {
-  if (attempt.status === "running" || attempt.status === "validating") return true;
-  const governingIds = new Set(changeSets.map(({ id }) => id));
-  return attempt.changeSetIds.some((id) => governingIds.has(id));
+  return attempt.status === "running"
+    || attempt.status === "validating"
+    || attempt.status === "blocked";
 }
 
 function candidateProjectHead(

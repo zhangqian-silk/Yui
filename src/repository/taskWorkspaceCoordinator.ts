@@ -229,6 +229,9 @@ export class TaskWorkspaceCoordinator {
       }
       releaseMaintenance = acquireProjectMaintenanceLocks(this.preparer.home, projectIds);
       const laneWorkspaces = managedWorkspaces.filter(({ owner }) => owner.type === "execution-lane");
+      const integrationWorkspaces = managedWorkspaces.filter(
+        ({ owner }) => owner.type === "integration-attempt"
+      );
       const workspaces = managedWorkspaces
         .filter(({ owner }) => owner.type === "work-item");
       const workItems = workspaces.map((workspace) => {
@@ -302,6 +305,34 @@ export class TaskWorkspaceCoordinator {
           };
         }
       }
+      for (const workspace of integrationWorkspaces) {
+        if (workspace.owner.type !== "integration-attempt") continue;
+        const attempt = this.store.getIntegrationAttempt(
+          task.id,
+          workspace.owner.integrationAttemptId
+        );
+        if (attempt === null
+          || attempt.status === "running"
+          || attempt.status === "blocked"
+          || attempt.status === "validating") {
+          throw new Error(
+            `IntegrationAttempt must be terminal before archive cleanup: ${
+              workspace.owner.integrationAttemptId
+            }.`
+          );
+        }
+        if (await this.preparer.inspectIntegrationWorkspace(task.id, attempt.id) === "dirty") {
+          return {
+            taskId,
+            status: "retained-dirty",
+            ...(task.cwd === undefined ? {} : { path: task.cwd }),
+            error: `Integration worktree is dirty: ${attempt.id}.`,
+            reason: "dirty-worktree",
+            resource: `integration-attempt:${task.id}/${attempt.id}`,
+            retryable: true
+          };
+        }
+      }
       const state = await this.preparer.inspectTaskMainWorkspace(taskId);
       if (state === "dirty") {
         return {
@@ -325,9 +356,7 @@ export class TaskWorkspaceCoordinator {
         );
       }
       const roleNames = this.store.listRoles(taskId).map(({ name }) => name);
-      if (roleNames.length > 0) {
-        await this.runtime.stopTaskRoleSessions(taskId, roleNames);
-      }
+      await this.#stopLiveRoles(taskId, roleNames);
       await this.runtime.assertTaskPhysicalResourcesReleased?.(task.id);
       this.#assertTaskArchiveSnapshot(snapshot);
       for (const workspace of laneWorkspaces) {
@@ -337,6 +366,15 @@ export class TaskWorkspaceCoordinator {
             task.id,
             workspace.owner.executionGroupId,
             workspace.owner.executionLaneId
+          );
+        }
+      }
+      for (const workspace of integrationWorkspaces) {
+        this.#assertTaskArchiveLifecycle(task);
+        if (workspace.owner.type === "integration-attempt") {
+          await this.preparer.cleanupIntegrationWorkspace(
+            task.id,
+            workspace.owner.integrationAttemptId
           );
         }
       }

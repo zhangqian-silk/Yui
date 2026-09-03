@@ -224,7 +224,8 @@ const roleAgentClearOptions = [
   "--clear-search", "--clear-agent-config"
 ] as const;
 const agentProfileOptions = [
-  "--description", "--instructions", "--skill", "--model", "--effort"
+  "--description", "--instructions", "--skill",
+  "--agent", "--model", "--effort", "--inherit-worker"
 ] as const;
 const agentProfileClearOptions = [
   "--clear-description", "--clear-instructions", "--clear-skills",
@@ -298,8 +299,8 @@ const globalSessionChildren: readonly NodeInput[] = [
 const profileChildren: readonly NodeInput[] = [
   {
     name: "add",
-    summary: "Add a reusable Agent Profile.",
-    usage: "yui config profile add <id> [--access <read|write>] [Profile settings]",
+    summary: "Add a reusable Agent Profile that inherits Worker runtime or selects one explicit Agent.",
+    usage: "yui config profile add <id> [--access <read|write>] [--inherit-worker | --agent <id> [--model <model>] [--effort <effort>]] [Profile settings]",
     options: ["--access", ...agentProfileOptions],
     optionValues: { "--access": ["read", "write"] }
   },
@@ -307,8 +308,8 @@ const profileChildren: readonly NodeInput[] = [
   { name: "show", summary: "Show one Agent Profile.", usage: "yui config profile show <id>" },
   {
     name: "update",
-    summary: "Update an Agent Profile.",
-    usage: "yui config profile update <id> [--access <read|write>] [Profile settings]",
+    summary: "Update an Agent Profile's behavior or runtime source.",
+    usage: "yui config profile update <id> [--access <read|write>] [--inherit-worker | [--agent <id>] [--model <model>|--clear-model] [--effort <effort>|--clear-effort]] [Profile settings]",
     options: ["--access", ...agentProfileOptions, ...agentProfileClearOptions],
     optionValues: { "--access": ["read", "write"] }
   },
@@ -434,10 +435,16 @@ const taskChildren: readonly NodeInput[] = [
     options: ["--json"]
   },
   {
+    name: "remote-delivery",
+    summary: "Project exact Task heads and current PR/MR evidence into merge coverage.",
+    usage: "yui task remote-delivery <task> [--json]",
+    options: ["--json"]
+  },
+  {
     name: "archive",
     summary: "Archive a Task after confirming the main worktree outcome.",
-    usage: "yui task archive <id> (--integrated|--abandon)",
-    options: ["--integrated", "--abandon"]
+    usage: "yui task archive <id> (--integrated [--force]|--abandon)",
+    options: ["--integrated", "--abandon", "--force"]
   },
   { name: "reconcile", summary: "Run one immediate Controller reconciliation.", usage: "yui task reconcile <id>" },
   {
@@ -447,9 +454,9 @@ const taskChildren: readonly NodeInput[] = [
     children: [
       {
         name: "integrate",
-        summary: "Merge the remote development head into the Task workspace.",
-        usage: "yui task upstream integrate <task> [--latest] [--project <project>]",
-        options: ["--latest", "--project"]
+        summary: "Rebase Task changes onto the remote development head through Integration.",
+        usage: "yui task upstream integrate <task> (--latest|--project <project>) [--check <command> ...]",
+        options: ["--latest", "--project", "--check"]
       }
     ]
   },
@@ -606,14 +613,19 @@ const taskChildren: readonly NodeInput[] = [
   },
   {
     name: "publication",
-    summary: "Record external PR/MR publication evidence for a Task.",
-    sections: [{ id: "manage", title: "Commands", entries: ["add", "list", "show"] }],
+    summary: "Create or update external PR/MR publication evidence for a Task.",
+    sections: [{ id: "manage", title: "Commands", entries: ["upsert", "verify", "list", "show"] }],
     children: [
       {
-        name: "add",
-        summary: "Record an external PR/MR and its publication state.",
-        usage: "yui task publication add <task> --project <project> --provider <github|gitlab> --repository <owner/name> --kind <pull-request|merge-request> --id <external-id> [--url <url>] [--title <text>] [--source-branch <branch>] [--target-branch <branch>] [--local-commit <sha>] [--remote-commit <sha>] [--state <open|merged|closed>] [--reported|--verified] [--evidence <text>] [--supersede <publication-id>] [--merged-at <iso-timestamp>]",
-        options: ["--project", "--provider", "--repository", "--kind", "--id", "--url", "--title", "--source-branch", "--target-branch", "--local-commit", "--remote-commit", "--state", "--reported", "--verified", "--evidence", "--supersede", "--merged-at"]
+        name: "upsert",
+        summary: "Create or immutably update an external PR/MR and its publication state.",
+        usage: "yui task publication upsert <task> --project <project> --provider <github|gitlab> --repository <owner/name> --kind <pull-request|merge-request> --id <external-id> [--url <url>] [--title <text>] [--source-branch <branch>] [--target-branch <branch>] [--local-commit <sha>] [--remote-commit <sha>] [--state <open|merged|closed>] [--reported|--verified] [--evidence <text>] [--merged-at <iso-timestamp>]",
+        options: ["--project", "--provider", "--repository", "--kind", "--id", "--url", "--title", "--source-branch", "--target-branch", "--local-commit", "--remote-commit", "--state", "--reported", "--verified", "--evidence", "--merged-at"]
+      },
+      {
+        name: "verify",
+        summary: "Verify one current GitHub PR against the exact Task delivery head through gh.",
+        usage: "yui task publication verify (<task>/<publication-id> | <task> <publication-id>)"
       },
       {
         name: "list",
@@ -637,8 +649,8 @@ const taskChildren: readonly NodeInput[] = [
     children: [
       {
         name: "add",
-        summary: "Add a Role to a Task.",
-        usage: "yui task role add <task> <name> [--profile <id>] [--agent <id>] [Role and Agent settings]",
+        summary: "Add a Task Role from a frozen Profile/Worker runtime or one explicit Agent.",
+        usage: "yui task role add <task> <name> [--profile <id>] [--agent <id> [Agent settings]] [Role settings]",
         options: ["--profile", "--agent", ...roleProfileOptions, ...roleAgentOptions],
         optionValues: roleAgentOptionValues
       },
@@ -651,8 +663,8 @@ const taskChildren: readonly NodeInput[] = [
       { name: "show", summary: "Show one Task Role.", usage: "yui task role show <task> <role>" },
       {
         name: "update",
-        summary: "Update a Task Role.",
-        usage: "yui task role update <task> <role> [Role and Agent settings]",
+        summary: "Update a Task Role; Agent settings target the named or active binding without switching it.",
+        usage: "yui task role update <task> <role> [--profile <id>] [--agent <id>] [Role and Agent settings]",
         options: ["--profile", "--agent", ...roleProfileOptions, ...roleAgentOptions,
           ...roleProfileClearOptions, ...roleAgentClearOptions],
         optionValues: roleAgentOptionValues
@@ -929,14 +941,15 @@ const taskChildren: readonly NodeInput[] = [
   },
   {
     name: "integration",
-    summary: "Safely integrate ChangeSets with Leader-owned conflict decisions.",
+    summary: "Integrate WorkItem results and upstream commits with Leader-owned decisions.",
     sections: [{ id: "manage", title: "Commands", entries: ["start", "continue", "resolve", "abort", "supersede", "list", "show", "cleanup", "queue"] }],
     children: [
       {
         name: "start",
         summary: "Build, validate, and CAS-commit an integration candidate.",
-        usage: "yui task integration start <task> [--project <project>] --change-set <id> [--change-set <id> ...] [--target <ref>] [--check <command> ...]",
-        options: ["--project", "--change-set", "--target", "--check"]
+        usage: "yui task integration start <task> --work-item <id> --strategy <ff|cherry-pick|merge|manual> [--project <project>] [--target <ref>] [--check <command> ...]",
+        options: ["--work-item", "--strategy", "--project", "--target", "--check"],
+        optionValues: { "--strategy": ["ff", "cherry-pick", "merge", "manual"] }
       },
       {
         name: "continue",
@@ -1495,7 +1508,7 @@ export const ROOT_COMMAND = buildNode({
       name: "task",
       summary: "Manage Tasks, WorkItems, Turns, and integration.",
       sections: [
-        { id: "lifecycle", title: "Lifecycle", entries: ["create", "project", "base", "update", "activate", "execution", "complete", "reopen", "retire", "list", "show", "context", "next-action", "archive", "replace", "reconcile", "upstream"] },
+        { id: "lifecycle", title: "Lifecycle", entries: ["create", "project", "base", "update", "activate", "execution", "complete", "reopen", "retire", "list", "show", "context", "next-action", "remote-delivery", "archive", "replace", "reconcile", "upstream"] },
         { id: "collaboration", title: "Collaboration", entries: ["message", "input", "grant", "workflow", "publication", "work", "turn", "review", "integration", "role", "overlap", "change-set"] },
         { id: "knowledge", title: "Task Knowledge", entries: ["brief", "decision", "milestone", "event", "continuation", "wake"] }
       ],

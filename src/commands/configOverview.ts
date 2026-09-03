@@ -7,6 +7,7 @@ import { runAgentCommand, type AgentCommandStore } from "./agentCommands.js";
 import { runConfigCommand } from "./configCommands.js";
 import { runGlobalRoleCommand, type GlobalRoleCommandOptions } from "./globalRoleCommands.js";
 import { runProfileCommand } from "./profileCommands.js";
+import type { AgentProfileView } from "../profile/agentProfileRuntime.js";
 import { CONFIG_DOMAINS, type ConfigDomain } from "../config/configCatalog.js";
 
 export type ConfigOverviewResult = Readonly<{
@@ -47,7 +48,10 @@ export function runConfigOverview(
     name,
     store.getGlobalRole(name)
   ]));
-  const profiles = store.listAgentProfiles();
+  const profileResult = runProfileCommand(["list"], store);
+  const profiles = (
+    profileResult.data as Readonly<{ profiles: readonly AgentProfileView[] }>
+  ).profiles;
   const completion = inspectCompletionStates(store.getConfig(), environment, identity);
   const roleOutput = runGlobalRoleCommand(
     ["list"],
@@ -58,7 +62,7 @@ export function runConfigOverview(
     throw new Error("Config overview received an invalid Role control result.");
   }
 
-  const profileOutput = runProfileCommand(["list"], store).output;
+  const profileOutput = profileResult.output;
   const agentOutput = runAgentCommand(
     ["list"],
     store as unknown as AgentCommandStore

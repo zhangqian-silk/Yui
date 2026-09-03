@@ -9,14 +9,6 @@ import {
   runtimeObservationFromTaskEvent,
   type RuntimeObservation
 } from "../runtime/runtimeObservation.js";
-import {
-  YUI_CONTROL_PLANE_DESCRIPTOR,
-  YUI_TASK_RUNTIME_DESCRIPTOR,
-  assertExactTaskRuntimeEnvironment,
-  exactControlPlaneDigest,
-  parseExactControlPlaneDescriptor,
-  refreshReusedTaskRuntimeDescriptorSource
-} from "../runtime/exactControlPlane.js";
 import { formatTurnReceiptId } from "../task/taskRecordReference.js";
 import { managedProviderTurnId } from "../runtime/providerRuntimeIdentity.js";
 import type { TaskEvent } from "../event/taskEvent.js";
@@ -70,28 +62,7 @@ export function resolveRuntimeHookTurnFence(
   const roleName = requireIdentity(environment.YUI_ROLE, "Role name");
   const agentId = requireIdentity(environment.YUI_AGENT_ID, "Agent id");
   const workspace = requireIdentity(environment.YUI_WORKSPACE, "YUI workspace");
-  const runtimeSource = environment[YUI_TASK_RUNTIME_DESCRIPTOR];
-  const runtime = runtimeSource === undefined
-    ? undefined
-    : assertExactTaskRuntimeEnvironment(
-        runtimeSource,
-        environment,
-        exactControlPlaneDigest(parseExactControlPlaneDescriptor(requireIdentity(
-          environment[YUI_CONTROL_PLANE_DESCRIPTOR],
-          "Exact control-plane descriptor"
-        ))),
-        home
-      );
-  const launchId = requireIdentity(
-    runtime?.launchId ?? environment.YUI_LAUNCH_ID,
-    "Launch id"
-  );
   const nativeSessionId = requireIdentity(payloadNativeSessionId, "Provider session id");
-  const expectedNativeSessionId = runtime?.nativeSessionId ?? environment.YUI_NATIVE_SESSION_ID;
-  if (expectedNativeSessionId !== undefined
-    && nativeSessionId !== requireIdentity(expectedNativeSessionId, "YUI native session id")) {
-    throw new Error("Runtime observation Hook native Session does not match its launch envelope.");
-  }
 
   const store = openCurrentTaskStore(home);
   const task = store.getTask(taskId);
@@ -113,6 +84,22 @@ export function resolveRuntimeHookTurnFence(
   const session = sessions?.sessions[agentId];
   const activeTurn = store.getActiveTurn(taskId, roleName);
   const providerTurn = sessions?.providerBinding?.turn;
+  // Launch generation and Turn are durable facts, never envelope facts. A
+  // native pane outlives both, so anything it inherited at launch is stale for
+  // every later generation; the Session's own record (or the in-flight launch
+  // reservation during startup) is the only current answer.
+  const lifecycleMailbox = store.getWorkMailbox(runtimeLifecycleTarget({
+    scope: "task",
+    taskId,
+    roleName
+  }));
+  const reservedLaunchId = isRuntimeLaunchReservation(lifecycleMailbox?.processing)
+    ? lifecycleMailbox?.processing?.batchId
+    : undefined;
+  const launchId = requireIdentity(session?.launchId ?? reservedLaunchId, "Launch id");
+  const durableTurnId = activeTurn?.id
+    ?? managedProviderTurnId(providerTurn)
+    ?? undefined;
   const directProviderTurn = providerTurn !== null
     && providerTurn !== undefined
     && providerTurn.turnId === undefined
@@ -166,20 +153,12 @@ export function resolveRuntimeHookTurnFence(
       }
     )
   );
-  const mailbox = store.getWorkMailbox(runtimeLifecycleTarget({
-    scope: "task",
-    taskId,
-    roleName
-  }));
+  const mailbox = lifecycleMailbox;
   const exactReservation = isRuntimeLaunchReservation(mailbox?.processing, launchId)
     && !hasRuntimeCleanupObligation(mailbox);
   const startupTurnId = options.startupSession === undefined
     ? undefined
-    : requireIdentity(
-        runtime?.turnId
-          ?? environment.YUI_TURN_ID,
-        "Turn id"
-      );
+    : requireIdentity(durableTurnId, "Turn id");
   const startupReservation = startupTurnId !== undefined
     && exactReservation
     && !hasRuntimeCleanupObligation(mailbox);
@@ -192,8 +171,11 @@ export function resolveRuntimeHookTurnFence(
     && startupReservation
     && startupTurn?.mode === "new"
     && session.status === "ended";
+  // The startup mode itself says whether Yui preallocated the native Session
+  // id or the Provider reports it. A preallocated startup is proven against
+  // Yui's deterministic launch identity, which is stronger than comparing a
+  // value the launch envelope carried.
   const preallocatedStartup = options.startupSession === "preallocated"
-    && expectedNativeSessionId !== undefined
     && (session === undefined || replacementStartup)
     && startupReservation
     && nativeSessionId === nativeSessionIdForLaunch(
@@ -203,11 +185,10 @@ export function resolveRuntimeHookTurnFence(
       adapterId
     );
   const discoveredStartup = options.startupSession === "discovered"
-    && expectedNativeSessionId === undefined
     && (session === undefined || replacementStartup)
     && startupReservation;
   const terminalTurnId = options.terminal === true && acceptedBinding === null
-    ? requireIdentity(environment.YUI_TURN_ID ?? runtime?.turnId, "Turn id")
+    ? requireIdentity(durableTurnId, "Turn id")
     : undefined;
   const terminalTurn = acceptedBinding !== null
     ? store.getTurn(taskId, acceptedBinding.fence.turnId!)
@@ -231,42 +212,7 @@ export function resolveRuntimeHookTurnFence(
     ?? activeTurn?.id
     ?? startupTurnId
     ?? terminalTurnId!;
-  let effectiveRuntime = runtime;
-  let effectiveLaunchId = acceptedBinding?.fence.launchId ?? launchId;
-  const sessionLaunchId = session?.launchId;
-  if (
-    acceptedBinding === null
-    && runtime !== undefined
-    && session !== undefined
-    && !replacementStartup
-    && sessionLaunchId !== undefined
-    && typeof runtimeSource === "string"
-    && !runtimeSource.trimStart().startsWith("{")
-    && (
-      runtime.turnId !== turnId
-      || runtime.launchId !== sessionLaunchId
-      || runtime.nativeSessionId !== session.nativeSessionId
-    )
-  ) {
-    // A reused native pane keeps its original descriptor source. Advance only
-    // that Hook-owned source to the current durable generation before the
-    // volatile fence; the Controller no longer scans history to keep it fresh.
-    effectiveRuntime = refreshReusedTaskRuntimeDescriptorSource(
-      runtimeSource,
-      home,
-      store,
-      {
-        turnId,
-        launchId: sessionLaunchId,
-        nativeSessionId: session.nativeSessionId
-      }
-    );
-    effectiveLaunchId = effectiveRuntime.launchId!;
-  }
-  if (acceptedBinding === null
-    && effectiveRuntime?.turnId !== undefined && effectiveRuntime.turnId !== turnId) {
-    throw new Error("Runtime observation Hook Turn does not match its current descriptor.");
-  }
+  const effectiveLaunchId = acceptedBinding?.fence.launchId ?? launchId;
   const turn = acceptedBinding !== null || exactTerminal
     ? terminalTurn
     : store.getActiveTurn(taskId, roleName);

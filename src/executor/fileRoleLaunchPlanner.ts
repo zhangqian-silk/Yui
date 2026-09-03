@@ -55,15 +55,10 @@ import {
 } from "./effectiveLaunch.js";
 import {
   YUI_CONTROL_PLANE_DESCRIPTOR,
-  YUI_TASK_RUNTIME_DESCRIPTOR,
-  assertExactTaskRuntimeState,
   createExactControlPlaneDescriptor,
-  createExactTaskRuntimeDescriptor,
   exactControlPlaneDigest,
-  exactTaskRuntimeDescriptorPath,
   serializeExactDescriptor,
-  type ExactControlPlaneDescriptor,
-  type ExactTaskRuntimeDescriptor
+  type ExactControlPlaneDescriptor
 } from "../runtime/exactControlPlane.js";
 import { detectRunningRelease } from "../release/runtimeRelease.js";
 import {
@@ -194,63 +189,6 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
   }>): void {
     const hash = createHash("sha256").update(input.callerKey).digest("hex");
     this.store.setJobCallerKeyHash(input.taskId, input.roleName, input.agentId, hash);
-  }
-
-  /** Re-publishes provider-discovered native identity after its durable fold. */
-  refreshTaskRuntimeDescriptor(input: Readonly<{
-    taskId: string;
-    roleName: string;
-    turnId?: string;
-    launchId: string;
-    nativeSessionId: string;
-    agentId: string;
-    adapterId: string;
-    workspace: string;
-  }>): void {
-    const task = this.store.getTask(input.taskId);
-    const role = this.store.getRole(input.taskId, input.roleName);
-    if (task === null
-      || task.status !== "active"
-      || task.executionGate.state !== "enabled"
-      || role === null) {
-      throw new Error(`Task runtime is not current: ${input.taskId}/${input.roleName}.`);
-    }
-    const run = this.store.getActiveTurn(input.taskId, input.roleName);
-    const sessions = this.store.getTaskRoleSessionSet(input.taskId, input.roleName);
-    const session = sessions?.sessions[role.activeAgentId];
-    if (session === undefined || session.launchId === undefined) {
-      throw new Error(
-        `Task runtime native Session is not ready: ${input.taskId}/${input.roleName}.`
-      );
-    }
-    const effective = run?.effective ?? session.effective;
-    const descriptor = createExactTaskRuntimeDescriptor({
-      controlPlaneDigest: exactControlPlaneDigest(this.#controlPlane),
-      taskId: input.taskId,
-      roleName: input.roleName,
-      agentId: session.agentId,
-      adapterId: session.adapterId as "codex" | "claude",
-      workspace: effective.workspace.root,
-      ...(run === null ? {} : { turnId: run.id }),
-      launchId: session.launchId,
-      nativeSessionId: session.nativeSessionId
-    });
-    if (
-      descriptor.turnId !== input.turnId
-      || descriptor.launchId !== input.launchId
-      || descriptor.nativeSessionId !== input.nativeSessionId
-      || descriptor.agentId !== input.agentId
-      || descriptor.adapterId !== input.adapterId
-      || descriptor.workspace !== canonicalPath(input.workspace)
-    ) {
-      throw new Error("Prepared Task runtime generation is not current.");
-    }
-    assertExactTaskRuntimeState(descriptor, this.store);
-    // Publish only the current-control source. A reused native pane keeps its
-    // own stable source path; its Hook self-refreshes that source before the
-    // volatile fence instead of the Controller scanning history to find it.
-    const currentSource = exactTaskRuntimeDescriptorPath(this.home, descriptor);
-    this.#writeExactTaskRuntimeDescriptor(descriptor, currentSource);
   }
 
   plan(input: TaskRoleLaunchPlanInput): PlannedRoleSession {
@@ -665,27 +603,6 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
       throw new Error(`Managed Claude Turn is no longer active: ${input.turnId}.`);
     }
 
-    const runtimeDescriptor = owner.scope === "task"
-      ? createExactTaskRuntimeDescriptor({
-          controlPlaneDigest: exactControlPlaneDigest(this.#controlPlane),
-          taskId: owner.taskId,
-          roleName: role.name,
-          agentId: configured.id,
-          adapterId: configured.adapterId,
-          workspace: effectiveWorkspace,
-          ...(input.turnId === undefined ? {} : { turnId: input.turnId }),
-          ...(input.launchId === undefined ? {} : { launchId: input.launchId }),
-          ...(session === null
-            ? {}
-            : { nativeSessionId: session.nativeSessionId })
-        })
-      : undefined;
-    const runtimeDescriptorSource = runtimeDescriptor === undefined
-      ? undefined
-      : exactTaskRuntimeDescriptorPath(this.home, runtimeDescriptor);
-    if (runtimeDescriptor !== undefined && runtimeDescriptorSource !== undefined) {
-      this.#writeExactTaskRuntimeDescriptor(runtimeDescriptor, runtimeDescriptorSource);
-    }
     // Generate a candidate per-Provider-process DurableJob caller key for
     // every task-scope launch. A reused live Conversation keeps the key that
     // its process inherited; a new Host or a Conversation replacement commits
@@ -767,11 +684,10 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
         YUI_SESSION_MANIFEST: sessionContext.sessionManifestPath,
         YUI_SESSION_CLI: sessionContext.sessionCliPath,
         ...(jobCallerKey === undefined ? {} : { YUI_JOB_CALLER_KEY: jobCallerKey }),
-        ...(runtimeDescriptor === undefined
+        ...(owner.scope !== "task"
           ? {}
           : {
-              [YUI_CONTROL_PLANE_DESCRIPTOR]: serializeExactDescriptor(this.#controlPlane),
-              [YUI_TASK_RUNTIME_DESCRIPTOR]: runtimeDescriptorSource!
+              [YUI_CONTROL_PLANE_DESCRIPTOR]: serializeExactDescriptor(this.#controlPlane)
             }),
         ...(sessionTitle === undefined
           ? {}
@@ -787,7 +703,10 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
         ...(input.launchId === undefined
           ? {}
           : { YUI_LAUNCH_ID: input.launchId }),
-        ...(input.turnId === undefined ? {} : { YUI_TURN_ID: input.turnId }),
+        // No Turn is exported into the Session environment. A native pane
+        // outlives its Turn, so a Turn id frozen here would be stale for every
+        // later Turn. The Agent Host sets it explicitly per spawned Provider
+        // Turn, and every durable decision reads the active Turn from state.
         ...(session === null
           ? {}
           : { YUI_NATIVE_SESSION_ID: session.nativeSessionId })
@@ -912,14 +831,6 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
         ...workspaceScopeEnvironment(launch.env, workspace)
       }
     };
-  }
-
-  #writeExactTaskRuntimeDescriptor(
-    descriptor: ExactTaskRuntimeDescriptor,
-    sourcePath: string
-  ): void {
-    writeTextFileAtomically(sourcePath, `${serializeExactDescriptor(descriptor)}\n`);
-    this.#resourceRegistrar().registerExactTaskRuntimeDescriptor(descriptor, sourcePath);
   }
 
   #selectConfiguredAgentEnvironment(

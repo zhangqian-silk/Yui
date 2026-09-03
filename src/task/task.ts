@@ -16,7 +16,12 @@ export type TaskExecutionState = "enabled" | "stopped";
 export type TaskProjectBinding = Readonly<{
   projectId: string;
   directory: string;
+  /** Declarative development branch captured while the Task is Draft. */
   baseRef: string;
+  /** Exact remote commit cloned when the Task was activated. */
+  baseCommit?: string;
+  /** Exact commit currently checked out by the authoritative Task main. */
+  currentCommit?: string;
 }>;
 
 export type TaskMetadata = {
@@ -42,7 +47,7 @@ export type TaskMetadataUpdate = Partial<{
 }>;
 
 export type Task = {
-  schemaVersion: 6;
+  schemaVersion: 7;
   id: string;
   title: string;
   /** Project-defined intent; it describes the request, never its execution topology. */
@@ -80,7 +85,7 @@ export type Task = {
 export function createTask(id: string, title: string, now: Date, metadata: TaskMetadata = {}): Task {
   const timestamp = now.toISOString();
   return {
-    schemaVersion: 6,
+    schemaVersion: 7,
     id: requireSafeIdentity(id, "Task id"),
     title: requireText(title, "Task title"),
     ...cloneMetadata(metadata),
@@ -128,6 +133,107 @@ export function activateTask(task: Task, now: Date): Task {
   if (task.status === "retired") throw new Error(`Cannot activate retired Task: ${task.id}.`);
   if (task.status === "active") return task;
   return { ...task, status: "active", updatedAt: now.toISOString() };
+}
+
+/**
+ * Freeze the exact remote inputs adopted by activation. Every Project must be
+ * present exactly once; Draft metadata remains declarative until this call.
+ */
+export function bindTaskProjectCommits(
+  task: Task,
+  commits: readonly Readonly<{ projectId: string; commit: string }>[],
+  now: Date
+): Task {
+  validateTask(task);
+  if (task.status !== "draft") {
+    throw new Error(`Task Project commits can only be bound during Draft activation: ${task.id}.`);
+  }
+  const byProject = new Map(commits.map(({ projectId, commit }) => [
+    requireSafeIdentity(projectId, "Project id"),
+    requireCommit(commit, "Task Project commit")
+  ]));
+  if (byProject.size !== commits.length
+    || byProject.size !== task.projectBindings.length
+    || task.projectBindings.some(({ projectId }) => !byProject.has(projectId))) {
+    throw new Error(`Task Project commit scope does not match its bindings: ${task.id}.`);
+  }
+  return validateTask({
+    ...task,
+    projectBindings: task.projectBindings.map((binding) => {
+      const commit = byProject.get(binding.projectId)!;
+      return { ...binding, baseCommit: commit, currentCommit: commit };
+    }),
+    updatedAt: now.toISOString()
+  });
+}
+
+/** Compare-and-swap one authoritative Task-main Project commit. */
+export function advanceTaskProjectCommit(
+  task: Task,
+  projectId: string,
+  expectedCommit: string,
+  nextCommit: string,
+  now: Date
+): Task {
+  validateTask(task);
+  const expected = requireCommit(expectedCommit, "Expected Task Project commit");
+  const next = requireCommit(nextCommit, "Next Task Project commit");
+  let found = false;
+  const projectBindings = task.projectBindings.map((binding) => {
+    if (binding.projectId !== projectId) return binding;
+    found = true;
+    if (binding.currentCommit !== expected) {
+      throw new Error(
+        `Task Project current commit moved: ${task.id}/${projectId}; `
+        + `expected ${expected}, found ${String(binding.currentCommit)}.`
+      );
+    }
+    return { ...binding, currentCommit: next };
+  });
+  if (!found) throw new Error(`Task Project binding not found: ${task.id}/${projectId}.`);
+  return validateTask({
+    ...task,
+    projectBindings,
+    updatedAt: now.toISOString()
+  });
+}
+
+/**
+ * Refresh Task commit facts from its authoritative main clones. An active
+ * Task may persist a newly added Project as pending intent before its first
+ * workspace prepare; that first successful prepare adopts the clone's HEAD as
+ * both the Project baseline and current result.
+ */
+export function synchronizeTaskProjectCommits(
+  task: Task,
+  commits: readonly Readonly<{ projectId: string; commit: string }>[],
+  now: Date
+): Task {
+  validateTask(task);
+  const byProject = new Map(commits.map(({ projectId, commit }) => [
+    requireSafeIdentity(projectId, "Project id"),
+    requireCommit(commit, "Task Project current commit")
+  ]));
+  if (byProject.size !== commits.length
+    || byProject.size !== task.projectBindings.length
+    || task.projectBindings.some(({ projectId }) => !byProject.has(projectId))) {
+    throw new Error(`Task Project commit scope does not match its bindings: ${task.id}.`);
+  }
+  const projectBindings = task.projectBindings.map((binding) => {
+    const commit = byProject.get(binding.projectId)!;
+    if (binding.baseCommit === undefined) {
+      return { ...binding, baseCommit: commit, currentCommit: commit };
+    }
+    return { ...binding, currentCommit: commit };
+  });
+  if (projectBindings.every((binding, index) => (
+    binding.currentCommit === task.projectBindings[index]?.currentCommit
+  ))) return task;
+  return validateTask({
+    ...task,
+    projectBindings,
+    updatedAt: now.toISOString()
+  });
 }
 
 export type TaskRetirementInput = Readonly<{
@@ -323,7 +429,7 @@ export function startTaskExecution(task: Task, now: Date): Task {
 }
 
 export function validateTask(task: Task): Task {
-  if (task.schemaVersion !== 6) throw new Error("Task must use schemaVersion 6.");
+  if (task.schemaVersion !== 7) throw new Error("Task must use schemaVersion 7.");
   requireSafeIdentity(task.id, "Task id");
   requireText(task.title, "Task title");
   if (task.type !== undefined) requireSafeIdentity(task.type, "Task type");
@@ -465,6 +571,17 @@ function normalizeProjectBindings(
     const projectId = requireSafeIdentity(binding.projectId, "Project id");
     const directory = requireSafeIdentity(binding.directory, "Project directory");
     const baseRef = requireText(binding.baseRef, "Task base ref");
+    const baseCommit = binding.baseCommit === undefined
+      ? undefined
+      : requireCommit(binding.baseCommit, "Task Project base commit");
+    const currentCommit = binding.currentCommit === undefined
+      ? undefined
+      : requireCommit(binding.currentCommit, "Task Project current commit");
+    if ((baseCommit === undefined) !== (currentCommit === undefined)) {
+      throw new Error(
+        `Task Project commit metadata must include both baseCommit and currentCommit: ${projectId}.`
+      );
+    }
     if (projectIds.has(projectId)) {
       throw new Error(`Task Project is duplicated: ${projectId}.`);
     }
@@ -473,8 +590,21 @@ function normalizeProjectBindings(
     }
     projectIds.add(projectId);
     directories.add(directory);
-    return { projectId, directory, baseRef };
+    return {
+      projectId,
+      directory,
+      baseRef,
+      ...(baseCommit === undefined ? {} : { baseCommit, currentCommit })
+    };
   });
+}
+
+function requireCommit(value: string, label: string): string {
+  const normalized = requireText(value, label).toLowerCase();
+  if (!/^[a-f0-9]{40}(?:[a-f0-9]{24})?$/u.test(normalized)) {
+    throw new Error(`${label} is invalid.`);
+  }
+  return normalized;
 }
 
 export function taskProjectBinding(

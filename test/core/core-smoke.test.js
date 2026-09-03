@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -35,18 +36,24 @@ import {
 } from "../../dist/commands/taskExecutionCommands.js";
 import {
   dispatchPreparedReviewRound,
+  previewTaskRoleAgentConfigurationMutation,
   runTaskCommand
 } from "../../dist/commands/taskCommands.js";
+import { upsertTaskPublication } from "../../dist/commands/taskPublicationCommands.js";
 import {
   createGlobalRole,
   createRole,
   createRoleAgentBinding
 } from "../../dist/role/role.js";
+import { createAgentProfile } from "../../dist/profile/agentProfile.js";
 import { materializeSessionBootstrap } from "../../dist/context/sessionBootstrapManifest.js";
 import { builtinAgentDriverRegistry } from "../../dist/runtime/builtinAgentDrivers.js";
 import { serializeAgentErrorRaw, standardAgentError } from "../../dist/runtime/agentError.js";
 import { runtimeLifecycleTarget } from "../../dist/runtime/lifecycleReservation.js";
 import { createExactControlPlaneDescriptor } from "../../dist/runtime/exactControlPlane.js";
+import { resolveManagedTaskCaller } from "../../dist/runtime/managedCaller.js";
+import { taskLeaderActionTurnId } from "../../dist/commands/taskActor.js";
+import { buildTurnContextPack } from "../../dist/context/turnContextPack.js";
 import { startStructuredProviderSession } from "../../dist/runtime/structuredProviderHost.js";
 import {
   acceptProviderTurn,
@@ -92,6 +99,7 @@ import {
 } from "../../dist/execution/legacyExecutionGroup.js";
 import { projectReviewerAvailability } from "../../dist/review/reviewerAvailability.js";
 import { projectNextAction } from "../../dist/task/nextAction.js";
+import { projectTaskRemoteDelivery } from "../../dist/task/remoteDelivery.js";
 import { listPublicCommandPaths } from "../../dist/cli/commandCatalog.js";
 import { runUpdate } from "../../dist/cli/updateOrchestrator.js";
 import { acquireHandoverLock, readHandoverFence } from "../../dist/release/runtimeRelease.js";
@@ -101,12 +109,17 @@ import { ensureStorageSchema, StorageSchemaError } from "../../dist/storage/stor
 import { latestStorageVersionState } from "../../dist/storage/upgrade/recordVersions.js";
 import { initializeCurrentTaskStore } from "../../dist/storage/currentTaskStore.js";
 import { createProject } from "../../dist/repository/project.js";
+import {
+  createIntegrationAttempt,
+  updateIntegrationAttempt
+} from "../../dist/integration/integrationAttempt.js";
 import { snapshotExecutionLaneWorkspaceSync } from "../../dist/repository/executionLaneGitSnapshot.js";
 import { FileTaskWorkspacePreparer } from "../../dist/repository/taskWorkspacePreparer.js";
 import { generateTaskWorkspaceIdentity } from "../../dist/repository/taskWorkspaceIdentity.js";
 import { SqliteTelemetryStore } from "../../dist/telemetry/sqliteTelemetryStore.js";
 import {
   activateTask,
+  bindTaskProjectCommits,
   bindTaskWorkspaceIdentity,
   createTask,
   startTaskExecution,
@@ -158,11 +171,143 @@ test("the packaged CLI starts and exposes the core workflow", () => {
     assert.ok(commands.includes(command), `missing core command: ${command}`);
   }
   assert.ok(commands.includes("task turn list"));
+  assert.ok(commands.includes("task publication upsert"));
+  assert.ok(commands.includes("task publication verify"));
+  assert.ok(commands.includes("task remote-delivery"));
+  assert.equal(commands.includes("task publication add"), false);
   assert.equal(commands.some((command) => command.startsWith("task run")), false);
   assert.equal(commands.includes("task rebuild"), false);
   assert.equal(commands.some((command) => command.startsWith("task history")), false);
   assert.equal(commands.includes("task review rebind"), false);
   assert.equal(commands.includes("task role session switch"), false);
+});
+
+test("publication evidence changes stay exact across upsert and remote delivery", () => {
+  const baseCommit = "1".repeat(40);
+  const headCommit = "2".repeat(40);
+  const originalRemoteCommit = "3".repeat(40);
+  const replacementRemoteCommit = "4".repeat(40);
+  const task = {
+    schemaVersion: 6,
+    id: "task-1",
+    title: "Publish exact head",
+    status: "active",
+    executionGate: { state: "enabled" },
+    projectBindings: [{
+      projectId: "project-1",
+      directory: "Repo",
+      baseRef: "master"
+    }],
+    createdAt: "2026-09-02T00:00:00.000Z",
+    updatedAt: "2026-09-02T00:00:00.000Z"
+  };
+  const verifiedPublication = {
+    schemaVersion: 1,
+    id: "publication-1",
+    taskId: task.id,
+    projectId: "project-1",
+    provider: "github",
+    repository: "example/repo",
+    externalKind: "pull-request",
+    externalId: "17",
+    localCommit: headCommit,
+    remoteCommit: originalRemoteCommit,
+    state: "merged",
+    verification: "verified",
+    evidence: "provider-confirmed merge",
+    mergedAt: "2026-09-02T00:01:00.000Z",
+    recordedBy: "operator",
+    source: "manual",
+    createdAt: "2026-09-02T00:01:00.000Z"
+  };
+  const publicationIdentity = {
+    projectId: "project-1",
+    provider: "github",
+    repository: "example/repo",
+    externalKind: "pull-request",
+    externalId: "17"
+  };
+  const applyUpsert = (input) => {
+    const publications = [verifiedPublication];
+    const events = [];
+    const reference = upsertTaskPublication({
+      findPublicationReferenceByExternalKey: () => publications.at(-1),
+      nextPublicationReferenceId: () => `publication-${publications.length + 1}`,
+      savePublicationReference: (_taskId, publication) => publications.push(publication),
+      nextEventId: () => `event-${events.length + 1}`,
+      saveEvent: (_taskId, event) => events.push(event)
+    }, task, { ...publicationIdentity, ...input }, "leader", new Date(
+      "2026-09-02T00:02:00.000Z"
+    ));
+    return { reference, publications, events };
+  };
+  const replay = applyUpsert({
+    remoteCommit: originalRemoteCommit.toUpperCase()
+  }).reference;
+  assert.equal(replay.idempotent, true);
+  const changedResult = applyUpsert({
+    remoteCommit: replacementRemoteCommit
+  });
+  const changed = changedResult.reference;
+  assert.equal(changed.reference.verification, "reported");
+  assert.equal(changed.reference.evidence, undefined);
+  assert.equal(changed.reference.mergedAt, undefined);
+  const evidenceChanged = applyUpsert({ evidence: "replacement evidence" }).reference;
+  assert.equal(evidenceChanged.reference.verification, "reported");
+  assert.equal(evidenceChanged.reference.remoteCommit, undefined);
+  assert.equal(evidenceChanged.reference.mergedAt, undefined);
+  const mergedAtChanged = applyUpsert({
+    mergedAt: "2026-09-02T00:04:00.000Z"
+  }).reference;
+  assert.equal(mergedAtChanged.reference.verification, "reported");
+  assert.equal(mergedAtChanged.reference.remoteCommit, undefined);
+  assert.equal(mergedAtChanged.reference.evidence, undefined);
+  const publications = changedResult.publications;
+  const events = changedResult.events;
+
+  const managedWorkspaces = [{
+    schemaVersion: 2,
+    owner: { type: "task", taskId: task.id },
+    root: "/tmp/task-1",
+    entries: [{
+      projectId: "project-1",
+      directory: "Repo",
+      access: "write",
+      path: "/tmp/task-1/Repo",
+      branch: "yui/task-1/main",
+      baseRef: "master",
+      baseCommit
+    }],
+    createdAt: "2026-09-02T00:00:00.000Z",
+    updatedAt: "2026-09-02T00:00:00.000Z"
+  }];
+  const projection = projectTaskRemoteDelivery({
+    task,
+    events,
+    publications,
+    managedWorkspaces,
+    turns: [],
+    currentCandidate: {
+      projects: [{ projectId: "project-1", commit: headCommit }]
+    }
+  });
+  assert.equal(projection.status, "merged");
+  assert.equal(projection.allMerged, true);
+  assert.equal(projection.allVerified, false);
+  assert.equal(projection.integratedCoverageSatisfied, false);
+  assert.equal(projection.projects[0].expectedLocalCommit, headCommit);
+  assert.equal(projection.projects[0].remoteCommit, replacementRemoteCommit);
+
+  const unavailable = projectTaskRemoteDelivery({
+    task,
+    events,
+    publications,
+    managedWorkspaces,
+    turns: [],
+    currentCandidate: null
+  });
+  assert.equal(unavailable.status, "unavailable");
+  assert.equal(unavailable.allMerged, false);
 });
 
 test("update quiesces the exact Controller before an adjacent storage migration", () => {
@@ -1678,17 +1823,23 @@ test("direct and replicated Review keep Producer results non-authoritative", (t)
     now,
     entropy: Buffer.alloc(16, 8)
   });
+  const commit = "a".repeat(40);
   const task = activateTask(bindTaskWorkspaceIdentity(createTask(
     "task-1",
     "Review one frozen Task candidate",
     now,
     {
       cwd: home,
-      projectBindings: [{ projectId: project.id, directory: "app", baseRef: "main" }]
+      projectBindings: [{
+        projectId: project.id,
+        directory: "app",
+        baseRef: "main",
+        baseCommit: commit,
+        currentCommit: commit
+      }]
     }
   ), taskIdentity, now), now);
   store.saveTask(task);
-  const commit = "a".repeat(40);
   const candidate = {
     schemaVersion: 1,
     projects: [{ projectId: project.id, commit }]
@@ -2535,6 +2686,246 @@ test("a new current Home initializes its SQLite authority exactly once", (t) => 
   }
 });
 
+test("Task Role Profiles preserve runtime and portable behavior across add and update", (t) => {
+  const home = mkdtempSync(join(tmpdir(), "yui-task-role-profile-update-smoke-"));
+  t.after(() => rmSync(home, { recursive: true, force: true }));
+  ensureStorageSchema(home);
+  const store = new SqliteTaskStore(home);
+  t.after(() => store.close());
+  const now = new Date("2026-09-03T06:10:00.000Z");
+  const task = activateTask(createTask("task-1", "Update one Role binding", now, {
+    cwd: home
+  }), now);
+  store.saveTask(task);
+  const codex = createConfiguredAgent("codex", "codex", "codex", [], [], now);
+  const claude = createConfiguredAgent("claude", "claude", "claude", [], [], now);
+  store.saveConfiguredAgent(codex);
+  store.saveConfiguredAgent(claude);
+  const workerBinding = createRoleAgentBinding(codex, {
+    adapterId: "codex",
+    permission: {
+      strategy: "configured",
+      sandbox: "workspace-write",
+      approval: "on-request"
+    },
+    model: "worker-model",
+    effort: "medium",
+    search: true
+  });
+  store.saveGlobalRole(createGlobalRole(
+    "worker",
+    [workerBinding],
+    workerBinding.agentId,
+    home,
+    now
+  ));
+  const codexProfile = createAgentProfile({
+    id: "profile-codex",
+    runtime: {
+      source: "explicit",
+      agentId: codex.id,
+      model: "profile-model",
+      effort: "high"
+    }
+  }, now);
+  const claudeProfile = createAgentProfile({
+    id: "profile-claude",
+    runtime: {
+      source: "explicit",
+      agentId: claude.id,
+      model: "claude-model"
+    }
+  }, now);
+  const inheritedProfile = createAgentProfile({
+    id: "profile-inherited",
+    defaultAccess: "write",
+    description: "Portable inherited behavior",
+    runtime: { source: "global-worker" }
+  }, now);
+  store.saveAgentProfile(codexProfile);
+  store.saveAgentProfile(claudeProfile);
+  store.saveAgentProfile(inheritedProfile);
+  const role = createRole(
+    task.id,
+    "runner",
+    [workerBinding],
+    workerBinding.agentId,
+    home,
+    now
+  );
+  store.saveRole(task.id, role);
+
+  const addWithProfileRuntime = [
+    "role", "add", task.id, "profile-runner",
+    "--profile", codexProfile.id,
+    "--agent", codex.id,
+    "--effort", "low"
+  ];
+  assert.deepEqual(
+    previewTaskRoleAgentConfigurationMutation(addWithProfileRuntime, store),
+    {
+      agentId: codex.id,
+      config: {
+        ...workerBinding.config,
+        model: "profile-model",
+        effort: "low"
+      },
+      cwd: home
+    }
+  );
+  runTaskCommand(addWithProfileRuntime, store, {
+    now: () => new Date("2026-09-03T06:10:05.000Z"),
+    environment: bareEnv
+  });
+  const added = store.getRole(task.id, "profile-runner");
+  assert.equal(added.activeAgentId, codex.id);
+  assert.deepEqual(added.agentBindings[codex.id].config, {
+    ...workerBinding.config,
+    model: "profile-model",
+    effort: "low"
+  });
+
+  const implicitOtherAgent = [
+    "role", "update", task.id, role.name, "--profile", claudeProfile.id
+  ];
+  assert.throws(
+    () => previewTaskRoleAgentConfigurationMutation(implicitOtherAgent, store),
+    /Agent Profile profile-claude resolves to Agent claude.*active Agent codex.*--agent claude/u
+  );
+  assert.throws(
+    () => runTaskCommand(implicitOtherAgent, store, {
+      now: () => new Date("2026-09-03T06:10:10.000Z"),
+      environment: bareEnv
+    }),
+    /Agent Profile profile-claude resolves to Agent claude.*active Agent codex.*--agent claude/u
+  );
+  assert.deepEqual(store.getRole(task.id, role.name), role);
+
+  const mergeProfileRuntime = [
+    "role", "update", task.id, role.name,
+    "--profile", codexProfile.id,
+    "--agent", codex.id,
+    "--effort", "low"
+  ];
+  assert.deepEqual(
+    previewTaskRoleAgentConfigurationMutation(mergeProfileRuntime, store),
+    {
+      agentId: codex.id,
+      config: {
+        ...workerBinding.config,
+        model: "profile-model",
+        effort: "low"
+      },
+      cwd: home
+    }
+  );
+  runTaskCommand(mergeProfileRuntime, store, {
+    now: () => new Date("2026-09-03T06:10:20.000Z"),
+    environment: bareEnv
+  });
+  assert.equal(store.getRole(task.id, role.name).activeAgentId, codex.id);
+  assert.deepEqual(
+    store.getRole(task.id, role.name).agentBindings[codex.id].config,
+    {
+      ...workerBinding.config,
+      model: "profile-model",
+      effort: "low"
+    }
+  );
+
+  const updateInactiveBinding = [
+    "role", "update", task.id, role.name,
+    "--profile", claudeProfile.id,
+    "--agent", claude.id
+  ];
+  assert.deepEqual(
+    previewTaskRoleAgentConfigurationMutation(updateInactiveBinding, store),
+    {
+      agentId: claude.id,
+      config: {
+        adapterId: "claude",
+        permission: { strategy: "bypass" },
+        model: "claude-model"
+      },
+      cwd: home
+    }
+  );
+  runTaskCommand(updateInactiveBinding, store, {
+    now: () => new Date("2026-09-03T06:10:30.000Z"),
+    environment: bareEnv
+  });
+  const updated = store.getRole(task.id, role.name);
+  assert.equal(updated.activeAgentId, codex.id);
+  assert.deepEqual(updated.agentBindings[claude.id].config, {
+    adapterId: "claude",
+    permission: { strategy: "bypass" },
+    model: "claude-model"
+  });
+
+  const claudeBinding = createRoleAgentBinding(claude, {
+    adapterId: "claude",
+    permission: {
+      strategy: "configured",
+      mode: "acceptEdits"
+    },
+    model: "existing-claude-model",
+    effort: "medium"
+  });
+  const portableRole = createRole(
+    task.id,
+    "portable",
+    [claudeBinding],
+    claude.id,
+    home,
+    now
+  );
+  store.saveRole(task.id, portableRole);
+  const applyInheritedBehavior = [
+    "role", "update", task.id, portableRole.name,
+    "--profile", inheritedProfile.id
+  ];
+  assert.equal(
+    previewTaskRoleAgentConfigurationMutation(applyInheritedBehavior, store),
+    undefined
+  );
+  runTaskCommand(applyInheritedBehavior, store, {
+    now: () => new Date("2026-09-03T06:10:40.000Z"),
+    environment: bareEnv
+  });
+  const portableUpdated = store.getRole(task.id, portableRole.name);
+  assert.equal(portableUpdated.activeAgentId, claude.id);
+  assert.deepEqual(portableUpdated.agentBindings, portableRole.agentBindings);
+  assert.equal(portableUpdated.description, "Portable inherited behavior");
+  assert.equal(portableUpdated.defaultAccess, "write");
+
+  const claudeWorkerBinding = createRoleAgentBinding(claude, {
+    adapterId: "claude",
+    permission: { strategy: "bypass" },
+    model: "worker-claude-model",
+    effort: "max"
+  });
+  store.saveGlobalRole(createGlobalRole(
+    "worker",
+    [workerBinding, claudeWorkerBinding],
+    claude.id,
+    home,
+    new Date("2026-09-03T06:10:50.000Z")
+  ));
+  runTaskCommand(
+    ["role", "add", task.id, "dormant-worker-profile", "--profile", codexProfile.id],
+    store,
+    { now: () => new Date("2026-09-03T06:11:00.000Z"), environment: bareEnv }
+  );
+  assert.deepEqual(
+    store.getRole(task.id, "dormant-worker-profile").agentBindings[codex.id].config,
+    {
+      ...workerBinding.config,
+      model: "profile-model",
+      effort: "high"
+    }
+  );
+});
+
 test("a valid aggregate-21 Home upgrades through every adjacent record step", async (t) => {
   const home = mkdtempSync(join(tmpdir(), "yui-aggregate-21-upgrade-smoke-"));
   const upgradeEnvironment = { ...bareEnv, YUI_HOME: home };
@@ -2553,13 +2944,100 @@ test("a valid aggregate-21 Home upgrades through every adjacent record step", as
   ensureStorageSchema(home);
   const now = new Date("2026-09-02T01:00:00.000Z");
   const store = new SqliteTaskStore(home);
-  const task = activateTask(createTask("task-1", "Upgrade existing Home", now, { cwd: home }), now);
+  const baseCommit = "1".repeat(40);
+  store.saveProject(createProject(
+    "project-1",
+    "app",
+    home,
+    { stable: "master", development: "master" },
+    now
+  ));
+  const task = activateTask(bindTaskProjectCommits(
+    createTask("task-1", "Upgrade existing Home", now, {
+      cwd: home,
+      projectBindings: [{
+        projectId: "project-1",
+        directory: "app",
+        baseRef: "master"
+      }]
+    }),
+    [{ projectId: "project-1", commit: baseCommit }],
+    now
+  ), now);
   store.saveTask(task);
+  const configuredAgent = createConfiguredAgent("codex", "codex", "codex", [], [], now);
+  store.saveConfiguredAgent(configuredAgent);
+  const sharedDirectory = join(home, "shared");
+  mkdirSync(sharedDirectory, { recursive: true });
+  const workerBinding = createRoleAgentBinding(configuredAgent, {
+    adapterId: "codex",
+    permission: {
+      strategy: "configured",
+      sandbox: "workspace-write",
+      approval: "on-request"
+    },
+    model: "legacy-model",
+    effort: "high",
+    search: true,
+    additionalDirectories: [sharedDirectory]
+  });
+  store.saveGlobalRole(createGlobalRole(
+    "worker",
+    [workerBinding],
+    workerBinding.agentId,
+    home,
+    now
+  ));
+  const legacyProfile = createAgentProfile({
+    id: "legacy-explicit-profile",
+    runtime: {
+      source: "explicit",
+      agentId: configuredAgent.id,
+      model: "legacy-model",
+      effort: "high"
+    }
+  }, now);
+  store.saveAgentProfile(legacyProfile);
   store.saveManagedWorkspace(createManagedWorkspace({
     owner: { type: "task", taskId: task.id },
     root: home,
-    entries: []
+    entries: [{
+      projectId: "project-1",
+      directory: "app",
+      access: "write",
+      path: join(home, "app"),
+      branch: "yui/task-1/main",
+      baseRef: "master",
+      baseCommit
+    }]
   }, now));
+  let latestIntegrationCommit = baseCommit;
+  for (let index = 1; index <= 10; index += 1) {
+    const candidateCommit = index.toString(16).padStart(40, "0");
+    latestIntegrationCommit = candidateCommit;
+    const attempt = createIntegrationAttempt({
+      id: `integration-${index}`,
+      taskId: task.id,
+      projectId: "project-1",
+      targetRef: "yui/task-1/main",
+      source: {
+        kind: "upstream",
+        branch: "master",
+        remoteCommit: candidateCommit,
+        taskBaseCommit: baseCommit,
+        strategy: "rebase"
+      },
+      beforeCommit: index === 1
+        ? baseCommit
+        : (index - 1).toString(16).padStart(40, "0")
+    }, now);
+    store.saveIntegrationAttempt(task.id, updateIntegrationAttempt(attempt, {
+      candidateCommit,
+      afterCommit: candidateCommit,
+      summary: `Committed Integration ${index}.`,
+      status: "committed"
+    }, new Date(now.getTime() + index)));
+  }
   const binding = createRoleAgentBinding({ id: "codex", adapterId: "codex" });
   for (const roleName of ["leader", "producer", "reviewer"]) {
     store.saveRole(task.id, createRole(task.id, roleName, [binding], binding.agentId, home, now));
@@ -2695,11 +3173,13 @@ test("a valid aggregate-21 Home upgrades through every adjacent record step", as
   );
   const database = new Database(join(home, "yui.db"));
   try {
-    for (const table of ["work_items", "turns"]) {
+    for (const table of ["work_items", "turns", "task_records"]) {
       const rows = database.prepare(`SELECT rowid, payload FROM ${table}`).all();
       for (const row of rows) {
         const payload = JSON.parse(row.payload);
-        payload.schemaVersion = table === "work_items" ? 13 : 1;
+        payload.schemaVersion = table === "work_items"
+          ? 13
+          : table === "turns" ? 1 : 6;
         database.prepare(`UPDATE ${table} SET payload = ? WHERE rowid = ?`)
           .run(JSON.stringify(payload), row.rowid);
       }
@@ -2716,6 +3196,31 @@ test("a valid aggregate-21 Home upgrades through every adjacent record step", as
       database.prepare("UPDATE review_rounds SET payload = ? WHERE rowid = ?")
         .run(JSON.stringify(payload), row.rowid);
     }
+    const profileRows = database.prepare("SELECT rowid, payload FROM agent_profiles").all();
+    for (const row of profileRows) {
+      const payload = JSON.parse(row.payload);
+      payload.schemaVersion = 2;
+      payload.model = payload.runtime.model;
+      payload.effort = payload.runtime.effort;
+      delete payload.runtime;
+      database.prepare("UPDATE agent_profiles SET payload = ? WHERE rowid = ?")
+        .run(JSON.stringify(payload), row.rowid);
+    }
+    const integrationRows = database.prepare(
+      "SELECT rowid, payload FROM integration_attempts"
+    ).all();
+    for (const row of integrationRows) {
+      const payload = JSON.parse(row.payload);
+      payload.schemaVersion = 5;
+      payload.expectedHead = payload.beforeCommit;
+      payload.changeSetIds = [payload.id.replace("integration-", "change-set-")];
+      delete payload.source;
+      delete payload.beforeCommit;
+      delete payload.afterCommit;
+      delete payload.summary;
+      database.prepare("UPDATE integration_attempts SET payload = ? WHERE rowid = ?")
+        .run(JSON.stringify(payload), row.rowid);
+    }
   } finally {
     database.close();
   }
@@ -2725,6 +3230,9 @@ test("a valid aggregate-21 Home upgrades through every adjacent record step", as
   manifest.recordVersions.workItem = 13;
   manifest.recordVersions.turn = 1;
   manifest.recordVersions.reviewRound = 6;
+  manifest.recordVersions.task = 6;
+  manifest.recordVersions.integrationAttempt = 5;
+  manifest.recordVersions.agentProfile = 2;
   writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
 
   const preflight = JSON.parse(execFileSync(
@@ -2734,7 +3242,7 @@ test("a valid aggregate-21 Home upgrades through every adjacent record step", as
   ));
   assert.equal(preflight.ok, true);
   assert.equal(preflight.data.outcome, "upgrade-plan");
-  assert.equal(preflight.data.report.steps.length, 5);
+  assert.equal(preflight.data.report.steps.length, 8);
   const upgraded = JSON.parse(execFileSync(
     process.execPath,
     [join(root, "dist", "cli.js"), "--json", "upgrade"],
@@ -2765,15 +3273,45 @@ test("a valid aggregate-21 Home upgrades through every adjacent record step", as
   assert.equal(migrationAudit.payload.reviewRoundId, pendingLegacyRound.id);
   assert.equal(migrationAudit.payload.executionGroupId, activeLegacyGroup.id);
   assert.equal(migrationAudit.payload.terminalizedTurnIds, legacyReviewTurn.id);
+  assert.equal(reopened.getTask(task.id).schemaVersion, 7);
+  assert.equal(reopened.getTask(task.id).projectBindings[0].baseCommit, baseCommit);
+  assert.equal(
+    reopened.getTask(task.id).projectBindings[0].currentCommit,
+    latestIntegrationCommit
+  );
+  assert.deepEqual(reopened.getAgentProfile(legacyProfile.id).runtime, {
+    source: "explicit",
+    agentId: configuredAgent.id,
+    model: "legacy-model",
+    effort: "high"
+  });
+  runTaskCommand(
+    ["role", "add", task.id, "migrated-profile-role", "--profile", legacyProfile.id],
+    reopened,
+    { now: () => new Date("2026-09-02T01:00:30.000Z"), environment: bareEnv }
+  );
+  assert.deepEqual(
+    reopened.getRole(task.id, "migrated-profile-role").agentBindings[configuredAgent.id].config,
+    workerBinding.config
+  );
   const newItem = createWorkItem("work-item-2", task.id, {
     title: "New work after upgrade",
-    assignee: "producer"
+    assignee: "producer",
+    writeProjectIds: ["project-1"]
   }, new Date("2026-09-02T01:01:00.000Z"));
   reopened.saveWorkItem(task.id, newItem);
   reopened.saveManagedWorkspace(createManagedWorkspace({
     owner: { type: "work-item", taskId: task.id, workItemId: newItem.id },
     root: join(home, newItem.id),
-    entries: []
+    entries: [{
+      projectId: "project-1",
+      directory: "app",
+      access: "write",
+      path: join(home, newItem.id, "app"),
+      branch: "yui/task-1/work-item-2",
+      baseRef: "master",
+      baseCommit: latestIntegrationCommit
+    }]
   }, new Date("2026-09-02T01:01:30.000Z")));
   runTaskCommand(
     ["work", "dispatch", `${task.id}/${newItem.id}`],
@@ -2781,6 +3319,70 @@ test("a valid aggregate-21 Home upgrades through every adjacent record step", as
     { now: () => new Date("2026-09-02T01:02:00.000Z"), environment: bareEnv }
   );
   assert.equal(reopened.getActiveTurn(task.id, "producer").workItemId, newItem.id);
+});
+
+test("aggregate-24 Profile hints migrate through the sole configured Agent without Worker", (t) => {
+  const home = mkdtempSync(join(tmpdir(), "yui-aggregate-24-profile-upgrade-smoke-"));
+  const upgradeEnvironment = { ...bareEnv, YUI_HOME: home };
+  t.after(() => rmSync(home, { recursive: true, force: true }));
+  ensureStorageSchema(home);
+  const now = new Date("2026-09-03T08:15:00.000Z");
+  const store = new SqliteTaskStore(home);
+  const configuredAgent = createConfiguredAgent("codex", "codex", "codex", [], [], now);
+  store.saveConfiguredAgent(configuredAgent);
+  const legacyProfile = createAgentProfile({
+    id: "workerless-legacy-profile",
+    runtime: {
+      source: "explicit",
+      agentId: configuredAgent.id,
+      model: "legacy-model",
+      effort: "high"
+    }
+  }, now);
+  store.saveAgentProfile(legacyProfile);
+  store.close();
+
+  const database = new Database(join(home, "yui.db"));
+  try {
+    const row = database.prepare(
+      "SELECT payload FROM agent_profiles WHERE id = ?"
+    ).get(legacyProfile.id);
+    const payload = JSON.parse(row.payload);
+    payload.schemaVersion = 2;
+    payload.model = payload.runtime.model;
+    payload.effort = payload.runtime.effort;
+    delete payload.runtime;
+    database.prepare("UPDATE agent_profiles SET payload = ? WHERE id = ?")
+      .run(JSON.stringify(payload), legacyProfile.id);
+  } finally {
+    database.close();
+  }
+  const manifestPath = join(home, "schema.json");
+  const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
+  manifest.aggregateSchemaVersion = 24;
+  manifest.recordVersions.turn = 3;
+  manifest.recordVersions.reviewRound = 6;
+  manifest.recordVersions.task = 6;
+  manifest.recordVersions.integrationAttempt = 5;
+  manifest.recordVersions.agentProfile = 2;
+  writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+
+  const upgraded = JSON.parse(execFileSync(
+    process.execPath,
+    [join(root, "dist", "cli.js"), "--json", "upgrade"],
+    { cwd: root, encoding: "utf8", env: upgradeEnvironment }
+  ));
+  assert.equal(upgraded.ok, true);
+  assert.equal(upgraded.data.outcome, "upgraded");
+  const reopened = new SqliteTaskStore(home);
+  t.after(() => reopened.close());
+  assert.equal(reopened.getGlobalRole("worker"), null);
+  assert.deepEqual(reopened.getAgentProfile(legacyProfile.id).runtime, {
+    source: "explicit",
+    agentId: configuredAgent.id,
+    model: "legacy-model",
+    effort: "high"
+  });
 });
 
 test("an existing SQLite Home with missing singleton rows fails closed", (t) => {
@@ -3016,4 +3618,144 @@ test("Claude global Stop hooks publish the native completion boundary", async (t
   assert.equal(event.adapterId, "claude");
   assert.equal(event.summary, "Done.");
   assert.deepEqual(signal, { key: "global-role:operator" });
+});
+
+test("managed Session authority follows durable state, not a frozen environment", (t) => {
+  const home = mkdtempSync(join(tmpdir(), "yui-managed-caller-smoke-"));
+  t.after(() => rmSync(home, { recursive: true, force: true }));
+  ensureStorageSchema(home);
+  const store = new SqliteTaskStore(home);
+  t.after(() => store.close());
+  const now = new Date("2026-09-03T00:00:00.000Z");
+  const workspace = join(home, "main");
+  const task = activateTask(createTask("task-1", "Outlive a control-plane change", now), now);
+  store.saveTask(task);
+  const binding = createRoleAgentBinding({ id: "codex", adapterId: "codex" });
+  const role = createRole(task.id, "leader", [binding], binding.agentId, workspace, now);
+  store.saveRole(task.id, role);
+  const callerKey = "a".repeat(64);
+  store.setJobCallerKeyHash(
+    task.id,
+    role.name,
+    binding.agentId,
+    createHash("sha256").update(callerKey).digest("hex")
+  );
+
+  // A native pane's environment is frozen at launch. It names only the
+  // process's own immutable identity: no Turn, no launch generation, and no
+  // descriptor path that a Yui upgrade or workspace move could invalidate.
+  const environment = {
+    YUI_SESSION_SCOPE: "task",
+    YUI_HOME: home,
+    YUI_TASK_ID: task.id,
+    YUI_ROLE: role.name,
+    YUI_WORKSPACE: workspace,
+    YUI_JOB_CALLER_KEY: callerKey
+  };
+
+  const betweenTurns = resolveManagedTaskCaller(store, environment);
+  assert.equal(betweenTurns.agentId, "codex");
+  assert.equal(betweenTurns.adapterId, "codex");
+  assert.equal(betweenTurns.currentTurnId, undefined);
+
+  store.saveActiveTurn(createTurn(
+    "turn-7",
+    task.id,
+    role.name,
+    "new",
+    turnInput("turn-7", task.id, role.name, "Do the work."),
+    now,
+    { effective: resolveEffectiveLaunch({ role, purpose: "execution" }) }
+  ));
+
+  // The same unchanged environment now reports the current Turn, so a Turn
+  // advance can never strand a live Session.
+  assert.equal(resolveManagedTaskCaller(store, environment).currentTurnId, "turn-7");
+  assert.equal(taskLeaderActionTurnId(store, task.id, environment), "turn-7");
+
+  // Replacing the native Session rotates the durable caller key. The
+  // superseded process loses authority with a bounded diagnosis instead of
+  // silently acting as the current runtime.
+  store.setJobCallerKeyHash(
+    task.id,
+    role.name,
+    binding.agentId,
+    createHash("sha256").update("b".repeat(64)).digest("hex")
+  );
+  assert.throws(
+    () => resolveManagedTaskCaller(store, environment),
+    /no longer the current runtime of task-1\/leader/u
+  );
+  assert.equal(taskLeaderActionTurnId(store, task.id, environment), undefined);
+});
+
+test("a Turn Context Pack reports which of the Task's records are in flight", (t) => {
+  const home = mkdtempSync(join(tmpdir(), "yui-live-task-state-smoke-"));
+  t.after(() => rmSync(home, { recursive: true, force: true }));
+  ensureStorageSchema(home);
+  const store = new SqliteTaskStore(home);
+  t.after(() => store.close());
+  const now = new Date("2026-09-03T00:00:00.000Z");
+  const workspace = join(home, "main");
+  const task = activateTask(createTask("task-1", "Report in-flight execution", now), now);
+  store.saveTask(task);
+  const binding = createRoleAgentBinding({ id: "codex", adapterId: "codex" });
+  const leader = createRole(task.id, "leader", [binding], binding.agentId, workspace, now);
+  store.saveRole(task.id, leader);
+  const reviewer = createRole(task.id, "final-reviewer", [binding], binding.agentId, workspace, now);
+  store.saveRole(task.id, reviewer);
+  const worker = createRole(task.id, "worker", [binding], binding.agentId, workspace, now);
+  store.saveRole(task.id, worker);
+  store.saveActiveTurn(createTurn(
+    "turn-22",
+    task.id,
+    leader.name,
+    "resume",
+    turnInput("turn-22", task.id, leader.name, "Finish the Task."),
+    now,
+    { effective: resolveEffectiveLaunch({ role: leader, purpose: "execution" }) }
+  ));
+
+  // Alone, the Leader sees only itself in flight.
+  const alone = buildTurnContextPack(store, task.id, "turn-22");
+  assert.deepEqual(alone.liveTaskState.activeTaskReviews, []);
+  assert.deepEqual(alone.liveTaskState.activeTurns.map((entry) => entry.turnId), ["turn-22"]);
+
+  // Another Role starts executing while the Leader Turn runs on.
+  store.saveActiveTurn(createTurn(
+    "turn-21",
+    task.id,
+    worker.name,
+    "new",
+    turnInput("turn-21", task.id, worker.name, "Land the remaining change."),
+    now,
+    { effective: resolveEffectiveLaunch({ role: worker, purpose: "execution" }) }
+  ));
+
+  // The Pack already carried peer Turns as readable refs, but a ref is a
+  // pointer with no status: it cannot tell the Leader that turn-21 is still
+  // running. That is what this block adds.
+  const peer = buildTurnContextPack(store, task.id, "turn-22");
+  assert.deepEqual(
+    peer.liveTaskState.activeTurns.map((entry) => entry.turnId).sort(),
+    ["turn-21", "turn-22"]
+  );
+  assert.equal(peer.liveTaskState.activeTurns.length, 2);
+
+  // A requested Task-final Review is the blocker a Leader must not miss before
+  // it treats the Task as finishable.
+  store.saveReviewRound(task.id, createTaskReviewRound(
+    "review-round-6",
+    task.id,
+    reviewer.name,
+    "leader",
+    { schemaVersion: 1, projects: [{ projectId: "project-1", commit: "f".repeat(40) }] },
+    now
+  ));
+  const during = buildTurnContextPack(store, task.id, "turn-22");
+  assert.deepEqual(during.liveTaskState.activeTaskReviews, [{
+    reviewRoundId: "review-round-6",
+    reviewerRoleName: "final-reviewer",
+    status: "pending"
+  }]);
 });

@@ -9,16 +9,14 @@ import {
   recordResolutionDecision,
   supersedeIntegration,
   updateIntegrationAttempt,
-  type IntegrationAttempt
+  type IntegrationAttempt,
+  type WorkItemIntegrationStrategy
 } from "../integration/integrationAttempt.js";
 import { GitIntegrationService, type IntegrationJobPort } from "../integration/gitIntegrationService.js";
+import { FileTaskWorkspacePreparer } from "../repository/taskWorkspacePreparer.js";
 import { runTaskIntegrationQueueCommand } from "./taskIntegrationQueueCommands.js";
 import { taskLocalActor } from "./taskActor.js";
 import { resolveTaskRecordReference } from "../task/taskRecordReference.js";
-import {
-  runDeliveryGuardPreflight,
-  withGuardWarnings
-} from "./deliveryGuardPreflight.js";
 
 export type TaskIntegrationCommandOptions = Readonly<{
   now?: () => Date;
@@ -70,7 +68,7 @@ async function cleanupIntegration(
     );
   }
   const integration = requireIntegration(store, args[0], environment);
-  taskLocalActor(store, environment, integration.taskId, home);
+  taskLocalActor(store, environment, integration.taskId);
   if (integration.status !== "committed"
     && integration.status !== "superseded"
     && integration.status !== "failed") {
@@ -120,54 +118,52 @@ async function start(
   now: () => Date,
   options: TaskIntegrationCommandOptions
 ): Promise<Readonly<{ output: string; data: unknown }>> {
-  const usage = "Task Integration start usage: yui task integration start <task> [--project <project>] --change-set <id> [--change-set <id> ...] [--target <ref>] [--check <command> ...].";
+  const usage = "Task Integration start usage: yui task integration start <task> --work-item <id> --strategy <ff|cherry-pick|merge|manual> [--project <project>] [--target <ref>] [--check <command> ...].";
   const parsed = parseRepeatable(
     args,
-    new Set(["--change-set", "--check"]),
-    new Set(["--project", "--target"]),
+    new Set(["--check"]),
+    new Set(["--work-item", "--strategy", "--project", "--target"]),
     usage
   );
   if (parsed.positionals.length !== 1) throw usageError(usage);
-  const task = store.getTask(parsed.positionals[0]);
+  let task = store.getTask(parsed.positionals[0]);
   if (task === null) throw usageError(`Task not found: ${parsed.positionals[0]}.`);
   if (task.status !== "active") {
     throw usageError(`Task is not active: ${task.id}/${task.status}.`);
   }
-  taskLocalActor(store, options.environment, task.id, home);
-  const changeSetIds = parsed.many.get("--change-set") ?? [];
-  if (changeSetIds.length === 0) throw usageError("--change-set is required.", usage);
-  const changeSets = changeSetIds.map((id) => {
-    const changeSet = store.getChangeSet(task.id, id);
-    if (changeSet === null) throw usageError(`ChangeSet not found: ${id}.`);
-    return changeSet;
-  });
-  // Only diagnostic evidence commits (a reviewer's own commit on top of the
-  // frozen base) are barred from becoming an Integration source.  A clean
-  // review attests the frozen base itself (evidenceCommit === reviewBaseCommit),
-  // which is the candidate's own head and a legitimate source.
-  const diagnosticEvidence = new Set(store.listReviewRounds(task.id)
-    .flatMap(({ evidenceCommit, reviewBaseCommit }) =>
-      evidenceCommit !== undefined && evidenceCommit !== reviewBaseCommit
-        ? [evidenceCommit]
-        : []));
-  const reviewSource = changeSets.find(({ headCommit }) => diagnosticEvidence.has(headCommit));
-  if (reviewSource !== undefined) {
-    throw usageError(
-      `ReviewRound evidence commit cannot become an Integration source: ${reviewSource.id}.`
-    );
+  taskLocalActor(store, options.environment, task.id);
+  await new FileTaskWorkspacePreparer(home, store, undefined, now)
+    .prepareTaskWorkspace(task.id);
+  task = store.getTask(task.id);
+  if (task === null || task.status !== "active") {
+    throw usageError(`Task is no longer active: ${parsed.positionals[0]}.`);
   }
-  const projectIds = [...new Set(changeSets.map(({ projectId }) => projectId))];
-  if (projectIds.length !== 1) {
-    throw usageError("An Integration may only contain ChangeSets from one Project.");
+  const workItemId = parsed.one.get("--work-item");
+  const strategy = parsed.one.get("--strategy") as WorkItemIntegrationStrategy | undefined;
+  if (workItemId === undefined || strategy === undefined
+    || !["ff", "cherry-pick", "merge", "manual"].includes(strategy)) {
+    throw usageError(usage);
   }
+  const workItem = store.getWorkItem(task.id, workItemId);
+  if (workItem === null) throw usageError(`WorkItem not found: ${workItemId}.`);
+  const candidate = workItem.candidates.at(-1);
+  if (candidate?.gitSnapshot === undefined || candidate.workspace === undefined) {
+    throw usageError(`WorkItem has no committed result snapshot: ${workItem.id}.`);
+  }
+  const projectIds = candidate.workspace.entries
+    .filter(({ access }) => access === "write")
+    .map(({ projectId }) => projectId);
   const requestedProject = parsed.one.get("--project");
+  if (requestedProject === undefined && projectIds.length !== 1) {
+    throw usageError("Select --project when a WorkItem result contains multiple Projects.");
+  }
   const project = requestedProject === undefined
-    ? store.getProject(projectIds[0])
+    ? store.getProject(projectIds[0]!)
     : resolveProject(store.listProjects(), requestedProject);
   if (project === null) throw usageError(`Project not found: ${requestedProject ?? projectIds[0]}.`);
   assertProjectActive(project, "start an Integration");
-  if (project.id !== projectIds[0]) {
-    throw usageError(`ChangeSets belong to another Project: ${projectIds[0]}.`);
+  if (!projectIds.includes(project.id)) {
+    throw usageError(`WorkItem result does not contain Project: ${project.id}.`);
   }
   if (!task.projectBindings.some(({ projectId }) => projectId === project.id)) {
     throw usageError(`Project does not belong to Task: ${project.id}.`);
@@ -180,35 +176,37 @@ async function start(
   if (targetRef === undefined) {
     throw usageError(`Task main worktree is not ready; reconcile the Task first: ${task.id}.`);
   }
-  const expectedHead = (await new NodeGitWorkspace().inspect(project.path, targetRef)).baseCommit;
-  // The duplicate/budget preflight runs inside the same transaction as the
-  // attempt insert: on the single-writer SQLite backend the check and the
-  // record creation are atomic, so a concurrent Leader cannot sneak a
-  // duplicate Integration between the guard and the write.
+  const expectedHead = (await new NodeGitWorkspace().inspect(mainEntry!.path, targetRef)).baseCommit;
+  const snapshotEntry = candidate.workspace.entries.find(
+    ({ projectId }) => projectId === project.id
+  );
+  const resultCommit = candidate.gitSnapshot.projects.find(
+    ({ projectId }) => projectId === project.id
+  )?.commit;
+  if (snapshotEntry === undefined || resultCommit === undefined) {
+    throw usageError(`WorkItem result Project snapshot is incomplete: ${workItem.id}/${project.id}.`);
+  }
   const integration = store.transaction((tx) => {
-    taskLocalActor(tx, options.environment, task.id, home);
-    const guard = runDeliveryGuardPreflight(tx, task.id, {
-      kind: "integration-start",
-      projectId: project.id,
-      changeSetIds
-    }, { environment: options.environment, budget: true });
+    taskLocalActor(tx, options.environment, task.id);
     const created = createIntegrationAttempt({
       id: tx.nextIntegrationAttemptId(task.id),
       taskId: task.id,
       projectId: project.id,
       targetRef,
-      expectedHead,
-      changeSetIds,
+      beforeCommit: expectedHead,
+      source: {
+        kind: "work-item",
+        workItemId: workItem.id,
+        startCommit: snapshotEntry.baseCommit,
+        resultCommit,
+        strategy
+      },
       checkCommands: parsed.many.get("--check") ?? []
     }, now());
     tx.saveIntegrationAttempt(task.id, created);
-    return { attempt: created, guard };
+    return created;
   });
-  const result = await runIntegration(store, home, integration.attempt, now, options);
-  return {
-    ...result,
-    output: withGuardWarnings(integration.guard, result.output)
-  };
+  return runIntegration(store, home, integration, now, options);
 }
 
 async function continueIntegration(
@@ -223,7 +221,7 @@ async function continueIntegration(
   if (parsed.positionals.length !== 1) throw usageError(usage);
   const integration = requireIntegration(store, parsed.positionals[0], options.environment);
   requireActiveIntegrationTask(store, integration);
-  taskLocalActor(store, options.environment, integration.taskId, home);
+  taskLocalActor(store, options.environment, integration.taskId);
   if (
     integration.status !== "validating"
     && integration.status !== "running"
@@ -254,7 +252,9 @@ async function runIntegration(
     options.jobPort
   ).integrate(integration.taskId, integration.id);
   const output = result.status === "committed"
-    ? `Integrated ${result.attempt.changeSetIds.join(", ")} into ${result.attempt.targetRef} with CAS (${result.attempt.id})\n`
+    ? `Integrated ${integrationSourceLabel(result.attempt)} into ${
+        result.attempt.targetRef
+      } with CAS (${result.attempt.id})\n`
     : result.status === "blocked"
       ? `Integration ${result.attempt.id} requires a Task Agent resolution decision in ${result.workspace.path}\n`
       : result.status === "checks-running"
@@ -279,7 +279,7 @@ function resolveDecision(
   const resolved = store.transaction((tx) => {
     const integration = requireIntegration(tx, parsed.positionals[0], environment);
     const task = requireActiveIntegrationTask(tx, integration);
-    const actor = taskLocalActor(tx, environment, task.id, home);
+    const actor = taskLocalActor(tx, environment, task.id);
     const updated = recordResolutionDecision(integration, {
       action: selectedOption as "manual-resolution" | "reject",
       rationale
@@ -307,7 +307,7 @@ async function abortIntegration(
   if (parsed.positionals.length !== 1) throw usageError(usage);
   const integration = requireIntegration(store, parsed.positionals[0], options.environment);
   requireActiveIntegrationTask(store, integration);
-  taskLocalActor(store, options.environment, integration.taskId, home);
+  taskLocalActor(store, options.environment, integration.taskId);
   if (integration.status !== "running" && integration.status !== "blocked") {
     throw usageError(
       `Integration cannot be aborted from ${integration.status}: ${integration.id}.`
@@ -334,7 +334,7 @@ async function abortIntegration(
         `Integration cannot be aborted from ${current.status}: ${current.id}.`
       );
     }
-    taskLocalActor(tx, options.environment, current.taskId, home);
+    taskLocalActor(tx, options.environment, current.taskId);
     const aborted = updateIntegrationAttempt(current, {
       status: "failed",
       checks: [
@@ -370,7 +370,7 @@ function supersedeIntegrationCommand(
   if (reason === undefined) throw usageError(usage);
   // Superseding a committed Integration rewrites delivery-baseline evidence
   // and audit history, so it remains an explicit Task-control decision.
-  taskLocalActor(store, environment, integration.taskId, home);
+  taskLocalActor(store, environment, integration.taskId);
   // A queue-backed committed Attempt cannot be superseded: the queue entry
   // would remain in its current status while its Attempt becomes "superseded",
   // leaving contradictory terminal records that never converge. This covers
@@ -396,7 +396,7 @@ function supersedeIntegrationCommand(
         `Integration cannot be superseded from ${current.status}: ${current.id}.`
       );
     }
-    taskLocalActor(tx, environment, current.taskId, home);
+    taskLocalActor(tx, environment, current.taskId);
     const superseded = supersedeIntegration(current, reason, now);
     tx.saveIntegrationAttempt(superseded.taskId, superseded);
     return {
@@ -435,14 +435,14 @@ function list(
           { header: "Integration", minWidth: 11, maxWidth: 24 },
           { header: "Project", minWidth: 8, maxWidth: 20 },
           { header: "Target", minWidth: 8, maxWidth: 30 },
-          { header: "Changes", minWidth: 7, maxWidth: 10 },
+          { header: "Source", minWidth: 10, maxWidth: 28 },
           { header: "Status", minWidth: 7, maxWidth: 20 }
         ],
         integrations.map((entry) => [
           entry.id,
           entry.projectId,
           entry.targetRef,
-          String(entry.changeSetIds.length),
+          integrationSourceLabel(entry),
           entry.status
         ]),
         defaultTableWidth()
@@ -463,11 +463,13 @@ function show(
       `Task: ${integration.taskId}`,
       `Project: ${integration.projectId}`,
       `Target: ${integration.targetRef}`,
-      `Expected head: ${integration.expectedHead}`,
+      `Before commit: ${integration.beforeCommit}`,
       `Candidate: ${integration.candidateCommit ?? "-"}`,
+      `After commit: ${integration.afterCommit ?? "-"}`,
       `Job: ${integration.jobId ?? "-"}`,
-      `ChangeSets: ${integration.changeSetIds.join(", ")}`,
+      `Source: ${integrationSourceLabel(integration)}`,
       `Status: ${integration.status}`,
+      `Summary: ${integration.summary ?? "-"}`,
       `Conflict: ${integration.conflict?.summary ?? "-"}`,
       `Resolution: ${integration.resolution?.action ?? "-"}`,
       ...(integration.checks === undefined
@@ -483,6 +485,17 @@ function show(
     ].join("\n")}\n`,
     data: { integration }
   };
+}
+
+function integrationSourceLabel(integration: IntegrationAttempt): string {
+  if (integration.source.kind === "work-item") {
+    return `work-item:${integration.source.workItemId}@${
+      integration.source.resultCommit.slice(0, 12)
+    }`;
+  }
+  return integration.source.kind === "upstream"
+    ? `upstream:${integration.source.branch}@${integration.source.remoteCommit.slice(0, 12)}`
+    : `historical:${integration.source.changeSetIds.join(",")}`;
 }
 
 function requireIntegration(
