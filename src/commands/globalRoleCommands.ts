@@ -407,6 +407,8 @@ function profileUsingWorkerBinding(
   agentId: string
 ): string | null {
   if (role.name !== "worker") return null;
+  if (!Object.hasOwn(role.agentBindings, agentId)) return null;
+  if (agentId === role.activeAgentId) return null;
   const profile = store.listAgentProfiles().find((candidate) => (
     candidate.runtime.source === "explicit"
     && candidate.runtime.agentId === agentId
