@@ -473,18 +473,23 @@ function migrateTasks6To7(database: Database.Database): void {
         .map((entry) => [entry.projectId as string, entry])
     ));
   }
-  const latestCommitted = new Map<string, string>();
+  const latestCommitted = new Map<string, Readonly<{ id: string; commit: string }>>();
   for (const row of database.prepare(
-    "SELECT task_id, integration_id, payload FROM integration_attempts ORDER BY task_id, integration_id"
+    "SELECT task_id, integration_id, payload FROM integration_attempts"
   ).all() as { task_id: string; integration_id: string; payload: string }[]) {
     const attempt = jsonRecord(row.payload, "IntegrationAttempt");
     if (attempt.status !== "committed"
       || typeof attempt.projectId !== "string"
       || typeof attempt.candidateCommit !== "string") continue;
-    latestCommitted.set(
-      `${row.task_id}\u0000${attempt.projectId}`,
-      attempt.candidateCommit
-    );
+    const key = `${row.task_id}\u0000${attempt.projectId}`;
+    const previous = latestCommitted.get(key);
+    if (previous === undefined
+      || previous.id.localeCompare(row.integration_id, undefined, { numeric: true }) < 0) {
+      latestCommitted.set(key, {
+        id: row.integration_id,
+        commit: attempt.candidateCommit
+      });
+    }
   }
   const rows = database.prepare(
     "SELECT task_id, payload FROM task_records"
@@ -506,7 +511,7 @@ function migrateTasks6To7(database: Database.Database): void {
           : undefined;
       const currentCommit = latestCommitted.get(
         `${row.task_id}\u0000${binding.projectId}`
-      ) ?? recordedBase;
+      )?.commit ?? recordedBase;
       const baseRef = typeof binding.baseRef === "string" && isCommit(binding.baseRef)
         ? projectBranches.get(binding.projectId) ?? binding.baseRef
         : binding.baseRef;

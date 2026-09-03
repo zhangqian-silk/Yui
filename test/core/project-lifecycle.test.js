@@ -311,6 +311,18 @@ test("upstream rebase uses the unified Integration lifecycle without ChangeSets"
   assert.equal(store.listChangeSets(task.id).length, 0);
   assert.equal(integrated.attempt.source.kind, "upstream");
   assert.match(commandResult.output, /Upstream Integration results/u);
+  const integrationWorkspace = store.getIntegrationWorkspace(task.id, integrated.attempt.id);
+  assert.ok(integrationWorkspace);
+  const integrationEntry = integrationWorkspace.entries[0];
+  assert.equal(
+    git(["symbolic-ref", "--short", "HEAD"], integrationEntry.path),
+    integrationEntry.branch
+  );
+  assert.equal(
+    await preparer.cleanupIntegrationWorkspace(task.id, integrated.attempt.id),
+    "removed"
+  );
+  assert.equal(existsSync(integrationEntry.path), false);
 });
 
 test("a completed Review remains usable information after the Task head changes", () => {

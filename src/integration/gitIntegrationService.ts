@@ -858,7 +858,7 @@ export class GitIntegrationService {
           "rebase", "--onto",
           attempt.source.remoteCommit,
           attempt.source.taskBaseCommit,
-          attempt.beforeCommit
+          workspace.branch
         ]);
       } catch (error) {
         const affectedPaths = await conflictedPaths(candidatePath);
