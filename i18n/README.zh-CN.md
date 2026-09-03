@@ -37,7 +37,10 @@ Profile 的 runtime 要么动态继承当前全局 Worker active binding，要�
 一个 Agent 及可选 model/effort；adapter 始终由 Agent 配置派生。`profile list`
 和 `profile show` 会展示当前有效 Agent，以及继承时的 Worker launch revision，
 但不会因此改写 Profile 或增加其 revision。Profile 本身不持有 Session 或
-workspace。把 Yui Agent Profile 应用到新 Task Role 时，会冻结完整解析后的
+workspace。显式 Profile 指向当前 Worker Agent 时，其余 binding 配置取自
+Worker；指向其他 Agent 时使用 Provider 默认值。model/effort 仍由 Profile
+自身决定，省略即表示 Provider 默认值，而不是 Worker 中的值。把 Yui Agent
+Profile 应用到新 Task Role 时，会冻结完整解析后的
 binding，以及 instructions、Skills 和访问意图；之后 Profile 或全局 Worker
 变更不会反向改写已有 Task Role。它与 Codex 通过 `--profile` 选择的原生 config
 profile 不是一回事。Operator、Leader 与 Task Role 是运行时 Role。

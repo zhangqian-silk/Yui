@@ -2072,11 +2072,19 @@ test("a valid aggregate-21 Home upgrades through every adjacent record step", as
   store.saveTask(task);
   const configuredAgent = createConfiguredAgent("codex", "codex", "codex", [], [], now);
   store.saveConfiguredAgent(configuredAgent);
+  const sharedDirectory = join(home, "shared");
+  mkdirSync(sharedDirectory, { recursive: true });
   const workerBinding = createRoleAgentBinding(configuredAgent, {
     adapterId: "codex",
-    permission: { strategy: "bypass" },
+    permission: {
+      strategy: "configured",
+      sandbox: "workspace-write",
+      approval: "on-request"
+    },
     model: "legacy-model",
-    effort: "high"
+    effort: "high",
+    search: true,
+    additionalDirectories: [sharedDirectory]
   });
   store.saveGlobalRole(createGlobalRole(
     "worker",
@@ -2179,6 +2187,15 @@ test("a valid aggregate-21 Home upgrades through every adjacent record step", as
     model: "legacy-model",
     effort: "high"
   });
+  runTaskCommand(
+    ["role", "add", task.id, "migrated-profile-role", "--profile", legacyProfile.id],
+    reopened,
+    { now: () => new Date("2026-09-02T01:00:30.000Z"), environment: bareEnv }
+  );
+  assert.deepEqual(
+    reopened.getRole(task.id, "migrated-profile-role").agentBindings[configuredAgent.id].config,
+    workerBinding.config
+  );
   const newItem = createWorkItem("work-item-2", task.id, {
     title: "New work after upgrade",
     assignee: "producer"

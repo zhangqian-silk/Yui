@@ -49,8 +49,9 @@ export function resolveAgentProfileView(
 
 /**
  * Resolve one Profile into a complete Role binding. Inherited Profiles copy
- * the current Global Worker active binding verbatim; explicit Profiles use the
- * selected Agent's provider defaults plus their own model/effort.
+ * the current Global Worker active binding verbatim. An explicit Profile for
+ * that same Agent preserves the Worker's complete binding and overlays its own
+ * model/effort; another Agent starts from its provider defaults.
  */
 export function resolveAgentProfileRuntime(
   profile: AgentProfile,
@@ -107,10 +108,25 @@ export function resolveAgentProfileRuntime(
       reason: `Configured Agent not found: ${profile.runtime.agentId}.`
     };
   }
-  const defaults = createRoleAgentBinding(agent);
-  const config = structuredClone(defaults.config) as unknown as Record<string, unknown>;
-  if (profile.runtime.model !== undefined) config.model = profile.runtime.model;
-  if (profile.runtime.effort !== undefined) config.effort = profile.runtime.effort;
+  const worker = store.getGlobalRole("worker");
+  const workerBinding = worker?.activeAgentId === agent.id
+    ? worker.agentBindings[worker.activeAgentId]
+    : undefined;
+  if (workerBinding !== undefined && workerBinding.adapterId !== agent.adapterId) {
+    return {
+      status: "unavailable",
+      source: "explicit",
+      reason: `Global Role worker Agent adapter does not match its binding: ${agent.id}.`
+    };
+  }
+  const base = workerBinding === undefined
+    ? createRoleAgentBinding(agent)
+    : createRoleAgentBinding(agent, workerBinding.config);
+  const config = structuredClone(base.config) as unknown as Record<string, unknown>;
+  if (profile.runtime.model === undefined) delete config.model;
+  else config.model = profile.runtime.model;
+  if (profile.runtime.effort === undefined) delete config.effort;
+  else config.effort = profile.runtime.effort;
   return {
     status: "resolved",
     source: "explicit",
