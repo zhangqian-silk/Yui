@@ -512,9 +512,21 @@ function migrationProfileRuntimeAgent(
   const config = jsonRecord(configRow.payload, "Yui config") as YuiConfig;
   validateYuiConfig(config);
   if (config.defaultAgent === undefined) {
+    const configuredAgents = database.prepare(
+      "SELECT id FROM configured_agents ORDER BY id"
+    ).all() as { id: string }[];
+    if (configuredAgents.length === 1) {
+      const agent = migrationConfiguredAgent(
+        database,
+        configuredAgents[0].id,
+        "sole configured"
+      );
+      return { agentId: agent.id };
+    }
     throw new Error(
-      "AgentProfile migration requires Global Role worker or config.defaultAgent "
-      + "for legacy model or effort values."
+      "AgentProfile migration requires Global Role worker, config.defaultAgent, "
+      + "or exactly one configured Agent for legacy model or effort values; "
+      + `found ${configuredAgents.length} configured Agents.`
     );
   }
   migrationConfiguredAgent(database, config.defaultAgent, "config.defaultAgent");

@@ -2457,7 +2457,7 @@ test("a valid aggregate-21 Home upgrades through every adjacent record step", as
   assert.equal(reopened.getActiveTurn(task.id, "producer").workItemId, newItem.id);
 });
 
-test("aggregate-24 Profile hints migrate through the configured default Agent without Worker", (t) => {
+test("aggregate-24 Profile hints migrate through the sole configured Agent without Worker", (t) => {
   const home = mkdtempSync(join(tmpdir(), "yui-aggregate-24-profile-upgrade-smoke-"));
   const upgradeEnvironment = { ...bareEnv, YUI_HOME: home };
   t.after(() => rmSync(home, { recursive: true, force: true }));
@@ -2466,10 +2466,6 @@ test("aggregate-24 Profile hints migrate through the configured default Agent wi
   const store = new SqliteTaskStore(home);
   const configuredAgent = createConfiguredAgent("codex", "codex", "codex", [], [], now);
   store.saveConfiguredAgent(configuredAgent);
-  store.saveConfig({
-    ...store.getConfig(),
-    defaultAgent: configuredAgent.id
-  });
   const legacyProfile = createAgentProfile({
     id: "workerless-legacy-profile",
     runtime: {
