@@ -196,7 +196,8 @@ export const INTERACTION_POLICIES: readonly InteractionPolicy[] = Object.freeze(
     selectors: [],
     trailingOptions: {
       "--description": "value", "--instructions": "value",
-      "--skill": "value", "--model": "value", "--effort": "value", "--access": "value"
+      "--skill": "value", "--agent": "value", "--model": "value",
+      "--effort": "value", "--access": "value", "--inherit-worker": "flag"
     }
   },
   ...["show", "update", "remove"].map((command): InteractionPolicy => ({
@@ -212,8 +213,11 @@ export const INTERACTION_POLICIES: readonly InteractionPolicy[] = Object.freeze(
           trailingOptions: {
             "--description": "option-like-value",
             "--instructions": "option-like-value", "--skill": "value",
+            "--agent": "value", "--inherit-worker": "flag",
             "--model": "option-like-value", "--effort": "option-like-value",
-            "--access": "value"
+            "--access": "value", "--clear-description": "flag",
+            "--clear-instructions": "flag", "--clear-skills": "flag",
+            "--clear-model": "flag", "--clear-effort": "flag"
           }
         }
       : {}),
