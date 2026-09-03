@@ -290,6 +290,11 @@ export function validateIntegrationAttempt(attempt: IntegrationAttempt): Integra
     if (attempt.candidateCommit !== attempt.afterCommit) {
       throw new Error("Committed Integration candidate and afterCommit must match.");
     }
+    if (attempt.source.kind === "work-item"
+      && attempt.source.strategy === "manual"
+      && attempt.resolution?.action !== "manual-resolution") {
+      throw new Error("Committed manual Integration requires a Task-control resolution decision.");
+    }
   }
   if (attempt.jobId !== undefined) {
     validateTaskRecordReference(

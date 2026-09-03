@@ -198,7 +198,12 @@ export function advanceTaskProjectCommit(
   });
 }
 
-/** Refresh Task commit facts from its authoritative main clones. */
+/**
+ * Refresh Task commit facts from its authoritative main clones. An active
+ * Task may persist a newly added Project as pending intent before its first
+ * workspace prepare; that first successful prepare adopts the clone's HEAD as
+ * both the Project baseline and current result.
+ */
 export function synchronizeTaskProjectCommits(
   task: Task,
   commits: readonly Readonly<{ projectId: string; commit: string }>[],
@@ -215,10 +220,11 @@ export function synchronizeTaskProjectCommits(
     throw new Error(`Task Project commit scope does not match its bindings: ${task.id}.`);
   }
   const projectBindings = task.projectBindings.map((binding) => {
+    const commit = byProject.get(binding.projectId)!;
     if (binding.baseCommit === undefined) {
-      throw new Error(`Task Project base commit is unavailable: ${task.id}/${binding.projectId}.`);
+      return { ...binding, baseCommit: commit, currentCommit: commit };
     }
-    return { ...binding, currentCommit: byProject.get(binding.projectId)! };
+    return { ...binding, currentCommit: commit };
   });
   if (projectBindings.every((binding, index) => (
     binding.currentCommit === task.projectBindings[index]?.currentCommit

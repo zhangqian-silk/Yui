@@ -617,11 +617,16 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
           tx.saveTask(persistedTask);
         }
         tx.saveManagedWorkspace(preserveWorkspaceCreatedAt(workspace, current));
-        if (current === null) {
+        const adoptedProvenance = prepared
+          .filter(({ entry }) => (
+            current?.entries.every(({ projectId }) => projectId !== entry.projectId) ?? true
+          ))
+          .map(({ provenance }) => provenance);
+        if (adoptedProvenance.length > 0) {
           recordTaskBaseProvenanceEvents(
             tx,
             task.id,
-            prepared.map(({ provenance }) => provenance),
+            adoptedProvenance,
             timestamp
           );
         }

@@ -9,7 +9,10 @@ import { runProjectCommand } from "../../dist/commands/projectCommands.js";
 import { runTaskCommand } from "../../dist/commands/taskCommands.js";
 import { runTaskUpstreamCommand } from "../../dist/commands/taskUpstreamCommands.js";
 import { GitIntegrationService } from "../../dist/integration/gitIntegrationService.js";
-import { createIntegrationAttempt } from "../../dist/integration/integrationAttempt.js";
+import {
+  createIntegrationAttempt,
+  recordResolutionDecision
+} from "../../dist/integration/integrationAttempt.js";
 import { createProject } from "../../dist/repository/project.js";
 import { TaskWorkspaceCoordinator } from "../../dist/repository/taskWorkspaceCoordinator.js";
 import { FileTaskWorkspacePreparer } from "../../dist/repository/taskWorkspacePreparer.js";
@@ -227,17 +230,25 @@ test("WorkItem no-op Integration records the decision and archive removes all co
       workItemId: item.id,
       startCommit: resultCommit,
       resultCommit,
-      strategy: "cherry-pick"
+      strategy: "manual"
     }
   }, now);
   store.saveIntegrationAttempt(task.id, attempt);
-  const integrated = await new GitIntegrationService(home, store)
-    .integrate(task.id, attempt.id);
+  const service = new GitIntegrationService(home, store);
+  const blocked = await service.integrate(task.id, attempt.id);
+  assert.equal(blocked.status, "blocked");
+  const rationale = "The Leader confirmed that this WorkItem requires no code change.";
+  store.saveIntegrationAttempt(task.id, recordResolutionDecision(blocked.attempt, {
+    action: "manual-resolution",
+    rationale
+  }, "leader", now));
+  const integrated = await service.integrate(task.id, attempt.id);
 
   assert.equal(integrated.status, "committed", JSON.stringify(integrated.attempt, null, 2));
   assert.equal(integrated.attempt.beforeCommit, beforeCommit);
   assert.equal(integrated.attempt.afterCommit, beforeCommit);
-  assert.match(integrated.attempt.summary, /already represented|unchanged/iu);
+  assert.match(integrated.attempt.summary, /intentionally not applied/iu);
+  assert.match(integrated.attempt.summary, new RegExp(rationale, "u"));
   assert.equal(git(["rev-parse", "HEAD"], taskEntry.path), beforeCommit);
   assert.equal(store.listChangeSets(task.id).length, 0);
 

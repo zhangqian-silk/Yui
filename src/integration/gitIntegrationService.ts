@@ -1103,6 +1103,17 @@ function integrationSummary(attempt: IntegrationAttempt): string {
       ? "Historical Integration was already represented; Task head was unchanged."
       : "Historical Integration advanced the Task head.";
   }
+  if (attempt.source.strategy === "manual") {
+    const decision = attempt.resolution;
+    if (decision?.action !== "manual-resolution") {
+      throw new Error(`Manual Integration has no Task-control resolution decision: ${attempt.id}.`);
+    }
+    return unchanged
+      ? `WorkItem ${attempt.source.workItemId} was intentionally not applied; `
+        + `Task head was unchanged. Rationale: ${decision.rationale}`
+      : `Integrated WorkItem ${attempt.source.workItemId} with manual resolution. `
+        + `Rationale: ${decision.rationale}`;
+  }
   return unchanged
     ? `WorkItem ${attempt.source.workItemId} result was already represented; Task head was unchanged.`
     : `Integrated WorkItem ${attempt.source.workItemId} with ${attempt.source.strategy}.`;
