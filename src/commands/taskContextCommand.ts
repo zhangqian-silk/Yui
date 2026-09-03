@@ -446,7 +446,11 @@ export function runTaskContextCommand(
       : integrations.slice(-RECENT_RECORD_LIMIT).map((integration) => (
           `  ${integration.id} [${integration.status}/${integration.projectId}] — ${
             integration.targetRef
-          }; ${integration.changeSetIds.join(", ")}`
+          }; ${integration.source.kind === "work-item"
+            ? `WorkItem ${integration.source.workItemId}@${integration.source.resultCommit.slice(0, 12)}`
+            : integration.source.kind === "upstream"
+              ? `upstream ${integration.source.branch}@${integration.source.remoteCommit.slice(0, 12)}`
+              : `historical ChangeSets ${integration.source.changeSetIds.join(", ")}`}`
         ))),
     "",
     `Publication references (${publications.length}):`,

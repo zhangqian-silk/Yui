@@ -7,11 +7,31 @@ import test from "node:test";
 
 import { runProjectCommand } from "../../dist/commands/projectCommands.js";
 import { runTaskCommand } from "../../dist/commands/taskCommands.js";
+import { runTaskUpstreamCommand } from "../../dist/commands/taskUpstreamCommands.js";
+import { GitIntegrationService } from "../../dist/integration/gitIntegrationService.js";
+import {
+  createIntegrationAttempt,
+  recordResolutionDecision
+} from "../../dist/integration/integrationAttempt.js";
 import { createProject } from "../../dist/repository/project.js";
+import { TaskWorkspaceCoordinator } from "../../dist/repository/taskWorkspaceCoordinator.js";
+import { FileTaskWorkspacePreparer } from "../../dist/repository/taskWorkspacePreparer.js";
+import {
+  createTaskReviewRound,
+  finishReviewRound
+} from "../../dist/review/reviewRound.js";
+import { createTaskFinalReviewContract } from "../../dist/review/taskFinalReviewContract.js";
 import { latestStorageVersionState } from "../../dist/storage/upgrade/recordVersions.js";
 import { inspectStorageSchema } from "../../dist/storage/storageSchema.js";
 import { SqliteTaskStore } from "../../dist/storage/sqliteStore.js";
-import { activateTask, createTask } from "../../dist/task/task.js";
+import { projectNextAction } from "../../dist/task/nextAction.js";
+import { activateTask, completeTask, createTask } from "../../dist/task/task.js";
+import {
+  createCandidateGitSnapshot,
+  createWorkItem,
+  submitWorkItemCandidate,
+  updateWorkItemStatus
+} from "../../dist/workItem/workItem.js";
 import { sanitizedTestEnv } from "../helpers/sanitizedEnv.mjs";
 
 const now = new Date("2026-08-27T00:00:00.000Z");
@@ -77,6 +97,292 @@ function registerManagedProject(store, projectId, checkout, remote) {
   store.saveProject(project);
   return project;
 }
+
+test("Task activation clones the remote branch into an independent Task repository", async (t) => {
+  const home = newHome(t);
+  const store = newStore(t, home);
+  const workspaceRoot = mkdtempSync(join(tmpdir(), "yui-task-workspace-"));
+  t.after(() => rmSync(workspaceRoot, { recursive: true, force: true }));
+  store.saveConfig({
+    ...store.getConfig(),
+    defaultWorkspace: workspaceRoot
+  });
+  const { remote, checkout } = setupDivergedCheckout(home, "project-1");
+  registerManagedProject(store, "project-1", checkout, remote);
+  const remoteHead = git(["rev-parse", "refs/heads/master"], remote);
+  const task = createTask(store.nextTaskId(), "Independent Task clone", now, {
+    projectBindings: [{ projectId: "project-1", directory: "app", baseRef: "master" }]
+  });
+  store.saveTask(task);
+
+  const activated = await new FileTaskWorkspacePreparer(home, store)
+    .activateTaskWorkspace(task.id);
+  const persisted = store.getTask(task.id);
+  const taskWorkspace = store.getTaskWorkspace(task.id);
+  const taskEntry = taskWorkspace.entries[0];
+
+  assert.equal(activated.status, "ready");
+  assert.equal(persisted.status, "active");
+  assert.equal(persisted.projectBindings[0].baseRef, "master");
+  assert.equal(persisted.projectBindings[0].baseCommit, remoteHead);
+  assert.equal(persisted.projectBindings[0].currentCommit, remoteHead);
+  assert.notEqual(taskEntry.path, checkout);
+  assert.equal(git(["rev-parse", "HEAD"], taskEntry.path), remoteHead);
+  assert.notEqual(
+    git(["rev-parse", "--path-format=absolute", "--git-common-dir"], taskEntry.path),
+    git(["rev-parse", "--path-format=absolute", "--git-common-dir"], checkout)
+  );
+  assert.equal(existsSync(join(taskEntry.path, "local.txt")), false);
+  assert.equal(
+    store.listEvents(task.id).find(({ type }) => type === "task.base-provenance")?.payload.source,
+    "remote-fetch"
+  );
+});
+
+test("Task activation rolls back every fresh clone when one remote cannot be cloned", async (t) => {
+  const home = newHome(t);
+  const store = newStore(t, home);
+  const workspaceRoot = mkdtempSync(join(tmpdir(), "yui-task-workspace-"));
+  t.after(() => rmSync(workspaceRoot, { recursive: true, force: true }));
+  store.saveConfig({ ...store.getConfig(), defaultWorkspace: workspaceRoot });
+  const { remote, checkout } = setupDivergedCheckout(home, "project-1");
+  registerManagedProject(store, "project-1", checkout, remote);
+  const secondCheckout = join(home, "projects", "project-2");
+  execFileSync("git", ["clone", remote, secondCheckout], { env: gitEnv });
+  store.saveProject(createProject(
+    "project-2",
+    "broken",
+    secondCheckout,
+    { stable: "master", development: "master" },
+    now,
+    { remoteUrl: join(home, "missing.git"), ownership: "managed" }
+  ));
+  const task = createTask(store.nextTaskId(), "Atomic activation", now, {
+    projectBindings: [
+      { projectId: "project-1", directory: "app", baseRef: "master" },
+      { projectId: "project-2", directory: "broken", baseRef: "master" }
+    ]
+  });
+  store.saveTask(task);
+
+  await assert.rejects(
+    new FileTaskWorkspacePreparer(home, store).activateTaskWorkspace(task.id),
+    /clone|repository|remote|missing/iu
+  );
+
+  const persisted = store.getTask(task.id);
+  assert.equal(persisted.status, "draft");
+  assert.equal(persisted.cwd, undefined);
+  assert.equal(persisted.workspaceIdentity, undefined);
+  assert.equal(store.getTaskWorkspace(task.id), null);
+  assert.deepEqual(store.listManagedWorkspaces(task.id), []);
+  assert.deepEqual(store.listTurns(task.id), []);
+  assert.equal(existsSync(join(workspaceRoot, "tasks", task.id)), false);
+});
+
+test("WorkItem no-op Integration records the decision and archive removes all code workspaces", async (t) => {
+  const home = newHome(t);
+  const store = newStore(t, home);
+  const workspaceRoot = mkdtempSync(join(tmpdir(), "yui-task-workspace-"));
+  t.after(() => rmSync(workspaceRoot, { recursive: true, force: true }));
+  store.saveConfig({ ...store.getConfig(), defaultWorkspace: workspaceRoot });
+  const { remote, checkout } = setupDivergedCheckout(home, "project-1");
+  registerManagedProject(store, "project-1", checkout, remote);
+  const task = createTask(store.nextTaskId(), "No-op delivery", now, {
+    projectBindings: [{ projectId: "project-1", directory: "app", baseRef: "master" }]
+  });
+  store.saveTask(task);
+  const preparer = new FileTaskWorkspacePreparer(home, store);
+  await preparer.activateTaskWorkspace(task.id);
+  const taskWorkspace = store.getTaskWorkspace(task.id);
+  const taskEntry = taskWorkspace.entries[0];
+  const beforeCommit = store.getTask(task.id).projectBindings[0].currentCommit;
+
+  let item = createWorkItem(
+    store.nextWorkItemId(task.id),
+    task.id,
+    { title: "Confirm existing behavior", writeProjectIds: ["project-1"] },
+    now
+  );
+  item = updateWorkItemStatus(item, "running", now);
+  store.saveWorkItem(task.id, item);
+  const workItemWorkspace = await preparer.prepareWorkItemWorkspace(task.id, item.id);
+  const resultCommit = git(["rev-parse", "HEAD"], workItemWorkspace.entries[0].path);
+  item = submitWorkItemCandidate(item, {
+    summary: "The requested behavior is already present.",
+    source: { type: "direct" },
+    workspace: workItemWorkspace,
+    gitSnapshot: createCandidateGitSnapshot(workItemWorkspace, [{
+      projectId: "project-1",
+      commit: resultCommit
+    }])
+  }, now);
+  store.saveWorkItem(task.id, item);
+
+  const attempt = createIntegrationAttempt({
+    id: store.nextIntegrationAttemptId(task.id),
+    taskId: task.id,
+    projectId: "project-1",
+    targetRef: taskEntry.branch,
+    beforeCommit,
+    source: {
+      kind: "work-item",
+      workItemId: item.id,
+      startCommit: resultCommit,
+      resultCommit,
+      strategy: "manual"
+    }
+  }, now);
+  store.saveIntegrationAttempt(task.id, attempt);
+  const service = new GitIntegrationService(home, store);
+  const blocked = await service.integrate(task.id, attempt.id);
+  assert.equal(blocked.status, "blocked");
+  const rationale = "The Leader confirmed that this WorkItem requires no code change.";
+  store.saveIntegrationAttempt(task.id, recordResolutionDecision(blocked.attempt, {
+    action: "manual-resolution",
+    rationale
+  }, "leader", now));
+  const integrated = await service.integrate(task.id, attempt.id);
+
+  assert.equal(integrated.status, "committed", JSON.stringify(integrated.attempt, null, 2));
+  assert.equal(integrated.attempt.beforeCommit, beforeCommit);
+  assert.equal(integrated.attempt.afterCommit, beforeCommit);
+  assert.match(integrated.attempt.summary, /intentionally not applied/iu);
+  assert.match(integrated.attempt.summary, new RegExp(rationale, "u"));
+  assert.equal(git(["rev-parse", "HEAD"], taskEntry.path), beforeCommit);
+  assert.equal(store.listChangeSets(task.id).length, 0);
+
+  store.saveWorkItem(task.id, updateWorkItemStatus(item, "completed", now, "accepted no-op"));
+  store.saveTask(completeTask(store.getTask(task.id), now, {
+    by: "user",
+    summary: "No code change was required."
+  }));
+  const coordinator = new TaskWorkspaceCoordinator(store, preparer, {
+    async stopTaskRoleSessions() {},
+    async assertTaskPhysicalResourcesReleased() {}
+  });
+  const cleaned = await coordinator.cleanupTaskForArchive(task.id, "integrated");
+  assert.equal(cleaned.status, "removed");
+  assert.equal(existsSync(taskEntry.path), false);
+  assert.deepEqual(store.listManagedWorkspaces(task.id), []);
+
+  runTaskCommand(["archive", task.id, "--integrated"], store, {
+    now: () => now,
+    environment: userEnv
+  });
+  assert.equal(store.getTask(task.id).status, "archived");
+  assert.equal(store.getWorkItem(task.id, item.id).status, "completed");
+  assert.equal(store.getIntegrationAttempt(task.id, attempt.id).status, "committed");
+});
+
+test("upstream rebase uses the unified Integration lifecycle without ChangeSets", async (t) => {
+  const home = newHome(t);
+  const store = newStore(t, home);
+  const workspaceRoot = mkdtempSync(join(tmpdir(), "yui-task-workspace-"));
+  t.after(() => rmSync(workspaceRoot, { recursive: true, force: true }));
+  store.saveConfig({ ...store.getConfig(), defaultWorkspace: workspaceRoot });
+  const { remote, seed, checkout } = setupDivergedCheckout(home, "project-1");
+  registerManagedProject(store, "project-1", checkout, remote);
+  const task = createTask(store.nextTaskId(), "Upstream rebase", now, {
+    projectBindings: [{ projectId: "project-1", directory: "app", baseRef: "master" }]
+  });
+  store.saveTask(task);
+  const preparer = new FileTaskWorkspacePreparer(home, store);
+  await preparer.activateTaskWorkspace(task.id);
+  const taskEntry = store.getTaskWorkspace(task.id).entries[0];
+  commitFile(taskEntry.path, "task.txt", "task\n", "task change");
+  const beforeCommit = git(["rev-parse", "HEAD"], taskEntry.path);
+  assert.notEqual(
+    store.getTask(task.id).projectBindings[0].currentCommit,
+    beforeCommit,
+    "the command should synchronize a direct Task-main commit before Integration"
+  );
+  commitFile(seed, "remote-2.txt", "remote 2\n", "remote change 2");
+  git(["push", "origin", "master"], seed);
+  const remoteCommit = git(["rev-parse", "HEAD"], seed);
+
+  const commandResult = await runTaskUpstreamCommand(
+    ["integrate", task.id, "--latest"],
+    store,
+    home,
+    { now: () => now, environment: userEnv }
+  );
+  const integrated = commandResult.data.integrations[0];
+
+  assert.equal(integrated.status, "committed", JSON.stringify(integrated.attempt, null, 2));
+  assert.equal(integrated.attempt.beforeCommit, beforeCommit);
+  assert.notEqual(integrated.attempt.afterCommit, beforeCommit);
+  assert.equal(git(["rev-parse", "HEAD^"], taskEntry.path), remoteCommit);
+  assert.ok(existsSync(join(taskEntry.path, "task.txt")));
+  assert.ok(existsSync(join(taskEntry.path, "remote-2.txt")));
+  assert.equal(
+    store.getTask(task.id).projectBindings[0].currentCommit,
+    integrated.attempt.afterCommit
+  );
+  assert.equal(store.listChangeSets(task.id).length, 0);
+  assert.equal(integrated.attempt.source.kind, "upstream");
+  assert.match(commandResult.output, /Upstream Integration results/u);
+  const integrationWorkspace = store.getIntegrationWorkspace(task.id, integrated.attempt.id);
+  assert.ok(integrationWorkspace);
+  const integrationEntry = integrationWorkspace.entries[0];
+  assert.equal(
+    git(["symbolic-ref", "--short", "HEAD"], integrationEntry.path),
+    integrationEntry.branch
+  );
+  assert.equal(
+    await preparer.cleanupIntegrationWorkspace(task.id, integrated.attempt.id),
+    "removed"
+  );
+  assert.equal(existsSync(integrationEntry.path), false);
+});
+
+test("a completed Review remains usable information after the Task head changes", () => {
+  const oldCommit = "a".repeat(40);
+  const currentCommit = "b".repeat(40);
+  const task = activateTask(createTask("task-1", "Review information", now, {
+    projectBindings: [{ projectId: "project-1", directory: "app", baseRef: "master" }]
+  }), now);
+  const contract = createTaskFinalReviewContract({
+    taskId: task.id,
+    reviewerRoleName: "reviewer",
+    controlPlaneDigest: "c".repeat(64)
+  });
+  const round = finishReviewRound(createTaskReviewRound(
+    "review-round-1",
+    task.id,
+    "reviewer",
+    "leader",
+    {
+      schemaVersion: 1,
+      projects: [{ projectId: "project-1", commit: oldCommit }]
+    },
+    now,
+    contract
+  ), "completed", "Reviewed the earlier head.", now, {
+    checks: [{ name: "review", outcome: "passed" }],
+    evidenceCommit: oldCommit
+  });
+
+  const action = projectNextAction({
+    task,
+    workItems: [],
+    changeSets: [],
+    integrations: [],
+    integrationQueueEntries: [],
+    reviewRounds: [round],
+    reviewConfig: { roleName: "reviewer", trigger: "final" },
+    openInputRequests: [],
+    activeTurns: [],
+    leaderTurns: [],
+    currentTaskReviewCandidate: {
+      schemaVersion: 1,
+      projects: [{ projectId: "project-1", commit: currentCommit }]
+    }
+  });
+
+  assert.equal(action.kind, "complete-task");
+  assert.doesNotMatch(action.reason, /no valid Task-final Review/iu);
+});
 
 test("project reset refuses divergence without --discard-local and lists the local commits", async (t) => {
   const home = newHome(t);

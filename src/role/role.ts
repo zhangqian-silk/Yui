@@ -249,6 +249,11 @@ export function switchActiveRoleAgent(
     : {
         ...sessions,
         activeAgentId: normalizedTarget,
+        ...(
+          sessions.owner.scope === "task" && fromAgentId !== normalizedTarget
+            ? { providerBinding: null }
+            : {}
+        ),
         updatedAt: timestamp
       } as RoleSessionSet;
 

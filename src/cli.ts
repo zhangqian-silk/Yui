@@ -190,6 +190,7 @@ import { runSetupCommand, validateSetupInvocation } from "./setup/setupCommand.j
 import { NodeCommandExecutor } from "./tmux/commandExecutor.js";
 import { TmuxManager } from "./tmux/tmuxManager.js";
 import { WorkItemChangeSetManager } from "./workspace/workItemChangeSetManager.js";
+import { workspaceProjectEntry } from "./worktree/managedWorkspace.js";
 import { parseWebCommandOptions, startYuiWebServer } from "./web/webServer.js";
 import {
   AgentConfigurationCatalogService
@@ -1447,7 +1448,9 @@ export async function main(): Promise<void> {
       return;
     }
     if (resolved[1] === "upstream") {
-      const result = await runTaskUpstreamCommand(resolved.slice(2), store);
+      const result = await runTaskUpstreamCommand(resolved.slice(2), store, home, {
+        environment: process.env
+      });
       emit(result.output, false, result.data);
       return;
     }
@@ -1489,12 +1492,23 @@ export async function main(): Promise<void> {
         // Keep completion offline by default. An explicit refresh is the only
         // path that may fetch and reconcile a moved remote baseline.
         if (refreshRemote) {
-          await reconcileTaskRemoteBaselines(
+          const reconciled = await reconcileTaskRemoteBaselines(
             resolved[2],
             store,
             home,
             { environment: process.env, jobPort: createControllerIntegrationJobPort(home, { environment: process.env }) }
           );
+          if (reconciled.length > 0) {
+            const updates = reconciled.map((entry) => (
+              `${entry.projectId}: ${entry.fromCommit} -> ${entry.toCommit} `
+              + `(Integration ${entry.integrationId})`
+            )).join("; ");
+            throw usageError(
+              `Remote baseline reconciliation advanced Task ${resolved[2]} (${updates}). `
+              + "The Task remains active so the Leader can inspect the new authoritative head, "
+              + "decide how prior Review evidence applies, and retry task complete."
+            );
+          }
         }
       }
     }
@@ -2606,6 +2620,9 @@ async function snapshotActualTaskReviewCandidate(
   if (task.projectBindings.length === 0) {
     throw usageError(`Final Task Review requires a Project-backed Task: ${task.id}.`);
   }
+  // Reconcile the durable currentCommit facts from the authoritative Task
+  // clones before freezing a completion/review candidate.
+  await preparer.prepareTaskWorkspace(task.id);
   const workspace = store.getTaskWorkspace(task.id);
   if (workspace === null
     || workspace.owner.type !== "task"
@@ -2671,12 +2688,18 @@ async function deltaRecheckPreflightForTaskCommand(
     );
   }
   const repositoryPaths: Record<string, string> = {};
+  const taskWorkspace = store.getTaskWorkspace(task.id);
+  if (taskWorkspace === null || taskWorkspace.owner.type !== "task") {
+    throw usageError(`Task has no authoritative main workspace: ${task.id}.`);
+  }
   for (const candidateProject of actualTaskReviewCandidate.projects) {
-    const project = store.getProject(candidateProject.projectId);
-    if (project === null) {
-      throw usageError(`Delta-recheck Project not found: ${candidateProject.projectId}.`);
+    const entry = workspaceProjectEntry(taskWorkspace, candidateProject.projectId);
+    if (entry === undefined) {
+      throw usageError(
+        `Delta-recheck Task workspace Project not found: ${candidateProject.projectId}.`
+      );
     }
-    repositoryPaths[candidateProject.projectId] = project.path;
+    repositoryPaths[candidateProject.projectId] = entry.path;
   }
   const assessment = await assessDeltaRecheck({
     repositoryPaths,

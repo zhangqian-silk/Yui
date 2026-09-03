@@ -4,6 +4,8 @@ import Database from "better-sqlite3";
 
 import { validateTurn } from "../../turn/turn.js";
 import { validateWorkItem } from "../../workItem/workItem.js";
+import { validateTask } from "../../task/task.js";
+import { validateIntegrationAttempt } from "../../integration/integrationAttempt.js";
 import { validateExecutionGroup } from "../../execution/executionGroup.js";
 import { SqliteTaskStore } from "../sqliteStore.js";
 import {
@@ -20,7 +22,7 @@ const FIRST_SUPPORTED_AGGREGATE_VERSION = 21;
 export type StorageUpgradeStep = Readonly<{
   fromAggregate: number;
   toAggregate: number;
-  recordKind: "workItem" | "turn";
+  recordKind: "workItem" | "turn" | "task" | "integrationAttempt";
   fromRecordVersion: number;
   toRecordVersion: number;
 }>;
@@ -251,7 +253,9 @@ function migrationPlan(
   const all: readonly StorageUpgradeStep[] = [
     { fromAggregate: 21, toAggregate: 22, recordKind: "workItem", fromRecordVersion: 13, toRecordVersion: 14 },
     { fromAggregate: 22, toAggregate: 23, recordKind: "turn", fromRecordVersion: 1, toRecordVersion: 2 },
-    { fromAggregate: 23, toAggregate: 24, recordKind: "turn", fromRecordVersion: 2, toRecordVersion: 3 }
+    { fromAggregate: 23, toAggregate: 24, recordKind: "turn", fromRecordVersion: 2, toRecordVersion: 3 },
+    { fromAggregate: 24, toAggregate: 25, recordKind: "task", fromRecordVersion: 6, toRecordVersion: 7 },
+    { fromAggregate: 25, toAggregate: 26, recordKind: "integrationAttempt", fromRecordVersion: 5, toRecordVersion: 6 }
   ];
   return all.filter(({ fromAggregate }) => fromAggregate >= manifest.aggregateSchemaVersion);
 }
@@ -267,6 +271,8 @@ function recordVersionsMatchAggregate(
   if (aggregate <= 21) expected.workItem = 13;
   if (aggregate <= 22) expected.turn = 1;
   else if (aggregate === 23) expected.turn = 2;
+  if (aggregate <= 24) expected.task = 6;
+  if (aggregate <= 25) expected.integrationAttempt = 5;
   const actualKinds = Object.keys(actual).sort();
   const expectedKinds = Object.keys(expected).sort();
   return actualKinds.length === expectedKinds.length
@@ -299,6 +305,22 @@ function validateMigrationDatabase(home: string, manifest: ParsedStorageManifest
         throw new Error(`Turn payload version ${String(turn.schemaVersion)} does not match its manifest.`);
       }
     }
+    const expectedTask = manifest.aggregateSchemaVersion <= 24 ? 6 : 7;
+    for (const { payload } of database.prepare("SELECT payload FROM task_records").all() as { payload: string }[]) {
+      const task = jsonRecord(payload, "Task");
+      if (![expectedTask, 7].includes(task.schemaVersion as number)) {
+        throw new Error(`Task payload version ${String(task.schemaVersion)} does not match its manifest.`);
+      }
+    }
+    const expectedIntegration = manifest.aggregateSchemaVersion <= 25 ? 5 : 6;
+    for (const { payload } of database.prepare("SELECT payload FROM integration_attempts").all() as { payload: string }[]) {
+      const attempt = jsonRecord(payload, "IntegrationAttempt");
+      if (![expectedIntegration, 6].includes(attempt.schemaVersion as number)) {
+        throw new Error(
+          `IntegrationAttempt payload version ${String(attempt.schemaVersion)} does not match its manifest.`
+        );
+      }
+    }
   } finally {
     database.close();
   }
@@ -316,6 +338,8 @@ function applyMigration(home: string, manifest: ParsedStorageManifest, now: Date
       if (manifest.aggregateSchemaVersion <= 21) migrateWorkItems13To14(database, now);
       if (manifest.aggregateSchemaVersion <= 22) migrateTurns(database, 1, 2);
       if (manifest.aggregateSchemaVersion <= 23) migrateTurns(database, 2, 3);
+      if (manifest.aggregateSchemaVersion <= 24) migrateTasks6To7(database);
+      if (manifest.aggregateSchemaVersion <= 25) migrateIntegrations5To6(database, now);
     }).immediate();
   } finally {
     database.close();
@@ -424,6 +448,170 @@ function migrateTurns(database: Database.Database, from: number, to: number): vo
       "UPDATE turns SET payload = ? WHERE task_id = ? AND turn_id = ?"
     ).run(JSON.stringify(migrated), row.task_id, row.turn_id);
   }
+}
+
+function migrateTasks6To7(database: Database.Database): void {
+  const projectBranches = new Map<string, string>();
+  for (const row of database.prepare("SELECT id, payload FROM projects").all() as {
+    id: string;
+    payload: string;
+  }[]) {
+    const project = jsonRecord(row.payload, "Project");
+    if (typeof project.developmentBranch === "string") {
+      projectBranches.set(row.id, project.developmentBranch);
+    }
+  }
+  const workspaceEntries = new Map<string, Map<string, Record<string, unknown>>>();
+  for (const row of database.prepare(
+    "SELECT task_id, payload FROM managed_workspaces WHERE owner_kind = 'task'"
+  ).all() as { task_id: string; payload: string }[]) {
+    const workspace = jsonRecord(row.payload, "ManagedWorkspace");
+    if (!Array.isArray(workspace.entries)) continue;
+    workspaceEntries.set(row.task_id, new Map(
+      (workspace.entries as Record<string, unknown>[])
+        .filter((entry) => typeof entry.projectId === "string")
+        .map((entry) => [entry.projectId as string, entry])
+    ));
+  }
+  const latestCommitted = new Map<string, Readonly<{ id: string; commit: string }>>();
+  for (const row of database.prepare(
+    "SELECT task_id, integration_id, payload FROM integration_attempts"
+  ).all() as { task_id: string; integration_id: string; payload: string }[]) {
+    const attempt = jsonRecord(row.payload, "IntegrationAttempt");
+    if (attempt.status !== "committed"
+      || typeof attempt.projectId !== "string"
+      || typeof attempt.candidateCommit !== "string") continue;
+    const key = `${row.task_id}\u0000${attempt.projectId}`;
+    const previous = latestCommitted.get(key);
+    if (previous === undefined
+      || previous.id.localeCompare(row.integration_id, undefined, { numeric: true }) < 0) {
+      latestCommitted.set(key, {
+        id: row.integration_id,
+        commit: attempt.candidateCommit
+      });
+    }
+  }
+  const rows = database.prepare(
+    "SELECT task_id, payload FROM task_records"
+  ).all() as { task_id: string; payload: string }[];
+  for (const row of rows) {
+    const task = jsonRecord(row.payload, "Task");
+    if (task.schemaVersion === 7) continue;
+    if (task.schemaVersion !== 6 || !Array.isArray(task.projectBindings)) {
+      throw new Error(`Task ${row.task_id} cannot migrate from version ${String(task.schemaVersion)}.`);
+    }
+    const entries = workspaceEntries.get(row.task_id);
+    const projectBindings = (task.projectBindings as Record<string, unknown>[]).map((binding) => {
+      if (typeof binding.projectId !== "string") return binding;
+      const entry = entries?.get(binding.projectId);
+      const recordedBase = typeof entry?.baseCommit === "string"
+        ? entry.baseCommit
+        : typeof binding.baseRef === "string" && isCommit(binding.baseRef)
+          ? binding.baseRef
+          : undefined;
+      const currentCommit = latestCommitted.get(
+        `${row.task_id}\u0000${binding.projectId}`
+      )?.commit ?? recordedBase;
+      const baseRef = typeof binding.baseRef === "string" && isCommit(binding.baseRef)
+        ? projectBranches.get(binding.projectId) ?? binding.baseRef
+        : binding.baseRef;
+      return {
+        ...binding,
+        baseRef,
+        ...(recordedBase === undefined || currentCommit === undefined
+          ? {}
+          : { baseCommit: recordedBase, currentCommit })
+      };
+    });
+    const migrated = { ...task, schemaVersion: 7, projectBindings };
+    validateTask(migrated as never);
+    database.prepare(
+      "UPDATE task_records SET payload = ? WHERE task_id = ?"
+    ).run(JSON.stringify(migrated), row.task_id);
+  }
+}
+
+function migrateIntegrations5To6(database: Database.Database, now: Date): void {
+  const timestamp = now.toISOString();
+  const rows = database.prepare(
+    "SELECT task_id, integration_id, payload FROM integration_attempts"
+  ).all() as { task_id: string; integration_id: string; payload: string }[];
+  for (const row of rows) {
+    const attempt = jsonRecord(row.payload, "IntegrationAttempt");
+    if (attempt.schemaVersion === 6) continue;
+    if (attempt.schemaVersion !== 5
+      || typeof attempt.expectedHead !== "string"
+      || !Array.isArray(attempt.changeSetIds)
+      || attempt.changeSetIds.length === 0) {
+      throw new Error(
+        `IntegrationAttempt ${row.integration_id} cannot migrate from version ${
+          String(attempt.schemaVersion)
+        }.`
+      );
+    }
+    const active = ["running", "blocked", "validating"].includes(String(attempt.status));
+    const {
+      expectedHead,
+      changeSetIds,
+      conflict: _conflict,
+      resolution: _resolution,
+      endedAt: previousEndedAt,
+      ...base
+    } = attempt;
+    const status = active ? "failed" : attempt.status;
+    const candidateCommit = typeof attempt.candidateCommit === "string"
+      ? attempt.candidateCommit
+      : undefined;
+    const migrated = {
+      ...base,
+      schemaVersion: 6,
+      source: {
+        kind: "historical-change-sets",
+        changeSetIds
+      },
+      beforeCommit: expectedHead,
+      status,
+      ...(status === "committed" && candidateCommit !== undefined
+        ? {
+            afterCommit: candidateCommit,
+            summary: "Migrated committed Integration with historical ChangeSet provenance."
+          }
+        : {}),
+      ...(active
+        ? {
+            checks: [
+              ...(Array.isArray(attempt.checks) ? attempt.checks : []),
+              {
+                name: "storage-migration",
+                outcome: "failed",
+                details: "The pre-v6 Integration source model was retired; create a new Integration."
+              }
+            ],
+            updatedAt: timestamp,
+            endedAt: timestamp
+          }
+        : previousEndedAt === undefined ? {} : { endedAt: previousEndedAt })
+    };
+    validateIntegrationAttempt(migrated as never);
+    const migratedRecord = migrated as unknown as Record<string, unknown>;
+    database.prepare(
+      `UPDATE integration_attempts
+       SET status = ?, payload = ?, updated_at = ?
+       WHERE task_id = ? AND integration_id = ?`
+    ).run(
+      migrated.status,
+      JSON.stringify(migrated),
+      typeof migratedRecord.updatedAt === "string"
+        ? migratedRecord.updatedAt
+        : timestamp,
+      row.task_id,
+      row.integration_id
+    );
+  }
+}
+
+function isCommit(value: string): boolean {
+  return /^[a-f0-9]{40}(?:[a-f0-9]{24})?$/iu.test(value);
 }
 
 function assertDatabaseHealthy(database: Database.Database): void {
