@@ -33,6 +33,7 @@ import {
   startTaskExecutionCommand,
   stopTaskExecutionCommand
 } from "../../dist/commands/taskExecutionCommands.js";
+import { upsertTaskPublication } from "../../dist/commands/taskPublicationCommands.js";
 import { runTaskCommand } from "../../dist/commands/taskCommands.js";
 import {
   createGlobalRole,
@@ -79,6 +80,7 @@ import {
 } from "../../dist/execution/workItemExecution.js";
 import { projectReviewerAvailability } from "../../dist/review/reviewerAvailability.js";
 import { projectNextAction } from "../../dist/task/nextAction.js";
+import { projectTaskRemoteDelivery } from "../../dist/task/remoteDelivery.js";
 import { listPublicCommandPaths } from "../../dist/cli/commandCatalog.js";
 import { runUpdate } from "../../dist/cli/updateOrchestrator.js";
 import { acquireHandoverLock, readHandoverFence } from "../../dist/release/runtimeRelease.js";
@@ -148,11 +150,143 @@ test("the packaged CLI starts and exposes the core workflow", () => {
     assert.ok(commands.includes(command), `missing core command: ${command}`);
   }
   assert.ok(commands.includes("task turn list"));
+  assert.ok(commands.includes("task publication upsert"));
+  assert.ok(commands.includes("task publication verify"));
+  assert.ok(commands.includes("task remote-delivery"));
+  assert.equal(commands.includes("task publication add"), false);
   assert.equal(commands.some((command) => command.startsWith("task run")), false);
   assert.equal(commands.includes("task rebuild"), false);
   assert.equal(commands.some((command) => command.startsWith("task history")), false);
   assert.equal(commands.includes("task review rebind"), false);
   assert.equal(commands.includes("task role session switch"), false);
+});
+
+test("publication evidence changes stay exact across upsert and remote delivery", () => {
+  const baseCommit = "1".repeat(40);
+  const headCommit = "2".repeat(40);
+  const originalRemoteCommit = "3".repeat(40);
+  const replacementRemoteCommit = "4".repeat(40);
+  const task = {
+    schemaVersion: 6,
+    id: "task-1",
+    title: "Publish exact head",
+    status: "active",
+    executionGate: { state: "enabled" },
+    projectBindings: [{
+      projectId: "project-1",
+      directory: "Repo",
+      baseRef: "master"
+    }],
+    createdAt: "2026-09-02T00:00:00.000Z",
+    updatedAt: "2026-09-02T00:00:00.000Z"
+  };
+  const verifiedPublication = {
+    schemaVersion: 1,
+    id: "publication-1",
+    taskId: task.id,
+    projectId: "project-1",
+    provider: "github",
+    repository: "example/repo",
+    externalKind: "pull-request",
+    externalId: "17",
+    localCommit: headCommit,
+    remoteCommit: originalRemoteCommit,
+    state: "merged",
+    verification: "verified",
+    evidence: "provider-confirmed merge",
+    mergedAt: "2026-09-02T00:01:00.000Z",
+    recordedBy: "operator",
+    source: "manual",
+    createdAt: "2026-09-02T00:01:00.000Z"
+  };
+  const publicationIdentity = {
+    projectId: "project-1",
+    provider: "github",
+    repository: "example/repo",
+    externalKind: "pull-request",
+    externalId: "17"
+  };
+  const applyUpsert = (input) => {
+    const publications = [verifiedPublication];
+    const events = [];
+    const reference = upsertTaskPublication({
+      findPublicationReferenceByExternalKey: () => publications.at(-1),
+      nextPublicationReferenceId: () => `publication-${publications.length + 1}`,
+      savePublicationReference: (_taskId, publication) => publications.push(publication),
+      nextEventId: () => `event-${events.length + 1}`,
+      saveEvent: (_taskId, event) => events.push(event)
+    }, task, { ...publicationIdentity, ...input }, "leader", new Date(
+      "2026-09-02T00:02:00.000Z"
+    ));
+    return { reference, publications, events };
+  };
+  const replay = applyUpsert({
+    remoteCommit: originalRemoteCommit.toUpperCase()
+  }).reference;
+  assert.equal(replay.idempotent, true);
+  const changedResult = applyUpsert({
+    remoteCommit: replacementRemoteCommit
+  });
+  const changed = changedResult.reference;
+  assert.equal(changed.reference.verification, "reported");
+  assert.equal(changed.reference.evidence, undefined);
+  assert.equal(changed.reference.mergedAt, undefined);
+  const evidenceChanged = applyUpsert({ evidence: "replacement evidence" }).reference;
+  assert.equal(evidenceChanged.reference.verification, "reported");
+  assert.equal(evidenceChanged.reference.remoteCommit, undefined);
+  assert.equal(evidenceChanged.reference.mergedAt, undefined);
+  const mergedAtChanged = applyUpsert({
+    mergedAt: "2026-09-02T00:04:00.000Z"
+  }).reference;
+  assert.equal(mergedAtChanged.reference.verification, "reported");
+  assert.equal(mergedAtChanged.reference.remoteCommit, undefined);
+  assert.equal(mergedAtChanged.reference.evidence, undefined);
+  const publications = changedResult.publications;
+  const events = changedResult.events;
+
+  const managedWorkspaces = [{
+    schemaVersion: 2,
+    owner: { type: "task", taskId: task.id },
+    root: "/tmp/task-1",
+    entries: [{
+      projectId: "project-1",
+      directory: "Repo",
+      access: "write",
+      path: "/tmp/task-1/Repo",
+      branch: "yui/task-1/main",
+      baseRef: "master",
+      baseCommit
+    }],
+    createdAt: "2026-09-02T00:00:00.000Z",
+    updatedAt: "2026-09-02T00:00:00.000Z"
+  }];
+  const projection = projectTaskRemoteDelivery({
+    task,
+    events,
+    publications,
+    managedWorkspaces,
+    turns: [],
+    currentCandidate: {
+      projects: [{ projectId: "project-1", commit: headCommit }]
+    }
+  });
+  assert.equal(projection.status, "merged");
+  assert.equal(projection.allMerged, true);
+  assert.equal(projection.allVerified, false);
+  assert.equal(projection.integratedCoverageSatisfied, false);
+  assert.equal(projection.projects[0].expectedLocalCommit, headCommit);
+  assert.equal(projection.projects[0].remoteCommit, replacementRemoteCommit);
+
+  const unavailable = projectTaskRemoteDelivery({
+    task,
+    events,
+    publications,
+    managedWorkspaces,
+    turns: [],
+    currentCandidate: null
+  });
+  assert.equal(unavailable.status, "unavailable");
+  assert.equal(unavailable.allMerged, false);
 });
 
 test("update quiesces the exact Controller before an adjacent storage migration", () => {

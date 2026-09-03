@@ -89,6 +89,13 @@ import {
   planReplicatedWorkItemLanes,
   validateTaskArchiveRequest
 } from "./commands/taskCommands.js";
+import {
+  assertTaskRemoteDeliveryIntegrated,
+  createTaskRemoteDeliveryProof,
+  type TaskRemoteDeliveryProof
+} from "./commands/taskRemoteDeliveryCommand.js";
+import { runTaskPublicationVerifyCommand } from "./commands/taskPublicationVerifyCommand.js";
+import { createGitHubCliPublicationVerifier } from "./external/githubPublicationVerifier.js";
 import { taskActor } from "./commands/taskActor.js";
 import {
   parseTaskExecutionStartRequest,
@@ -1088,6 +1095,28 @@ export async function main(): Promise<void> {
       emit(result.output, false, result.data);
       return;
     }
+    if (resolved[1] === "publication" && resolved[2] === "verify") {
+      const result = await runTaskPublicationVerifyCommand(
+        resolved.slice(3),
+        store,
+        {
+          verifiers: {
+            github: createGitHubCliPublicationVerifier({
+              environmentPath: process.env.PATH
+            })
+          },
+          candidateForTask: async (taskId) => {
+            const status = store.getTask(taskId)?.status;
+            return status === "active" || status === "retired"
+              ? snapshotActualTaskReviewCandidate(taskId, store, workspacePreparer)
+              : null;
+          },
+          environment: process.env
+        }
+      );
+      emit(result.output, false, result.data);
+      return;
+    }
     if (resolved[1] === "overlap") {
       const result = await runTaskOverlapCommand(resolved.slice(2), store);
       emit(result.output, false, result.data);
@@ -1312,15 +1341,38 @@ export async function main(): Promise<void> {
       });
       return;
     }
+    let archiveRemoteDeliveryProof: TaskRemoteDeliveryProof | undefined;
+    let archiveTaskReviewCandidate: TaskReviewCandidate | undefined;
     if (resolved[1] === "archive") {
-      const { taskId, disposition } = validateTaskArchiveRequest(
+      const { taskId, disposition, forceUnverified } = validateTaskArchiveRequest(
         resolved.slice(2),
         store,
-        { runtime, environment: process.env, yuiHome: home }
+        {
+          runtime,
+          environment: process.env,
+          yuiHome: home
+        }
       );
       const task = store.getTask(taskId);
       if (task === null) throw new Error(`Task disappeared after archive validation: ${taskId}.`);
       if (task.status !== "archived") {
+        if (disposition === "integrated") {
+          archiveTaskReviewCandidate = await actualTaskReviewCandidateForTaskCommand(
+            resolved,
+            store,
+            workspacePreparer,
+            process.env
+          );
+          archiveRemoteDeliveryProof = createTaskRemoteDeliveryProof(
+            store,
+            task,
+            archiveTaskReviewCandidate ?? null
+          );
+          assertTaskRemoteDeliveryIntegrated(
+            archiveRemoteDeliveryProof.delivery,
+            { forceUnverified }
+          );
+        }
         const workItemIds = store.listManagedWorkspaces(task.id)
           .flatMap(({ owner }) => owner.type === "work-item" ? [owner.workItemId] : []);
         for (const workItemId of workItemIds) {
@@ -1545,12 +1597,14 @@ export async function main(): Promise<void> {
         process.env,
         taskFinalReviewContract
       );
-      const actualTaskReviewCandidate = await actualTaskReviewCandidateForTaskCommand(
-        resolved,
-        store,
-        workspacePreparer,
-        process.env
-      );
+      const actualTaskReviewCandidate = archiveRemoteDeliveryProof === undefined
+        ? await actualTaskReviewCandidateForTaskCommand(
+          resolved,
+          store,
+          workspacePreparer,
+          process.env
+        )
+        : archiveTaskReviewCandidate;
       const deltaRecheckPreflight = await deltaRecheckPreflightForTaskCommand(
         resolved.slice(1),
         store,
@@ -1591,6 +1645,9 @@ export async function main(): Promise<void> {
           ...(actualTaskReviewCandidate === undefined
             ? {}
             : { actualTaskReviewCandidate }),
+          ...(archiveRemoteDeliveryProof === undefined
+            ? {}
+            : { archiveRemoteDeliveryProof }),
           ...(deltaRecheckPreflight === undefined
             ? {}
             : { deltaRecheckPreflight }),
@@ -2596,12 +2653,22 @@ async function actualTaskReviewCandidateForTaskCommand(
       && (round.scope ?? "work-item") === "task") {
       taskId = reference.taskId;
     }
-  } else if ((args[1] === "context" || args[1] === "next-action")
+  } else if (args[1] === "archive"
+    && args[2] !== undefined
+    && args.includes("--integrated")) {
+    taskId = store.getTask(args[2])?.id;
+  } else if ((
+    args[1] === "show"
+    || args[1] === "context"
+    || args[1] === "next-action"
+    || args[1] === "remote-delivery"
+  )
     && args[2] !== undefined) {
     taskId = store.getTask(args[2])?.id;
     decisionSupportRead = true;
   }
-  if (taskId === undefined || store.getTask(taskId)?.status !== "active") return undefined;
+  const status = taskId === undefined ? undefined : store.getTask(taskId)?.status;
+  if (taskId === undefined || (status !== "active" && status !== "retired")) return undefined;
   try {
     return await snapshotActualTaskReviewCandidate(taskId, store, preparer);
   } catch (error) {

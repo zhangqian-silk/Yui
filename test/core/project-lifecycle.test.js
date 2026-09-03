@@ -7,6 +7,7 @@ import test from "node:test";
 
 import { runProjectCommand } from "../../dist/commands/projectCommands.js";
 import { runTaskCommand } from "../../dist/commands/taskCommands.js";
+import { createTaskRemoteDeliveryProof } from "../../dist/commands/taskRemoteDeliveryCommand.js";
 import { runTaskUpstreamCommand } from "../../dist/commands/taskUpstreamCommands.js";
 import { GitIntegrationService } from "../../dist/integration/gitIntegrationService.js";
 import {
@@ -25,7 +26,7 @@ import { latestStorageVersionState } from "../../dist/storage/upgrade/recordVers
 import { inspectStorageSchema } from "../../dist/storage/storageSchema.js";
 import { SqliteTaskStore } from "../../dist/storage/sqliteStore.js";
 import { projectNextAction } from "../../dist/task/nextAction.js";
-import { activateTask, completeTask, createTask } from "../../dist/task/task.js";
+import { activateTask, createTask } from "../../dist/task/task.js";
 import {
   createCandidateGitSnapshot,
   createWorkItem,
@@ -253,10 +254,23 @@ test("WorkItem no-op Integration records the decision and archive removes all co
   assert.equal(store.listChangeSets(task.id).length, 0);
 
   store.saveWorkItem(task.id, updateWorkItemStatus(item, "completed", now, "accepted no-op"));
-  store.saveTask(completeTask(store.getTask(task.id), now, {
-    by: "user",
-    summary: "No code change was required."
-  }));
+  runTaskCommand([
+    "complete",
+    task.id,
+    "--summary",
+    "No code change was required."
+  ], store, {
+    now: () => now,
+    environment: userEnv,
+    actualTaskReviewCandidate: {
+      schemaVersion: 1,
+      projects: [{ projectId: "project-1", commit: beforeCommit }]
+    }
+  });
+  const archiveRemoteDeliveryProof = createTaskRemoteDeliveryProof(
+    store,
+    store.getTask(task.id)
+  );
   const coordinator = new TaskWorkspaceCoordinator(store, preparer, {
     async stopTaskRoleSessions() {},
     async assertTaskPhysicalResourcesReleased() {}
@@ -268,7 +282,8 @@ test("WorkItem no-op Integration records the decision and archive removes all co
 
   runTaskCommand(["archive", task.id, "--integrated"], store, {
     now: () => now,
-    environment: userEnv
+    environment: userEnv,
+    archiveRemoteDeliveryProof
   });
   assert.equal(store.getTask(task.id).status, "archived");
   assert.equal(store.getWorkItem(task.id, item.id).status, "completed");

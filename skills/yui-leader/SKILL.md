@@ -163,6 +163,57 @@ a Message only for a new semantic conclusion with value to another reader, and
 create an InputRequest only for a real user choice, authorization, or
 unavailable external fact that blocks progress.
 
+## Record confirmed publication state
+
+When you create, reuse, close, reopen, or merge a Task's PR/MR, or receive a
+result that confirms one of those state changes, update the Task's Publication
+with `task publication upsert` before ending the same work stage:
+
+```sh
+yui task publication upsert <task> --project <project> \
+  --provider github --repository <owner/name> --kind pull-request --id <number> \
+  --url <url> --state open --reported
+```
+
+Write only the repository identity, URL, state, and commit or merge evidence
+already available to you. Omitted metadata inherits the current record.
+Omitted verification and merge evidence inherit only while the complete
+evidence context is unchanged: local commit, state, remote commit, evidence,
+and `mergedAt`. Changing any explicitly supplied context value resets omitted
+verification to `reported` and clears omitted merge-evidence fields; changing
+only the local commit also defaults the Publication to `open`. For a reported
+merge, include the exact local commit, remote commit, `mergedAt`, and evidence
+when available.
+When you execute an authorized GitHub PR merge yourself, immediately upsert
+that merge result and run
+`yui task publication verify <task>/<publication>` before ending the same work
+stage. The verifier queries the exact GitHub PR through local `gh`, checks its
+head against the Task delivery head, and appends the verified superseding
+record. If either synchronization or verification fails, preserve and report
+the failure rather than claiming verified delivery. Do not run provider
+verification merely to refresh state when the current authorization does not
+cover that real external resource. Publication is external delivery evidence
+only: it does not replace Candidate capture, Review, Integration, acceptance,
+or Task completion gates.
+
+When deciding or reporting whether all Task code is merged, read
+`yui task remote-delivery <task>` instead of equating `completed` with merged.
+The projection compares the current Task-main heads (provisional while active
+or reopened) or the latest frozen completion heads with current unsuperseded
+Publications. A Project contributes `allMerged` only when the Publication
+records that exact local head in state `merged`; `allVerified` remains a
+separate stronger fact. Reopening and adding a commit therefore makes old merge
+evidence stale until Publication is upserted for the new head. Archive
+`--integrated` requires both exact merged and verified coverage. If every head
+is merged but a Publication is still reported, run its explicit verification
+before proposing archive. `--integrated --force` may override only that
+verification gap and requires explicit user authorization for the exact Task;
+it never overrides missing, stale, open, or closed merge evidence. Deliberate
+non-merge uses the existing explicit `--abandon` path.
+If an older completed Task lacks frozen completion heads, reopen and complete
+it again to record them; never infer the missing head from a Publication or
+worktree.
+
 ## Lead with judgment
 
 - `yui task next-action <task-id>` is decision support, not an autopilot. It

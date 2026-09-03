@@ -356,9 +356,7 @@ export class TaskWorkspaceCoordinator {
         );
       }
       const roleNames = this.store.listRoles(taskId).map(({ name }) => name);
-      if (roleNames.length > 0) {
-        await this.runtime.stopTaskRoleSessions(taskId, roleNames);
-      }
+      await this.#stopLiveRoles(taskId, roleNames);
       await this.runtime.assertTaskPhysicalResourcesReleased?.(task.id);
       this.#assertTaskArchiveSnapshot(snapshot);
       for (const workspace of laneWorkspaces) {

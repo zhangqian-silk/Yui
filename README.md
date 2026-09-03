@@ -680,6 +680,76 @@ yui task context <task-id>
 
 Use the narrower `task work`, `task message`, `task turn`, and Task Knowledge commands when you need one collection or record.
 
+Record a Task's confirmed PR/MR delivery state with one idempotent command:
+
+```sh
+yui task publication upsert <task-id> --project <project> \
+  --provider github --repository <owner/name> --kind pull-request --id <number> \
+  --url <url> --state open --reported
+```
+
+The required provider/repository/external ID selects the current Publication.
+The first upsert creates it. Later upserts inherit omitted metadata and omitted
+merge evidence only while the full evidence context remains unchanged. That
+context is the local commit, PR/MR state, remote commit, evidence text, and
+merge time. If any explicitly supplied context value differs, omitted
+verification resets to `reported` and omitted merge-evidence fields are
+cleared; changing the local commit without an explicit state also resets the
+Publication to `open`. Resupplying identical values remains idempotent. Each
+semantic change appends a new immutable record linked to the previous version,
+while identical input creates no event. `list`, `show`, and `task context`
+retain the complete history. This records facts already known to the caller;
+it does not query a provider or replace Review, Integration, or Task completion
+gates.
+
+Verify one current GitHub Publication against the real PR state:
+
+```sh
+yui task publication verify <task-id>/<publication-id>
+```
+
+Verification is an explicit external read. The first implementation invokes a
+trusted, PATH-pinned local `gh` executable and reuses its authentication; Yui
+does not store a GitHub token. The command requires the current unsuperseded
+Publication to record the exact Task delivery head, then requires GitHub to
+report the same PR head as merged and to return a remote merge commit. It
+rechecks the Task head and Publication after the remote call before appending a
+new immutable `verified` record. Missing `gh`, unavailable authentication,
+ambiguous provider output, open/closed PRs, moved heads, and concurrent local
+changes fail without recording verification. GitLab verification is not
+implemented in this first version.
+
+Query whether every delivered Project head is represented by a current merged
+Publication:
+
+```sh
+yui task remote-delivery <task-id>
+yui task remote-delivery <task-id> --json
+```
+
+This is a read-only derived projection, not a Task status or writable `merged`
+flag. Active and reopened Tasks use the current clean Task-main heads and mark
+them provisional; completed and archived Tasks use the latest frozen
+`task.completed` heads. For each Project, Yui reports the expected local
+commit, the matching current unsuperseded Publication, PR/MR state,
+verification, and remote commit. Aggregate coverage is `none`, `unavailable`,
+`pending`, `partial`, or `merged`, with independent `allMerged` and
+`allVerified` values.
+Only a current Publication whose `localCommit` exactly matches the expected
+head and whose state is `merged` contributes merged coverage. Missing commits,
+open/closed records, stale heads, and superseded Publications never imply
+remote delivery. Projects whose Task head equals their managed base need no
+Publication. `task show`, `task context`, `task next-action`, and the Web detail
+projection use this same selector.
+`Archive --integrated coverage` requires both `allMerged=true` and
+`allVerified=true`.
+
+When a valid older completed Task has no frozen completion heads, Yui reports
+`unavailable` and keeps integrated archive fail-closed. Reopen and complete the
+Task again to record exact heads, then retry archive. Yui does not guess the
+missing head from a Publication or worktree, and `--force` never overrides
+missing head evidence.
+
 When the requested outcome is finished, complete the Task to stop automatic Leader wakes without deleting its sessions or Task main worktree:
 
 ```sh
@@ -719,9 +789,17 @@ worktrees are non-blocking completion advisories, but they must be settled
 before archive. Every isolated WorkItem worktree is explicitly cleaned as
 integrated or abandoned; that cleanup also removes its managed branch. Archive
 requires `--integrated` or `--abandon` to state the Task main outcome and is
-allowed only after Task main is clean. It removes managed worktrees but retains
-Task and WorkItem records. The Task main branch is retained as a recovery
-artifact instead of being silently deleted.
+allowed only after Task main is clean. `--integrated` additionally requires
+remote-delivery `allMerged=true` and `allVerified=true`; Task completion or a
+reported merge alone is never treated as verified remote delivery. When every
+exact Task head is merged but one or more Publications remain `reported`, the
+command identifies those Publications and refuses archive. An explicitly
+authorized `task archive <task-id> --integrated --force` may override only that
+verification gap and records the override in the archive event; it never
+bypasses missing, stale, open, or closed merge evidence. An intentional
+non-merge uses the existing explicit `--abandon` path. Archive removes managed
+worktrees but retains Task and WorkItem records. The Task main branch is
+retained as a recovery artifact instead of being silently deleted.
 Task lifecycle completion/selection only suggests valid source states: Draft for activate, active for complete, and completed for reopen.
 
 ## Sessions and tmux

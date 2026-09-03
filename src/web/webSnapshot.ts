@@ -23,6 +23,10 @@ import {
   projectSessionTokenMetrics,
   resolveSessionTokenIdentity
 } from "../runtime/sessionTokenMetrics.js";
+import {
+  projectTaskRemoteDelivery,
+  type TaskRemoteDelivery
+} from "../task/remoteDelivery.js";
 
 export type WebDashboardStore = Pick<TaskStore,
   | "transaction"
@@ -45,6 +49,8 @@ export type WebDashboardStore = Pick<TaskStore,
   | "listProjects"
   | "listChangeSets"
   | "listIntegrationAttempts"
+  | "listPublicationReferences"
+  | "listManagedWorkspaces"
   | "getWorkMailbox"
   | "getPendingWakeup"
   | "getLeaderFailure"
@@ -204,6 +210,7 @@ export function buildWebTaskDetail(
     });
     const execution = buildTaskExecutionProjection(reader, taskId, task, now);
     if (execution === null) return null;
+    const remoteDelivery = webRemoteDelivery(reader, task);
     const workItems = reader.listWorkItems(taskId);
     const roleSessionSets = reader.listRoleSessionSets(taskId);
     const workItemObservability = new Map(
@@ -215,6 +222,7 @@ export function buildWebTaskDetail(
         ...(projectNames.length === 0 ? {} : { projectNames })
       },
       execution,
+      remoteDelivery,
       observability: execution.observability,
       brief: reader.getTaskBrief(taskId),
       roles,
@@ -234,6 +242,20 @@ export function buildWebTaskDetail(
       decisions: reader.listDecisions(taskId),
       milestones: reader.listMilestones(taskId)
     };
+  });
+}
+
+function webRemoteDelivery(
+  reader: WebDashboardStore,
+  task: Task
+): TaskRemoteDelivery {
+  return projectTaskRemoteDelivery({
+    task,
+    events: reader.listEvents?.(task.id) ?? [],
+    publications: reader.listPublicationReferences(task.id),
+    managedWorkspaces: reader.listManagedWorkspaces(task.id),
+    turns: reader.listTurns(task.id),
+    currentCandidate: null
   });
 }
 

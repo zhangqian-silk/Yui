@@ -141,6 +141,13 @@ import { createDecision, supersedeDecision } from "../decision/decision.js";
 import { createMilestone } from "../milestone/milestone.js";
 import { runPublicationCommand } from "./taskPublicationCommands.js";
 import {
+  assertTaskRemoteDeliveryProof,
+  type TaskRemoteDeliveryProof,
+  projectTaskRemoteDeliveryFromStore,
+  renderTaskRemoteDelivery,
+  runTaskRemoteDeliveryCommand
+} from "./taskRemoteDeliveryCommand.js";
+import {
   enqueueWork,
   requireCompleteWorkExecution,
   settleExactWorkExecution
@@ -488,6 +495,8 @@ export type TaskCommandOptions = Readonly<{
   /** Verified under the release handover lock by the exact global Operator CLI. */
   /** Physical Task-main heads verified by the CLI immediately before command execution. */
   actualTaskReviewCandidate?: TaskReviewCandidate;
+  /** CLI-frozen remote merge coverage checked before destructive archive cleanup. */
+  archiveRemoteDeliveryProof?: TaskRemoteDeliveryProof;
   /** Issue 07: CLI-verified delta-recheck assessment for `task review request --delta-recheck`. */
   deltaRecheckPreflight?: DeltaRecheckPreflight;
   /** Issue 07: per-Project diff text for a delta-recheck dispatch, digest-verified. */
@@ -629,13 +638,22 @@ export function runTaskCommand(
     case "create": return createTaskCommand(rest, store, options);
     case "update": return output(updateTaskCommand(rest, store, options));
     case "list": return listTaskCommand(rest, store);
-    case "show": return showTaskCommand(rest, store);
+    case "show": return showTaskCommand(
+      rest,
+      store,
+      options.actualTaskReviewCandidate ?? null
+    );
     case "context": return runTaskContextCommand(
       rest,
       store,
       options.actualTaskReviewCandidate ?? null
     );
     case "next-action": return runTaskNextActionCommand(
+      rest,
+      store,
+      options.actualTaskReviewCandidate ?? null
+    );
+    case "remote-delivery": return runTaskRemoteDeliveryCommand(
       rest,
       store,
       options.actualTaskReviewCandidate ?? null
@@ -1012,7 +1030,11 @@ function listTaskCommand(args: string[], store: TaskWorkflowStore): TaskCommandE
   return output(rendered, snapshot.result);
 }
 
-function showTaskCommand(args: string[], store: TaskWorkflowStore): TaskCommandExecution {
+function showTaskCommand(
+  args: string[],
+  store: TaskWorkflowStore,
+  currentTaskCandidate: TaskReviewCandidate | null
+): TaskCommandExecution {
   const [taskId] = args;
   exactPositionals(args, 1, "Task show usage: yui task show <id>.");
   const task = requireTask(store, taskId);
@@ -1026,6 +1048,11 @@ function showTaskCommand(args: string[], store: TaskWorkflowStore): TaskCommandE
   const changeSets = store.listChangeSets(task.id);
   const integrations = store.listIntegrationAttempts(task.id);
   const publications = store.listPublicationReferences(task.id);
+  const remoteDelivery = projectTaskRemoteDeliveryFromStore(
+    store,
+    task,
+    currentTaskCandidate
+  );
   const verifiedMergedPublications = publications.filter((reference) => (
     reference.state === "merged" && reference.verification === "verified"
   )).length;
@@ -1086,11 +1113,17 @@ function showTaskCommand(args: string[], store: TaskWorkflowStore): TaskCommandE
     `ChangeSets: ${counts.changeSets}`,
     `Integration Attempts: ${counts.integrations}`,
     `Publication references: ${counts.publications} (${verifiedMergedPublications} verified merged)`,
+    renderTaskRemoteDelivery(remoteDelivery).trimEnd(),
     `Open inputs: ${counts.openInputs}`,
     `Created: ${presentTime(task.createdAt, timeZone)}`,
     `Updated: ${presentTime(task.updatedAt, timeZone)}`
   ].join("\n").concat("\n");
-  return output(rendered, { task, counts, hasBrief: brief !== null });
+  return output(rendered, {
+    task,
+    counts,
+    hasBrief: brief !== null,
+    remoteDelivery
+  });
 }
 
 function activateTaskCommand(
@@ -1221,16 +1254,28 @@ function completeTaskCommand(
         tree: publishedTreeProof.tree
       }, now);
     }
+    const taskWorkspace = readinessFacts.managedWorkspaces.find((workspace) => (
+      workspace.owner.type === "task"
+      && workspace.owner.taskId === task.id
+    ));
+    const completedProjectHeads = actualTaskCandidate === undefined
+      ? undefined
+      : formatProjectCommits(actualTaskCandidate.projects);
+    const completedProjectBases = taskWorkspace === undefined
+      ? undefined
+      : formatProjectCommits(taskWorkspace.entries.map(({ projectId, baseCommit }) => ({
+        projectId,
+        commit: baseCommit
+      })));
     const terminalEvent = recordTaskEvent(tx, task.id, "task.completed", {
       by: actor,
       summary,
-      ...(actualTaskCandidate === undefined
+      ...(completedProjectHeads === undefined
         ? {}
-        : {
-            projectHeads: actualTaskCandidate.projects
-              .map(({ projectId, commit }) => `${projectId}@${commit}`)
-              .join(",")
-          }),
+        : { projectHeads: completedProjectHeads }),
+      ...(completedProjectBases === undefined
+        ? {}
+        : { projectBases: completedProjectBases }),
       ...(readiness.advisories.length === 0
         ? {}
         : { cleanupAdvisories: String(readiness.advisories.length) })
@@ -1324,6 +1369,14 @@ function archiveTaskCommand(
       && task.status !== "retired") {
       throw usageError(`Task ${task.id} must be completed or retired before it can be archived.`);
     }
+    const remoteDelivery = request.disposition === "integrated"
+      ? assertTaskRemoteDeliveryProof(
+        tx,
+        task,
+        options.archiveRemoteDeliveryProof,
+        { forceUnverified: request.forceUnverified }
+      )
+      : undefined;
     assertNoOpenInputRequests(tx, task.id, "archiving the Task");
     const unresolvedIntegration = tx.listIntegrationAttempts(task.id).find((integration) => (
       integration.status === "running"
@@ -1374,9 +1427,37 @@ function archiveTaskCommand(
     for (const role of tx.listRoles(task.id)) {
       tx.removeWorkMailbox(roleMailbox(task.id, role.name));
     }
+    const remoteProjectHeads = remoteDelivery === undefined
+      ? undefined
+      : formatProjectCommits(
+        remoteDelivery.projects.map(({ projectId, expectedLocalCommit }) => ({
+          projectId,
+          commit: expectedLocalCommit
+        }))
+      );
+    const remoteProjectBases = remoteDelivery === undefined
+      ? undefined
+      : formatProjectCommits(
+        remoteDelivery.projects.map(({ projectId, baseCommit }) => ({
+          projectId,
+          commit: baseCommit
+        }))
+      );
     recordTaskEvent(tx, task.id, "task.archived", {
       by: actor,
-      workspaceDisposition: request.disposition
+      workspaceDisposition: request.disposition,
+      ...(remoteDelivery === undefined
+        ? {}
+        : {
+            mergeCoverage: remoteDelivery.status,
+            allMerged: String(remoteDelivery.allMerged),
+            allVerified: String(remoteDelivery.allVerified),
+            ...(request.forceUnverified && !remoteDelivery.allVerified
+              ? { verificationOverride: "true" }
+              : {})
+          }),
+      ...(remoteProjectHeads === undefined ? {} : { projectHeads: remoteProjectHeads }),
+      ...(remoteProjectBases === undefined ? {} : { projectBases: remoteProjectBases })
     }, now);
     enqueueWork(tx, taskMailbox(task.id), "task-archived", now, [taskRef(task.id)]);
     return { task: archived, changed: true } as const;
@@ -1557,22 +1638,50 @@ function assertTaskRetirementProof(
 
 export function parseTaskArchiveArguments(
   args: readonly string[]
-): Readonly<{ taskId: string; disposition: "integrated" | "abandoned" }> {
-  const usage = "Task archive usage: yui task archive <id> (--integrated|--abandon).";
-  if (args.length !== 2 || !["--integrated", "--abandon"].includes(args[1] ?? "")) {
+): Readonly<{
+  taskId: string;
+  disposition: "integrated" | "abandoned";
+  forceUnverified: boolean;
+}> {
+  const usage = "Task archive usage: "
+    + "yui task archive <id> (--integrated [--force]|--abandon).";
+  const taskId = args[0]?.trim();
+  const flags = args.slice(1);
+  if (taskId === undefined
+    || taskId.length === 0
+    || flags.some((flag, index) => (
+      !["--integrated", "--abandon", "--force"].includes(flag)
+      || flags.indexOf(flag) !== index
+    ))) {
+    throw usageError(usage);
+  }
+  const integrated = flags.includes("--integrated");
+  const abandoned = flags.includes("--abandon");
+  const forceUnverified = flags.includes("--force");
+  if (integrated === abandoned || (forceUnverified && !integrated)) {
     throw usageError(usage);
   }
   return {
-    taskId: args[0]!,
-    disposition: args[1] === "--integrated" ? "integrated" : "abandoned"
+    taskId,
+    disposition: integrated ? "integrated" : "abandoned",
+    forceUnverified
   };
+}
+
+function formatProjectCommits(
+  projects: readonly Readonly<{ projectId: string; commit: string | null }>[]
+): string | undefined {
+  const values = projects.flatMap(({ projectId, commit }) => (
+    commit === null ? [] : [`${projectId}@${commit}`]
+  ));
+  return values.length === 0 ? undefined : values.join(",");
 }
 
 export function validateTaskArchiveRequest(
   args: readonly string[],
   store: TaskWorkflowStore,
   options: TaskCommandOptions = {}
-): Readonly<{ taskId: string; disposition: "integrated" | "abandoned" }> {
+): ReturnType<typeof parseTaskArchiveArguments> {
   const request = parseTaskArchiveArguments(args);
   const task = requireTask(store, request.taskId);
   taskActor(store, options, task.id);
