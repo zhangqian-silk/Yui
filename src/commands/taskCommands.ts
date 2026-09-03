@@ -7369,15 +7369,16 @@ function resolveTaskRoleAgentBindingUpdate(
   const explicitAgentId = parsed.one("--agent")?.trim();
   const targetAgentId = explicitAgentId || role.activeAgentId;
 
+  if (profile?.runtime.source === "global-worker"
+    && explicitAgentId === undefined
+    && !changesAgentConfig) {
+    return undefined;
+  }
+
   let binding: RoleAgentBinding;
   if (profile !== undefined) {
     const profileRuntime = resolvedAgentProfileRuntime(profile, store);
     if (profileRuntime.binding.agentId !== targetAgentId) {
-      if (profile.runtime.source === "global-worker"
-        && explicitAgentId === undefined
-        && !changesAgentConfig) {
-        return undefined;
-      }
       const target = explicitAgentId === undefined
         ? `active Agent ${role.activeAgentId}`
         : `--agent ${explicitAgentId}`;
