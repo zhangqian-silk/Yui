@@ -61,6 +61,35 @@ export type TurnContextPack = Readonly<{
   }>;
   budget: TurnContextBudgetResult;
   digest: string;
+  liveTaskState: TurnContextLiveTaskState;
+}>;
+
+/**
+ * What is true on the Task right now, read when the Pack was built.
+ *
+ * Everything else in the Pack is the frozen contract this Turn was handed. A
+ * long-running Turn can be handed that contract and then find the Task has
+ * moved on: another Role may still be executing, or a Task-final Review may
+ * still be in flight. Without this block a Leader has to already suspect that
+ * and go ask, which is exactly the situation where it will not.
+ *
+ * These are record pointers, not content, and they gate nothing. They sit
+ * outside the content digest on purpose: that digest is the delta cursor for
+ * the frozen refs and must not move just because the world moved.
+ */
+export type TurnContextLiveTaskState = Readonly<{
+  activeTurns: readonly Readonly<{
+    turnId: string;
+    roleName: string;
+    purpose: Turn["purpose"];
+    workItemId?: string;
+    reviewRoundId?: string;
+  }>[];
+  activeTaskReviews: readonly Readonly<{
+    reviewRoundId: string;
+    reviewerRoleName: string;
+    status: "pending" | "running";
+  }>[];
 }>;
 
 type MaterializedRef = Readonly<{ ref: ContextRef; value: unknown }>;
@@ -359,9 +388,37 @@ export function buildTurnContextPack(store: TaskStore, taskId: string, turnId: s
       returnedBytes: preliminaryBytes,
       truncated: false as const
     }),
-    digest
+    digest,
+    liveTaskState: readLiveTaskState(store, taskId)
   });
   return pack;
+}
+
+/** Reads the Task's current in-flight execution, outside the frozen contract. */
+function readLiveTaskState(store: TaskStore, taskId: string): TurnContextLiveTaskState {
+  const activeTurns = store.listTurns(taskId)
+    .filter((turn) => turn.status === "active")
+    .map((turn) => Object.freeze({
+      turnId: turn.id,
+      roleName: turn.roleName,
+      purpose: turn.purpose,
+      ...(turn.workItemId === undefined ? {} : { workItemId: turn.workItemId }),
+      ...(turn.reviewRoundId === undefined ? {} : { reviewRoundId: turn.reviewRoundId })
+    }));
+  const activeTaskReviews = store.listReviewRounds(taskId)
+    .filter((round) => (
+      (round.scope ?? "work-item") === "task"
+      && (round.status === "pending" || round.status === "running")
+    ))
+    .map((round) => Object.freeze({
+      reviewRoundId: round.id,
+      reviewerRoleName: round.reviewerRoleName,
+      status: round.status as "pending" | "running"
+    }));
+  return Object.freeze({
+    activeTurns: Object.freeze(activeTurns),
+    activeTaskReviews: Object.freeze(activeTaskReviews)
+  });
 }
 
 export function expandTurnContextRef(

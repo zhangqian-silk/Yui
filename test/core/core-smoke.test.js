@@ -48,6 +48,8 @@ import { runtimeLifecycleTarget } from "../../dist/runtime/lifecycleReservation.
 import { createExactControlPlaneDescriptor } from "../../dist/runtime/exactControlPlane.js";
 import { resolveManagedTaskCaller } from "../../dist/runtime/managedCaller.js";
 import { taskLeaderActionTurnId } from "../../dist/commands/taskActor.js";
+import { buildTurnContextPack } from "../../dist/context/turnContextPack.js";
+import { createTaskReviewRound } from "../../dist/review/reviewRound.js";
 import { startStructuredProviderSession } from "../../dist/runtime/structuredProviderHost.js";
 import {
   acceptProviderTurn,
@@ -2686,4 +2688,75 @@ test("managed Session authority follows durable state, not a frozen environment"
     /no longer the current runtime of task-1\/leader/u
   );
   assert.equal(taskLeaderActionTurnId(store, task.id, environment), undefined);
+});
+
+test("a Turn Context Pack reports which of the Task's records are in flight", (t) => {
+  const home = mkdtempSync(join(tmpdir(), "yui-live-task-state-smoke-"));
+  t.after(() => rmSync(home, { recursive: true, force: true }));
+  ensureStorageSchema(home);
+  const store = new SqliteTaskStore(home);
+  t.after(() => store.close());
+  const now = new Date("2026-09-03T00:00:00.000Z");
+  const workspace = join(home, "main");
+  const task = activateTask(createTask("task-1", "Report in-flight execution", now), now);
+  store.saveTask(task);
+  const binding = createRoleAgentBinding({ id: "codex", adapterId: "codex" });
+  const leader = createRole(task.id, "leader", [binding], binding.agentId, workspace, now);
+  store.saveRole(task.id, leader);
+  const reviewer = createRole(task.id, "final-reviewer", [binding], binding.agentId, workspace, now);
+  store.saveRole(task.id, reviewer);
+  const worker = createRole(task.id, "worker", [binding], binding.agentId, workspace, now);
+  store.saveRole(task.id, worker);
+  store.saveActiveTurn(createTurn(
+    "turn-22",
+    task.id,
+    leader.name,
+    "resume",
+    turnInput("turn-22", task.id, leader.name, "Finish the Task."),
+    now,
+    { effective: resolveEffectiveLaunch({ role: leader, purpose: "execution" }) }
+  ));
+
+  // Alone, the Leader sees only itself in flight.
+  const alone = buildTurnContextPack(store, task.id, "turn-22");
+  assert.deepEqual(alone.liveTaskState.activeTaskReviews, []);
+  assert.deepEqual(alone.liveTaskState.activeTurns.map((entry) => entry.turnId), ["turn-22"]);
+
+  // Another Role starts executing while the Leader Turn runs on.
+  store.saveActiveTurn(createTurn(
+    "turn-21",
+    task.id,
+    worker.name,
+    "new",
+    turnInput("turn-21", task.id, worker.name, "Land the remaining change."),
+    now,
+    { effective: resolveEffectiveLaunch({ role: worker, purpose: "execution" }) }
+  ));
+
+  // The Pack already carried peer Turns as readable refs, but a ref is a
+  // pointer with no status: it cannot tell the Leader that turn-21 is still
+  // running. That is what this block adds.
+  const peer = buildTurnContextPack(store, task.id, "turn-22");
+  assert.deepEqual(
+    peer.liveTaskState.activeTurns.map((entry) => entry.turnId).sort(),
+    ["turn-21", "turn-22"]
+  );
+  assert.equal(peer.liveTaskState.activeTurns.length, 2);
+
+  // A requested Task-final Review is the blocker a Leader must not miss before
+  // it treats the Task as finishable.
+  store.saveReviewRound(task.id, createTaskReviewRound(
+    "review-round-6",
+    task.id,
+    reviewer.name,
+    "leader",
+    { schemaVersion: 1, projects: [{ projectId: "project-1", commit: "f".repeat(40) }] },
+    now
+  ));
+  const during = buildTurnContextPack(store, task.id, "turn-22");
+  assert.deepEqual(during.liveTaskState.activeTaskReviews, [{
+    reviewRoundId: "review-round-6",
+    reviewerRoleName: "final-reviewer",
+    status: "pending"
+  }]);
 });
