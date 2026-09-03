@@ -33,6 +33,14 @@ than an Agent using current context, must make the decision.
   fence, retry, recovery path, or permanent validation only for a normal
   product path, a hard authority or data-integrity boundary, or an observed
   failure whose cost justifies the added protocol.
+- Optimize for the lowest total lifecycle complexity under the current
+  contract. Do not treat “long-term” as permission to model every possible
+  future edge. Prefer a bounded redesign when repeated patches reveal a wrong
+  responsibility or duplicated authority; otherwise make the smallest
+  coherent change and stop.
+- Require a concrete current reason before adding another module, abstraction,
+  configuration switch, compatibility path, fallback, or orchestration phase.
+  Small implementation details do not need independently managed architecture.
 
 ## Keep Yui validation lean
 
@@ -55,33 +63,34 @@ Agent Driver registration.
 - Run `npm run build` plus the smallest temporary check needed for local
   confidence. The PR gate runs the same core smoke and package-start check; the
   release adds only artifact/install evidence unique to publishing.
-- A generic request to implement, test, validate, or run E2E never authorizes a
-  real Agent, provider, model, paid API, shared Home, or production resource.
-  Run such validation only when the user explicitly selects that exact resource
-  and effect boundary in the current request.
+- Configured Leader, Worker, Reviewer, and native child Agents are normal
+  execution resources and may develop or review Yui within their assigned
+  authority. A generic request to implement, test, validate, or run E2E does
+  not authorize additional validation that uses a live provider/model as the
+  test subject, paid APIs, shared Homes, production systems, real account
+  quota, or another non-disposable external effect. Run that validation only
+  when the user explicitly selects its exact resource and effect boundary.
 
 ## Let the Leader choose the smallest useful topology
 
 Execution topology is a Leader judgment made from current Task context, not a
 core scheduling policy. Yui should provide the same composable operations for
-direct work, native children, and managed Runs without trying to infer an
-optimal decomposition from file count, risk labels, or workflow phase.
+direct work, native children, and managed Turns without trying to infer an
+optimal decomposition from Task type, file count, risk labels, subsystem
+names, or workflow phase.
 
-Classify Yui software work as `bugfix` or `feature`. A reproducible bugfix is
-Leader-owned: implement it on clean committed Task main, run the smallest
-targeted check while changing code, and run the complete local delivery check
-once on the final commit. If it proves to require independent delivery owners,
-reclassify it as a feature before creating WorkItems. Do not create a Worker or
-ReviewRound merely because the fix touches a sensitive subsystem.
+Task type records intent; it does not prescribe ownership. The Leader should
+own ordinary bounded work directly when current context and tools are enough.
+Create WorkItems only for substantial requirements with independent ownership,
+acceptance, and useful parallel progress. Investigation, implementation steps,
+tests, findings, and small repairs stay inside the existing Task or WorkItem
+instead of becoming a record-by-record diary.
 
-For a feature, the Leader decides whether to own the complete result or split
-it into substantial requirements for different Workers. Create multiple
-WorkItems only when those requirements have independent ownership and useful
-parallel progress; persistence, authorization, concurrency, recovery, release,
-or multi-Project scope increases implementation and validation risk but does
-not by itself justify extra WorkItems. Investigation, implementation steps,
-tests, findings, and small repair edits stay inside the existing Task or
-WorkItem instead of becoming a record-by-record diary.
+Persistence, authorization, concurrency, recovery, release, or multi-Project
+scope may justify stronger implementation and validation evidence, but none
+automatically requires more WorkItems, Roles, abstractions, or protocol. Keep
+tightly coupled behavior under one coherent owner unless splitting lowers the
+complete coordination and Integration cost.
 
 For an ordinary WorkItem, use its existing owner or assignee directly in the
 main workspace Yui supplies for that execution. A Leader-owned WorkItem uses
@@ -98,11 +107,14 @@ to settle, and gives the main Reviewer the durable successful results for one
 authoritative synthesis Turn. Automatic policy-triggered Candidate Review
 stays direct.
 
-Risk controls review and evidence strength. Use one Task-final Review of the
-frozen Task main when it materially protects the control plane, whether or not
-the Task used WorkItems. Route findings to the original owner; the Leader fixes
-small Task-main issues directly, and creates a Repair WorkItem only when the
-repair is itself a substantial independently owned requirement.
+Risk controls review and evidence strength. Before delivery, the Leader makes
+an explicit review judgment: direct inspection may be sufficient, or one
+independent Review may materially protect the control plane. A configured
+Reviewer is normal execution, not real-resource E2E. Do not create a
+ReviewRound merely because work touched a sensitive subsystem, and do not
+force Review through a Core gate. Route findings to the original owner; the
+Leader fixes small Task-main issues directly and creates a Repair WorkItem only
+when the repair is itself a substantial independently owned requirement.
 
 ## Implement the current Yui contract
 

@@ -39,6 +39,11 @@ For every managed Task Turn:
    If no cursor is available, reload the exact pack; do not reconstruct state
    from transcript memory.
 
+`liveTaskState.activeTurns` and `liveTaskState.activeTaskReviews` are
+observational views of work currently in flight. They grant no authority and
+create no Task-wide lock or gate; use each exact Turn or Review binding when a
+decision depends on it.
+
 The pack's authority view and writable Project IDs are hard boundaries. A
 native subagent inherits the parent Turn's refs and authority; it does not gain a
 new Yui actor, Turn, Session, or cross-Task read permission.
@@ -52,6 +57,23 @@ may move between Yui's remote TUI and Desktop; never reconstruct it from
 Global context grants no Task implementation workspace. Read a Task only after
 the Operator has routed to its public/task-authorized context command; never
 invent a Task Turn identity for a GlobalRole.
+
+## Separate execution from real-resource validation
+
+The current Leader and configured Worker, Reviewer, Operator, custom Role, and
+native child Agents are normal execution resources. They may develop, inspect,
+and review within their existing Task authority without additional user
+authorization merely because the Agent uses a real model.
+
+Using a live provider or model as the subject of validation is different.
+Paid APIs, shared infrastructure, production systems, real account quota, and
+other non-disposable external effects require the user to proactively authorize
+that exact resource and effect boundary. A generic request to implement, test,
+validate, run E2E, or complete a Task does not grant that authority.
+
+When such validation was not requested, use deterministic or isolated evidence,
+state the material gap, and optionally recommend a separate follow-up. Do not
+create an InputRequest merely to solicit permission for it.
 
 Provider acceptance, Context load, Turn completion, and Task completion are
 separate facts. For a managed Task Turn, end the Provider Turn with one truthful

@@ -49,6 +49,13 @@ pack.
   exact Project, reason, impact, and Leader decision needed. Continue only
   after a new exact dispatch authorizes it.
 
+Implement the smallest coherent design that satisfies the current WorkItem.
+Reuse established responsibilities and patterns when they fit. Use a bounded
+refactor when repeated patches expose the wrong boundary, but do not add
+frameworks, configuration, fallbacks, compatibility paths, or abstractions for
+hypothetical future variants. Keep coupled changes together and avoid turning
+small helpers into independently managed architecture.
+
 For Project-backed delivery, commit the Develop workspace changes and leave it
 clean before handoff so Yui can freeze the exact Candidate head. ReviewRound
 workspaces are diagnostic evidence owners, never ChangeSet sources. Do not
@@ -63,10 +70,9 @@ changed behavior; do not repeat an unchanged successful check. Follow Project
 Policy for required validation and state passed, failed, and intentionally
 skipped checks honestly.
 
-Real models, paid APIs, shared infrastructure, production systems, and account
-quota remain user-owned authority. A generic request to implement or test does
-not authorize them. Prefer deterministic fakes and isolated resources, and
-report the remaining verification gap without blocking ordinary delivery.
+Follow `yui-runtime`'s distinction between normal Agent execution and
+real-resource validation. Ordinary Worker implementation is authorized by this
+Turn; additional live-provider, paid, shared, or production validation is not.
 
 ## Return a useful result
 

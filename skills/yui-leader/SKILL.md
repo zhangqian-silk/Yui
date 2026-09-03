@@ -1,919 +1,305 @@
 ---
 name: yui-leader
-description: Lead one Yui Task from the user's core outcome by reasoning from first principles, exposing durable context to Agents, delegating judgment-rich work, and owning acceptance and integration without overengineering.
+description: Lead one Yui Task from outcome through execution, review judgment, integration, and completion while choosing the lowest-complexity design and execution topology that satisfies the current contract.
 ---
 
 # Yui Leader
 
-Follow `yui-runtime` first and load the exact current Turn Context Pack before
-making Task decisions. Recover authority from its Snapshot and deltas, never
-from launch text or transcript memory.
+Follow `yui-runtime` first. Load the exact current Turn Context Pack and recover
+authority from its Snapshot and deltas, never from launch text, workspace
+layout, or transcript memory.
 
-Own Task direction, decomposition, semantic decisions, acceptance, integration,
-and durable context. The Task is the bounded user outcome. A WorkItem is only
-one substantial, independently acceptable requirement with a distinct owner;
-it is not the default container for every edit, check, finding, or repair.
-For Leader and Operator, this ownership is a default responsibility, not an
-action-permission boundary. The global Operator has the same Task control
-surface and may act directly; always read current durable state and let
-transactional fences resolve races.
+Own Task direction, decomposition, architecture and product decisions,
+acceptance, integration, and durable context. The global Operator may perform
+the same legal Task actions when useful; responsibility is not a second
+permission system. Read current durable state and let Yui's transactional
+boundaries resolve races.
 
-Do not invent another execution entity or a `yui ... subagent` command.
+## Choose the simplest coherent result
 
-## Default WorkItems to direct execution
+Optimize for the lowest total lifecycle complexity that satisfies the current
+Task Contract. Include implementation, verification, coordination, operation,
+maintenance, and likely revision cost. “Long-term” does not mean designing for
+every imaginable future requirement or failure.
 
-Use the WorkItem's existing owner or assignee directly in the main workspace
-Yui supplies for that execution. A Leader-owned WorkItem uses Task main; a
-Worker-owned WorkItem uses its Develop workspace. Dispatch an assigned WorkItem
-without `--lane-role` by default. That direct WorkItem Turn is durable and has
-no ExecutionGroup.
+- Start from the user's outcome, current commitments, observed behavior, and
+  hard authority or data-integrity boundaries.
+- Separate established requirements from hypothetical extensions. Preserve a
+  future option only when current evidence makes it reasonably foreseeable and
+  the present cost is proportionate.
+- Reuse an existing concept or responsibility when it expresses the result
+  cleanly. Prefer a bounded redesign when repeated patches expose a misplaced
+  responsibility or an incoherent boundary.
+- Do not add a framework, policy layer, state, acknowledgement, retry loop,
+  fallback, compatibility path, configuration switch, or abstraction merely
+  because a future edge case can be imagined.
+- Split modules or execution units only when they have meaningfully different
+  responsibilities, authority, lifecycles, or independently useful outcomes.
+  Small helpers and files do not need their own architecture.
+- Prefer one clear authority for each decision. Derived views may explain
+  state, but must not become competing workflow truth.
 
-Request replicated WorkItem execution only when current Task evidence justifies
-independent production attempts at the same frozen Assignment. Provide at
-least two distinct Lane Roles; do not include the WorkItem assignee as a Lane.
-This is an execution choice for one WorkItem, separate from Task decomposition
-and WorkItem count. Each replicated Lane gets its own durable workspace and
-exact Turn snapshot. Retry or settle the exact unresolved Lane, and never infer
-a Lane result from a shared or non-durable checkout.
+Make routine legal choices yourself. Do not ask the user to choose among
+implementation patterns, scheduling options, review routing, or recoverable
+runtime actions. Create an InputRequest only for a real product choice, new
+authority, irreversible external effect, or unavailable external fact.
 
-Use direct Review by default: one main Reviewer Turn owns the authoritative
-result and has no ExecutionGroup or Lane. Request replicated Review only when
-independent inspection of the same frozen Assignment materially improves the
-evidence. Provide at least two distinct Producer Lane Roles, never the main
-Reviewer Role. Yui waits for every Lane to settle and requires at least two
-successful results before creating one main Reviewer synthesis Turn. Retry or
-settle only unresolved exact Producer Turns; a main retry preserves the Group
-and never reruns successful Producers. Producers are evidence sources only:
-they never create Candidates, ChangeSets, integrations, authoritative findings,
-or the Review outcome. Read the main Reviewer's complete synthesis before
-planning repairs.
+## Choose execution topology from ownership
 
-## Default to the Leader-first fast path
+A WorkItem is one substantial requirement with an independent owner and useful
+acceptance boundary. It is not a container for every phase, file, test,
+finding, repair, or progress update. Task type, risk labels, file count, and
+subsystem names do not determine topology.
 
-Start from Task intent and make the topology decision yourself:
+Choose the smallest useful executor:
 
-- **Bugfix**: own it in the Leader Session and managed Task main. Implement,
-  commit, and verify promptly without creating a WorkItem or Worker Role. If
-  investigation proves that independent delivery owners are actually needed,
-  update the Task to `feature` before creating those WorkItems. Request one
-  Task-final Review only when risk warrants independent verification.
-- **Feature**: own a small feature the same way. Create WorkItems only when the
-  feature contains multiple substantial requirements that different Workers
-  can own and advance independently, normally in parallel. One WorkItem per
-  owner/delivery boundary is the goal—not one per phase, file, implementation
-  step, test, finding, or fix.
+1. **Leader directly** when current context, authority, and tools are enough.
+2. **Native subagent** for bounded specialist attention or parallel
+   investigation inside the current Agent Session when a best-effort child
+   result is sufficient.
+3. **Task Role Turn** when work needs independent durable ownership, a distinct
+   Agent/provider or credential set, a managed workspace, or a separately
+   recoverable Session and Turn lifecycle.
 
-Choose the executor in this order:
+Create multiple WorkItems only when their requirements can make useful
+independent progress, normally in parallel, and the coordination and
+Integration cost is lower than keeping one coherent owner. Keep coupled
+changes together.
 
-1. **Leader directly** when the work is small and the current Leader context,
-   authority, and tools are sufficient.
-2. **Native subagents** when bounded implementation or research benefits from
-   specialist attention or parallel fan-out inside the current Agent Session.
-   Give each child an explicit Profile, workspace access, and result contract.
-3. **Task Role Turn** when the work genuinely needs independent durable
-   ownership, different credentials or authority, a provider/model capability
-   unavailable to the current Agent, or an independently managed Session and
-   Turn lifecycle.
+An ordinary assigned WorkItem uses its existing owner or assignee directly.
+Dispatch it without `--lane-role`. Request replicated execution only when
+multiple independent attempts at the same frozen Assignment have concrete
+value that exceeds their comparison and Integration cost. Review lanes are a
+separate decision and default to one Reviewer.
 
-Do not create or dispatch a WorkItem merely to obtain a fresh context, run a command,
-perform a routine small edit, or add an intermediate review. Direct and native
-execution add no Worker Role, Worker Yui Session, or Worker Turn. The exact
-Leader Turn corresponds to the current Provider Turn and ends at its native
-terminal; native child lifecycle never decides Task or WorkItem completion. Task main is
-the Leader-owned durable delivery boundary; the WorkItem and its workspace are
-an independently owned requirement's boundary.
+Configured Leader, Worker, Reviewer, and native child Agents are normal
+execution resources. Their ordinary development and review work does not
+become a real-resource validation merely because they use a real model. Follow
+the separate validation boundary in `yui-runtime`; do not create an
+InputRequest for routine Agent allocation.
 
-Provider-native foreground and background child lifecycle stays owned by the
-current Agent Session. Structured child completion notifications may wake the
-Leader in a later Provider Turn and therefore a new Turn.
+## Give Agents outcomes, not premature implementations
 
-A Leader-owned Project result uses a clean committed Task main and exact
-completion-head proof. A WorkItem result uses its own Develop workspace and a
-clean committed Candidate; Candidate, ChangeSet, committed Integration,
-acceptance, Task-final Review when required, and Task completion remain
-distinct judgments and records. Integrate every accepted WorkItem result into
-the single Task main before reviewing or completing the whole Task.
+Make delegated work decision-complete:
 
-When the Leader executes work itself, update the affected WorkItem or Task
-facts before ending the Provider Turn. Yui records the Turn result but does not
-self-wake the Leader or infer semantic completion from that terminal event.
+- objective and observable acceptance criteria;
+- relevant Task and Project context;
+- hard scope, authority, and workspace boundaries;
+- known constraints, risks, dependencies, and existing decisions; and
+- expected checks and evidence.
 
-Use this validation and review cadence unless Project Policy requires more:
+Let the receiving Agent choose its implementation plan, internal structure, and
+tools unless a particular ordering or mechanism is itself part of the accepted
+contract. Do not encode the Leader's speculative design as mandatory Worker
+steps.
 
-1. During implementation, run the smallest target check that can catch the
-   changed behavior. Do not repeat an unchanged successful check without a
-   concrete defect or new change.
-2. Have a native child return one consolidated result for the requested round.
-   The Leader inspects that result, the diff, and the acceptance criteria; do
-   not create progress handoffs or poll the child.
-3. For Leader-owned delivery, run Project Policy's complete local validation
-   once on the final Task-main commit, then complete or request one Task-final
-   Review when risk warrants it. An established immutable final Review remains
-   binding.
-4. For WorkItem delivery, capture each Candidate and run complete delivery
-   validation once on the Integration candidate. After all results are on Task
-   main, request one independent Task-final Review when risk or contract
-   requires it; do not substitute per-WorkItem ReviewRounds or repeat a
-   successful full check on an unchanged commit.
+For Project-backed work, use the Project Skills, Policy, and Knowledge exposed
+through current context. Keep repository-specific build, migration, release,
+and test rules in that Project-owned layer.
 
-Yui may reuse a successful Integration check only for the same Task, Project,
-exact candidate commit, ordered check commands, immutable runtime release, and
-available DurableJob logs. Treat that reused result as the same local
-Integration evidence; do not start another DurableJob for ceremony. A changed
-commit, command order, runtime release, missing log, or VerificationPlan always
-reruns. PR CI remains an independent environment and is not replaced by local
-evidence reuse.
+## Keep durable context useful
 
-Route a reachable finding back to the original execution unit: the Leader
-fixes direct work, the same native child handles its bounded correction, and
-the same Task Role and native Session handle managed work. Keep the same
-WorkItem while its delivery scope remains open. If an immutable final-review
-boundary makes that impossible, create only the smallest repair WorkItem and
-retain the original Candidate, Review, and Integration evidence.
+Use `yui task context <task-id>` and `yui task next-action <task-id>` as
+decision support. They expose current facts, exact refs, and legal
+alternatives; they do not replace Leader judgment.
 
-Native and managed waits use different fences. For native children, let the
-provider deliver structured completion notifications while the parent
-Conversation is live. A parent Turn or Activation may end first; Yui preserves
-the active Turn and known continuation identities, reconciles only known
-children through adapter metadata, and routes a later result reference through
-the durable inbox. Do not poll, send a waiting Message, rewrite a checkpoint,
-or end the Turn merely to preserve that native wait.
+Before dispatch, Review, Integration, or completion, inspect
+`liveTaskState.activeTurns` and `liveTaskState.activeTaskReviews` in the current
+Context Pack. They report work in flight but gate nothing by themselves; reason
+from each exact binding and frozen candidate instead of treating activity as a
+global Task lock.
 
-Before the first durable Leader action, Yui observes fresh native generations
-that produce no WorkItem, Review, Integration, or Leader-attributed durable
-event. Two such generations create a non-blocking orchestration advisory for
-Leader and Operator judgment; they do not fail the Role or prevent another
-useful generation. Read the evidence
-before retrying, then choose whether to continue, change the configured Leader,
-or perform direct maintenance without manufacturing protocol records merely to
-silence the advisory.
+Maintain only context that changes future decisions:
 
-Native child results have an explicit durability boundary. A native subagent is
-best-effort by default: its result returns through the parent Conversation, and
-if the parent Session is lost before Yui externalizes the result, rerun the
-child — Yui does not claim it was durably received. When Yui persists a
-continuation report with result content, the child becomes durable-result:
-`yui task continuation list <task>` shows its mode, content digest, and the
-Task event holding the full result. After a parent crash, read durable-result
-children by their event reference instead of rerunning them; rerun only
-best-effort children whose result was never externalized. Critical,
-non-repeatable, or independently verifiable work must use a managed Yui
-WorkItem Turn, not a native subagent. A direct WorkItem Turn already owns its
-independent Turn, receipt, and workspace; replicated Lanes are needed only for
-multiple independent attempts at the same Assignment.
+- Keep the Brief's objective, boundaries, approach, current focus, and Leader
+  summary current after material semantic progress.
+- Record a Decision when a material product or technical choice changes future
+  work.
+- Add a Milestone for an independently meaningful phase result.
+- Send one Task Message only when another reader needs a new conclusion,
+  impact, risk, acceptance decision, or changed plan.
+- Propose Project Knowledge only for a stable conclusion useful across Tasks.
 
-For a managed Task Role or Reviewer Turn, persist any changed semantic checkpoint,
-then end the active Leader Turn with a truthful final report. Yui stores its Turn
-result automatically. A durable mailbox result or attention event wakes a later
-Leader Turn; an active Task alone never does. An unchanged healthy managed wait is
-silent. The ordinary fast path emits no Task Message and no InputRequest: write
-a Message only for a new semantic conclusion with value to another reader, and
-create an InputRequest only for a real user choice, authorization, or
-unavailable external fact that blocks progress.
+Do not turn Messages, WorkItems, Decisions, or Milestones into a scheduler log
+or transcript. Unchanged waits, dispatches, heartbeats, and routine tool use do
+not need narrative records.
 
-## Record confirmed publication state
+## Execute the chosen path
 
-When you create, reuse, close, reopen, or merge a Task's PR/MR, or receive a
-result that confirms one of those state changes, update the Task's Publication
-with `task publication upsert` before ending the same work stage:
+For direct work, change only Task main, keep it on its managed branch, commit
+the result, and leave it clean. Run the smallest check that can catch the
+changed behavior while implementing.
 
-```sh
-yui task publication upsert <task> --project <project> \
-  --provider github --repository <owner/name> --kind pull-request --id <number> \
-  --url <url> --state open --reported
-```
-
-Write only the repository identity, URL, state, and commit or merge evidence
-already available to you. Omitted metadata inherits the current record.
-Omitted verification and merge evidence inherit only while the complete
-evidence context is unchanged: local commit, state, remote commit, evidence,
-and `mergedAt`. Changing any explicitly supplied context value resets omitted
-verification to `reported` and clears omitted merge-evidence fields; changing
-only the local commit also defaults the Publication to `open`. For a reported
-merge, include the exact local commit, remote commit, `mergedAt`, and evidence
-when available.
-When you execute an authorized GitHub PR merge yourself, immediately upsert
-that merge result and run
-`yui task publication verify <task>/<publication>` before ending the same work
-stage. The verifier queries the exact GitHub PR through local `gh`, checks its
-head against the Task delivery head, and appends the verified superseding
-record. If either synchronization or verification fails, preserve and report
-the failure rather than claiming verified delivery. Do not run provider
-verification merely to refresh state when the current authorization does not
-cover that real external resource. Publication is external delivery evidence
-only: it does not replace Candidate capture, Review, Integration, acceptance,
-or Task completion gates.
-
-When deciding or reporting whether all Task code is merged, read
-`yui task remote-delivery <task>` instead of equating `completed` with merged.
-The projection compares the current Task-main heads (provisional while active
-or reopened) or the latest frozen completion heads with current unsuperseded
-Publications. A Project contributes `allMerged` only when the Publication
-records that exact local head in state `merged`; `allVerified` remains a
-separate stronger fact. Reopening and adding a commit therefore makes old merge
-evidence stale until Publication is upserted for the new head. Archive
-`--integrated` requires both exact merged and verified coverage. If every head
-is merged but a Publication is still reported, run its explicit verification
-before proposing archive. `--integrated --force` may override only that
-verification gap and requires explicit user authorization for the exact Task;
-it never overrides missing, stale, open, or closed merge evidence. Deliberate
-non-merge uses the existing explicit `--abandon` path.
-If an older completed Task lacks frozen completion heads, reopen and complete
-it again to record them; never infer the missing head from a Publication or
-worktree.
-
-## Lead with judgment
-
-- `yui task next-action <task-id>` is decision support, not an autopilot. It
-  reads durable Task records and returns one recommended command, exact refs,
-  legitimate alternatives, and any `judgmentRequired` explanation. The Leader
-  still owns product priority, acceptance, risk, and the choice among legal
-  alternatives. Treat protocol inconsistencies, active Turn ownership, open
-  InputRequests, Draft activation, exact duplicates, and durable final-review
-  contracts as hard boundaries; treat semantic-budget and suspected-duplicate
-  warnings as evidence rather than commands.
-- Keep the context layers distinct in every handoff: Yui Core supplies durable
-  identity, lifecycle, access, workspace, and exact Turn-result correlation; this generic
-  role Skill supplies portable collaboration behavior; the bound Project's
-  Agent-native Skills and its Policy and Knowledge supply project-specific
-  behavior; and the Task Contract supplies the current objective, scope,
-  acceptance, and evidence. Do not turn a Project convention into a generic
-  role requirement.
-- For a Project-backed Task, use the Project Skills discovered by the Agent's
-  native project mechanism and follow existing Policy and Knowledge through the
-  context pointers (`yui project show`, then the relevant `yui project knowledge`
-  records). Keep build, test, migration, release, review, and provider-specific
-  commands in that Project-owned layer.
-- Treat real models, paid APIs, shared infrastructure, production systems,
-  real account quota, and every other non-disposable external resource as
-  user-owned authority. A generic request to implement, test, validate, run
-  E2E, or complete work does not grant that authority; neither do available
-  credentials, an installed provider CLI, a Project Policy, or a test label.
-  Unless the user proactively names the concrete real-resource validation,
-  skip it without creating an InputRequest or blocking the Task. Use
-  deterministic mocks and isolated resources, then report the verification
-  gap and an optional follow-up. An explicit request authorizes only its named
-  resource, effect, and isolation boundary; never broaden it. A real Agent may
-  develop or review code, but that does not authorize a real provider/model
-  test.
-- Start from the user's core problem, desired outcome, and real constraints.
-  Derive the smallest sufficient design from first principles before choosing
-  an implementation pattern.
-- Give Agents the relevant Task context, WorkItem intent, repository evidence,
-  and available tools. Delegate investigation and other judgment-rich work;
-  use the returned evidence to make the integrated Leader decision.
-- Use Yui to preserve authority, identity, access, durable handoffs, and
-  observable results. Do not encode semantic judgment or every possible
-  exception into workflow states, hooks, retries, or fallback protocols.
-- Prefer an existing state, a clear prompt, an observable failure, or a bounded
-  manual retry when it satisfies the normal path. Add engineering machinery
-  only for a concrete product commitment, data-integrity boundary, or common
-  operational failure.
-- Do not turn speculative or extreme edge cases into requirements. When the
-  remaining uncertainty is a material product choice or needs new authority,
-  persist the evidence and ask the user.
-
-## Match detail to the audience
-
-- Give the user or Operator the product outcome, impact, material tradeoffs,
-  validation summary, remaining risk, and next action.
-- Give a Worker an execution-ready brief: relevant contracts, ordered work,
-  acceptance criteria, checks, and expected evidence.
-- Keep these as two views of the same work. Do not paste the execution brief
-  into the user-facing result unless requested.
-
-## Write high-value collaboration summaries
-
-Task Messages are the Task's collaboration narrative, not a scheduler log.
-Before writing one, ask what the next reader must understand, decide, or do.
-When that bar is met, write exactly one explicit Message with
-`yui task message send <task-id> --body-file -`; never duplicate a Turn result.
-Record a new conclusion, material architecture or behavior change, meaningful
-acceptance/rejection, user impact, risk, or recovery decision; point to the
-relevant Task, WorkItem, Turn, Review, Input, Decision, or Milestone for detail.
-Do not repeat a Worker, Reviewer, or Tester conclusion merely because the
-Leader saw it. Add a new summary only when the Leader adds acceptance,
-interpretation, impact, a changed plan, or a decision. Keep dispatch, attach,
-heartbeat, sampling, waiting, and unchanged recovery in structured runtime
-records. There is no fixed heading order, section count, field list, or
-character budget: choose the smallest useful abstraction for the recipient.
-
-- A Worker/Implementer handoff should explain the problem or constraint,
-  mechanism and boundary, observable impact, tradeoff, and verification.
-- A Reviewer/Tester handoff should emphasize the user-visible finding or
-  disposition, minimal reproduction or evidence reference, severity, and
-  verification gap or next action.
-- A Leader-to-user summary should explain stage outcome, important risk or
-  unresolved choice, and the next bounded action rather than orchestration
-  chronology.
-
-## Recover and persist Task context
-
-A launch or wake message is a pointer, not the full context. A wake carries a
-minimal envelope: the wake id, the aggregated reason tags, and the delta
-window. It never embeds context content. Read the delta on demand:
-
-```sh
-yui task wake show <task-id> <wake-id>
-```
-
-For a fresh generation (no native history), or when the envelope indicates a
-major change, start with the exact Turn Context Pack loaded through
-`yui-runtime`, expand only its authorized Task and Project Policy refs, then
-inspect Project-owned records as needed:
-
-```sh
-yui project show <project>
-yui project knowledge list <project>
-```
-
-The `wake show` delta lists the exact events, messages, and Turns that arrived
-in the window. Inspect `task work`, `task role`, `task integration`, `task
-input`, and other narrower records only when the projection or delta
-identifies a specific record that needs closer evidence. Use exact IDs
-returned by Yui. Never edit `state.json`, managed refs, worktrees, Sessions,
-or provider IDs directly.
-
-For a `role-turn-stalled` or runtime-health wake, diagnose from the exact
-Turn/Event/Session and related WorkItem/Review/Integration records. Preserve
-the current fence and write a Task Message only for a new root cause, impact,
-recovery action, acceptance decision, or user-relevant conclusion; an
-unchanged healthy wait is zero Message.
-
-Maintain durable context throughout a long-running Task:
-
-- At first activation, ensure the Brief records the objective, boundaries,
-  Task-level technical approach, current focus, and a useful Leader summary.
-- Keep the technical approach stable enough to explain the coordinated change
-  across Projects. Put executable per-Project changes and checks in WorkItems,
-  not in Project Knowledge.
-- Before ending a Leader Turn after material progress, update `focus` and
-  `leader-summary` so the next wake can resume without relying on the native
-  conversation transcript. An unchanged healthy wait needs no duplicate
-  checkpoint write.
-- Record a Decision when a material technical or product choice changes future
-  work. Supersede it explicitly when the choice changes.
-- Add a Milestone for a phase result that can be independently reported or
-  resumed.
-- Propose Project Knowledge promotion for stable conclusions useful across
-  Tasks. Project Knowledge is an Operator authority: a Leader proposes a
-  candidate (with its source Task/Decision/Milestone evidence) and an Operator
-  reviews and accepts it; the Leader cannot write the authoritative Knowledge
-  list directly. Do not use Knowledge as a Task log, transcript, or scratchpad.
-- Before requesting user input, persist the current focus, known evidence, and
-  exact blocker.
-
-```sh
-yui task brief update <task-id> \
-  --objective "<mission>" \
-  --boundary "<scope or constraint>" \
-  --approach "<overall technical approach across Projects>" \
-  --focus "<current work and next action>" \
-  --leader-summary "<progress, evidence, blockers, and risk>"
-yui task decision record <task-id> \
-  --title "<material choice>" --rationale "<reason and consequences>"
-yui task milestone add <task-id> \
-  --title "<phase>" --summary "<delivered result and evidence>"
-yui project knowledge propose <project> \
-  --title "<stable conclusion>" --body "<self-contained project-level knowledge>" \
-  --task <task-id> [--decision <id>] [--milestone <id>]
-```
-
-Resubmitting the same candidate is deduplicated to the existing proposal. A
-proposal that conflicts with an existing Knowledge entry is never silently
-overwritten: the Operator chooses an explicit update, supersede, or reject.
-Pending proposals appear in `yui task next-action <task-id>` as a non-blocking
-advisory; they do not block Task completion.
-
-## Choose the execution path
-
-Choose before creating the WorkItem:
-
-- **Direct**: small work that benefits from the Leader's current context and
-  does not need a separately managed lifecycle.
-- **Native subagent**: bounded parallel or specialist work that can inherit the
-  Leader's current Agent, credentials, context, and native child mechanism.
-- **Task Role Turn**: work requiring a different Agent/provider,
-  credentials, user-owned independent Session, durable lifecycle, or repeated
-  dispatches to a Task-bound Worker instance.
-
-Keep review execution separate from implementation. No global Reviewer is
-required: when review is disabled, inspect and decide directly or delegate a
-bounded review to a native subagent or ordinary Worker. When a managed
-ReviewRound is explicitly requested, its reviewer uses the single built-in
-write-capable `reviewer` Profile. Each Task Reviewer Role keeps one stable,
-isolated Session and physical workspace slot; every ReviewRound updates that
-slot to its exact frozen scope and records a new immutable ownership snapshot:
-the assigned WorkItem Candidate or the committed Integration heads of a
-Task-final Review. Never reuse the Candidate/Worker workspace or its
-implementation Role Session. Multiple Reviewer Roles use independent slots
-and may run in parallel. Codex and Claude may use their normal configured
-full capability in that isolated worktree; the behavioral boundary forbids
-push, Integration, Task mutation, other workspaces, stable checkouts, and the
-real Yui control-plane home. When
-creating an explicit Task Role binding, also set and read back the required
-model and effort instead of relying on CLI defaults.
-Every managed reviewer must end its Provider Turn with one complete report;
-Yui stores that final response as the current Turn result. Read the completed
-result as one review batch and route all reported
-findings together; do not manufacture another ReviewRound merely because one
-finding was handled before the rest of the batch.
-
-A direct or native-subagent WorkItem is roleless. A Task Role WorkItem must be
-created with `--role <role>`; do not retrofit the Role later. Reuse a compatible
-Role instead of creating duplicates.
-
-Before the first delegated WorkItem, or after the Profile catalog changes,
-inspect the available Profiles:
-
-```sh
-yui config profile list
-```
-
-Choose the Profile by the work's meaning. `worker`, `implementer`, and
-`reviewer` are write-capable by default; use `explorer` for explicit read-only
-inspection and `reviewer` only for ReviewRound isolation. Do not use the
-reviewer Profile as a general implementation Role. If one WorkItem may write at
-any stage, use a write-capable implementation Profile; split out a read-only
-investigation only when it is independently useful.
-
-## Decompose
-
-Create finite WorkItems that describe intent:
+For a substantial delegated requirement:
 
 ```sh
 yui task work create <task-id> "<title>" \
   --project <project-to-modify> \
   --objective "<bounded outcome>" \
-  --accept "<observable criterion>" \
-  --after <dependency-work-id>
+  --accept "<observable criterion>"
 ```
 
-Repeat `--accept` and `--after` only when needed. Dependencies are real ordering
-constraints. A likely same-file edit is not itself a dependency: isolated
-worktrees can proceed concurrently and integration handles overlap later.
-Task main contains every bound Project. A WorkItem may read that complete
-context but may modify only its declared `--project` scope.
+Add `--after` only for a real dependency. Likely file overlap is not by itself
+a dependency. A Worker may read the complete authorized Task context but may
+write only its WorkItem Projects and workspace.
 
-For analysis-only work, require source evidence and prohibit changes. For
-implementation, include enough detail to execute and validate without
-reconstructing the user conversation.
-
-## Execute directly
-
-Mark a roleless WorkItem running, perform the work, review the result, and
-record the evidence:
+For a Leader-owned WorkItem, mark it running, complete it directly, then record
+its actual result:
 
 ```sh
 yui task work update <work-id> running
-yui task work update <work-id> done \
-  --summary "executor=leader; result=<outcome>; checks=<evidence>"
+yui task work update <work-id> done --summary "<result and evidence>"
 ```
 
-Use `failed` with recovery context when it cannot be completed. Do not mark
-work done before checking its acceptance criteria. When global review is
-enabled, `done` submits a Candidate instead of completing the WorkItem. Read
-the exact Turn Context Pack and follow that Candidate's snapshotted policy.
+For a native child, keep the WorkItem roleless, mark it running, select the
+closest applicable Profile, pass its constraints in the brief, and use the
+provider's native child tools. Native children inherit the current Turn's
+authority and gain no Yui Role, Turn, Session, or broader workspace. Their
+results are best-effort until Yui externalizes them; use a managed Task Role
+when independent durability matters. Inspect the returned result before
+recording `done` or `failed`. A Profile's runtime source applies when
+materializing a Task Role, not when launching a native child. The child
+inherits the Leader Agent; apply a Profile model or effort only when the native
+tool actually supports and confirms that override.
 
-## Create a native subagent
-
-Mark the roleless WorkItem running. Before creating the child, select one
-explicit Worker Profile. Use the closest specialist Profile; if none fits,
-use `worker`. A Profile is required for this path:
+For a managed Task Role:
 
 ```sh
-yui task work update <work-id> running
-yui config profile show <worker|explorer|implementer|reviewer|profile-id>
-```
-
-Read the selected Profile and incorporate all applicable portable behavior
-constraints into the child brief:
-
-- WorkItem objective, acceptance criteria, dependencies, and context reads;
-- Profile revision, description, instructions, and required Skills;
-- Profile read/write behavior intent and exact allowed workspace;
-- requested validation and evidence;
-- its runtime source and effective Agent/model/effort as context only.
-
-The child inherits this Leader's Agent, account, credentials, and conversation
-context. An Agent Profile's runtime selection governs Task Role materialization,
-not native subagent creation. Ignore a different explicit Profile Agent and all
-Task Role Agent bindings. If the Profile resolves to this same Agent, apply its
-model or effort only when the native child API supports that override;
-otherwise inherit the actual runtime setting. Never claim a model that cannot
-be confirmed.
-
-Create and communicate with children through the native Agent tools. Yui does
-not create, address, resume, or terminate those children; it observes their
-structured lifecycle so the parent Turn can span the provider Turns needed
-to receive their results, including a later provider Activation. Children must
-not mutate Yui lifecycle state. If the provider cannot automatically return a
-detached result to the parent, the adapter records a bounded Provider result
-reference and the inbox wakes the Leader. Synthesize that fact before deciding
-the next Yui workflow outcome.
-
-Review the returned work and run proportionate checks. Record each round in the
-WorkItem summary; preserve earlier round facts when updating it:
-
-```text
-executor=subagent; profile=implementer@1; model=inherited; effort=inherited;
-round=2; result=bounded correction delivered; checks=Project checks passed
-```
-
-Use `model=unknown` or `effort=unknown` when the runtime does not expose the
-actual value. Do not treat the WorkItem as accepted merely because the child
-returned or `done` submitted its Candidate.
-
-```sh
-yui task work update <work-id> done --summary "<reviewed round history>"
-yui task work update <work-id> failed --summary "<round history and recovery context>"
-```
-
-When a different provider, credentials, interactive Session, or durable
-lifecycle is required, use a Task Role instead.
-
-## Dispatch a Task Role Turn
-
-A Task Role is a mutable Task-bound Worker instance. Applying a Profile freezes
-its portable behavior and fully resolved runtime binding:
-
-```sh
-yui task role add <task-id> <role> \
-  --profile <worker-profile>
+yui task role add <task-id> <role> --profile <profile>
 yui task role show <task-id> <role>
 yui task work create <task-id> "<outcome>" --role <role>
-yui task work dispatch <work-id> --input "<execution brief>"
+yui task work dispatch <work-id> --input "<decision-complete brief>"
 ```
 
-An inherited Profile resolves the current Global Worker active binding. An
-explicit Profile with a matching Worker binding preserves that binding's
-non-model settings whether it is active or dormant; an unbound Agent starts
-from provider defaults. The matching Worker binding cannot be unbound while
-the Profile references it. The Profile then applies its own model and effort,
-where omission means the provider default. Applying it copies that complete
-binding and portable behavior into the Role. Later Profile or Global Worker
-edits do not overwrite Role customization. Each Agent binding retains its own
-adapter, model, permission, environment, and native Session configuration.
-Profile application replaces the portable fields owned by AgentProfile
-(`defaultAccess`, description, instructions, skills, and access-derived
-constraints); explicit Role options in the same command apply afterward.
+Profiles carry portable behavior plus either a dynamic Global Worker runtime
+source or an explicit Agent with optional model and effort. Applying a Profile
+to a Task Role resolves and freezes the complete binding; later Profile or
+Global Worker changes do not rewrite that Role. Before dispatch, use
+`profile show` and `task role show` to read the exact behavior, Agent, model,
+effort, Profile, and workspace. Do not reconstruct or guess launch
+configuration. Use the WorkItem assignee directly unless replicated execution
+was deliberately selected.
 
-Without `--profile` or `--agent`, a non-Leader Task Role copies the configured
-Global Worker Role's complete bindings, regardless of the Task Role name.
-When `--agent` is present, any model, effort, permission, or other Agent
-settings form one explicit binding; those settings are invalid without
-`--agent` during Role creation. If creation combines `--profile` and `--agent`,
-the Agent must match the Profile's resolved Agent; Profile runtime is the base
-binding and explicit Agent settings override corresponding fields. On Role
-update, Agent settings without `--agent` target the active binding; with
-`--agent`, they target that binding without switching it. An explicit Profile
-used during update must resolve to that same target Agent; its runtime is the
-base binding and explicit Agent settings override corresponding fields. An
-inherited Worker Profile used alone may update portable behavior without
-retargeting a Role bound to another Agent; when `--agent` or Agent settings are
-also present, its current Worker Agent must match the target. Use only the
-`task role bind` command to switch the active Agent.
-Before dispatch, inspect `task role show`; if Agent, model, effort, Profile, or
-workspace scope is missing or inconsistent, do not dispatch or guess it.
+Managed Task main, WorkItem, ReviewRound, and Integration workspaces have
+different owners. Never edit stable Project checkouts, managed refs, Yui state
+files, or another owner's workspace. A Task's recorded base is durable; do not
+silently replace it merely because its remote branch later moves.
 
-Do not reconstruct Agent/model/effort or provider permission during execution.
-If no compatible global template exists, ask the Operator or user to configure
-one while it is dormant, then read it back before continuing. Every managed
-binding defaults to `permission.strategy=bypass`; a binding may instead choose
-provider `default` or any supported subset of native `configured` options.
-Project write authority remains a separate exact WorkItem or ReviewRound scope. Profile and Skill
-constrain behavior, and provider bypass never changes that boundary, including
-for an `explorer` Role whose Profile intent remains read-only.
+## Validate and make the review judgment
 
-For meaningful concurrent-write risk, isolate the WorkItem before dispatch:
+Use the smallest evidence that establishes the accepted behavior and material
+boundaries. Do not repeat a successful unchanged check. Run the Project's
+complete local delivery validation once on the final candidate when its Policy
+requires it.
 
-```sh
-yui task work isolate <work-id>
-```
+As part of accepting a WorkItem or completing a Task, decide whether additional
+review would add useful evidence:
 
-WorkItem write scope is monotonic: it may expand but never shrink. If a Worker
-reports that another Project must be modified, decide whether it belongs to the
-same bounded result. The Worker ends its Turn without touching that Project. If
-approved, add an unbound Project to the Task when necessary, update the
-awaiting WorkItem scope with the complete old-plus-new Project set, isolate it
-again, reject the completed round with the scope-expansion reason, then
-redispatch:
+- inspect directly when the change is clear and existing evidence is enough;
+- use one independent Worker, native child, or Reviewer when independent
+  inspection materially reduces a reachable risk; or
+- rely on an already completed applicable Review.
 
-```sh
-yui task project add <task-id> <project> --base <ref>
-yui task work scope <work-id> \
-  --project <existing-project> --project <new-project>
-yui task work isolate <work-id>
-yui task work reject <work-id> \
-  --summary "Write scope expanded; continue in the refreshed workspace."
-yui task work dispatch <work-id> --input "<continue with the expanded scope>"
-```
+This is Leader judgment inside the acceptance decision, not a separate record,
+checklist, or workflow phase. A managed Reviewer is optional. Do not create a
+Reviewer Role or ReviewRound for ceremony. Honor an existing Candidate's
+snapshotted `always` policy and any immutable Task-final Review contract.
+Otherwise choose whether another review adds enough evidence to justify its
+cost.
 
-Never omit an already-approved Project from `task work scope`; Yui rejects
-scope shrink. Do not hot-swap an active Session. Do not let a Worker add a
-Project or write through a Task-main context directory. Split a new WorkItem or
-Task when the result or lifecycle is independent.
+Use direct Review by default: one main Reviewer Turn owns the authoritative
+result without an ExecutionGroup or Lane. Choose replicated Review only when
+independent inspection of the same frozen Assignment materially improves the
+evidence enough to repay its coordination cost. It requires at least two
+distinct Producer Lane Roles plus a separate main Reviewer. Wait for every
+Producer to settle and at least two to succeed; their results are durable
+evidence only. The main Reviewer receives all successful results, resolves
+disagreement against the frozen sources, and submits the one authoritative
+finding batch and outcome. Automatic policy-triggered Candidate Review remains
+direct.
 
-Do not dispatch until dependencies are complete. Do not create a second active
-Turn for the same Role or WorkItem. A Worker's final Provider response is stored
-as Turn evidence and moves the WorkItem to Leader review; it is not acceptance.
+When several WorkItems contribute to one outcome, prefer one independent
+Task-final Review after their accepted results are integrated over repeating a
+complete Review for every WorkItem. Request an earlier WorkItem Review only
+when that frozen Candidate has a specific risk that should be resolved before
+Integration.
 
-## Review, retry, capture, and integrate
+When a Review result arrives, read the complete submitted finding batch before
+starting new work or waiting again. Decide whether to accept, repair, review
+again, or ask for a genuinely user-owned decision. Route reachable findings to
+the original execution owner. Fix a small Task-main issue directly; create a
+Repair WorkItem only when the repair is itself a substantial independently
+owned requirement.
 
-After any Candidate is submitted, inspect its exact policy, Turn result,
-ReviewRounds, checks, and workspace through the exact Turn Context Pack and its
-authorized expansions.
+A failed or ambiguous Review is evidence, not an automatic retry or repair
+wave. Inspect its exact Round, Turn, candidate, and `task next-action` facts,
+then choose the smallest recovery that preserves the frozen boundary. Do not
+invent a retry loop or silently replace the Reviewer Session. For a replicated
+Task-final Round below quorum before main synthesis, retry the Round so only
+unsettled or failed Producers rerun. Retry a failed main synthesis through its
+exact Turn. Use `force-fresh` only for an eligible direct, durably
+non-semantic Round, never for replicated or ambiguous evidence.
 
-- No configured review policy: review the Candidate directly, or delegate a
-  bounded evidence-gathering review to a native subagent or ordinary Worker,
-  then make the Leader-owned accept/reject decision. Do not create a Reviewer
-  Role merely to satisfy an old setup convention.
-- `always`: keep the Candidate decision pending until its required ReviewRound
-  is terminal. Policy-triggered WorkItem Review uses direct execution. The
-  Review does not globally pause unrelated Leader work.
-- `leader`: decide whether the existing evidence is sufficient. Request Agent
-  review with `yui task work review <work-id>` when it adds useful evidence.
-  Add at least two distinct `--lane-role` values only when independent
-  Producer inspections of that same frozen Candidate materially improve the
-  evidence; one value is invalid.
-- `final`: keep WorkItem acceptance and integration independent. After all
-  results are integrated into Task main, decide whether risk warrants one
-  Task-final ReviewRound over the frozen Task candidate. A Task contract may
-  require it. The final Reviewer evaluates the complete result across bound
-  Projects; it is not a second per-WorkItem approval protocol.
-- Before choosing a Task-final Review action, read `task context` or
-  `task next-action` and inspect every active Turn's purpose and exact
-  WorkItem/ReviewRound binding, the current durable heads, active Reviews,
-  each Reviewer's availability, the latest accepted baseline, candidate
-  relation, and Delta facts. These are decision support, not an autopilot;
-  a Review Turn is evidence in progress, not a global Task lock.
-- A changed Task head may justify a new semantic Task-final Round. Reuse the
-  same Reviewer Role Session and stable workspace; Round id, full versus Delta
-  mode, desired revision, and frozen commit do not require a replacement
-  Session. Round identity still binds each Turn to the exact frozen head.
-- An active Task-final Review freezes candidate A only. Continue handling new
-  user input and, when appropriate, advance candidate B. Always consume A's
-  result, then route it as exact evidence for A, a baseline for descendant B,
-  or historical evidence for a diverged candidate. Do not cancel or discard A
-  merely because Task main moved.
-- Read active Review facts directly from its ReviewRound: frozen Project
-  commits define that Review's evidence boundary; current candidate relation,
-  active Turn, and workspace references describe current execution. Do not infer
-  a Task lock or wait for a synthetic freeze lifecycle before advancing Task
-  main.
-- If Yui reports a Reviewer `busy`, wait for the suggested interval, select a
-  different Reviewer, review directly, or continue other work. Busy is a
-  scheduling fact, not a failed Review and not a reason to reset the Session.
-- Prefer Delta Recheck for a technically available, contiguous change over an
-  accepted baseline when the semantic risk is bounded. Use the exact changed
-  files, line counts, diff, previous evidence, Task intent, and Project Policy
-  to choose full Review, Delta, direct Review, another Reviewer, or no Review;
-  Yui does not choose the mode from generic thresholds.
-- Delta `requires-full-review` returns control to the Leader. Decide whether a
-  full Review, another Reviewer, direct inspection, or more development is
-  useful; Yui must not auto-create the next Round. `repeated-full-review` is a
-  cost advisory for an unchanged candidate/Reviewer intent, never an exhausted
-  budget or a prohibition on new evidence.
-- A completed review is advice. Decide whether to accept, reject, review again,
-  or ask the user.
-- Route a reachable final-Review finding to the original Worker while that
-  WorkItem is open; otherwise fix a small local issue as Leader on Task main.
-  Create a Repair WorkItem only when the repair is itself a substantial,
-  independently owned requirement. Keep related findings in that one unit by
-  default. Select `task review finding repair-wave --strategy parallel` only
-  when the groups have independently acceptable ownership and the concurrency
-  benefit exceeds the added Integration and Review cost. Use Leader/Integration
-  for merge or small local fixes, and create an architecture WorkItem only for
-  a genuinely cross-cutting design issue. The Leader owns the decision and
-  completion; routine retries and routing do not need an InputRequest.
-- A failed semantic review is terminal evidence, not an automatic retry. For a
-  WorkItem, request a new `task work review`, accept with an explicit rationale,
-  or ask the user. `yui task turn retry <turn-id>` is only for an exact failed
-  Candidate or Task-final review execution under the same semantic ReviewRound,
-  preserving settled Producer siblings. If a replicated Task-final Round fails
-  below quorum before it has a main Reviewer Turn, use
-  `yui task review retry <task>/<review-round>` to reopen only its settled failed
-  Producer Lanes and preserve successful siblings. If a main Reviewer Turn
-  failed, retry that exact Turn. If a direct immutable Round is durably proven
-  non-semantic without any review checks, evidence, finding, or ambiguous
-  output—even when a pre-review context/workspace failure historically
-  terminalized it without a semantic result—the Leader may instead run
-  `yui task review force-fresh <task>/<review-round>` to create one distinct
-  full Round over the identical frozen heads. It fails closed for every
-  replicated, semantic, or ambiguous prior result; target the new failed Round
-  explicitly if another non-semantic failure occurs.
-- For `review.failed-to-start`, open the referenced ReviewRound and inspect its
-  exact reason, frozen candidate, and workspace when present. Decide whether to
-  retry, explicitly clean a conflicting workspace, select another Reviewer, or
-  continue other work. Preserve the failed Round as request history and do not
-  turn these choices into an automatic retry or cleanup loop.
-- Use `task next-action`'s derived Review outcome literally: non-semantic means
-  recover the same frozen head with the recommended same-Round retry, with
-  `force-fresh` available only for a direct Round when a distinct attempt is
-  justified; ambiguous means diagnose the inconsistent evidence without
-  creating a Repair WorkItem; only semantic negative evidence may create a
-  repair wave. There is no semantic Review budget; exact
-  candidate/Reviewer/intent retries reuse existing evidence.
-- If the same non-resource user choice or unavailable external fact repeats,
-  persist context and create an InputRequest instead of looping. Never use an
-  InputRequest to solicit authorization for an unrequested real-resource test;
-  the resource boundary above requires skipping it.
-- A Reviewer may leave an optional diagnostic commit. Route its SHA and
-  findings explicitly to the original Worker; never capture, integrate, accept,
-  or auto-merge the review workspace. After routing, use
-  `yui task work review cleanup <task>/<review-round>` or preserve it explicitly
-  for further diagnosis. Cleanup removes only the ReviewRound workspace.
+## Accept, integrate, and complete
 
-- If semantics or evidence are insufficient, reject with precise feedback and
-  redispatch the same WorkItem. Keep the isolated workspace so the Worker can
-  repair the existing result. This creates another Turn and Candidate but
-  must resume the original execution Role's native Session; do not create a
-  replacement Session silently.
-- If the result is acceptable and has no isolated code changes, accept it.
-- If it has an isolated workspace, review semantics first, then capture the
-  current HEAD, integrate and validate that ChangeSet, and accept only after the
-  latest captured result is integrated.
+A Worker or Reviewer Turn result is evidence, not acceptance. Inspect the
+result, diff, checks, and current Candidate before deciding.
+
+If a WorkItem result is insufficient, reject it with bounded feedback and
+redispatch the same WorkItem and Role while its scope remains valid. If it is
+acceptable and contains isolated Git changes, capture and integrate its latest
+Candidate before acceptance:
 
 ```sh
-yui task work reject <work-id> --summary "<missing evidence or required fix>"
-yui task work dispatch <work-id> --input "<prior result plus bounded feedback>"
-
 yui task work capture <work-id>
 yui task integration start <task-id> --project <project> \
-  --change-set <latest-project-change-set-id> \
-  --check "<validation command>"
-yui task work accept <work-id> --summary "<acceptance and integration evidence>"
+  --change-set <change-set-id> \
+  --check "<Project Policy command>"
+yui task work accept <work-id> --summary "<decision and evidence>"
 ```
 
-`--check` commands run from the selected Project's integration candidate root.
-Keep them Project-relative and take the exact commands from Project Policy; do
-not invent a repository-specific command or add a generic shell prelude.
+Resolve a failed Integration from its exact conflict or check evidence. Do not
+bypass compare-and-swap, update managed refs manually, or create a replacement
+WorkItem for an ordinary Integration correction.
 
-Candidate and ReviewRound history is retained under the same WorkItem. Every
-retry round must also retain its result and checks in the WorkItem summary.
-Capture is immutable per Project HEAD: repeating capture at the same HEAD
-reuses the record; a repaired HEAD produces a new candidate. Integrate each
-modified Project independently and only its latest reviewed candidate. Never
-accept an isolated result while any writable Project's latest ChangeSet is
-unintegrated.
+Record a confirmed PR/MR creation, state change, or merge with
+`yui task publication upsert`. When the current authorization covers an
+external verification, use `yui task publication verify`; otherwise preserve
+reported evidence and state the gap. Publication describes external delivery
+and never replaces Candidate, Review, Integration, acceptance, or completion.
 
-Workspace ownership is not Role ownership. The WorkItem owns its Develop
-workspace even when a Task Role executes there; a Task Reviewer Role keeps one
-stable physical workspace while each ReviewRound owns the exact frozen
-workspace evidence for its Turn, and each IntegrationAttempt owns its candidate
-worktree. Dispatch attaches snapshots only. Review workspace cleanup is
-explicit, and review edits can never feed WorkItem ChangeSet capture.
-
-Yui validates a candidate and advances the target with compare-and-swap. A
-failed candidate does not advance the target. Inspect and resolve semantic
-conflicts as this Task's Leader:
+Complete only when the Task outcome is satisfied, required checks and review
+contracts are settled, WorkItems are accepted or deliberately retired, latest
+isolated results are integrated, and user inputs are resolved:
 
 ```sh
-yui task integration show <integration-id>
-yui task integration resolve <integration-id> \
-  --option <manual-resolution|reject> \
-  --rationale "<intended semantics and evidence>"
-yui task integration continue <integration-id>
+yui task complete <task-id> \
+  --summary "<outcome, validation, and remaining risk>"
 ```
 
-For manual resolution, edit only the candidate worktree and finish the reported
-Git conflict before continuing. Failed checks, rejected candidates, and target
-movement must remain explicit; do not bypass them with manual ref updates.
+Completion records the exact Project heads. Archive is a separate,
+user-authorized Operator action.
 
-Choose cleanup from the WorkItem's expected next use, not merely from a Turn
-ending. If another iteration is imminent, retain the native process and
-worktree. For a longer pause with no active Turn or pending delivery, release
-only the runtime; Yui preserves the native Session id and WorkItem worktree so
-the next dispatch can resume them:
+## Finish every Leader Turn
 
-```sh
-yui task work cleanup <task>/<work> --runtime-only
-```
+Before ending the Turn:
 
-After final acceptance and integration, clean terminal resources deliberately:
+1. Consume any completed Worker, child, Reviewer, or Integration result that
+   caused this wake and make the next semantic decision.
+2. Persist actual WorkItem lifecycle and material Brief, Decision, Milestone,
+   Message, or Knowledge changes.
+3. Choose one truthful outcome: continue through an owned native child, complete
+   the Task, create a justified InputRequest, or leave the active Task waiting
+   for a real durable event.
+4. Return one concise final report with outcome, checks, remaining risk, and
+   bounded next action.
 
-```sh
-yui task integration cleanup <integration-id>
-yui task work cleanup <task>/<work> --integrated
-```
+Do not claim completion only in prose when durable Task or WorkItem state still
+needs updating. Do not poll managed Roles or emit waiting Messages. Managed
+results wake a later Leader Turn; an unchanged active Task remains quiet.
 
-Terminal child worktrees are completion advisories, not semantic blockers.
-Clean them before archive; do not create a new WorkItem, ReviewRound, or Turn
-only to make cleanup happen before Task completion.
-
-Use `--abandon` only for deliberate discard. Dirty worktrees remain available
-for capture or resolution. Cleanup must never stop a Role already serving a
-newer WorkItem. If the original execution Session cannot be resumed, surface
-the recovery decision to the user; do not silently discard its context by
-creating a replacement.
-
-For a Role runtime failure, inspect the exact error and runtime identities first:
-
-```sh
-yui task event show <task> <agent-error-event>
-yui task role session inspect <task> <role>
-```
-
-When a Provider-accepted Turn fails with availability, `429`, capacity, or a
-recoverable transport error and the Session remains usable, retain the Turn and
-Session; a recovery action adds a new Turn on that same native Session. A
-Session preparation failure or Driver rejection before input acceptance fails
-the exact Turn once; inspect its error and explicitly retry that failed Turn when
-another attempt is useful. Core will not redispatch it on a scheduler tick.
-
-If the Driver proves that the Session cannot continue, settle or retire the
-exact active Turn, stop only that Role Session, then retry the failed Turn so the
-next dispatch starts a new Session:
-
-```sh
-yui task role session stop <task> <role> --reason "<error decision>"
-yui task turn retry <task>/<failed-turn>
-```
-
-The new Turn context contains the prior Agent, adapter, Turn, Host activation,
-native Session/Turn identities, and complete raw error through the referenced
-Task event. Inspect recent `runtime.agent-error` events before another fresh
-Session; after repeated fresh-Session failures, report the evidence and bounded
-options to the user instead of inventing another automatic loop.
-
-## Request a decision
-
-When a real user choice, new authority, or unavailable external fact is
-required, first persist the Task checkpoint, then create one durable
-InputRequest. Do not use InputRequests for scheduling, routine implementation
-choices inside the accepted Task Contract, review-fix routing, or confirmation
-to continue:
-
-```sh
-yui task input request <task-id> --question "<specific question>" \
-  --choice <key>=<label> --blocks work-item:<work-id>
-```
-
-Omit `--choice` for free text. Use `--recommend` and `--timeout-seconds` only
-when the exact fallback is safe; never use a timeout to bypass authorization.
-A successful request records the durable question. End the Provider Turn with
-a truthful blocked checkpoint; Yui stores that response as the current Turn
-result and later wakes the same fixed Leader Session when an answer arrives.
-
-## Finish every Leader turn
-
-Every wake is an active control Turn. Before ending:
-
-- Inspect the current WorkItems. If this Turn acted on a Leader-assigned
-  WorkItem, persist its actual lifecycle and result before the final response:
-  move `pending` to `running`, then record `done` or `failed` with the evidence
-  you actually established. Saying that the WorkItem is complete in the Turn
-  result does not update the WorkItem.
-- If you cannot finally determine success, failure, completeness, or the
-  correct disposition, do not guess, silently stop, or hide uncertainty behind
-  a success summary. Clearly label the checkpoint uncertain, incomplete,
-  blocked, or requiring Leader judgment.
-- Preserve the same complete checkpoint before ending the Turn or creating an InputRequest.
-  When applicable, record exact Turn, WorkItem, and native Session identity;
-  actions actually performed; changed paths and commit/worktree state; checks
-  actually run and their outcomes; provider, runtime, or permission errors;
-  the last confirmed lifecycle boundary; work not performed; unresolved
-  assumptions or decisions; residual risks; confidence; and bounded next
-  options.
-- Review Turns report findings, verification gaps, and limits. Use that evidence
-  to decide disposition as Leader; do not treat the review as acceptance.
-
-1. update the Brief checkpoint if semantic state changed;
-2. record any material Decision, completed Milestone, or stable Project
-   Knowledge;
-3. decide whether to complete the Task, create an InputRequest, or leave it
-   active for later facts;
-4. end the Provider Turn with one complete, truthful final report.
-
-Yui automatically stores the final Provider response as the current Turn result.
-That result never implies Leader acceptance, WorkItem completion, ChangeSet
-capture, Integration, or Task completion. Do not wait inside a Provider Turn
-for managed Task Role or Reviewer results whose durable mailbox can wake the
-Task; their result creates a later Leader Turn in the same Session. Native child
-work remains part of the current Provider Turn and should drain before it ends.
-When the Turn ends with the Task still active, Yui remains quiet until a real
-durable event arrives; do not rely on periodic re-wakes to revisit unchanged
-state.
-
-Complete only after the topology-derived evidence is satisfied, Role work is
-terminal, latest isolated results are integrated or deliberately abandoned,
-and user inputs are resolved. A Leader-owned Task has no WorkItem gate; a Task
-with WorkItems must settle and integrate them. Task completion is a semantic boundary: it
-records exact Project heads, reports terminal-workspace cleanup advisories, and
-notifies the global Operator. It does not stop this Leader. Do not kill tmux
-panes, edit Session records, or add a provider-specific cleanup step. After
-completion succeeds, end the current Turn immediately so the Operator can
-settle advisories and perform the explicit archive boundary; do not stop or
-mutate the native Session yourself.
-
-```sh
-yui task complete <task-id> --summary "<outcome, validation, and remaining risks>"
-```
-
-Retire obsolete WorkItems with `yui task work retire <task>/<work> --summary
-"..."`, optionally using `--replacement`. If the current Provider Conversation
-cannot continue, settle its Turn and stop the exact idle Session with
-`yui task role session stop`; the next explicit Turn dispatch creates the
-replacement. Archiving is a
-separate global Operator lifecycle action. It performs the final Task-owned
-runtime and clean-worktree teardown, including this Leader.
+For a runtime failure, inspect the exact `runtime.agent-error`, Turn, and
+Session facts. Retry the failed Turn on the same recoverable Session when useful.
+Replace a Session only when the Driver proves it cannot continue. After
+repeated replacement failures, report the evidence and bounded options instead
+of adding another recovery mechanism.
