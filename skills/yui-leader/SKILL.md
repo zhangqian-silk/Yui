@@ -618,25 +618,30 @@ authorized expansions.
   WorkItem, request a new `task work review`, accept with an explicit rationale,
   or ask the user. `yui task turn retry <turn-id>` is only for an exact failed
   Candidate or Task-final review execution under the same semantic ReviewRound,
-  preserving settled Producer siblings. If
-  that immutable Round is durably proven non-semantic without any review
-  checks, evidence, finding, or ambiguous output—even when a pre-review
-  context/workspace failure historically terminalized it without a semantic result—
-  the Leader may run
+  preserving settled Producer siblings. If a replicated Task-final Round fails
+  below quorum before it has a main Reviewer Turn, use
+  `yui task review retry <task>/<review-round>` to reopen only its settled failed
+  Producer Lanes and preserve successful siblings. If a main Reviewer Turn
+  failed, retry that exact Turn. If a direct immutable Round is durably proven
+  non-semantic without any review checks, evidence, finding, or ambiguous
+  output—even when a pre-review context/workspace failure historically
+  terminalized it without a semantic result—the Leader may instead run
   `yui task review force-fresh <task>/<review-round>` to create one distinct
   full Round over the identical frozen heads. It fails closed for every
-  semantic or ambiguous prior result; target the new failed Round explicitly
-  if another non-semantic failure occurs.
+  replicated, semantic, or ambiguous prior result; target the new failed Round
+  explicitly if another non-semantic failure occurs.
 - For `review.failed-to-start`, open the referenced ReviewRound and inspect its
   exact reason, frozen candidate, and workspace when present. Decide whether to
   retry, explicitly clean a conflicting workspace, select another Reviewer, or
   continue other work. Preserve the failed Round as request history and do not
   turn these choices into an automatic retry or cleanup loop.
 - Use `task next-action`'s derived Review outcome literally: non-semantic means
-  recover the same frozen head with `force-fresh`; ambiguous means diagnose the
-  inconsistent evidence without creating a Repair WorkItem; only semantic
-  negative evidence may create a repair wave. There is no semantic Review
-  budget; exact candidate/Reviewer/intent retries reuse existing evidence.
+  recover the same frozen head with the recommended same-Round retry, with
+  `force-fresh` available only for a direct Round when a distinct attempt is
+  justified; ambiguous means diagnose the inconsistent evidence without
+  creating a Repair WorkItem; only semantic negative evidence may create a
+  repair wave. There is no semantic Review budget; exact
+  candidate/Reviewer/intent retries reuse existing evidence.
 - If the same non-resource user choice or unavailable external fact repeats,
   persist context and create an InputRequest instead of looping. Never use an
   InputRequest to solicit authorization for an unrequested real-resource test;

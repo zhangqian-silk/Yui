@@ -56,8 +56,9 @@ binding fails before review begins:
 - return only the exact infrastructure diagnosis, with no semantic findings or
   checks, through the assigned Review Turn;
 - do not recommend a Repair WorkItem—the Leader must recover the same frozen
-  review boundary with `task review force-fresh` when Yui proves the outcome
-  non-semantic;
+  review boundary with Yui's projected same-Round `task review retry` or exact
+  `task turn retry`; `task review force-fresh` is reserved for an eligible
+  direct Round when the Leader deliberately chooses a distinct attempt;
 - if any candidate inspection or Reviewer output did occur, report it
   explicitly. Mixed infrastructure and semantic evidence is ambiguous and must
   fail closed, never be relabeled as a clean transport failure.

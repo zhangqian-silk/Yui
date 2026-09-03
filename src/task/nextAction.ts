@@ -561,14 +561,44 @@ export function projectNextAction(facts: NextActionFacts): NextAction {
     : classifyReviewRoundOutcome(failedFinal, nextActionReviewOutcomeEvidence(facts));
   if (finalReviewRequired
     && failedFinal !== undefined && failedFinalOutcome?.kind === "non-semantic") {
+    const reviewerTurn = failedFinal.reviewerTurnId === undefined
+      ? undefined
+      : facts.reviewOutcomeEvidence?.turns.find(
+          ({ id }) => id === failedFinal.reviewerTurnId
+        );
+    const sameRoundCommand = failedFinal.reviewerTurnId === undefined
+      ? `yui task review retry ${task.id}/${failedFinal.id}`
+      : reviewerTurn?.status === "failed"
+        ? `yui task turn retry ${task.id}/${reviewerTurn.id}`
+        : undefined;
+    const directForceFresh = failedFinal.executionGroup === undefined
+      ? {
+          kind: "force-fresh-review",
+          reason:
+            "Create a distinct full Round only when preserving this direct non-semantic attempt as immutable history is preferable.",
+          recommendedCommand:
+            `yui task review force-fresh ${task.id}/${failedFinal.id}`,
+          refs: [ref("review-round", failedFinal.id)]
+        }
+      : undefined;
     return buildAction(facts, {
       kind: "resume-review",
       reason: `Task-final Review ${failedFinal.id} ended before a semantic review was proven.`,
-      refs: [ref("review-round", failedFinal.id)],
+      refs: [
+        ref("review-round", failedFinal.id),
+        ...(reviewerTurn?.status === "failed" ? [ref("turn", reviewerTurn.id)] : [])
+      ],
       preconditions: [
         { fact: "Task-final Review has semantic evidence", satisfied: false, ref: ref("review-round", failedFinal.id) }
       ],
-      recommendedCommand: `yui task review force-fresh ${task.id}/${failedFinal.id}`
+      ...(sameRoundCommand !== undefined
+        ? { recommendedCommand: sameRoundCommand }
+        : directForceFresh === undefined
+          ? {}
+          : { recommendedCommand: directForceFresh.recommendedCommand }),
+      ...(sameRoundCommand === undefined || directForceFresh === undefined
+        ? {}
+        : { alternatives: [directForceFresh] })
     });
   }
   if (finalReviewRequired
