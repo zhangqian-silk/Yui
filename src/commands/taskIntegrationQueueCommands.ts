@@ -302,5 +302,5 @@ function requireTaskControlActor(
   taskId: string,
   home?: string
 ) {
-  return taskLocalActor(store, environment, taskId, home);
+  return taskLocalActor(store, environment, taskId);
 }

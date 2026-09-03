@@ -68,7 +68,7 @@ async function cleanupIntegration(
     );
   }
   const integration = requireIntegration(store, args[0], environment);
-  taskLocalActor(store, environment, integration.taskId, home);
+  taskLocalActor(store, environment, integration.taskId);
   if (integration.status !== "committed"
     && integration.status !== "superseded"
     && integration.status !== "failed") {
@@ -131,7 +131,7 @@ async function start(
   if (task.status !== "active") {
     throw usageError(`Task is not active: ${task.id}/${task.status}.`);
   }
-  taskLocalActor(store, options.environment, task.id, home);
+  taskLocalActor(store, options.environment, task.id);
   await new FileTaskWorkspacePreparer(home, store, undefined, now)
     .prepareTaskWorkspace(task.id);
   task = store.getTask(task.id);
@@ -187,7 +187,7 @@ async function start(
     throw usageError(`WorkItem result Project snapshot is incomplete: ${workItem.id}/${project.id}.`);
   }
   const integration = store.transaction((tx) => {
-    taskLocalActor(tx, options.environment, task.id, home);
+    taskLocalActor(tx, options.environment, task.id);
     const created = createIntegrationAttempt({
       id: tx.nextIntegrationAttemptId(task.id),
       taskId: task.id,
@@ -221,7 +221,7 @@ async function continueIntegration(
   if (parsed.positionals.length !== 1) throw usageError(usage);
   const integration = requireIntegration(store, parsed.positionals[0], options.environment);
   requireActiveIntegrationTask(store, integration);
-  taskLocalActor(store, options.environment, integration.taskId, home);
+  taskLocalActor(store, options.environment, integration.taskId);
   if (
     integration.status !== "validating"
     && integration.status !== "running"
@@ -279,7 +279,7 @@ function resolveDecision(
   const resolved = store.transaction((tx) => {
     const integration = requireIntegration(tx, parsed.positionals[0], environment);
     const task = requireActiveIntegrationTask(tx, integration);
-    const actor = taskLocalActor(tx, environment, task.id, home);
+    const actor = taskLocalActor(tx, environment, task.id);
     const updated = recordResolutionDecision(integration, {
       action: selectedOption as "manual-resolution" | "reject",
       rationale
@@ -307,7 +307,7 @@ async function abortIntegration(
   if (parsed.positionals.length !== 1) throw usageError(usage);
   const integration = requireIntegration(store, parsed.positionals[0], options.environment);
   requireActiveIntegrationTask(store, integration);
-  taskLocalActor(store, options.environment, integration.taskId, home);
+  taskLocalActor(store, options.environment, integration.taskId);
   if (integration.status !== "running" && integration.status !== "blocked") {
     throw usageError(
       `Integration cannot be aborted from ${integration.status}: ${integration.id}.`
@@ -334,7 +334,7 @@ async function abortIntegration(
         `Integration cannot be aborted from ${current.status}: ${current.id}.`
       );
     }
-    taskLocalActor(tx, options.environment, current.taskId, home);
+    taskLocalActor(tx, options.environment, current.taskId);
     const aborted = updateIntegrationAttempt(current, {
       status: "failed",
       checks: [
@@ -370,7 +370,7 @@ function supersedeIntegrationCommand(
   if (reason === undefined) throw usageError(usage);
   // Superseding a committed Integration rewrites delivery-baseline evidence
   // and audit history, so it remains an explicit Task-control decision.
-  taskLocalActor(store, environment, integration.taskId, home);
+  taskLocalActor(store, environment, integration.taskId);
   // A queue-backed committed Attempt cannot be superseded: the queue entry
   // would remain in its current status while its Attempt becomes "superseded",
   // leaving contradictory terminal records that never converge. This covers
@@ -396,7 +396,7 @@ function supersedeIntegrationCommand(
         `Integration cannot be superseded from ${current.status}: ${current.id}.`
       );
     }
-    taskLocalActor(tx, environment, current.taskId, home);
+    taskLocalActor(tx, environment, current.taskId);
     const superseded = supersedeIntegration(current, reason, now);
     tx.saveIntegrationAttempt(superseded.taskId, superseded);
     return {

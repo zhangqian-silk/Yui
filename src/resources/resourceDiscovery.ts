@@ -222,36 +222,7 @@ function discoverRuntimeArtifacts(
   const discovered: DiscoveredResource[] = [];
   const now = input.now;
 
-  // 3a. Exact Task runtime descriptors: runtime/exact-task-runtime/<digest>.json
-  const exactDirectory = join(home, "runtime", "exact-task-runtime");
-  for (const entry of safeReaddir(exactDirectory)) {
-    if (!entry.name.endsWith(".json")) continue;
-    const path = join(exactDirectory, entry.name);
-    const descriptor = readJsonFile(path);
-    const taskId = typeof descriptor?.taskId === "string" ? descriptor.taskId : undefined;
-    const owner: ResourceOwner = {
-      home,
-      ...(taskId === undefined ? {} : { taskId }),
-      basis: taskId === undefined ? "unattributed" : "descriptor"
-    };
-    const taskStatus = taskId === undefined ? undefined : input.taskStatusById.get(taskId);
-    discovered.push({
-      record: createResourceRecord({
-        kind: "runtime-artifact",
-        path: resolve(path),
-        owner,
-        ...(sizeOf(path) === undefined ? {} : { sizeBytes: sizeOf(path) }),
-        cleanliness: "n/a",
-        activeRefs: [],
-        disposition: "active"
-      }, now),
-      ownerTerminal: taskId === undefined
-        ? false
-        : isTerminalTaskStatus(taskStatus as never)
-    });
-  }
-
-  // 3b. Task runtime isolation roots: <home>.task-runtimes/<taskId>/<owner>/<launch>/
+  // 3a. Task runtime isolation roots: <home>.task-runtimes/<taskId>/<owner>/<launch>/
   const runtimeRoot = `${resolve(home)}.task-runtimes`;
   if (existsSync(runtimeRoot)) {
     for (const taskEntry of safeReaddir(runtimeRoot)) {

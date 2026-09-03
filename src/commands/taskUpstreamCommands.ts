@@ -75,7 +75,7 @@ async function integrateUpstream(
   if (task.status !== "active") {
     throw usageError(`Task must be active to integrate upstream: ${taskId}/${task.status}.`);
   }
-  taskLocalActor(store, options.environment, task.id, home);
+  taskLocalActor(store, options.environment, task.id);
   const git = options.git ?? new NodeGitWorkspace();
   const now = options.now ?? (() => new Date());
   await new FileTaskWorkspacePreparer(home, store, git, now)

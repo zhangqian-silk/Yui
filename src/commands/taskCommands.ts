@@ -1,5 +1,5 @@
 import type { ConfiguredAgent } from "../agent/agent.js";
-import { createHash, randomUUID } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
 import { createTurnInput } from "../context/turnInputContract.js";
 import {
@@ -314,6 +314,7 @@ import {
   taskLocalActor as resolveTaskLocalActor,
   taskLeaderActionTurnId
 } from "./taskActor.js";
+import { currentManagedRuntime } from "../runtime/managedCaller.js";
 import { enqueueOperatorEvent } from "../scheduler/operatorEvent.js";
 import { queueLeaderWakeup } from "../scheduler/wakeupQueue.js";
 import { renderWakeReason, wakeReason } from "../scheduler/wakeReason.js";
@@ -4049,7 +4050,7 @@ function disposeReviewFindingCommand(
     const command: ReviewFindingDispositionCommand = {
       disposition,
       by: actor === "leader"
-        ? taskLeaderActionTurnId(tx, task.id, options.environment, options.yuiHome) ?? actor
+        ? taskLeaderActionTurnId(tx, task.id, options.environment) ?? actor
         : actor,
       ...(parsed.options.get("--note") === undefined ? {} : { note: parsed.options.get("--note")! }),
       ...(parsed.options.get("--work-item") === undefined ? {} : { workItemId: parsed.options.get("--work-item")! }),
@@ -5056,7 +5057,7 @@ function retireTurn(
     }
     if (run.status === "active") {
       if (actor === "leader"
-        && taskLeaderActionTurnId(tx, task.id, options.environment, options.yuiHome) === run.id) {
+        && taskLeaderActionTurnId(tx, task.id, options.environment) === run.id) {
         throw usageError("A Task Leader cannot retire its own current authority Turn.", usage);
       }
       const expectedProgressAt = requiredOption(
@@ -5196,6 +5197,17 @@ function parseTurnContextReference(value: string): { taskId: string; turnId: str
   return { taskId, turnId };
 }
 
+/**
+ * A Turn Context Pack is information the Role's own runtime reads in order to
+ * work. Authorization is therefore scope-shaped, not schedule-shaped: the
+ * caller must be the current runtime of the Task Role that owns the Turn,
+ * proven by its per-Session caller key against durable state.
+ *
+ * It deliberately does not require the Turn to still be the active one. An
+ * Agent whose Turn has advanced must still be able to read the context it was
+ * given; losing read access to its own Role's history is what forces an
+ * otherwise healthy Agent to stop and escalate to a human.
+ */
 function authorizeTurnContext(
   store: TaskWorkflowStore,
   taskId: string,
@@ -5204,31 +5216,16 @@ function authorizeTurnContext(
 ): void {
   const managed = environment?.YUI_SESSION_SCOPE !== undefined
     || environment?.YUI_TASK_ID !== undefined
-    || environment?.YUI_ROLE !== undefined
-    || environment?.YUI_TURN_ID !== undefined;
+    || environment?.YUI_ROLE !== undefined;
   if (!managed) return;
   const run = store.getTurn(taskId, turnId);
-  const active = run === null ? null : store.getActiveTurn(taskId, run.roleName);
-  if (environment?.YUI_SESSION_SCOPE !== "task"
-    || environment.YUI_TASK_ID !== taskId
-    || run === null
-    || environment.YUI_ROLE !== run.roleName
-    || environment.YUI_AGENT_ID !== run.effective.agentId
-    || environment.YUI_ADAPTER_ID !== run.effective.adapterId
-    || run.status !== "active"
-    || active?.id !== turnId) {
+  if (run === null) {
     throw usageError(`Turn Context access is not authorized: ${taskId}/${turnId}.`);
   }
-  const callerKey = environment.YUI_JOB_CALLER_KEY;
-  const expectedCallerKeyHash = store.getJobCallerKeyHash(
-    taskId,
-    run.roleName,
-    run.effective.agentId
-  );
-  if (callerKey === undefined
-    || expectedCallerKeyHash === null
-    || createHash("sha256").update(callerKey).digest("hex") !== expectedCallerKeyHash) {
-    throw usageError(`Turn Context caller key is not authorized: ${taskId}/${turnId}.`);
+  if (currentManagedRuntime(store, environment, taskId, run.roleName) === undefined) {
+    throw usageError(
+      `Turn Context access requires the current runtime of ${taskId}/${run.roleName}.`
+    );
   }
 }
 
@@ -7274,8 +7271,7 @@ function leaderActionEventPayload(
   const turnId = taskLeaderActionTurnId(
     store,
     taskId,
-    options.environment,
-    options.yuiHome
+    options.environment
   );
   return turnId === undefined ? {} : { leaderTurnId: turnId };
 }
@@ -7501,12 +7497,12 @@ function assertTaskExecutionEnabled(task: Task, action: string): void {
 function taskActor(
   store: Pick<
     TaskWorkflowStore,
-    "getRole" | "getActiveTurn" | "getTaskRoleSessionSet"
+    "getRole" | "getActiveTurn" | "getJobCallerKeyHash"
   >,
   options: TaskCommandOptions,
   taskId: string
 ) {
-  return resolveTaskLocalActor(store, options.environment, taskId, options.yuiHome);
+  return resolveTaskLocalActor(store, options.environment, taskId);
 }
 
 function inactiveTaskMessage(task: Task, action: string): string {
