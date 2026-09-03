@@ -4537,21 +4537,26 @@ function assertTaskReviewRequestLane(
   const activeTurns = store.listTurns(taskId).filter((entry) => (
     entry.roleName === reviewerRoleName && entry.status === "active"
   ));
-  if (reusableRound === undefined || reusableRound.status === "pending") {
+  const assertReviewerIdle = (): void => {
     if (activePointer !== null || activeTurns.length > 0
       || hasMailboxWork(reviewerMailbox) || hasMailboxWork(runtimeMailbox)) {
       throw usageError(`Reviewer has unrelated active execution: ${reviewerRoleName}.`);
     }
+  };
+  if (reusableRound === undefined || reusableRound.status === "pending") {
+    assertReviewerIdle();
     return;
   }
   if (reusableRound.status === "completed") {
-    if (activePointer !== null || activeTurns.length > 0
-      || hasMailboxWork(reviewerMailbox) || hasMailboxWork(runtimeMailbox)) {
-      throw usageError(`Reviewer has unrelated active execution: ${reviewerRoleName}.`);
-    }
+    assertReviewerIdle();
     return;
   }
   const reviewerTurnId = reusableRound.reviewerTurnId;
+  if (reviewerTurnId === undefined
+    && reusableRound.executionGroup?.lanes.some(({ disposition }) => disposition === "open")) {
+    assertReviewerIdle();
+    return;
+  }
   const activeMatches = reviewerTurnId !== undefined
     && activePointer?.id === reviewerTurnId
     && activePointer.status === "active"

@@ -1731,7 +1731,14 @@ test("direct and replicated Review keep Producer results non-authoritative", (t)
       }]
     }, now)];
   }));
-  const finish = (turn, status, completedAt, report, producerLabel) => {
+  const finish = (
+    turn,
+    status,
+    completedAt,
+    report,
+    producerLabel,
+    includeGitSnapshot = true
+  ) => {
     const result = store.transaction((tx) => terminalizeExactTaskTurn(tx, {
       taskId: task.id,
       roleName: turn.roleName,
@@ -1751,7 +1758,7 @@ test("direct and replicated Review keep Producer results non-authoritative", (t)
               summary: `${turn.roleName} completed.`,
               report,
               checks: [{ name: "core", outcome: "passed" }],
-              ...(turn.executionLaneId === undefined
+              ...(turn.executionLaneId === undefined || !includeGitSnapshot
                 ? {}
                 : {
                     gitSnapshot: {
@@ -1870,13 +1877,16 @@ test("direct and replicated Review keep Producer results non-authoritative", (t)
       evidence: [`${label} evidence`]
     }]
   });
-  finish(
+  const firstProducer = finish(
     producerTurns[0],
     "completed",
     new Date("2026-09-02T00:15:00.000Z"),
     producerReport("producer-a"),
-    "producer-a"
+    "producer-a",
+    false
   );
+  assert.equal(firstProducer.status, "completed");
+  assert.deepEqual(firstProducer.result.producer.codeRefs, []);
   assert.equal(store.getReviewRound(task.id, replicatedRound.id).reviewerTurnId, undefined);
   assert.deepEqual(store.listReviewFindings(task.id), []);
   finish(

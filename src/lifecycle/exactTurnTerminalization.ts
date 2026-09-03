@@ -452,7 +452,8 @@ export function terminalizeExactTaskTurn(
     : undefined;
   const incompleteProducer = producer !== undefined
     && (producer.checks.length === 0
-      || (turn.effective.writeProjectIds.length > 0
+      || (turn.purpose === "execution"
+        && turn.effective.writeProjectIds.length > 0
         && !producerCoversWriteProjects(producer, turn.effective.writeProjectIds)));
   const terminal = input.outcome.status === "completed" && !incompleteProducer
     ? completeTurn(turn, input.outcome.summary, now, input.outcome.provider, producer)
@@ -477,9 +478,8 @@ export function terminalizeExactTaskTurn(
       if (terminal.status === "completed") {
         const grouped = updateWorkItemExecutionLane(group, turn.executionLaneId, {
           currentTurnId: turn.id,
-          ...(terminal.status === "completed"
-            ? { successfulTurnId: turn.id, disposition: "succeeded" as const }
-            : { disposition: "failed" as const })
+          successfulTurnId: turn.id,
+          disposition: "succeeded"
         }, now);
         store.saveWorkItem(input.taskId, updateWorkItemExecutionGroup(item, grouped, now));
       }
@@ -498,9 +498,8 @@ export function terminalizeExactTaskTurn(
       if (terminal.status === "completed") {
         const grouped = updateExecutionLane(group, turn.executionLaneId, {
           currentTurnId: turn.id,
-          ...(terminal.status === "completed"
-            ? { successfulTurnId: turn.id, disposition: "succeeded" as const }
-            : { disposition: "failed" as const })
+          successfulTurnId: turn.id,
+          disposition: "succeeded"
         }, now);
         store.saveReviewRound(
           input.taskId,
