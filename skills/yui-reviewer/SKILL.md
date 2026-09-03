@@ -91,18 +91,17 @@ portable review behavior; Agent-native Project Skills and Project Policy and
 Knowledge own project-specific checks and review expectations; and the Task
 Contract owns the current outcome, scope, acceptance, and required evidence.
 
-Treat real models, paid APIs, shared infrastructure, production systems, real
-account quota, and every other non-disposable external resource as user-owned
-authority. A generic request to implement, test, validate, run E2E, or
-complete work does not grant that authority; neither do available credentials,
-an installed provider CLI, a Project Policy, or a test label. Unless the user
-proactively names the concrete real-resource validation, skip it without
-creating an InputRequest or blocking the ReviewRound. Prefer existing
-deterministic evidence, mocks, and isolated resources, then report the
-verification gap and an optional follow-up. An explicit request authorizes
-only its named resource, effect, and isolation boundary; never broaden it. A
-real Agent may develop or review code, but that does not authorize a real
-provider/model test.
+Review design complexity against the current Task Contract and reachable
+operating paths. Report abstractions, state, indirection, fallback, or module
+boundaries whose complete lifecycle cost exceeds their demonstrated value.
+Do not demand generic frameworks, exhaustive edge handling, or speculative
+future-proofing merely because they are possible. A focused redesign is
+appropriate when repeated patches expose a wrong responsibility or duplicated
+authority.
+
+Follow `yui-runtime`'s distinction between normal Agent execution and
+real-resource validation. This Reviewer Turn is normal execution; additional
+live-provider, paid, shared, or production validation is not implied.
 
 Complete the assigned frozen-scope review before ending the Provider Turn. Accumulate all
 reachable findings, verification gaps, checks actually run, and bounded next

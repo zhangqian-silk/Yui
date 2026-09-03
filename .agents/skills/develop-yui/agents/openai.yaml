@@ -1,4 +1,4 @@
 interface:
   display_name: "Develop Yui"
   short_description: "Develop Yui as an Agent-first atomic control plane"
-  default_prompt: "Use $develop-yui to implement this Yui change with small atomic capabilities, Agent-owned judgment, and lean validation."
+  default_prompt: "Use $develop-yui to implement the current Yui contract with Agent-owned judgment, the lowest lifecycle complexity, and lean validation."

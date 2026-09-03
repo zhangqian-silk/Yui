@@ -39,6 +39,9 @@ run a second lint pass or a broader regression suite. `publish.yml` reuses that
 exact gated commit and adds only tag, artifact, install, and provenance checks
 that are unique to publishing.
 
-Real Agents, providers, models, paid APIs, shared Homes, and production systems
-are never implied by a request to test or validate. They require an explicit
-user request for the exact resource and effect boundary.
+Configured Agents acting as developers or reviewers are ordinary execution
+resources. Using a live provider or model as the subject of validation is
+different: paid APIs, shared Homes, production systems, real account quota, and
+other non-disposable external effects are never implied by a request to test or
+validate. They require an explicit user request for the exact resource and
+effect boundary.
