@@ -824,7 +824,7 @@ const taskChildren: readonly NodeInput[] = [
       },
       {
         name: "retry",
-        summary: "Retry a failed execution Turn or request a fresh Round for an exact failed final Review Turn.",
+        summary: "Retry an exact failed execution or review Turn while preserving its semantic unit.",
         usage: "yui task turn retry <task>/<turn>"
       },
       {

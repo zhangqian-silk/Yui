@@ -104,6 +104,7 @@ import {
   deltaRecheckBlocksAcceptance,
   finishReviewRound,
   recordReviewWorkspaceDisposition,
+  retryReviewRound,
   retryRunningReviewExecutionLane,
   retryTaskReviewRound,
   startReplicatedReviewRound,
@@ -6144,8 +6145,8 @@ function assertPendingFinalReviewWorkspaceEvidence(
 }
 
 /**
- * Task-control retry of an exact failed Task-final review Turn. The old failed
- * Turn remains the attempt trail, while the semantic ReviewRound is reset to
+ * Task-control retry of an exact failed review Turn. The old failed Turn
+ * remains the attempt trail, while the semantic ReviewRound is reset to
  * pending under its existing identity. Every identity and frozen-head fence is
  * checked inside one transaction so a partial fail-old-without-reset state can
  * never be committed.
@@ -6171,12 +6172,7 @@ function retryFailedReviewRun(
     if (round === null) {
       throw dataError(`ReviewRound not found for run ${run.id}: ${run.reviewRoundId}.`);
     }
-    if ((round.scope ?? "work-item") !== "task") {
-      throw usageError(
-        `Review Turn ${run.id} is not a Task-final review; request a new WorkItem review `
-        + "for a new Candidate."
-      );
-    }
+    const taskScope = (round.scope ?? "work-item") === "task";
     const retryLane = run.executionLaneId === undefined
       ? undefined
       : round.executionGroup?.lanes.find(({ id }) => id === run.executionLaneId);
@@ -6200,48 +6196,102 @@ function retryFailedReviewRun(
       );
     }
     const retryReviewerRoleName = retryLane?.roleName ?? round.reviewerRoleName;
-    const taskFinalContract = taskFinalReviewContractForMutation(tx, task.id, options);
-    if (!sameTaskFinalReviewContract(round.taskFinalReviewContract, taskFinalContract)) {
-      throw usageError(`Task final-review contract does not match ReviewRound ${round.id}.`);
-    }
     if (round.status !== "failed"
       && round.status !== "running"
       && round.status !== "pending"
       && round.status !== "completed") {
       throw usageError(`ReviewRound ${round.id} is not retryable from ${round.status}.`);
     }
-    const currentTaskCandidate = actualTaskReviewCandidateForMutation(tx, task, options);
-    if (!isSameTaskReviewCandidate(currentTaskCandidate, round.taskCandidate!)) {
-      throw usageError(
-        `Task-final ReviewRound ${round.id} no longer matches the frozen Task heads.`
+    const allRounds = tx.listReviewRounds(task.id);
+    if (taskScope) {
+      const taskFinalContract = taskFinalReviewContractForMutation(tx, task.id, options);
+      if (!sameTaskFinalReviewContract(round.taskFinalReviewContract, taskFinalContract)) {
+        throw usageError(`Task final-review contract does not match ReviewRound ${round.id}.`);
+      }
+      const currentTaskCandidate = actualTaskReviewCandidateForMutation(tx, task, options);
+      if (!isSameTaskReviewCandidate(currentTaskCandidate, round.taskCandidate!)) {
+        throw usageError(
+          `Task-final ReviewRound ${round.id} no longer matches the frozen Task heads.`
+        );
+      }
+      const taskRounds = reviewRoundsByIdentity(allRounds
+        .filter((entry) => (entry.scope ?? "work-item") === "task"));
+      const roundIndex = taskRounds.findIndex(({ id }) => id === round.id);
+      if (roundIndex < 0) {
+        throw dataError(`Final ReviewRound is not in Task history: ${round.id}.`);
+      }
+      const laterRound = taskRounds.slice(roundIndex + 1).find((entry) => (
+        entry.reviewerRoleName === retryReviewerRoleName
+      ));
+      if (laterRound !== undefined && !isSameTaskReviewCandidate(
+        laterRound.taskCandidate,
+        round.taskCandidate!
+      )) {
+        throw usageError(
+          `A newer final Task candidate already has ReviewRound ${laterRound.id}.`
+        );
+      }
+      assertNoConflictingTaskReviewRound(
+        allRounds,
+        round.id,
+        retryReviewerRoleName
       );
-    }
-    const taskRounds = reviewRoundsByIdentity(tx.listReviewRounds(task.id)
-      .filter((entry) => (entry.scope ?? "work-item") === "task"));
-    const roundIndex = taskRounds.findIndex(({ id }) => id === round.id);
-    if (roundIndex < 0) {
-      throw dataError(`Final ReviewRound is not in Task history: ${round.id}.`);
-    }
-    const laterRound = taskRounds.slice(roundIndex + 1).find((entry) => (
-      entry.reviewerRoleName === retryReviewerRoleName
-    ));
-    if (laterRound !== undefined && !isSameTaskReviewCandidate(
-      laterRound.taskCandidate,
-      round.taskCandidate!
-    )) {
-      throw usageError(
-        `A newer final Task candidate already has ReviewRound ${laterRound.id}.`
-      );
+    } else {
+      if (round.workItemId === undefined || round.candidateId === undefined) {
+        throw dataError(`WorkItem ReviewRound has no Candidate anchor: ${round.id}.`);
+      }
+      if (run.workItemId !== round.workItemId) {
+        throw usageError(`Review Turn ${run.id} does not match WorkItem ${round.workItemId}.`);
+      }
+      const item = tx.getWorkItem(task.id, round.workItemId);
+      if (item === null || item.status !== "awaiting_acceptance") {
+        throw usageError(
+          `WorkItem ReviewRound ${round.id} no longer has an awaiting Candidate.`
+        );
+      }
+      const candidate = currentWorkItemCandidate(item);
+      if (candidate === undefined || candidate.id !== round.candidateId) {
+        throw usageError(
+          `WorkItem ReviewRound ${round.id} no longer matches the current Candidate.`
+        );
+      }
+      if (candidate.gitSnapshot?.reviewBaseCommit !== round.reviewBaseCommit) {
+        throw usageError(`ReviewRound Candidate snapshot changed: ${round.id}.`);
+      }
+      if (candidate.reviewPolicy === undefined
+        || candidate.reviewPolicy.trigger === "final"
+        || candidate.reviewPolicy.roleName !== round.reviewerRoleName) {
+        throw usageError(`Candidate review policy no longer matches ReviewRound ${round.id}.`);
+      }
+      const candidateRounds = reviewRoundsByIdentity(allRounds.filter((entry) => (
+        entry.workItemId === round.workItemId
+        && entry.candidateId === round.candidateId
+      )));
+      const roundIndex = candidateRounds.findIndex(({ id }) => id === round.id);
+      if (roundIndex < 0) {
+        throw dataError(`ReviewRound is not in Candidate history: ${round.id}.`);
+      }
+      const laterRound = candidateRounds[roundIndex + 1];
+      if (laterRound !== undefined) {
+        throw usageError(
+          `A newer ReviewRound already exists for Candidate ${round.candidateId}: `
+          + `${laterRound.id}.`
+        );
+      }
+      const activeCandidateRound = candidateRounds.find((entry) => (
+        entry.id !== round.id
+        && (entry.status === "pending" || entry.status === "running")
+      ));
+      if (activeCandidateRound !== undefined) {
+        throw usageError(
+          `Candidate already has an active ReviewRound: ${activeCandidateRound.id}.`
+        );
+      }
     }
     const allReviewerRounds = reviewRoundsByIdentity(
-      tx.listReviewRounds(task.id).filter((entry) => (
+      allRounds.filter((entry) => (
         entry.reviewerRoleName === retryReviewerRoleName
       ))
-    );
-    assertNoConflictingTaskReviewRound(
-      tx.listReviewRounds(task.id),
-      round.id,
-      retryReviewerRoleName
     );
     const activeRound = allReviewerRounds.find((entry) => (
       entry.id !== round.id
@@ -6406,7 +6456,7 @@ function retryFailedReviewRun(
     // Issue 06: infra retry resets the same semantic Round to pending instead
     // of manufacturing a new Round, so Round count and finding identity stay
     // stable across execution-attempt failures.
-    const resetRound = retryTaskReviewRound(roundToReset, requestedBy);
+    const resetRound = retryReviewRound(roundToReset, requestedBy);
     tx.saveReviewRound(task.id, resetRound);
     recordTaskEvent(tx, task.id, "turn.review-retried", {
       turnId: run.id,

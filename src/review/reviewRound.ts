@@ -331,33 +331,41 @@ export function finishReviewRound(
 }
 
 /**
- * Issue 06: retry a failed Task-final execution attempt under the same semantic
- * Round identity. Turn history remains the attempt trail; the Round itself
- * returns to pending so infrastructure retries do not manufacture a new
- * semantic ReviewRound or duplicate findings.
+ * Retry a failed review execution attempt under the same semantic Round
+ * identity. Turn history remains the attempt trail; the Round itself returns
+ * to pending so infrastructure retries do not manufacture a new semantic
+ * ReviewRound or duplicate findings.
  */
-export function retryTaskReviewRound(
+export function retryReviewRound(
   round: ReviewRound,
   requestedBy: TaskCompletedBy
 ): ReviewRound {
   validateReviewRound(round);
-  if ((round.scope ?? "work-item") !== "task") {
-    throw new Error(`Only a Task-final ReviewRound can be retried in place: ${round.id}.`);
-  }
   if (round.status !== "failed") {
     throw new Error(`ReviewRound ${round.id} is not retryable from ${round.status}.`);
   }
+  const taskScope = (round.scope ?? "work-item") === "task";
   return validateReviewRound({
     schemaVersion: round.schemaVersion,
     id: round.id,
     taskId: round.taskId,
+    ...(round.scope === undefined ? {} : { scope: round.scope }),
+    ...(taskScope
+      ? {}
+      : {
+          workItemId: round.workItemId!,
+          candidateId: round.candidateId!
+        }),
     reviewerRoleName: round.reviewerRoleName,
     reviewBaseCommit: round.reviewBaseCommit,
-    scope: "task",
-    ...(round.taskCandidate === undefined ? {} : { taskCandidate: round.taskCandidate }),
-    ...(round.taskFinalReviewContract === undefined
-      ? {}
-      : { taskFinalReviewContract: round.taskFinalReviewContract }),
+    ...(taskScope
+      ? {
+          taskCandidate: round.taskCandidate!,
+          ...(round.taskFinalReviewContract === undefined
+            ? {}
+            : { taskFinalReviewContract: round.taskFinalReviewContract })
+        }
+      : {}),
     ...(round.deltaRecheck === undefined
       ? {}
       // A retried delta Round is still the same semantic recheck: the
@@ -385,6 +393,17 @@ export function retryTaskReviewRound(
     ...(round.workspace === undefined ? {} : { workspace: round.workspace }),
     createdAt: round.createdAt
   });
+}
+
+/** Task-final compatibility wrapper for callers that require that scope. */
+export function retryTaskReviewRound(
+  round: ReviewRound,
+  requestedBy: TaskCompletedBy
+): ReviewRound {
+  if ((round.scope ?? "work-item") !== "task") {
+    throw new Error(`Only a Task-final ReviewRound can be retried in place: ${round.id}.`);
+  }
+  return retryReviewRound(round, requestedBy);
 }
 
 /** A failed producer attempt leaves its logical Lane open for another Turn. */

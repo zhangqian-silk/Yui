@@ -614,10 +614,11 @@ authorized expansions.
   for merge or small local fixes, and create an architecture WorkItem only for
   a genuinely cross-cutting design issue. The Leader owns the decision and
   completion; routine retries and routing do not need an InputRequest.
-- A failed review is terminal evidence, not an automatic retry. Retry a
-  WorkItem review with a new `task work review`, accept with an explicit
-  rationale, or ask the user. `yui task turn retry <turn-id>` retries an exact
-  failed Task-final Reviewer execution under the same semantic ReviewRound. If
+- A failed semantic review is terminal evidence, not an automatic retry. For a
+  WorkItem, request a new `task work review`, accept with an explicit rationale,
+  or ask the user. `yui task turn retry <turn-id>` is only for an exact failed
+  Candidate or Task-final review execution under the same semantic ReviewRound,
+  preserving settled Producer siblings. If
   that immutable Round is durably proven non-semantic without any review
   checks, evidence, finding, or ambiguous output—even when a pre-review
   context/workspace failure historically terminalized it without a semantic result—
