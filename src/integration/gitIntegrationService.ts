@@ -855,6 +855,8 @@ export class GitIntegrationService {
       try {
         await git([
           "-C", candidatePath,
+          "-c", "user.name=Yui",
+          "-c", "user.email=yui@local",
           "rebase", "--onto",
           attempt.source.remoteCommit,
           attempt.source.taskBaseCommit,
@@ -1210,6 +1212,8 @@ async function continueUpstreamRebase(path: string): Promise<void> {
   try {
     await git([
       "-C", path,
+      "-c", "user.name=Yui",
+      "-c", "user.email=yui@local",
       "-c", "core.editor=true",
       "rebase", "--continue"
     ]);
