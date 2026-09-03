@@ -292,6 +292,50 @@ export function renderTaskDetail(detail, data, t, locale, actions) {
   // the attention/blocker facts behind it.
   const band = executionBand(data.execution, t, locale);
   if (band) summaryBody.append(band);
+  if (data.remoteDelivery) {
+    const remote = data.remoteDelivery;
+    const card = node("article", "record-card");
+    const head = node("div", "record-head");
+    head.append(
+      node("strong", "record-title", t("detail.remoteDelivery")),
+      pill(t, "remoteDelivery", remote.status)
+    );
+    card.append(head);
+    card.append(node(
+      "p",
+      "record-copy",
+      t("detail.expectedHeads") + " · " + remote.source
+        + (remote.provisional ? " · " + t("detail.provisional") : "")
+    ));
+    const facts = node("div", "record-meta");
+    const unavailable = remote.status === "unavailable";
+    facts.append(
+      node("span", "", t("detail.allMerged") + " · "
+        + (unavailable
+          ? t("detail.unavailable")
+          : remote.allMerged ? t("common.yes") : t("common.no"))),
+      node("span", "", t("detail.allVerified") + " · "
+        + (unavailable
+          ? t("detail.unavailable")
+          : remote.allVerified ? t("common.yes") : t("common.no"))),
+      node("span", "", t("detail.integratedCoverage") + " · "
+        + (unavailable
+          ? t("detail.unavailable")
+          : remote.integratedCoverageSatisfied ? t("detail.satisfied") : t("detail.blocked")))
+    );
+    card.append(facts);
+    remote.projects.forEach(function (project) {
+      card.append(node(
+        "p",
+        "muted mono",
+        project.directory + " · " + project.coverage + " · "
+          + (project.expectedLocalCommit ? project.expectedLocalCommit.slice(0, 12) : "unknown")
+          + " → "
+          + (project.remoteCommit ? project.remoteCommit.slice(0, 12) : "unknown")
+      ));
+    });
+    summaryBody.append(card);
+  }
   const observability = data.observability || (data.execution && data.execution.observability);
   const metrics = observabilityMetricCard(observability, t);
   if (metrics) summaryBody.append(metrics);

@@ -9,11 +9,14 @@ import { resolveProject } from "../repository/project.js";
 import {
   createPublicationReference,
   type PublicationReference,
+  type PublicationReferenceInput,
   type PublicationExternalKind,
   type PublicationProvider,
+  type PublicationRecordedBy,
   type PublicationState,
   type PublicationVerification
 } from "../task/publicationReference.js";
+import type { Task } from "../task/task.js";
 import { resolveTaskRecordReference } from "../task/taskRecordReference.js";
 import type {
   TaskCommandExecution,
@@ -24,6 +27,17 @@ import type {
 const PROVIDERS = new Set(["github", "gitlab"]);
 const EXTERNAL_KINDS = new Set(["pull-request", "merge-request"]);
 const STATES = new Set(["open", "merged", "closed"]);
+const INHERITED_METADATA_FIELDS = [
+  "externalUrl",
+  "title",
+  "sourceBranch",
+  "targetBranch"
+] as const satisfies readonly (keyof PublicationReferenceInput)[];
+const INHERITED_EVIDENCE_FIELDS = [
+  "remoteCommit",
+  "evidence",
+  "mergedAt"
+] as const satisfies readonly (keyof PublicationReferenceInput)[];
 
 export function runPublicationCommand(
   args: string[],
@@ -32,7 +46,7 @@ export function runPublicationCommand(
 ): TaskCommandExecution {
   const [command, ...rest] = args;
   switch (command) {
-    case "add": return addPublication(rest, store, options);
+    case "upsert": return upsertPublication(rest, store, options);
     case "list": return listPublications(rest, store);
     case "show": return showPublication(rest, store);
     default:
@@ -42,137 +56,135 @@ export function runPublicationCommand(
   }
 }
 
-function addPublication(
+function upsertPublication(
   args: string[],
   store: TaskWorkflowStore,
   options: TaskCommandOptions
 ): TaskCommandExecution {
-  const usage = "Task publication add usage: yui task publication add <task> --project <project> --provider <github|gitlab> --repository <owner/name> --kind <pull-request|merge-request> --id <external-id> [--url <url>] [--title <text>] [--source-branch <branch>] [--target-branch <branch>] [--local-commit <sha>] [--remote-commit <sha>] [--state <open|merged|closed>] [--reported|--verified] [--evidence <text>] [--supersede <publication-id>] [--merged-at <iso-timestamp>].";
-  const parsed = parseAddArgs(args, usage);
+  const usage = "Task publication upsert usage: yui task publication upsert <task> --project <project> --provider <github|gitlab> --repository <owner/name> --kind <pull-request|merge-request> --id <external-id> [--url <url>] [--title <text>] [--source-branch <branch>] [--target-branch <branch>] [--local-commit <sha>] [--remote-commit <sha>] [--state <open|merged|closed>] [--reported|--verified] [--evidence <text>] [--merged-at <iso-timestamp>].";
+  const parsed = parseUpsertArgs(args, usage);
+  exactPositionals(parsed.positionals, 1, usage);
   const task = requireTask(store, parsed.positionals[0]);
-  const projectReference = requiredOption(parsed.options, "--project");
+  const projectReference = requiredOption(parsed.options, "--project", usage);
   const project = resolveProject(store.listProjects(), projectReference);
   if (project === null) throw usageError(`Project not found: ${projectReference}.`, usage);
   if (!task.projectBindings.some((binding) => binding.projectId === project.id)) {
     throw usageError(`Project is not bound to Task ${task.id}: ${projectReference}.`, usage);
   }
   const actor = taskActor(options.environment, task.id);
-  const state = enumOption<PublicationState>(parsed.options, "--state", STATES, usage) ?? "open";
+  const state = enumOption<PublicationState>(parsed.options, "--state", STATES, usage);
   const verification = parseVerification(parsed, usage);
-  const input = {
+  const input: PublicationReferenceInput = {
     projectId: project.id,
-    provider: enumOption<PublicationProvider>(parsed.options, "--provider", PROVIDERS, usage)!,
-    repository: requiredOption(parsed.options, "--repository"),
-    externalKind: enumOption<PublicationExternalKind>(parsed.options, "--kind", EXTERNAL_KINDS, usage)!,
-    externalId: requiredOption(parsed.options, "--id"),
-    ...(parsed.options.has("--url") ? { externalUrl: requiredOption(parsed.options, "--url") } : {}),
-    ...(parsed.options.has("--title") ? { title: requiredOption(parsed.options, "--title") } : {}),
+    provider: requiredEnumOption<PublicationProvider>(
+      parsed.options, "--provider", PROVIDERS, usage
+    ),
+    repository: requiredOption(parsed.options, "--repository", usage),
+    externalKind: requiredEnumOption<PublicationExternalKind>(
+      parsed.options, "--kind", EXTERNAL_KINDS, usage
+    ),
+    externalId: requiredOption(parsed.options, "--id", usage),
+    ...(parsed.options.has("--url")
+      ? { externalUrl: requiredOption(parsed.options, "--url", usage) }
+      : {}),
+    ...(parsed.options.has("--title")
+      ? { title: requiredOption(parsed.options, "--title", usage) }
+      : {}),
     ...(parsed.options.has("--source-branch")
-      ? { sourceBranch: requiredOption(parsed.options, "--source-branch") }
+      ? { sourceBranch: requiredOption(parsed.options, "--source-branch", usage) }
       : {}),
     ...(parsed.options.has("--target-branch")
-      ? { targetBranch: requiredOption(parsed.options, "--target-branch") }
+      ? { targetBranch: requiredOption(parsed.options, "--target-branch", usage) }
       : {}),
     ...(parsed.options.has("--local-commit")
-      ? { localCommit: requiredOption(parsed.options, "--local-commit") }
+      ? { localCommit: requiredOption(parsed.options, "--local-commit", usage) }
       : {}),
     ...(parsed.options.has("--remote-commit")
-      ? { remoteCommit: requiredOption(parsed.options, "--remote-commit") }
+      ? { remoteCommit: requiredOption(parsed.options, "--remote-commit", usage) }
       : {}),
-    state,
-    verification,
+    ...(state === undefined ? {} : { state }),
+    ...(verification === undefined ? {} : { verification }),
     ...(parsed.options.has("--evidence")
-      ? { evidence: requiredOption(parsed.options, "--evidence") }
-      : {}),
-    ...(parsed.options.has("--supersede")
-      ? { supersedes: requiredOption(parsed.options, "--supersede") }
+      ? { evidence: requiredOption(parsed.options, "--evidence", usage) }
       : {}),
     ...(parsed.options.has("--merged-at")
-      ? { mergedAt: requiredOption(parsed.options, "--merged-at") }
-      : {}),
-    recordedBy: actor,
-    source: "manual" as const
+      ? { mergedAt: requiredOption(parsed.options, "--merged-at", usage) }
+      : {})
   };
-  const externalKey = `${input.provider}/${input.repository}/${input.externalId}`;
   const now = clock(options);
-  const result = store.transaction((tx) => {
-    const existing = tx.findPublicationReferenceByExternalKey(externalKey);
-    if (existing !== null) {
-      if (existing.taskId !== task.id) {
-        throw dataError(
-          `Publication external identity already belongs to Task ${existing.taskId}: ${externalKey}.`
-        );
-      }
-      const semantic = createPublicationReference(
-        existing.id,
-        task.id,
-        input.supersedes === existing.id
-          ? {
-              projectId: input.projectId,
-              provider: input.provider,
-              repository: input.repository,
-              externalKind: input.externalKind,
-              externalId: input.externalId,
-              ...(input.externalUrl === undefined ? {} : { externalUrl: input.externalUrl }),
-              ...(input.title === undefined ? {} : { title: input.title }),
-              ...(input.sourceBranch === undefined ? {} : { sourceBranch: input.sourceBranch }),
-              ...(input.targetBranch === undefined ? {} : { targetBranch: input.targetBranch }),
-              ...(input.localCommit === undefined ? {} : { localCommit: input.localCommit }),
-              ...(input.remoteCommit === undefined ? {} : { remoteCommit: input.remoteCommit }),
-              state: input.state,
-              verification: input.verification,
-              ...(input.evidence === undefined ? {} : { evidence: input.evidence }),
-              ...(input.mergedAt === undefined ? {} : { mergedAt: input.mergedAt }),
-              recordedBy: input.recordedBy,
-              source: input.source
-            }
-          : input,
-        new Date(existing.createdAt)
-      );
-      if (isDeepStrictEqual(semantic, existing)) {
-        return { reference: existing, idempotent: true };
-      }
-      if (input.supersedes === undefined || input.supersedes !== existing.id) {
-        throw usageError(
-          `Publication ${externalKey} conflicts with current record ${existing.id}; `
-          + "use --supersede with that id to append corrected evidence.",
-          usage
-        );
-      }
-    } else if (input.supersedes !== undefined) {
-      throw usageError(
-        `Publication supersede target has a different external identity: ${input.supersedes}.`,
-        usage
-      );
-    }
-    const reference = createPublicationReference(
-      tx.nextPublicationReferenceId(task.id),
-      task.id,
-      input,
-      now
-    );
-    tx.savePublicationReference(task.id, reference);
-    recordTaskEvent(tx, task.id, "publication.recorded", {
-      publicationId: reference.id,
-      provider: reference.provider,
-      repository: reference.repository,
-      externalKind: reference.externalKind,
-      externalId: reference.externalId,
-      state: reference.state,
-      verification: reference.verification
-    }, now);
-    return { reference, idempotent: false };
-  });
+  const result = store.transaction((tx) => upsertTaskPublication(
+    tx,
+    task,
+    input,
+    actor,
+    now
+  ));
   return output(
     result.idempotent
-      ? `Publication reference already recorded: ${result.reference.id}.\n`
-      : `Recorded publication ${result.reference.id} (${
+      ? `Publication reference already current: ${result.reference.id}.\n`
+      : `Upserted publication ${result.reference.id} (${
         result.reference.provider
       }/${result.reference.repository}/${result.reference.externalKind}/${
         result.reference.externalId
       }) for ${result.reference.taskId}.\n`,
     result.reference
   );
+}
+
+/**
+ * One immutable Publication upsert against the caller's current transaction.
+ * External verification uses the same lineage and idempotency path as manual
+ * evidence instead of maintaining a second mutation protocol.
+ */
+export function upsertTaskPublication(
+  store: TaskWorkflowStore,
+  task: Task,
+  input: PublicationReferenceInput,
+  actor: PublicationRecordedBy,
+  now: Date
+): Readonly<{ reference: PublicationReference; idempotent: boolean }> {
+  const externalKey = `${input.provider}/${input.repository}/${input.externalId}`;
+  const existing = store.findPublicationReferenceByExternalKey(externalKey);
+  if (existing !== null && existing.taskId !== task.id) {
+    throw dataError(
+      `Publication external identity already belongs to Task ${existing.taskId}: ${externalKey}.`
+    );
+  }
+  const effective = existing === null
+    ? input
+    : inheritPublicationInput(existing, input);
+  if (existing !== null) {
+    const semantic = createPublicationReference(
+      existing.id,
+      task.id,
+      {
+        ...effective,
+        recordedBy: existing.recordedBy,
+        source: existing.source
+      },
+      new Date(existing.createdAt)
+    );
+    if (isDeepStrictEqual(
+      publicationSemantics(semantic),
+      publicationSemantics(existing)
+    )) {
+      return { reference: existing, idempotent: true };
+    }
+  }
+  const reference = createPublicationReference(
+    store.nextPublicationReferenceId(task.id),
+    task.id,
+    {
+      ...effective,
+      ...(existing === null ? {} : { supersedes: existing.id }),
+      recordedBy: actor,
+      source: "manual"
+    },
+    now
+  );
+  store.savePublicationReference(task.id, reference);
+  recordPublicationEvent(store, reference, now);
+  return { reference, idempotent: false };
 }
 
 function listPublications(args: string[], store: TaskWorkflowStore): TaskCommandExecution {
@@ -275,13 +287,15 @@ function lineageSummary(reference: PublicationReference): string {
 }
 
 function parseVerification(
-  parsed: ParsedAddTail,
+  parsed: ParsedUpsertTail,
   usage: string
-): PublicationVerification {
+): PublicationVerification | undefined {
   if (parsed.flags.has("--reported") && parsed.flags.has("--verified")) {
     throw usageError("--reported and --verified are mutually exclusive.", usage);
   }
-  return parsed.flags.has("--verified") ? "verified" : "reported";
+  if (parsed.flags.has("--verified")) return "verified";
+  if (parsed.flags.has("--reported")) return "reported";
+  return undefined;
 }
 
 function enumOption<T extends string>(
@@ -298,11 +312,103 @@ function enumOption<T extends string>(
   return value as T;
 }
 
+function requiredEnumOption<T extends string>(
+  options: ReadonlyMap<string, string>,
+  name: string,
+  allowed: ReadonlySet<string>,
+  usage: string
+): T {
+  const value = enumOption<T>(options, name, allowed, usage);
+  if (value === undefined) {
+    throw usageError(`${name} is required.`, usage);
+  }
+  return value;
+}
+
+function inheritPublicationInput(
+  existing: PublicationReference,
+  input: PublicationReferenceInput
+): PublicationReferenceInput {
+  const localCommitChanged = input.localCommit !== undefined
+    && normalizeCommitForComparison(input.localCommit) !== existing.localCommit;
+  const stateChanged = input.state !== undefined && input.state !== existing.state;
+  const remoteCommitChanged = input.remoteCommit !== undefined
+    && normalizeCommitForComparison(input.remoteCommit) !== existing.remoteCommit;
+  const evidenceChanged = input.evidence !== undefined
+    && input.evidence.trim() !== existing.evidence;
+  const mergedAtChanged = input.mergedAt !== undefined
+    && input.mergedAt !== existing.mergedAt;
+  const evidenceContextChanged = localCommitChanged
+    || stateChanged
+    || remoteCommitChanged
+    || evidenceChanged
+    || mergedAtChanged;
+  const inherited: PublicationReferenceInput = {
+    projectId: input.projectId,
+    provider: input.provider,
+    repository: input.repository,
+    externalKind: input.externalKind,
+    externalId: input.externalId,
+    state: input.state ?? (localCommitChanged ? "open" : existing.state),
+    verification: input.verification ?? (
+      evidenceContextChanged ? "reported" : existing.verification
+    ),
+    ...(input.localCommit === undefined
+      ? (existing.localCommit === undefined ? {} : { localCommit: existing.localCommit })
+      : { localCommit: input.localCommit })
+  };
+  for (const field of INHERITED_METADATA_FIELDS) {
+    const value = input[field] ?? existing[field];
+    if (value !== undefined) Object.assign(inherited, { [field]: value });
+  }
+  for (const field of INHERITED_EVIDENCE_FIELDS) {
+    const value = input[field] ?? (
+      evidenceContextChanged ? undefined : existing[field]
+    );
+    if (value !== undefined) Object.assign(inherited, { [field]: value });
+  }
+  return inherited;
+}
+
+function normalizeCommitForComparison(value: string): string {
+  return value.trim().toLowerCase();
+}
+
+function publicationSemantics(reference: PublicationReference) {
+  const {
+    schemaVersion: _schemaVersion,
+    id: _id,
+    taskId: _taskId,
+    supersedes: _supersedes,
+    recordedBy: _recordedBy,
+    source: _source,
+    createdAt: _createdAt,
+    ...semantics
+  } = reference;
+  return semantics;
+}
+
 function requireTask(store: TaskWorkflowStore, taskId: string | undefined) {
   const id = requiredText(taskId, "Task id");
   const task = store.getTask(id);
   if (task === null) throw taskNotFound(id);
   return task;
+}
+
+function recordPublicationEvent(
+  store: TaskWorkflowStore,
+  reference: PublicationReference,
+  now: Date
+): void {
+  recordTaskEvent(store, reference.taskId, "publication.recorded", {
+    publicationId: reference.id,
+    provider: reference.provider,
+    repository: reference.repository,
+    externalKind: reference.externalKind,
+    externalId: reference.externalId,
+    state: reference.state,
+    verification: reference.verification
+  }, now);
 }
 
 function recordTaskEvent(
@@ -317,8 +423,16 @@ function recordTaskEvent(
   ));
 }
 
-function requiredOption(options: ReadonlyMap<string, string>, name: string): string {
-  return requiredText(options.get(name), name);
+function requiredOption(
+  options: ReadonlyMap<string, string>,
+  name: string,
+  usage?: string
+): string {
+  const value = options.get(name)?.trim();
+  if (value === undefined || value.length === 0) {
+    throw usageError(`${name} is required.`, usage);
+  }
+  return value;
 }
 
 function requiredText(value: string | undefined, label: string): string {
@@ -345,17 +459,17 @@ function exactPositionals(values: readonly string[], count: number, usage: strin
   }
 }
 
-type ParsedAddTail = Readonly<{
+type ParsedUpsertTail = Readonly<{
   positionals: string[];
   options: ReadonlyMap<string, string>;
   flags: ReadonlySet<string>;
 }>;
 
-function parseAddArgs(args: string[], usage: string): ParsedAddTail {
+function parseUpsertArgs(args: string[], usage: string): ParsedUpsertTail {
   const valueOptions = new Set([
     "--project", "--provider", "--repository", "--kind", "--id", "--url",
     "--title", "--source-branch", "--target-branch", "--local-commit",
-    "--remote-commit", "--state", "--evidence", "--supersede", "--merged-at"
+    "--remote-commit", "--state", "--evidence", "--merged-at"
   ]);
   const flags = new Set(["--reported", "--verified"]);
   const positionals: string[] = [];

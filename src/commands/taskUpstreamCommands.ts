@@ -1,24 +1,17 @@
 import { usageError } from "../errors/cliError.js";
-import { createTaskEvent } from "../event/taskEvent.js";
+import { GitIntegrationService } from "../integration/gitIntegrationService.js";
+import { createIntegrationAttempt } from "../integration/integrationAttempt.js";
 import { NodeGitWorkspace, type GitWorkspacePort } from "../repository/gitWorkspace.js";
-import { acquireProjectMaintenanceLock } from "../repository/projectMaintenanceLock.js";
+import { FileTaskWorkspacePreparer } from "../repository/taskWorkspacePreparer.js";
 import type { TaskStore } from "../storage/taskStore.js";
-import type { Task } from "../task/task.js";
 import { workspaceProjectEntry } from "../worktree/managedWorkspace.js";
-
-/**
- * RFC Phase 4: Active Task upstream integration.
- *
- * After activation, the initial baseline is a historical fact. Introducing new
- * upstream code is a normal upstream integration, not a baseline rewrite. This
- * command resolves the exact upstream commit, merges it into the Task
- * worktree, and records the result as a Task event.  On failure, the original
- * HEAD is restored so Task commits are not lost.
- */
+import { parseRepeatable } from "./taskIntegrationCommands.js";
+import { taskLocalActor } from "./taskActor.js";
 
 export type TaskUpstreamCommandOptions = Readonly<{
   git?: GitWorkspacePort;
   now?: () => Date;
+  environment?: NodeJS.ProcessEnv;
 }>;
 
 export type TaskUpstreamCommandResult = Readonly<{
@@ -29,12 +22,11 @@ export type TaskUpstreamCommandResult = Readonly<{
 export async function runTaskUpstreamCommand(
   args: readonly string[],
   store: TaskStore,
+  home: string,
   options: TaskUpstreamCommandOptions = {}
 ): Promise<TaskUpstreamCommandResult> {
   const [command, ...rest] = args;
-  if (command === "integrate") {
-    return integrateUpstream(rest, store, options);
-  }
+  if (command === "integrate") return integrateUpstream(rest, store, home, options);
   throw usageError(
     command === undefined
       ? "Task upstream command is required."
@@ -45,145 +37,119 @@ export async function runTaskUpstreamCommand(
 async function integrateUpstream(
   args: readonly string[],
   store: TaskStore,
+  home: string,
   options: TaskUpstreamCommandOptions
 ): Promise<TaskUpstreamCommandResult> {
-  const usage = "Task upstream integrate usage: yui task upstream integrate <task> [--latest] [--project <project>].";
-  const taskId = args[0];
-  if (taskId === undefined) throw usageError(usage);
-  const flags = new Set(args.slice(1));
-  if (flags.size !== args.length - 1) {
-    throw usageError(usage);
+  const usage = "Task upstream integrate usage: yui task upstream integrate <task> (--latest|--project <project>) [--check <command> ...].";
+  let latest = false;
+  const normalized: string[] = [];
+  for (const arg of args) {
+    if (arg === "--latest") {
+      if (latest) throw usageError("Option may only be specified once: --latest.", usage);
+      latest = true;
+      continue;
+    }
+    normalized.push(
+      ...(arg.startsWith("--project=")
+        ? ["--project", arg.slice("--project=".length)]
+        : [arg])
+    );
   }
-  const latest = flags.has("--latest");
-  const projectFlag = args.find((arg) => arg.startsWith("--project="));
-  const projectRef = projectFlag?.slice("--project=".length);
+  const parsed = parseRepeatable(
+    normalized,
+    new Set(["--check"]),
+    new Set(["--project"]),
+    usage
+  );
+  if (parsed.positionals.length !== 1) throw usageError(usage);
+  const taskId = parsed.positionals[0]!;
+  const projectRef = parsed.one.get("--project");
   if (!latest && projectRef === undefined) {
-    throw usageError("Specify --latest to integrate the remote development head, or --project=<project> to target one Project.");
+    throw usageError("Specify --latest for every Task Project, or --project <project>.");
   }
   if (latest && projectRef !== undefined) {
     throw usageError("--latest and --project are mutually exclusive.");
   }
-  for (const flag of flags) {
-    if (flag !== "--latest" && !flag.startsWith("--project=")) {
-      throw usageError(usage);
-    }
-  }
-
-  const task = store.getTask(taskId);
+  let task = store.getTask(taskId);
   if (task === null) throw usageError(`Task not found: ${taskId}.`);
   if (task.status !== "active") {
     throw usageError(`Task must be active to integrate upstream: ${taskId}/${task.status}.`);
   }
-  // RFC Phase 4: integrating upstream rewrites the Task worktree HEAD. Refuse
-  // while the Leader has an active Turn so the merge never lands under a
-  // running Session.
-  const activeLeaderRun = store.getActiveTurn(taskId, "leader");
-  if (activeLeaderRun !== null) {
-    throw usageError(
-      `Task has an active Leader Turn (${activeLeaderRun.id}); stop it before integrating upstream: ${taskId}.`
-    );
-  }
-  const workspace = store.getTaskWorkspace(taskId);
-  if (workspace === null) {
-    throw usageError(`Task has no workspace: ${taskId}. Activate it first.`);
-  }
-
+  taskLocalActor(store, options.environment, task.id);
   const git = options.git ?? new NodeGitWorkspace();
   const now = options.now ?? (() => new Date());
-  const results: Array<{
-    projectId: string;
-    oldHead: string;
-    newHead: string;
-    upstreamCommit: string;
-  }> = [];
+  await new FileTaskWorkspacePreparer(home, store, git, now)
+    .prepareTaskWorkspace(task.id);
+  task = store.getTask(task.id);
+  if (task === null || task.status !== "active") {
+    throw usageError(`Task is no longer active: ${taskId}.`);
+  }
+  const workspace = store.getTaskWorkspace(task.id);
+  if (workspace === null || workspace.owner.type !== "task") {
+    throw usageError(`Task has no authoritative main clone: ${task.id}.`);
+  }
+
+  const service = new GitIntegrationService(store.rootDirectory(), store, git, now);
+  const results = [];
 
   for (const binding of task.projectBindings) {
     if (projectRef !== undefined && binding.projectId !== projectRef) continue;
     const project = store.getProject(binding.projectId);
-    if (project === null) {
-      throw usageError(`Project not found: ${binding.projectId}.`);
-    }
+    if (project === null) throw usageError(`Project not found: ${binding.projectId}.`);
     if (project.remoteUrl === undefined) {
       throw usageError(`Project has no remote URL: ${project.id}.`);
+    }
+    if (binding.baseCommit === undefined || binding.currentCommit === undefined) {
+      throw usageError(`Task Project has no activated commit boundary: ${task.id}/${project.id}.`);
     }
     const entry = workspaceProjectEntry(workspace, project.id);
     if (entry === undefined) {
       throw usageError(`Task workspace has no entry for Project: ${project.id}.`);
     }
-
-    // Hold the per-Project maintenance fence while resolving the remote
-    // baseline so a concurrent `project refresh` cannot interleave with the
-    // fetch.
-    const releaseMaintenance = acquireProjectMaintenanceLock(store.rootDirectory(), project.id);
-    let oldHead: string;
-    let newHead: string;
-    let upstreamCommit: string;
-    try {
-      // Resolve the exact upstream commit.
-      const upstream = await git.resolveRemoteBaseline({
-        repositoryPath: project.path,
-        remoteUrl: project.remoteUrl,
-        developmentRef: project.developmentBranch
-      });
-      upstreamCommit = upstream.commit;
-
-      // Record the current HEAD as a backup before merging.
-      const current = await git.inspect(entry.path, "HEAD");
-      oldHead = current.baseCommit;
-
-      try {
-        // mergeWorktree always creates a merge commit (--no-ff); record the
-        // actual resulting HEAD rather than assuming a fast-forward.
-        await git.mergeWorktree({
-          targetPath: entry.path,
-          sourceRefs: [upstream.commit]
-        });
-      } catch (error) {
-        // Restore the original HEAD on failure.  mergeWorktree already aborts
-        // a conflicted merge, so HEAD is usually already at oldHead; reset
-        // only when the merge left HEAD moved or the tree dirty.
-        let restoreNote: string;
-        try {
-          await git.resetWorktree({
-            targetPath: entry.path,
-            expectedHead: oldHead,
-            restoreHead: oldHead
-          });
-          restoreNote = ` The workspace has been restored to ${oldHead}.`;
-        } catch {
-          restoreNote = ` The workspace may be left in a conflicted state; inspect ${entry.path} manually.`;
-        }
-        const message = error instanceof Error ? error.message : String(error);
-        throw new Error(
-          `Upstream integration failed for Project ${project.id}: ${message}.` + restoreNote
-        );
-      }
-      const after = await git.inspect(entry.path, "HEAD");
-      newHead = after.baseCommit;
-    } finally {
-      releaseMaintenance();
+    const head = (await git.inspect(entry.path, entry.branch)).baseCommit;
+    if (head !== binding.currentCommit) {
+      throw usageError(
+        `Task Project current commit diverged from its main clone: ${task.id}/${project.id}.`
+      );
     }
-
-    // Record the integration event immediately so a later Project's failure
-    // does not lose this Project's audit trail.
-    const result = { projectId: project.id, oldHead, newHead, upstreamCommit };
-    store.transaction((tx) => {
-      tx.saveEvent(task.id, createTaskEvent(
-        tx.nextEventId(task.id),
-        task.id,
-        "task.upstream-integrated",
-        result,
-        now()
-      ));
+    const remote = await git.resolveRemoteHead({
+      remoteUrl: project.remoteUrl,
+      branch: binding.baseRef
     });
+    const attempt = store.transaction((tx) => {
+      const created = createIntegrationAttempt({
+        id: tx.nextIntegrationAttemptId(task.id),
+        taskId: task.id,
+        projectId: project.id,
+        targetRef: entry.branch,
+        beforeCommit: binding.currentCommit!,
+        source: {
+          kind: "upstream",
+          branch: remote.branch,
+          remoteCommit: remote.commit,
+          taskBaseCommit: binding.baseCommit!,
+          strategy: "rebase"
+        },
+        checkCommands: parsed.many.get("--check") ?? []
+      }, now());
+      tx.saveIntegrationAttempt(task.id, created);
+      return created;
+    });
+    const result = await service.integrate(task.id, attempt.id);
     results.push(result);
+    if (result.status !== "committed") break;
   }
 
-  const lines = results.map((r) =>
-    `  ${r.projectId}: ${r.oldHead.slice(0, 12)} -> ${r.newHead.slice(0, 12)} (upstream: ${r.upstreamCommit.slice(0, 12)})`
-  );
+  if (projectRef !== undefined && results.length === 0) {
+    throw usageError(`Task Project not found: ${task.id}/${projectRef}.`);
+  }
+  const lines = results.map(({ attempt, status }) => (
+    `  ${attempt.projectId}: ${attempt.beforeCommit.slice(0, 12)} -> ${
+      (attempt.afterCommit ?? attempt.candidateCommit ?? attempt.beforeCommit).slice(0, 12)
+    } (${status})`
+  ));
   return {
-    output: `Integrated upstream for Task ${taskId}:\n${lines.join("\n")}\n`,
-    data: { taskId, integrations: results }
+    output: `Upstream Integration results for Task ${task.id}:\n${lines.join("\n")}\n`,
+    data: { taskId: task.id, integrations: results }
   };
 }

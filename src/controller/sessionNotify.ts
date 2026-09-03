@@ -14,10 +14,10 @@ export type CodexSessionNotification = Readonly<{
   roleName: string;
   agentId: string;
   adapterId: "codex";
-  launchId: string;
+  /** Launch generation carried by the notify envelope, if the process has one. */
+  launchId?: string;
   nativeSessionId: string;
   nativeTurnId: string;
-  turnId?: string;
   title?: string;
   lastAssistantMessage: string;
 }>;
@@ -43,16 +43,20 @@ export async function runSessionNotifyCommand(
 ): Promise<void> {
   const params = parseCodexSessionNotification(payloadArgument, environment);
   const home = requireText(environment.YUI_HOME, "YUI_HOME");
+  // A Codex process outlives its Turn, so the notify envelope cannot say which
+  // Turn or launch generation is current. Durable Session state answers both;
+  // the envelope's launch id is used only before a Session has been projected.
+  const current = currentNotifyGeneration(home, params);
   const enqueued = new FileRuntimeEventInbox(home).enqueueTurnCompleted({
     scope: params.scope,
     ...(params.scope === "task" ? { taskId: params.taskId } : {}),
     roleName: params.roleName,
     agentId: params.agentId,
     adapterId: params.adapterId,
-    launchId: params.launchId,
+    ...(current.launchId === undefined ? {} : { launchId: current.launchId }),
     nativeSessionId: params.nativeSessionId,
     nativeTurnId: params.nativeTurnId,
-    ...(params.turnId === undefined ? {} : { turnId: params.turnId }),
+    ...(current.turnId === undefined ? {} : { turnId: current.turnId }),
     ...(params.title === undefined ? {} : { title: params.title }),
     summary: params.lastAssistantMessage
   });
@@ -77,9 +81,36 @@ export async function runSessionNotifyCommand(
     },
     { timeoutMs: 100 }
   ).catch(() => {});
-  if (enqueued.created && shouldSetThreadName(home, params)) {
+  if (enqueued.created && shouldSetThreadName(home, params, current.turnId)) {
     const request = threadNameRequest(params, environment);
     if (request !== null) await setThreadName(request).catch(() => {});
+  }
+}
+
+/**
+ * Reads the durable launch generation and active Turn for the notifying
+ * Session. The envelope's launch id only applies before Yui has projected a
+ * Session for this Role, which is the one moment durable state cannot answer.
+ */
+function currentNotifyGeneration(
+  home: string,
+  params: CodexSessionNotification
+): Readonly<{ launchId?: string; turnId?: string }> {
+  if (params.scope !== "task" || params.taskId === undefined) {
+    return params.launchId === undefined ? {} : { launchId: params.launchId };
+  }
+  try {
+    const store = openCurrentTaskStore(home);
+    const session = store.getTaskRoleSessionSet(params.taskId, params.roleName)
+      ?.sessions[params.agentId];
+    const activeTurn = store.getActiveTurn(params.taskId, params.roleName);
+    const launchId = session?.launchId ?? params.launchId;
+    return {
+      ...(launchId === undefined ? {} : { launchId }),
+      ...(activeTurn === null ? {} : { turnId: activeTurn.id })
+    };
+  } catch {
+    return params.launchId === undefined ? {} : { launchId: params.launchId };
   }
 }
 
@@ -94,9 +125,6 @@ export function parseCodexSessionNotification(
   const nativeSessionId = requireText(payload["thread-id"], "Codex thread-id");
   const nativeTurnId = requireText(payload["turn-id"], "Codex turn-id");
   const lastAssistantMessage = requireAssistantMessage(payload["last-assistant-message"]);
-  const turnId = environment.YUI_TURN_ID === undefined
-    ? undefined
-    : requireText(environment.YUI_TURN_ID, "YUI_TURN_ID");
   const title = environment.YUI_SESSION_TITLE === undefined
     ? undefined
     : requireText(environment.YUI_SESSION_TITLE, "YUI_SESSION_TITLE");
@@ -109,10 +137,11 @@ export function parseCodexSessionNotification(
     roleName: requireText(environment.YUI_ROLE, "YUI_ROLE"),
     agentId: requireText(environment.YUI_AGENT_ID, "YUI_AGENT_ID"),
     adapterId: requireCodexAdapter(environment.YUI_ADAPTER_ID),
-    launchId: requireText(environment.YUI_LAUNCH_ID, "YUI_LAUNCH_ID"),
+    ...(environment.YUI_LAUNCH_ID === undefined
+      ? {}
+      : { launchId: requireText(environment.YUI_LAUNCH_ID, "YUI_LAUNCH_ID") }),
     nativeSessionId,
     nativeTurnId,
-    ...(turnId === undefined ? {} : { turnId }),
     ...(title === undefined ? {} : { title }),
     lastAssistantMessage
   } as const;
@@ -165,16 +194,17 @@ function requireAssistantMessage(value: unknown): string {
 
 function shouldSetThreadName(
   home: string,
-  params: CodexSessionNotification
+  params: CodexSessionNotification,
+  turnId: string | undefined
 ): boolean {
   if (
     params.scope !== "task"
     || params.title === undefined
-    || params.turnId === undefined
+    || turnId === undefined
   ) return false;
   try {
     const store = openCurrentTaskStore(home);
-    return store.getTurn(params.taskId!, params.turnId)?.mode === "new";
+    return store.getTurn(params.taskId!, turnId)?.mode === "new";
   } catch {
     return false;
   }

@@ -2,10 +2,9 @@ import type { DurableJob } from "../job/durableJob.js";
 import type { IntegrationQueueEntry } from "../integration/integrationQueueEntry.js";
 import type { IntegrationAttempt } from "../integration/integrationAttempt.js";
 import {
-  changeSetDeliverySettled,
-  governingChangeSets,
+  governingWorkItemDeliveries,
   integrationAttemptRequiresSettlement,
-  latestGoverningQueueEntries
+  workItemDeliverySettled
 } from "../integration/deliveryObligation.js";
 import { isReviewFindingBlocking, type ReviewFinding } from "../review/reviewFinding.js";
 import { deltaRecheckBlocksAcceptance } from "../review/reviewRound.js";
@@ -231,36 +230,19 @@ export function projectCompletionReadiness(
     });
   }
 
-  // Integration obligations follow only the Candidate that currently governs
-  // each independent delivery unit. Superseded Candidate history remains
-  // visible without keeping the Task open forever.
-  const deliveryChangeSets = governingChangeSets(facts.workItems, facts.changeSets);
-  for (const item of facts.workItems) {
-    if (item.status !== "completed") continue;
-    const candidate = item.candidates?.at(-1);
-    const hasGitDelivery = candidate?.workspace !== undefined
-      || candidate?.gitSnapshot !== undefined;
-    if (hasGitDelivery
-      && !deliveryChangeSets.some((changeSet) => changeSet.workItemId === item.id)) {
-      blockers.push({
-        code: "integration-evidence-missing",
-        ref: ref("work-item", item.id),
-        reason: `Completed WorkItem ${item.id} has an uncaptured Git delivery.`,
-        fix: `yui task work capture ${task.id}/${item.id}`
-      });
-    }
-  }
-  for (const changeSet of deliveryChangeSets) {
-    if (changeSetDeliverySettled(
-      changeSet,
-      facts.integrations,
-      facts.integrationQueueEntries
-    )) continue;
+  // Integration obligations follow the exact start/result commits of the
+  // Candidate that currently governs each independent delivery unit.
+  for (const delivery of governingWorkItemDeliveries(facts.workItems)) {
+    if (workItemDeliverySettled(delivery, facts.integrations)) continue;
     blockers.push({
       code: "integration-evidence-missing",
-      ref: ref("change-set", changeSet.id),
-      reason: `ChangeSet ${changeSet.id} is not part of a committed Integration.`,
-      fix: `yui task integration start ${task.id} --project ${changeSet.projectId} --change-set ${changeSet.id}`
+      ref: ref("work-item", delivery.workItemId),
+      reason: `WorkItem ${delivery.workItemId} result for Project ${
+        delivery.projectId
+      } is not part of a committed Integration.`,
+      fix: `yui task integration start ${task.id} --work-item ${
+        delivery.workItemId
+      } --project ${delivery.projectId} --strategy <ff|cherry-pick|merge|manual>`
     });
   }
 
@@ -268,7 +250,7 @@ export function projectCompletionReadiness(
   // settle. Historical blocked Attempts remain audit evidence only.
   for (const integration of facts.integrations) {
     if (!UNRESOLVED_INTEGRATION_STATUSES.has(integration.status)) continue;
-    if (!integrationAttemptRequiresSettlement(integration, deliveryChangeSets)) continue;
+    if (!integrationAttemptRequiresSettlement(integration)) continue;
     blockers.push({
       code: "unresolved-integration",
       ref: ref("integration-attempt", integration.id),
@@ -277,11 +259,9 @@ export function projectCompletionReadiness(
     });
   }
 
-  // Unsettled integration queue entries must commit or be superseded.
-  for (const entry of latestGoverningQueueEntries(
-    deliveryChangeSets,
-    facts.integrationQueueEntries
-  )) {
+  // Legacy queue entries may still launch an Integration and therefore must
+  // settle even though ChangeSets are no longer delivery authority.
+  for (const entry of facts.integrationQueueEntries) {
     if (entry.status === "committed" || entry.status === "superseded") continue;
     blockers.push({
       code: "unsettled-integration-queue-entry",

@@ -16,5 +16,5 @@
  */
 export const CURRENT_STORAGE_LAYOUT_VERSION = 8;
 
-/** Aggregate 25 migrates AgentProfile v2 runtime hints to the v3 runtime union. */
-export const CURRENT_AGGREGATE_SCHEMA_VERSION = 25;
+/** Aggregate 27 migrates AgentProfile v2 after Task and Integration source migrations. */
+export const CURRENT_AGGREGATE_SCHEMA_VERSION = 27;

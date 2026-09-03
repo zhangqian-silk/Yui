@@ -35,7 +35,6 @@ export type ProjectIntegrationProof = Readonly<{
   projectId: string;
   baseCommit: string;
   headCommit: string;
-  changeSetId?: string;
   publishedCommit?: string;
 }>;
 
@@ -128,54 +127,36 @@ export class WorkItemChangeSetManager {
         );
       }
       const headCommit = (await git.inspect(entry.path, "HEAD")).baseCommit;
-      const latest = latestWorkItemChangeSet(
-        this.store,
-        item.taskId,
-        item.id,
-        entry.projectId
-      );
-      if (headCommit === entry.baseCommit) {
-        if (latest !== undefined) {
-          throw new Error(
-            `WorkItem Project no longer matches its latest ChangeSet: ${
-              item.id
-            }/${entry.projectId}.`
-          );
-        }
-        projects.push({
-          projectId: entry.projectId,
-          baseCommit: entry.baseCommit,
-          headCommit
-        });
-        continue;
-      }
-      if (
-        latest === undefined
-        || latest.baseCommit !== entry.baseCommit
-        || latest.headCommit !== headCommit
-        || latest.branch !== entry.branch
-      ) {
+      const candidate = governingWorkItemCandidate(item);
+      const resultCommit = candidate?.gitSnapshot?.projects.find(
+        ({ projectId }) => projectId === entry.projectId
+      )?.commit;
+      if (candidate?.workspace === undefined
+        || !isDeepStrictEqual(candidate.workspace, workspace)
+        || resultCommit !== headCommit) {
         throw new Error(
-          `WorkItem Project has uncaptured commits: ${item.id}/${entry.projectId}.`
+          `WorkItem Project no longer matches its frozen result: ${item.id}/${entry.projectId}.`
         );
       }
       const integrated = this.store.listIntegrationAttempts(item.taskId).some(
         (integration) => (
           integration.status === "committed"
           && integration.projectId === entry.projectId
-          && integration.changeSetIds.includes(latest.id)
+          && integration.source.kind === "work-item"
+          && integration.source.workItemId === item.id
+          && integration.source.startCommit === entry.baseCommit
+          && integration.source.resultCommit === headCommit
         )
       );
       if (!integrated) {
         throw new Error(
-          `WorkItem ChangeSet is not integrated: ${latest.id}.`
+          `WorkItem result is not integrated: ${item.id}/${entry.projectId}.`
         );
       }
       projects.push({
         projectId: entry.projectId,
         baseCommit: entry.baseCommit,
-        headCommit,
-        changeSetId: latest.id
+        headCommit
       });
     }
     return {
@@ -271,8 +252,7 @@ export class WorkItemChangeSetManager {
             projects.push({
               projectId: entry.projectId,
               baseCommit: entry.baseCommit,
-              headCommit,
-              changeSetId: latest.id
+              headCommit
             });
             continue;
           }

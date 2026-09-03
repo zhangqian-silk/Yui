@@ -262,8 +262,12 @@ export const INTERACTION_POLICIES: readonly InteractionPolicy[] = Object.freeze(
     trailingOptions: { "--all": "flag", "--verbose": "flag" }
   },
   {
+    ...taskTarget("remote-delivery"),
+    trailingOptions: { "--json": "flag" }
+  },
+  {
     ...taskTarget("archive", 2, ["completed", "retired"]),
-    trailingOptions: { "--integrated": "flag", "--abandon": "flag" },
+    trailingOptions: { "--integrated": "flag", "--abandon": "flag", "--force": "flag" },
     confirmation: { action: "Archive task", targetArgumentIndex: 2 }
   },
   taskTarget("reconcile"),
@@ -569,15 +573,21 @@ export const INTERACTION_POLICIES: readonly InteractionPolicy[] = Object.freeze(
     selectors: [
       { argumentIndex: 3, entity: "task", provider: "tasks", actionTarget: true },
       {
-        option: "--change-set",
+        option: "--work-item",
         requiredOption: true,
-        entity: "change-set",
-        provider: "change-sets",
+        entity: "work-item",
+        provider: "work-items",
         dependsOn: 3,
         actionTarget: false
       }
     ],
-    trailingOptions: { "--change-set": "value", "--target": "value", "--check": "value" }
+    trailingOptions: {
+      "--work-item": "value",
+      "--strategy": "value",
+      "--project": "value",
+      "--target": "value",
+      "--check": "value"
+    }
   },
   {
     commandPath: ["task", "integration", "list"],

@@ -393,14 +393,12 @@ function assertCallerAuthorized(
       "A managed Task Session may not start or cancel Jobs for a different Task."
     );
   }
-  if (caller.turnId === undefined) {
-    throw jobControlError(
-      "UNAUTHORIZED",
-      "A managed Task Session must bind its request to a Turn."
-    );
-  }
-  const run = store.getTurn(taskId, caller.turnId);
-  if (run === null || run.status !== "active" || run.roleName !== caller.role) {
+  // The Turn is resolved from durable state rather than presented by the
+  // caller: a long-lived Session process cannot hold a current Turn in its
+  // frozen environment, and its own claim would add nothing the store does
+  // not already own.
+  const run = caller.role === undefined ? null : store.getActiveTurn(taskId, caller.role);
+  if (run === null || run.status !== "active") {
     throw jobControlError(
       "UNAUTHORIZED",
       "A managed Task Session's Role is not bound to an active Turn."

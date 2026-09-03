@@ -1,13 +1,12 @@
 import { createHash } from "node:crypto";
-import { isDeepStrictEqual } from "node:util";
 
 import type { InputRequest } from "../input/inputRequest.js";
 import type { IntegrationAttempt } from "../integration/integrationAttempt.js";
 import type { ChangeSet } from "../integration/changeSet.js";
 import type { IntegrationQueueEntry } from "../integration/integrationQueueEntry.js";
 import {
-  changeSetDeliverySettled,
-  governingChangeSets
+  governingWorkItemDeliveries,
+  workItemDeliverySettled
 } from "../integration/deliveryObligation.js";
 import type { Turn } from "../turn/turn.js";
 import type { ReviewRound, TaskReviewCandidate } from "../review/reviewRound.js";
@@ -59,8 +58,7 @@ import {
 export type NextActionKind =
   | "implement-current-work-item"
   | "accept-or-reject-candidate"
-  | "capture-change-set"
-  | "integrate-change-set"
+  | "integrate-work-item"
   | "request-final-review"
   | "route-review-findings"
   | "resolve-execution-stage"
@@ -265,20 +263,6 @@ export function projectNextAction(facts: NextActionFacts): NextAction {
     .find((item) => item.status === "awaiting_acceptance");
   if (candidateReady !== undefined) {
     const candidate = currentWorkItemCandidate(candidateReady);
-    if (candidate !== undefined && isEmptyDirectCandidate(candidate)) {
-      const candidateRef = ref("candidate", `${candidateReady.id}/${candidate.id}`);
-      return buildAction(facts, {
-        kind: "repair-protocol-inconsistency",
-        reason: `Candidate ${candidate.id} is a Task-main delivery with base==head (no commits); reject it and re-dispatch real work.`,
-        refs: [ref("work-item", candidateReady.id), candidateRef],
-        conflicts: [candidateRef],
-        preconditions: [
-          { fact: "Direct Candidate contains at least one commit", satisfied: false, ref: candidateRef }
-        ],
-        recommendedCommand:
-          `yui task work reject ${task.id}/${candidateReady.id} --summary \"empty base==head candidate\"`
-      });
-    }
     const activeReview = latestActiveWorkItemReview(facts.reviewRounds, candidateReady, candidate);
     if (activeReview !== undefined) {
       const reviewRef = ref("review-round", activeReview.id);
@@ -353,6 +337,29 @@ export function projectNextAction(facts: NextActionFacts): NextAction {
           { fact: "Reviewer Turn exists", satisfied: false }
         ],
         recommendedCommand: `yui task work review ${task.id}/${candidateReady.id}`
+      });
+    }
+    const unintegrated = governingWorkItemDeliveries([candidateReady])
+      .find((delivery) => !workItemDeliverySettled(delivery, facts.integrations));
+    if (unintegrated !== undefined) {
+      return buildAction(facts, {
+        kind: "integrate-work-item",
+        reason: `Work Item ${candidateReady.id} result for Project ${
+          unintegrated.projectId
+        } has not passed a Leader-owned Integration.`,
+        refs: [ref("work-item", candidateReady.id)],
+        preconditions: [
+          {
+            fact: "Committed Integration records the exact WorkItem result",
+            satisfied: false,
+            ref: ref("work-item", candidateReady.id)
+          }
+        ],
+        recommendedCommand:
+          `yui task integration start ${task.id} --work-item ${candidateReady.id} `
+          + `--project ${unintegrated.projectId} --strategy cherry-pick`,
+        judgmentRequired:
+          "Leader must choose fast-forward, cherry-pick, merge, manual application, or an explicit no-op result."
       });
     }
     const refs = [
@@ -517,37 +524,27 @@ export function projectNextAction(facts: NextActionFacts): NextAction {
     });
   }
 
-  const uncaptured = facts.workItems.find((item) => needsChangeSetCapture(facts, item));
-  if (uncaptured !== undefined) {
-    return buildAction(facts, {
-      kind: "capture-change-set",
-      reason: `Work Item ${uncaptured.id} is completed but has no ChangeSet; capture its delivery boundary.`,
-      refs: [ref("work-item", uncaptured.id)],
-      preconditions: [
-        { fact: "Work Item is completed", satisfied: true, ref: ref("work-item", uncaptured.id) },
-        { fact: "ChangeSet exists for the Work Item", satisfied: false }
-      ],
-      recommendedCommand: `yui task work capture ${task.id}/${uncaptured.id}`
-    });
-  }
-
-  const unintegrated = governingChangeSets(facts.workItems, facts.changeSets)
-    .find((changeSet) => !changeSetDeliverySettled(
-      changeSet,
-      facts.integrations,
-      facts.integrationQueueEntries
-    ));
+  const unintegrated = governingWorkItemDeliveries(facts.workItems)
+    .find((delivery) => !workItemDeliverySettled(delivery, facts.integrations));
   if (unintegrated !== undefined) {
     return buildAction(facts, {
-      kind: "integrate-change-set",
-      reason: `ChangeSet ${unintegrated.id} has no committed Integration.`,
-      refs: [ref("change-set", unintegrated.id)],
+      kind: "integrate-work-item",
+      reason: `Work Item ${unintegrated.workItemId} result for Project ${
+        unintegrated.projectId
+      } has no committed Integration.`,
+      refs: [ref("work-item", unintegrated.workItemId)],
       preconditions: [
-        { fact: "ChangeSet exists", satisfied: true, ref: ref("change-set", unintegrated.id) },
-        { fact: "Committed Integration references the ChangeSet", satisfied: false }
+        {
+          fact: "Committed Integration records the exact WorkItem result",
+          satisfied: false,
+          ref: ref("work-item", unintegrated.workItemId)
+        }
       ],
       recommendedCommand:
-        `yui task integration start ${task.id} --project ${unintegrated.projectId} --change-set ${unintegrated.id}`
+        `yui task integration start ${task.id} --work-item ${unintegrated.workItemId} `
+        + `--project ${unintegrated.projectId} --strategy cherry-pick`,
+      judgmentRequired:
+        "Leader must choose fast-forward, cherry-pick, merge, manual application, or an explicit no-op result."
     });
   }
 
@@ -734,7 +731,7 @@ export function projectNextAction(facts: NextActionFacts): NextAction {
         ? [{ fact: "Valid established Task-final Review at the direct head", satisfied: false }]
         : [
             { fact: "All Work Items are terminal", satisfied: true },
-            { fact: "Every governing ChangeSet is settled", satisfied: true },
+            { fact: "Every governing WorkItem result is integrated", satisfied: true },
             { fact: "Valid Task-final Review at the integrated head", satisfied: false }
           ],
       recommendedCommand: deliveryWorkItems.length === 0
@@ -771,7 +768,7 @@ export function projectNextAction(facts: NextActionFacts): NextAction {
         : deliveryWorkItems.length === 0
           ? [{ fact: "Task main is clean, committed, and verified", satisfied: false }]
           : [
-            { fact: "Every governing ChangeSet is settled", satisfied: true },
+            { fact: "Every governing WorkItem result is integrated", satisfied: true },
             ...(finalReviewRequired
               ? [{
                   fact: "Valid Task-final Review at the integrated head",
@@ -1094,12 +1091,6 @@ function ref(kind: string, id: string): NextActionRef {
   return { kind, id };
 }
 
-function isEmptyDirectCandidate(candidate: WorkItem["candidates"][number]): boolean {
-  const snapshot = candidate.taskMainSnapshot;
-  if (snapshot === undefined) return false;
-  return snapshot.projects.every((project) => project.baseCommit === project.headCommit);
-}
-
 function latestFailedReviewFor(
   rounds: readonly ReviewRound[],
   workItemId: string
@@ -1124,21 +1115,6 @@ function latestTaskFinalReview(
     ));
 }
 
-function needsChangeSetCapture(facts: NextActionFacts, item: WorkItem): boolean {
-  if (item.status !== "completed") return false;
-  if (governingChangeSets([item], facts.changeSets).length > 0) return false;
-  const candidate = item.candidates.at(-1);
-  if (candidate === undefined) return false;
-  // A metadata-only Task-main Candidate has no WorkItem Develop
-  // workspace to capture; its boundary is the Task-main head itself.
-  if (candidate.workspace === undefined
-    && candidate.gitSnapshot === undefined
-    && candidate.taskMainSnapshot !== undefined) {
-    return false;
-  }
-  return candidate.workspace !== undefined || candidate.gitSnapshot !== undefined;
-}
-
 function hasValidFinalReview(facts: NextActionFacts): boolean {
   const contract = taskFinalReviewContract(facts);
   const final = [...facts.reviewRounds]
@@ -1154,29 +1130,7 @@ function hasValidFinalReview(facts: NextActionFacts): boolean {
     final,
     nextActionReviewOutcomeEvidence(facts)
   )) return false;
-  if (facts.currentTaskReviewCandidate !== undefined) {
-    return facts.currentTaskReviewCandidate !== null
-      && isDeepStrictEqual(final.taskCandidate, facts.currentTaskReviewCandidate);
-  }
-  const reviewedCommits = new Set(
-    (final.taskCandidate?.projects ?? []).map((project) => project.commit)
-  );
-  if (reviewedCommits.size === 0) return false;
-  const integratedHeads = new Set(
-    facts.integrations
-      .filter((attempt) => attempt.status === "committed")
-      .flatMap((attempt) =>
-        facts.changeSets
-          .filter((changeSet) => attempt.changeSetIds.includes(changeSet.id))
-          .map((changeSet) => changeSet.headCommit))
-  );
-  if (integratedHeads.size === 0) {
-    return facts.workItems.every(({ status }) => status === "retired");
-  }
-  for (const head of integratedHeads) {
-    if (!reviewedCommits.has(head)) return false;
-  }
-  return true;
+  return final.taskCandidate !== undefined;
 }
 
 /** Adapts the serializable next-action evidence bundle to the shared classifier. */
@@ -1199,7 +1153,6 @@ type Inconsistency = Readonly<{
 }>;
 
 function detectProtocolInconsistency(facts: NextActionFacts): Inconsistency | null {
-  const changeSetIds = new Set(facts.changeSets.map((changeSet) => changeSet.id));
   const workItemById = new Map(facts.workItems.map((item) => [item.id, item]));
 
   try {
@@ -1231,14 +1184,13 @@ function detectProtocolInconsistency(facts: NextActionFacts): Inconsistency | nu
 
   for (const attempt of facts.integrations) {
     if (attempt.status !== "committed") continue;
-    const dangling = attempt.changeSetIds
-      .filter((id) => !changeSetIds.has(id));
-    if (dangling.length > 0) {
+    if (attempt.source.kind === "work-item"
+      && !workItemById.has(attempt.source.workItemId)) {
       return {
-        reason: `Committed Integration ${attempt.id} references missing ChangeSet(s): ${dangling.join(", ")}.`,
+        reason: `Committed Integration ${attempt.id} references missing WorkItem ${attempt.source.workItemId}.`,
         conflicts: [
           ref("integration-attempt", attempt.id),
-          ...dangling.map((id) => ref("change-set", id))
+          ref("work-item", attempt.source.workItemId)
         ]
       };
     }

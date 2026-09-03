@@ -22,7 +22,7 @@ export type DurableJobCommandOptions = Readonly<{
   json?: boolean;
   environment?: NodeJS.ProcessEnv;
   /** Required for `job acknowledge` to validate Task-local control identity. */
-  store?: Pick<TaskStore, "getRole" | "getActiveTurn" | "getTaskRoleSessionSet">;
+  store?: Pick<TaskStore, "getRole" | "getActiveTurn" | "getJobCallerKeyHash">;
 }>;
 
 /**
@@ -130,7 +130,7 @@ async function acknowledgeJob(
       "job acknowledge requires a Task store to resolve the caller."
     );
   }
-  taskLocalActor(options.store, options.environment, ref.taskId, options.home);
+  taskLocalActor(options.store, options.environment, ref.taskId);
   const caller = resolveJobCaller(options.environment, ref.taskId);
   await ensureFileTaskController(options.home, { environment: options.environment });
   const result = await acknowledgeDurableJob(options.home, ref.taskId, ref.jobId, caller);

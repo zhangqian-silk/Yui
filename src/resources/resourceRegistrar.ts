@@ -13,7 +13,6 @@ import { basename, dirname, resolve } from "node:path";
 
 import type { ManagedWorkspace, ManagedWorkspaceOwner } from "../worktree/managedWorkspace.js";
 import type { TaskRuntimeIsolationDescriptor } from "../runtime/taskRuntimeIsolation.js";
-import type { ExactTaskRuntimeDescriptor } from "../runtime/exactControlPlane.js";
 import { createResourceRegistryStore } from "./resourceRegistryStore.js";
 import {
   upsertResourceRecord
@@ -96,35 +95,6 @@ export class ResourceRegistrar {
         owner,
         cleanliness: "n/a"
       })));
-  }
-
-  registerExactTaskRuntimeDescriptor(
-    descriptor: ExactTaskRuntimeDescriptor,
-    sourcePath: string
-  ): void {
-    try {
-      this.#registerExactTaskRuntimeDescriptor(descriptor, sourcePath);
-    } catch {
-      // Best-effort receipt; descriptor writes must proceed regardless.
-    }
-  }
-
-  #registerExactTaskRuntimeDescriptor(
-    descriptor: ExactTaskRuntimeDescriptor,
-    sourcePath: string
-  ): void {
-    const path = resolve(sourcePath);
-    if (!existsSync(path) || isReleaseNamespacePath(this.#home, path)) return;
-    this.#save([this.#record({
-      kind: "runtime-artifact",
-      path,
-      owner: {
-        home: this.#home,
-        taskId: descriptor.taskId,
-        basis: "descriptor"
-      },
-      cleanliness: "n/a"
-    })]);
   }
 
   registerSessionContext(path: string, owner: ResourceOwner): void {

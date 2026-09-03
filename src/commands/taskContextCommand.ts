@@ -21,6 +21,10 @@ import {
 import { operationalTaskRecords } from "../task/taskRecordRetirement.js";
 import { projectReviewDecision } from "../review/reviewDecision.js";
 import type { TaskReviewCandidate } from "../review/reviewRound.js";
+import {
+  projectTaskRemoteDeliveryFromStore,
+  renderTaskRemoteDelivery
+} from "./taskRemoteDeliveryCommand.js";
 
 const RECENT_RECORD_LIMIT = 5;
 const RELATED_RECORD_LIMIT = 5;
@@ -71,6 +75,11 @@ export function runTaskContextCommand(
     const changeSets = chronological(reader.listChangeSets(task.id));
     const integrations = chronological(reader.listIntegrationAttempts(task.id));
     const publications = chronological(reader.listPublicationReferences(task.id));
+    const remoteDelivery = projectTaskRemoteDeliveryFromStore(
+      reader,
+      task,
+      currentTaskReviewCandidate
+    );
     const nextActionFacts = reader.readNextActionFacts(task.id);
     if (nextActionFacts === null) {
       throw new Error(`Task next-action facts disappeared: ${task.id}.`);
@@ -102,6 +111,7 @@ export function runTaskContextCommand(
       changeSets,
       integrations,
       publications,
+      remoteDelivery,
       messages: operationalTaskRecords(reader.listMessages(task.id), events, "message"),
       openInputRequests: inputRequests.filter((request) => request.status === "open"),
       resolvedInputRequests: inputRequests.filter((request) => request.status !== "open"),
@@ -131,6 +141,7 @@ export function runTaskContextCommand(
     changeSets,
     integrations,
     publications,
+    remoteDelivery,
     messages,
     openInputRequests,
     resolvedInputRequests,
@@ -180,6 +191,7 @@ export function runTaskContextCommand(
     ...(task.retirementSummary === undefined ? [] : [`Retirement summary: ${task.retirementSummary}`]),
     ...(task.replacementTaskId === undefined ? [] : [`Replacement Task: ${task.replacementTaskId}`]),
     ...(task.archiveSummary === undefined ? [] : [`Archive summary: ${task.archiveSummary}`]),
+    renderTaskRemoteDelivery(remoteDelivery).trimEnd(),
     "Execution:",
     `  Status: ${execution.status}`,
     `  Owner/action: ${execution.owner}/${execution.action}`,
@@ -446,7 +458,11 @@ export function runTaskContextCommand(
       : integrations.slice(-RECENT_RECORD_LIMIT).map((integration) => (
           `  ${integration.id} [${integration.status}/${integration.projectId}] — ${
             integration.targetRef
-          }; ${integration.changeSetIds.join(", ")}`
+          }; ${integration.source.kind === "work-item"
+            ? `WorkItem ${integration.source.workItemId}@${integration.source.resultCommit.slice(0, 12)}`
+            : integration.source.kind === "upstream"
+              ? `upstream ${integration.source.branch}@${integration.source.remoteCommit.slice(0, 12)}`
+              : `historical ChangeSets ${integration.source.changeSetIds.join(", ")}`}`
         ))),
     "",
     `Publication references (${publications.length}):`,

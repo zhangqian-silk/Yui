@@ -1,10 +1,10 @@
 /**
  * Environment values owned by Yui's managed runtime.
  *
- * These values carry control-plane, Task, workspace, launch, or exact-action
- * identity. They are never user Agent environment bindings, and an ordinary
- * repository test must not inherit them from the managed Session that launched
- * the test command.
+ * These values carry control-plane, Task, workspace, or launch identity. They
+ * are never user Agent environment bindings, and an ordinary repository test
+ * must not inherit them from the managed Session that launched the test
+ * command.
  */
 export const YUI_MANAGED_RUNTIME_ENVIRONMENT_NAMES = Object.freeze([
   "YUI_CLI_NAME",
@@ -21,7 +21,6 @@ export const YUI_MANAGED_RUNTIME_ENVIRONMENT_NAMES = Object.freeze([
   "YUI_NATIVE_SESSION_ROOT",
   "YUI_NATIVE_SESSION_ID",
   "YUI_CONTROL_PLANE_DESCRIPTOR",
-  "YUI_TASK_RUNTIME_DESCRIPTOR",
   "YUI_TASK_RUNTIME_ISOLATION_DESCRIPTOR",
   "YUI_TASK_RUNTIME_SERVICE_NAMESPACE",
   "YUI_SESSION_TITLE",
@@ -30,7 +29,5 @@ export const YUI_MANAGED_RUNTIME_ENVIRONMENT_NAMES = Object.freeze([
   "YUI_WRITABLE_PROJECT_IDS",
   "YUI_CONTEXT_PROJECT_IDS",
   "YUI_WORKSPACE_PROJECTS",
-  "YUI_LEADER_ACTION_TURN_ID",
-  "YUI_LEADER_ACTION_RECEIPT_ID",
   "YUI_JOB_CALLER_KEY"
 ] as const);
