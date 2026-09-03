@@ -1133,35 +1133,75 @@ test("an unowned ended Provider binding does not block the next Turn", async (t)
     adapterId: agent.adapterId,
     mode: "new",
     sessionStarted: true,
-    session: null
+    session: {
+      agentId: agent.agentId,
+      adapterId: agent.adapterId,
+      nativeSessionId: "thread-new",
+      launchId: "activation-new",
+      status: "active",
+      effective
+    }
   };
+  const adapter = new FileSchedulerStoreAdapter(store);
   const delivery = {
-    prepareRoleSession: async () => {
+    prepareRoleSession: async (request) => {
       preparedCalls += 1;
-      return prepared;
-    },
-    waitUntilReady: async () => ({
-      prepared,
-      session: {
+      request.beforeHostStart({
+        owner: { scope: "task", taskId: task.id, roleName: leader.name },
+        launchId: "activation-new",
+        turnId: turn.id,
         agentId: agent.agentId,
         adapterId: agent.adapterId,
-        nativeSessionId: "thread-new",
-        launchId: "activation-new",
-        status: "active",
-        effective
-      }
-    }),
+        effective,
+        nativeSessionId: "thread-new"
+      });
+      return prepared;
+    },
+    waitUntilReady: async () => {
+      assert.equal(adapter.observeRuntimeObservation({
+        schemaVersion: 2,
+        eventId: "new-session-ready",
+        semanticKey: "new-session-ready",
+        kind: "session.ready",
+        authority: "provider-structured",
+        receivedAt: nextAt.toISOString(),
+        observedAt: nextAt.toISOString(),
+        sequence: 1,
+        ordinal: 0,
+        fence: {
+          taskId: task.id,
+          roleName: leader.name,
+          turnId: turn.id,
+          agentId: agent.agentId,
+          driverId: "openai/codex",
+          launchId: "activation-new",
+          sessionGenerationId: "activation-new",
+          nativeSessionId: "thread-new",
+          receiptId: "turn:task-1/turn-1",
+          conversationId: "thread-new",
+          activationId: "activation-new"
+        },
+        payload: {}
+      }, nextAt), "applied");
+      return { prepared, session: prepared.session };
+    },
     sendOnce: async () => "sent",
     inspectRole: async () => "present"
   };
 
   const [result] = await processActiveRoleTurnDeliveries(
-    new FileSchedulerStoreAdapter(store),
+    adapter,
     delivery,
     nextAt
   );
-  assert.equal(result.status, "delivered");
+  assert.equal(result.status, "delivered", JSON.stringify(result));
   assert.equal(preparedCalls, 1);
+  const replacedProvider = store.getTaskRoleSessionSet(task.id, leader.name).providerBinding;
+  assert.equal(replacedProvider.currentConversationEpoch, 2);
+  assert.equal(
+    replacedProvider.conversations.find(({ status }) => status === "current").conversationId,
+    "thread-new"
+  );
 });
 
 test("Task completion leaves its reusable Provider Session running", async (t) => {
