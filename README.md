@@ -163,6 +163,9 @@ base binding and explicit Agent settings override corresponding fields. An
 inherited Worker Profile used by itself may update portable Role behavior
 without retargeting a differently bound Agent; if `--agent` or Agent settings
 are also present, its currently resolved Worker Agent must match the target.
+Applying a Profile replaces the portable fields owned by AgentProfile
+(`defaultAccess`, description, instructions, skills, and access-derived
+constraints); explicit Role options in the same command apply afterward.
 This Yui Agent Profile is separate from a Codex native config profile also
 named `--profile`.
 

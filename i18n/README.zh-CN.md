@@ -364,7 +364,9 @@ effort、权限和其他 Agent 设置必须与 `--agent` 同时提供，以便�
 使用继承 Worker 的 Profile 时，可以只更新可移植 Role 行为，而不重新定向绑定
 到其他 Agent 的 Role；若同时传入 `--agent` 或 Agent 设置，其当前解析出的
 Worker Agent 必须与更新目标一致。创建回执与 `task context` 分别记录 Profile
-intent、精确可写 Project 与实际 permission strategy。
+intent、精确可写 Project 与实际 permission strategy。应用 Profile 会替换
+AgentProfile 所拥有的可移植字段（`defaultAccess`、description、instructions、
+skills 及由 access 派生的 constraints）；同一命令中的显式 Role 选项随后覆盖。
 
 ReviewRound 从冻结 Candidate SHA 创建独立的可写 worktree。只有 exact
 ReviewRound owner、reviewRoundId、冻结 base 与 workspace 全部匹配时，才获得

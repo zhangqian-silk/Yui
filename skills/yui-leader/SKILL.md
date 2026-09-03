@@ -495,6 +495,9 @@ where omission means the provider default. Applying it copies that complete
 binding and portable behavior into the Role. Later Profile or Global Worker
 edits do not overwrite Role customization. Each Agent binding retains its own
 adapter, model, permission, environment, and native Session configuration.
+Profile application replaces the portable fields owned by AgentProfile
+(`defaultAccess`, description, instructions, skills, and access-derived
+constraints); explicit Role options in the same command apply afterward.
 
 Without `--profile` or `--agent`, a non-Leader Task Role copies the configured
 Global Worker Role's complete bindings, regardless of the Task Role name.
