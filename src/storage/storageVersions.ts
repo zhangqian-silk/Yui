@@ -16,5 +16,5 @@
  */
 export const CURRENT_STORAGE_LAYOUT_VERSION = 8;
 
-/** Aggregate 24 persists Turn v3 WorkItem main-Group provenance. */
-export const CURRENT_AGGREGATE_SCHEMA_VERSION = 24;
+/** Aggregate 26 persists Task v7 commits and IntegrationAttempt v6 sources. */
+export const CURRENT_AGGREGATE_SCHEMA_VERSION = 26;

@@ -182,10 +182,10 @@ small enough to deliver on Task main or large enough for independently owned Wor
 one substantial requirement for one Worker, not a development step, test run,
 review finding, or local fix. Multiple WorkItems are useful only when distinct
 Workers can advance meaningful requirements independently. A WorkItem's
-governing Candidate defines its delivery obligation: its current ChangeSets
-must reach committed Integration or an explicit superseded queue disposition
-before Task-final Review or completion. Older Candidate and ChangeSet records
-remain audit evidence without keeping the Task open.
+governing Candidate defines its delivery obligation: each writable Project's
+exact start and result commits must be represented by a committed Integration
+before Task-final Review or completion. Older Candidate, ChangeSet, and queue
+records remain audit evidence without keeping the Task open.
 
 `project refresh` is the explicit network operation for a stable Project checkout. It fetches the
 configured stable branch directly from the Project remote URL and advances only through a clean,
@@ -412,19 +412,18 @@ yui task work isolate <task-id>/<work-item-id>
 yui task work reject <task-id>/<work-item-id> \
   --summary "Write scope expanded; continue in the refreshed workspace."
 yui task work dispatch <task-id>/<work-item-id>
-yui task work capture <task-id>/<work-item-id>
-yui task integration start <task-id> --project backend \
-  --change-set <backend-change-set-id> --check "<validation command>"
+yui task integration start <task-id> --work-item <work-item-id> \
+  --project backend --strategy cherry-pick --check "<validation command>"
 yui task integration cleanup <task-id>/<integration-id>
 yui task work cleanup <task-id>/<work-item-id> --integrated
 ```
 
-`capture` records one immutable ChangeSet per modified Project. Repeat capture
-at the same HEAD reuses the record; a repaired HEAD produces a new candidate.
-Integration remains a single-Project Git transaction, so the Leader integrates
-each Project independently. Acceptance succeeds only after every modified
-Project's latest candidate is integrated. Yui refuses integrated cleanup while
-any result remains unintegrated. Use `--abandon` only for deliberate discard.
+The WorkItem Candidate records its exact start and result commits. Integration
+remains a single-Project Git transaction, so the Leader integrates each Project
+independently and chooses fast-forward, cherry-pick, merge, or manual
+application. Acceptance succeeds only after every writable Project result has
+a committed Integration, including an explicit successful no-op when the
+result is already represented. Use `--abandon` only for deliberate discard.
 Dirty worktrees are retained. Native Agent Sessions may be scoped to their
 launch directory, so Yui retires a stopped Role Session whenever the Role moves
 between Task main and an isolated WorkItem worktree. The next dispatch starts a
@@ -600,7 +599,8 @@ still matches:
 
 ```sh
 yui task integration start <task-id> \
-  --change-set <change-set-id> \
+  --work-item <work-item-id> \
+  --strategy cherry-pick \
   --check "npm test"
 ```
 

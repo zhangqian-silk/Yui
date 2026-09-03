@@ -45,6 +45,7 @@ import {
   type TaskRuntimeIsolationPreparation
 } from "../runtime/taskRuntimeIsolation.js";
 import type { TaskStore } from "../storage/taskStore.js";
+import { advanceTaskProjectCommit } from "../task/task.js";
 import { yuiTmuxServerName } from "../tmux/tmuxManager.js";
 import {
   recordIntegrationCheckJob,
@@ -121,18 +122,15 @@ export type IntegrationJobPort = Readonly<{
   cancelJob(taskId: string, jobId: string): Promise<void>;
 }>;
 
-type PlannedCommit = Readonly<{ changeSetId: string; commit: string }>;
-export const REMOTE_BASELINE_CONFLICT_PREFIX = "Remote baseline merge conflicts";
+type PlannedCommit = Readonly<{ label: string; commit: string }>;
+export const REMOTE_BASELINE_CONFLICT_PREFIX = "Upstream rebase conflicts";
+const WORK_ITEM_MERGE_CONFLICT_PREFIX = "WorkItem merge conflicts";
+const MANUAL_INTEGRATION_PREFIX = "Manual WorkItem integration";
 export type IntegrationWorkspace = Readonly<{
   projectId: string;
   path: string;
   branch: string;
   baseCommit: string;
-}>;
-
-export type RemoteBaseline = Readonly<{
-  remoteUrl: string;
-  branch: string;
 }>;
 
 export class GitIntegrationService {
@@ -166,8 +164,7 @@ export class GitIntegrationService {
 
   async integrate(
     taskId: string,
-    integrationId: string,
-    options: Readonly<{ remoteBaseline?: RemoteBaseline }> = {}
+    integrationId: string
   ): Promise<IntegrationResult> {
     const initial = requireIntegration(this.store, taskId, integrationId);
     // The whole Integration is one Git transaction against the Project's
@@ -188,6 +185,15 @@ export class GitIntegrationService {
     }
     const project = this.store.getProject(initial.projectId);
     if (project === null) throw new Error(`Project not found: ${initial.projectId}.`);
+    const taskWorkspace = this.store.getTaskWorkspace(task.id);
+    const taskRepository = taskWorkspace?.entries.find(
+      ({ projectId }) => projectId === project.id
+    )?.path;
+    if (taskWorkspace === null
+      || taskWorkspace.owner.type !== "task"
+      || taskRepository === undefined) {
+      throw new Error(`Integration Task clone is unavailable: ${task.id}/${project.id}.`);
+    }
     // Issue 08: a Project with a VerificationPlan gates through its plan
     // (bootstrap + L2) and reuses exact-SHA artifacts; an unconfigured
     // Project keeps the existing explicit check path unchanged.
@@ -197,11 +203,11 @@ export class GitIntegrationService {
     let managedWorkspace: ManagedWorkspace;
     try {
       prepared = await this.git.ensureIntegrationWorktree({
-        repositoryPath: project.path,
+        repositoryPath: taskRepository,
         container: join(this.worktreeRoot, project.name),
         taskSegment: taskWorkspaceRefSegment(task),
         integrationId: initial.id,
-        baseRef: initial.expectedHead
+        baseRef: initial.beforeCommit
       });
       workspace = {
         projectId: project.id,
@@ -223,7 +229,7 @@ export class GitIntegrationService {
           access: "write",
           path: prepared.path,
           branch: prepared.branch,
-          baseRef: initial.expectedHead,
+          baseRef: initial.beforeCommit,
           baseCommit: prepared.baseCommit
         }]
       }, this.now());
@@ -233,7 +239,7 @@ export class GitIntegrationService {
       return this.#fail(initial, error, "integration-preparation");
     }
     if (initial.status === "validating") {
-      return this.#recoverValidating(initial, workspace, project.path);
+      return this.#recoverValidating(initial, workspace, taskRepository);
     }
     let current = initial;
 
@@ -241,55 +247,16 @@ export class GitIntegrationService {
     // already bound one: never re-apply commits or spawn a second job. The
     // job's terminal wakeup drives the resume through `integration continue`.
     if (current.status === "running" && current.jobId !== undefined) {
-      return this.#resumeCheckJob(current, workspace, prepared.path, project.path, gate);
+      return this.#resumeCheckJob(current, workspace, prepared.path, taskRepository, gate);
     }
 
     try {
-      if (options.remoteBaseline !== undefined) {
-        const mergeRemote = this.git.mergeRemoteIntoWorktree;
-        if (mergeRemote === undefined) {
-          throw new Error(
-            "Integration Git workspace does not support remote baseline reconciliation."
-          );
-        }
-        await mergeRemote.call(this.git, {
-          repositoryPath: prepared.path,
-          remoteUrl: options.remoteBaseline.remoteUrl,
-          branch: options.remoteBaseline.branch
-        });
-      }
-      // A remote-baseline Attempt starts from the exact previously committed
-      // Task head, so its ChangeSets are already represented by that tree.
-      // Keep their IDs as provenance/check evidence, but never cherry-pick the
-      // source commits again. A manual continuation of a remote merge carries
-      // the same semantic marker in its conflict report.
-      const remoteOnly = options.remoteBaseline !== undefined
-        || (current.resolution?.action === "manual-resolution"
-          && current.conflict?.summary.startsWith(REMOTE_BASELINE_CONFLICT_PREFIX));
-      const plan = remoteOnly
-        ? []
-        : await integrationCommitPlan(
-            this.store,
-            task.id,
-            project.path,
-            current.changeSetIds,
-            current.expectedHead
-          );
-      let remaining = plan;
-      if (current.resolution?.action === "manual-resolution"
-        && current.conflict?.summary.startsWith(REMOTE_BASELINE_CONFLICT_PREFIX)) {
-        await completeRemoteBaselineResolution(prepared.path);
-      } else if (current.resolution?.action === "manual-resolution") {
-        const resolvedCommit = await completeManualResolution(prepared.path);
-        const resolvedIndex = plan.findIndex(({ commit }) => commit === resolvedCommit);
-        if (resolvedIndex < 0) {
-          throw new Error(
-            `Manual resolution commit is not part of the Integration plan: ${resolvedCommit}.`
-          );
-        }
-        remaining = plan.slice(resolvedIndex + 1);
-      }
-      const conflict = await this.#applyCommits(current, workspace, prepared.path, remaining);
+      const conflict = await this.#applySource(
+        current,
+        workspace,
+        prepared.path,
+        project.remoteUrl
+      );
       if (conflict !== undefined) {
         return conflict;
       }
@@ -298,19 +265,25 @@ export class GitIntegrationService {
       // moved or its worktree is dirty, so the check commands never run on a
       // target that cannot be advanced.  advanceTargetRef re-verifies both
       // after the checks, so a move during the gate is still fenced at CAS.
-      await assertTargetReadyForChecks(project.path, current.targetRef, current.expectedHead);
+      await assertTargetReadyForChecks(taskRepository, current.targetRef, current.beforeCommit);
       if (gate !== undefined) {
         return this.#runVerificationGate(
           current,
           workspace,
           prepared.path,
           managedWorkspace,
-          project.path,
+          taskRepository,
           gate
         );
       }
       if (this.jobPort !== undefined && current.checkCommands.length > 0) {
-        return this.#startCheckJob(current, workspace, prepared.path, managedWorkspace, project.path);
+        return this.#startCheckJob(
+          current,
+          workspace,
+          prepared.path,
+          managedWorkspace,
+          taskRepository
+        );
       }
       const checkedHead = await gitLine(["-C", prepared.path, "rev-parse", "HEAD^{commit}"]);
       const checkResults = await this.#runChecks(current, managedWorkspace, prepared.path);
@@ -339,13 +312,12 @@ export class GitIntegrationService {
       }, this.now());
       this.store.saveIntegrationAttempt(task.id, current);
       await advanceTargetRef(
-        project.path,
+        taskRepository,
         current.targetRef,
         candidateCommit,
-        current.expectedHead
+        current.beforeCommit
       );
-      const committed = updateIntegrationAttempt(current, { status: "committed" }, this.now());
-      this.store.saveIntegrationAttempt(task.id, committed);
+      const committed = this.#recordCommitted(current);
       return this.#terminalResult("committed", committed, workspace);
     } catch (error) {
       if (error instanceof RemoteBaselineConflictError) {
@@ -357,15 +329,21 @@ export class GitIntegrationService {
         return { status: "blocked", attempt: pending, workspace };
       }
       if (current.status === "validating" && current.candidateCommit !== undefined) {
-        const target = await resolveRef(project.path, current.targetRef);
+        const target = await resolveRef(taskRepository, current.targetRef);
         if (target === current.candidateCommit) {
-          const committed = updateIntegrationAttempt(
-            current,
-            { status: "committed" },
-            this.now()
-          );
-          this.store.saveIntegrationAttempt(task.id, committed);
-          return this.#terminalResult("committed", committed, workspace);
+          try {
+            await assertTargetReadyForChecks(
+              taskRepository,
+              current.targetRef,
+              current.candidateCommit
+            );
+            const committed = this.#recordCommitted(current);
+            return this.#terminalResult("committed", committed, workspace);
+          } catch {
+            // Preserve the original failure below; a target ref at the
+            // candidate is insufficient when its checked-out tree is dirty or
+            // incomplete after an interrupted CAS application.
+          }
         }
       }
       return this.#fail(current, error, "integration", workspace);
@@ -389,6 +367,12 @@ export class GitIntegrationService {
       }
       const project = this.store.getProject(integration.projectId);
       if (project === null) throw new Error(`Project not found: ${integration.projectId}.`);
+      const taskRepository = this.store.getTaskWorkspace(task.id)?.entries.find(
+        ({ projectId }) => projectId === project.id
+      )?.path;
+      if (taskRepository === undefined) {
+        throw new Error(`Integration Task clone is unavailable: ${task.id}/${project.id}.`);
+      }
       const managedWorkspace = this.store.getIntegrationWorkspace(
         integration.taskId,
         integration.id
@@ -401,7 +385,7 @@ export class GitIntegrationService {
         );
       }
       const result = await this.git.removeIntegrationWorktree({
-        repositoryPath: project.path,
+        repositoryPath: taskRepository,
         container: join(this.worktreeRoot, project.name),
         taskSegment: taskWorkspaceRefSegment(task),
         integrationId: integration.id,
@@ -576,7 +560,7 @@ export class GitIntegrationService {
         level: "L2",
         commit: job.head,
         targetRef: attempt.targetRef,
-        baseHead: attempt.expectedHead
+        baseHead: attempt.beforeCommit
       });
       try {
         const artifact = await recordGateArtifactFromJob(
@@ -632,10 +616,9 @@ export class GitIntegrationService {
       repositoryPath,
       validating.targetRef,
       candidateCommit,
-      validating.expectedHead
+      validating.beforeCommit
     );
-    const committed = updateIntegrationAttempt(validating, { status: "committed" }, this.now());
-    this.store.saveIntegrationAttempt(attempt.taskId, committed);
+    const committed = this.#recordCommitted(validating);
     return this.#terminalResult("committed", committed, workspace);
   }
 
@@ -706,7 +689,7 @@ export class GitIntegrationService {
       level: "L2",
       commit: candidateCommit,
       targetRef: attempt.targetRef,
-      baseHead: attempt.expectedHead
+      baseHead: attempt.beforeCommit
     });
     if (gate.mode !== "record") {
       const existing = await lookupReusableGateArtifact(this.store, identity);
@@ -808,10 +791,9 @@ export class GitIntegrationService {
       repositoryPath,
       validating.targetRef,
       candidateCommit,
-      validating.expectedHead
+      validating.beforeCommit
     );
-    const committed = updateIntegrationAttempt(validating, { status: "committed" }, this.now());
-    this.store.saveIntegrationAttempt(attempt.taskId, committed);
+    const committed = this.#recordCommitted(validating);
     return this.#terminalResult("committed", committed, workspace);
   }
 
@@ -827,17 +809,146 @@ export class GitIntegrationService {
     });
   }
 
-  async #applyCommits(
+  async #applySource(
     attempt: IntegrationAttempt,
     workspace: IntegrationWorkspace,
     candidatePath: string,
-    commits: readonly PlannedCommit[]
+    remoteUrl: string | undefined
   ): Promise<IntegrationResult | undefined> {
-    for (const { changeSetId, commit } of commits) {
+    if (attempt.source.kind === "historical-change-sets") {
+      throw new Error(
+        `Historical Integration cannot be resumed under the current source contract: ${attempt.id}.`
+      );
+    }
+    if (attempt.source.kind === "upstream") {
+      if (remoteUrl === undefined) {
+        throw new Error(`Project has no remote URL for upstream Integration: ${attempt.projectId}.`);
+      }
+      if (attempt.resolution?.action === "manual-resolution"
+        && attempt.conflict?.summary.startsWith(REMOTE_BASELINE_CONFLICT_PREFIX)) {
+        await continueUpstreamRebase(candidatePath);
+        return undefined;
+      }
+      const fetchRemote = this.git.fetchRemoteHeadIntoWorktree;
+      if (fetchRemote === undefined) {
+        throw new Error("Integration Git workspace cannot fetch an upstream source.");
+      }
+      const fetched = await fetchRemote.call(this.git, {
+        repositoryPath: candidatePath,
+        remoteUrl,
+        branch: attempt.source.branch
+      });
+      if (fetched.commit !== attempt.source.remoteCommit) {
+        throw new Error(
+          `Upstream branch moved before Integration: expected ${
+            attempt.source.remoteCommit
+          }, fetched ${fetched.commit}.`
+        );
+      }
+      if (await this.git.isAncestor(
+        candidatePath,
+        attempt.source.remoteCommit,
+        attempt.beforeCommit
+      )) {
+        return undefined;
+      }
+      try {
+        await git([
+          "-C", candidatePath,
+          "-c", "user.name=Yui",
+          "-c", "user.email=yui@local",
+          "rebase", "--onto",
+          attempt.source.remoteCommit,
+          attempt.source.taskBaseCommit,
+          workspace.branch
+        ]);
+      } catch (error) {
+        const affectedPaths = await conflictedPaths(candidatePath);
+        if (affectedPaths.length === 0) throw error;
+        const pending = requireResolutionDecision(attempt, {
+          affectedPaths,
+          summary: `${REMOTE_BASELINE_CONFLICT_PREFIX} in ${attempt.targetRef}.`
+        }, this.now());
+        this.store.saveIntegrationAttempt(attempt.taskId, pending);
+        return { status: "blocked", attempt: pending, workspace };
+      }
+      return undefined;
+    }
+
+    if (attempt.source.strategy === "manual") {
+      if (attempt.resolution?.action === "manual-resolution"
+        && attempt.conflict?.summary.startsWith(MANUAL_INTEGRATION_PREFIX)) {
+        if (!await this.git.isClean(candidatePath)) {
+          throw new Error("Manual Integration workspace must be clean and committed.");
+        }
+        return undefined;
+      }
+      const pending = requireResolutionDecision(attempt, {
+        affectedPaths: [],
+        summary: `${MANUAL_INTEGRATION_PREFIX}; apply the selected WorkItem result in the Integration workspace.`
+      }, this.now());
+      this.store.saveIntegrationAttempt(attempt.taskId, pending);
+      return { status: "blocked", attempt: pending, workspace };
+    }
+
+    if (attempt.source.strategy === "ff") {
+      await git([
+        "-C", candidatePath,
+        "merge", "--ff-only",
+        attempt.source.resultCommit
+      ]);
+      return undefined;
+    }
+
+    if (attempt.source.strategy === "merge") {
+      if (attempt.resolution?.action === "manual-resolution"
+        && attempt.conflict?.summary.startsWith(WORK_ITEM_MERGE_CONFLICT_PREFIX)) {
+        await completeMergeResolution(candidatePath);
+        return undefined;
+      }
+      try {
+        await git([
+          "-C", candidatePath,
+          "-c", "user.name=Yui",
+          "-c", "user.email=yui@local",
+          "merge", "--no-edit", "--no-ff",
+          attempt.source.resultCommit
+        ]);
+      } catch (error) {
+        const affectedPaths = await conflictedPaths(candidatePath);
+        if (affectedPaths.length === 0) throw error;
+        const pending = requireResolutionDecision(attempt, {
+          affectedPaths,
+          summary: `${WORK_ITEM_MERGE_CONFLICT_PREFIX} in ${attempt.targetRef}.`
+        }, this.now());
+        this.store.saveIntegrationAttempt(attempt.taskId, pending);
+        return { status: "blocked", attempt: pending, workspace };
+      }
+      return undefined;
+    }
+
+    const commits = await commitsBetween(
+      candidatePath,
+      attempt.source.startCommit,
+      attempt.source.resultCommit,
+      attempt.source.workItemId
+    );
+    let remaining = commits;
+    if (attempt.resolution?.action === "manual-resolution") {
+      const resolvedCommit = await completeCherryPickResolution(candidatePath);
+      const resolvedIndex = commits.findIndex(({ commit }) => commit === resolvedCommit);
+      if (resolvedIndex < 0) {
+        throw new Error(
+          `Manual resolution commit is not part of the WorkItem result: ${resolvedCommit}.`
+        );
+      }
+      remaining = commits.slice(resolvedIndex + 1);
+    }
+    for (const { label, commit } of remaining) {
       // Fast-forward when the commit is a direct descendant of HEAD: this
       // preserves the original commit SHA, which exact-SHA review evidence
       // relies on.  Fall back to cherry-pick when the target moved since the
-      // ChangeSet was based (the commit is no longer a direct descendant).
+      // WorkItem was based (the commit is no longer a direct descendant).
       if (await gitSucceeds(["-C", candidatePath, "merge", "--ff-only", commit])) {
         continue;
       }
@@ -854,7 +965,7 @@ export class GitIntegrationService {
         }
         const pending = requireResolutionDecision(attempt, {
           affectedPaths,
-          summary: `ChangeSet ${changeSetId} conflicts with ${attempt.targetRef}.`
+          summary: `${label} conflicts with ${attempt.targetRef}.`
         }, this.now());
         this.store.saveIntegrationAttempt(attempt.taskId, pending);
         return { status: "blocked", attempt: pending, workspace };
@@ -877,13 +988,13 @@ export class GitIntegrationService {
       );
     }
     const target = await resolveRef(repositoryPath, attempt.targetRef);
-    if (target === attempt.expectedHead) {
+    if (target === attempt.beforeCommit) {
       try {
         await advanceTargetRef(
           repositoryPath,
           attempt.targetRef,
           attempt.candidateCommit,
-          attempt.expectedHead
+          attempt.beforeCommit
         );
       } catch (error) {
         return this.#fail(attempt, error, "integration-recovery", workspace);
@@ -891,14 +1002,55 @@ export class GitIntegrationService {
     } else if (target !== attempt.candidateCommit) {
       return this.#fail(
         attempt,
-        new Error(`Target moved to ${target}; expected ${attempt.expectedHead}.`),
+        new Error(`Target moved to ${target}; expected ${attempt.beforeCommit}.`),
         "integration-recovery",
         workspace
       );
     }
-    const committed = updateIntegrationAttempt(attempt, { status: "committed" }, this.now());
-    this.store.saveIntegrationAttempt(attempt.taskId, committed);
+    await assertTargetReadyForChecks(
+      repositoryPath,
+      attempt.targetRef,
+      attempt.candidateCommit
+    );
+    const committed = this.#recordCommitted(attempt);
     return this.#terminalResult("committed", committed, workspace);
+  }
+
+  #recordCommitted(attempt: IntegrationAttempt): IntegrationAttempt {
+    if (attempt.candidateCommit === undefined) {
+      throw new Error(`Committed Integration has no candidate commit: ${attempt.id}.`);
+    }
+    const candidateCommit = attempt.candidateCommit;
+    return this.store.transaction((tx) => {
+      const task = tx.getTask(attempt.taskId);
+      if (task === null) throw new Error(`Task not found: ${attempt.taskId}.`);
+      const binding = task.projectBindings.find(
+        ({ projectId }) => projectId === attempt.projectId
+      );
+      if (binding === undefined) {
+        throw new Error(`Task Project binding not found: ${task.id}/${attempt.projectId}.`);
+      }
+      if (binding.currentCommit !== candidateCommit) {
+        tx.saveTask(advanceTaskProjectCommit(
+          task,
+          attempt.projectId,
+          attempt.beforeCommit,
+          candidateCommit,
+          this.now()
+        ));
+      }
+      const committed = updateIntegrationAttempt(
+        attempt,
+        {
+          status: "committed",
+          afterCommit: candidateCommit,
+          summary: integrationSummary(attempt)
+        },
+        this.now()
+      );
+      tx.saveIntegrationAttempt(attempt.taskId, committed);
+      return committed;
+    });
   }
 
   #fail(
@@ -941,6 +1093,34 @@ export class GitIntegrationService {
   }
 }
 
+function integrationSummary(attempt: IntegrationAttempt): string {
+  const unchanged = attempt.beforeCommit === attempt.candidateCommit;
+  if (attempt.source.kind === "upstream") {
+    return unchanged
+      ? `Upstream ${attempt.source.remoteCommit} was already represented; Task head was unchanged.`
+      : `Rebased Task changes onto upstream ${attempt.source.remoteCommit}.`;
+  }
+  if (attempt.source.kind === "historical-change-sets") {
+    return unchanged
+      ? "Historical Integration was already represented; Task head was unchanged."
+      : "Historical Integration advanced the Task head.";
+  }
+  if (attempt.source.strategy === "manual") {
+    const decision = attempt.resolution;
+    if (decision?.action !== "manual-resolution") {
+      throw new Error(`Manual Integration has no Task-control resolution decision: ${attempt.id}.`);
+    }
+    return unchanged
+      ? `WorkItem ${attempt.source.workItemId} was intentionally not applied; `
+        + `Task head was unchanged. Rationale: ${decision.rationale}`
+      : `Integrated WorkItem ${attempt.source.workItemId} with manual resolution. `
+        + `Rationale: ${decision.rationale}`;
+  }
+  return unchanged
+    ? `WorkItem ${attempt.source.workItemId} result was already represented; Task head was unchanged.`
+    : `Integrated WorkItem ${attempt.source.workItemId} with ${attempt.source.strategy}.`;
+}
+
 async function isEmptyCherryPick(path: string, commit: string): Promise<boolean> {
   let cherryPickHead: string;
   try {
@@ -954,37 +1134,28 @@ async function isEmptyCherryPick(path: string, commit: string): Promise<boolean>
     && await gitSucceeds(["-C", path, "diff", "--cached", "--quiet"]);
 }
 
-async function integrationCommitPlan(
-  store: TaskStore,
-  taskId: string,
+async function commitsBetween(
   repositoryPath: string,
-  changeSetIds: readonly string[],
-  expectedHead: string
+  startCommit: string,
+  resultCommit: string,
+  workItemId: string
 ): Promise<PlannedCommit[]> {
+  const commits = (await git([
+    "-C", repositoryPath, "rev-list", "--reverse",
+    `${startCommit}..${resultCommit}`
+  ])).trim().split("\n").filter(Boolean);
   const plan: PlannedCommit[] = [];
-  for (const changeSetId of changeSetIds) {
-    const changeSet = store.getChangeSet(taskId, changeSetId);
-    if (changeSet === null) throw new Error(`ChangeSet not found: ${changeSetId}.`);
-    const commits = (await git([
-      "-C", repositoryPath, "rev-list", "--reverse",
-      `${changeSet.baseCommit}..${changeSet.headCommit}`
-    ])).trim().split("\n").filter(Boolean);
-    for (const commit of commits) {
-      // A Task-main recovery may capture commits after they are already
-      // present on the exact target. Treat those commits as applied rather
-      // than attempting an empty cherry-pick; the later checks and CAS still
-      // fence the committed Integration to expectedHead.
-      if (await gitSucceeds([
-        "-C", repositoryPath,
-        "merge-base", "--is-ancestor", commit, expectedHead
-      ])) continue;
-      plan.push({ changeSetId, commit });
-    }
+  for (const commit of commits) {
+    if (await gitSucceeds([
+      "-C", repositoryPath,
+      "merge-base", "--is-ancestor", commit, "HEAD"
+    ])) continue;
+    plan.push({ label: `WorkItem ${workItemId} commit ${commit}`, commit });
   }
   return plan;
 }
 
-async function completeManualResolution(path: string): Promise<string> {
+async function completeCherryPickResolution(path: string): Promise<string> {
   const unmerged = (await git(["-C", path, "diff", "--name-only", "--diff-filter=U"])).trim();
   if (unmerged.length > 0) {
     throw new Error(`Manual resolution is incomplete: ${unmerged.split("\n").join(", ")}.`);
@@ -1007,15 +1178,15 @@ async function completeManualResolution(path: string): Promise<string> {
   return cherryPickHead;
 }
 
-async function completeRemoteBaselineResolution(path: string): Promise<void> {
-  const unmerged = (await git(["-C", path, "diff", "--name-only", "--diff-filter=U"])).trim();
-  if (unmerged.length > 0) {
-    throw new Error(`Manual remote baseline resolution is incomplete: ${unmerged.split("\n").join(", ")}.`);
+async function completeMergeResolution(path: string): Promise<void> {
+  const affected = await conflictedPaths(path);
+  if (affected.length > 0) {
+    throw new Error(`Manual merge resolution is incomplete: ${affected.join(", ")}.`);
   }
   try {
     await gitLine(["-C", path, "rev-parse", "--verify", "MERGE_HEAD"]);
   } catch {
-    throw new Error("Manual remote baseline resolution has no active merge.");
+    throw new Error("Manual WorkItem resolution has no active merge.");
   }
   await git([
     "-C", path,
@@ -1023,6 +1194,47 @@ async function completeRemoteBaselineResolution(path: string): Promise<void> {
     "-c", "user.email=yui@local",
     "commit", "--no-edit"
   ]);
+}
+
+async function continueUpstreamRebase(path: string): Promise<void> {
+  const affected = await conflictedPaths(path);
+  if (affected.length > 0) {
+    throw new RemoteBaselineConflictError(
+      affected,
+      `${REMOTE_BASELINE_CONFLICT_PREFIX}: ${affected.join(", ")}.`
+    );
+  }
+  try {
+    await gitLine(["-C", path, "rev-parse", "--verify", "REBASE_HEAD"]);
+  } catch {
+    throw new Error("Manual upstream resolution has no active rebase.");
+  }
+  try {
+    await git([
+      "-C", path,
+      "-c", "user.name=Yui",
+      "-c", "user.email=yui@local",
+      "-c", "core.editor=true",
+      "rebase", "--continue"
+    ]);
+  } catch (error) {
+    const nextAffected = await conflictedPaths(path);
+    if (nextAffected.length > 0) {
+      throw new RemoteBaselineConflictError(
+        nextAffected,
+        `${REMOTE_BASELINE_CONFLICT_PREFIX}: ${nextAffected.join(", ")}.`,
+        { cause: error }
+      );
+    }
+    throw error;
+  }
+}
+
+async function conflictedPaths(path: string): Promise<string[]> {
+  return (await git([
+    "-C", path,
+    "diff", "--name-only", "--diff-filter=U"
+  ])).trim().split("\n").filter(Boolean);
 }
 
 /**
@@ -1453,7 +1665,18 @@ async function advanceTargetRef(
   if (current !== expectedHead) {
     throw new Error(`Target moved to ${current}; expected ${expectedHead}.`);
   }
-  await git(["-C", checkout, "merge", "--ff-only", "--no-edit", candidateCommit]);
+  // The candidate may be a rebased upstream result and therefore need not be
+  // a descendant of the old Task head. Advance the branch with a real
+  // compare-and-swap, then update only this checkout's index and worktree.
+  // `read-tree` never moves the ref, so an external ref change is not
+  // overwritten while the checked-out files are synchronized.
+  await git([
+    "-C", repositoryPath, "update-ref",
+    ref,
+    candidateCommit,
+    expectedHead
+  ]);
+  await git(["-C", checkout, "read-tree", "--reset", "-u", candidateCommit]);
   const advanced = await resolveRef(repositoryPath, targetRef);
   if (advanced !== candidateCommit) {
     throw new Error(`Integration target did not advance to candidate: ${targetRef}.`);

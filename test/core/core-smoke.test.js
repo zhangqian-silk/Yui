@@ -90,12 +90,17 @@ import { ensureStorageSchema, StorageSchemaError } from "../../dist/storage/stor
 import { latestStorageVersionState } from "../../dist/storage/upgrade/recordVersions.js";
 import { initializeCurrentTaskStore } from "../../dist/storage/currentTaskStore.js";
 import { createProject } from "../../dist/repository/project.js";
+import {
+  createIntegrationAttempt,
+  updateIntegrationAttempt
+} from "../../dist/integration/integrationAttempt.js";
 import { snapshotExecutionLaneWorkspaceSync } from "../../dist/repository/executionLaneGitSnapshot.js";
 import { FileTaskWorkspacePreparer } from "../../dist/repository/taskWorkspacePreparer.js";
 import { generateTaskWorkspaceIdentity } from "../../dist/repository/taskWorkspaceIdentity.js";
 import { SqliteTelemetryStore } from "../../dist/telemetry/sqliteTelemetryStore.js";
 import {
   activateTask,
+  bindTaskProjectCommits,
   bindTaskWorkspaceIdentity,
   createTask,
   startTaskExecution,
@@ -2201,13 +2206,67 @@ test("a valid aggregate-21 Home upgrades through every adjacent record step", as
   ensureStorageSchema(home);
   const now = new Date("2026-09-02T01:00:00.000Z");
   const store = new SqliteTaskStore(home);
-  const task = activateTask(createTask("task-1", "Upgrade existing Home", now, { cwd: home }), now);
+  const baseCommit = "1".repeat(40);
+  store.saveProject(createProject(
+    "project-1",
+    "app",
+    home,
+    { stable: "master", development: "master" },
+    now
+  ));
+  const task = activateTask(bindTaskProjectCommits(
+    createTask("task-1", "Upgrade existing Home", now, {
+      cwd: home,
+      projectBindings: [{
+        projectId: "project-1",
+        directory: "app",
+        baseRef: "master"
+      }]
+    }),
+    [{ projectId: "project-1", commit: baseCommit }],
+    now
+  ), now);
   store.saveTask(task);
   store.saveManagedWorkspace(createManagedWorkspace({
     owner: { type: "task", taskId: task.id },
     root: home,
-    entries: []
+    entries: [{
+      projectId: "project-1",
+      directory: "app",
+      access: "write",
+      path: join(home, "app"),
+      branch: "yui/task-1/main",
+      baseRef: "master",
+      baseCommit
+    }]
   }, now));
+  let latestIntegrationCommit = baseCommit;
+  for (let index = 1; index <= 10; index += 1) {
+    const candidateCommit = index.toString(16).padStart(40, "0");
+    latestIntegrationCommit = candidateCommit;
+    const attempt = createIntegrationAttempt({
+      id: `integration-${index}`,
+      taskId: task.id,
+      projectId: "project-1",
+      targetRef: "yui/task-1/main",
+      source: {
+        kind: "upstream",
+        branch: "master",
+        remoteCommit: candidateCommit,
+        taskBaseCommit: baseCommit,
+        strategy: "rebase"
+      },
+      beforeCommit: index === 1
+        ? baseCommit
+        : (index - 1).toString(16).padStart(40, "0")
+    }, now);
+    store.saveIntegrationAttempt(task.id, updateIntegrationAttempt(attempt, {
+      candidateCommit,
+      afterCommit: candidateCommit,
+      summary: `Committed Integration ${index}.`,
+      status: "committed"
+    }, new Date(now.getTime() + index)));
+  }
   const binding = createRoleAgentBinding({ id: "codex", adapterId: "codex" });
   for (const roleName of ["leader", "producer"]) {
     store.saveRole(task.id, createRole(task.id, roleName, [binding], binding.agentId, home, now));
@@ -2231,14 +2290,31 @@ test("a valid aggregate-21 Home upgrades through every adjacent record step", as
 
   const database = new Database(join(home, "yui.db"));
   try {
-    for (const table of ["work_items", "turns"]) {
+    for (const table of ["work_items", "turns", "task_records"]) {
       const rows = database.prepare(`SELECT rowid, payload FROM ${table}`).all();
       for (const row of rows) {
         const payload = JSON.parse(row.payload);
-        payload.schemaVersion = table === "work_items" ? 13 : 1;
+        payload.schemaVersion = table === "work_items"
+          ? 13
+          : table === "turns" ? 1 : 6;
         database.prepare(`UPDATE ${table} SET payload = ? WHERE rowid = ?`)
           .run(JSON.stringify(payload), row.rowid);
       }
+    }
+    const integrationRows = database.prepare(
+      "SELECT rowid, payload FROM integration_attempts"
+    ).all();
+    for (const row of integrationRows) {
+      const payload = JSON.parse(row.payload);
+      payload.schemaVersion = 5;
+      payload.expectedHead = payload.beforeCommit;
+      payload.changeSetIds = [payload.id.replace("integration-", "change-set-")];
+      delete payload.source;
+      delete payload.beforeCommit;
+      delete payload.afterCommit;
+      delete payload.summary;
+      database.prepare("UPDATE integration_attempts SET payload = ? WHERE rowid = ?")
+        .run(JSON.stringify(payload), row.rowid);
     }
   } finally {
     database.close();
@@ -2248,6 +2324,8 @@ test("a valid aggregate-21 Home upgrades through every adjacent record step", as
   manifest.aggregateSchemaVersion = 21;
   manifest.recordVersions.workItem = 13;
   manifest.recordVersions.turn = 1;
+  manifest.recordVersions.task = 6;
+  manifest.recordVersions.integrationAttempt = 5;
   writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
 
   const preflight = JSON.parse(execFileSync(
@@ -2257,7 +2335,7 @@ test("a valid aggregate-21 Home upgrades through every adjacent record step", as
   ));
   assert.equal(preflight.ok, true);
   assert.equal(preflight.data.outcome, "upgrade-plan");
-  assert.equal(preflight.data.report.steps.length, 3);
+  assert.equal(preflight.data.report.steps.length, 5);
   const upgraded = JSON.parse(execFileSync(
     process.execPath,
     [join(root, "dist", "cli.js"), "--json", "upgrade"],
@@ -2270,15 +2348,30 @@ test("a valid aggregate-21 Home upgrades through every adjacent record step", as
   t.after(() => reopened.close());
   assert.equal(reopened.getWorkItem(task.id, oldItem.id).schemaVersion, 14);
   assert.equal(reopened.getTurn(task.id, oldTurn.id).schemaVersion, 3);
+  assert.equal(reopened.getTask(task.id).schemaVersion, 7);
+  assert.equal(reopened.getTask(task.id).projectBindings[0].baseCommit, baseCommit);
+  assert.equal(
+    reopened.getTask(task.id).projectBindings[0].currentCommit,
+    latestIntegrationCommit
+  );
   const newItem = createWorkItem("work-item-2", task.id, {
     title: "New work after upgrade",
-    assignee: "producer"
+    assignee: "producer",
+    writeProjectIds: ["project-1"]
   }, new Date("2026-09-02T01:01:00.000Z"));
   reopened.saveWorkItem(task.id, newItem);
   reopened.saveManagedWorkspace(createManagedWorkspace({
     owner: { type: "work-item", taskId: task.id, workItemId: newItem.id },
     root: join(home, newItem.id),
-    entries: []
+    entries: [{
+      projectId: "project-1",
+      directory: "app",
+      access: "write",
+      path: join(home, newItem.id, "app"),
+      branch: "yui/task-1/work-item-2",
+      baseRef: "master",
+      baseCommit: latestIntegrationCommit
+    }]
   }, new Date("2026-09-02T01:01:30.000Z")));
   runTaskCommand(
     ["work", "dispatch", `${task.id}/${newItem.id}`],

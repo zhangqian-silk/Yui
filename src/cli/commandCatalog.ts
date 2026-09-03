@@ -453,9 +453,9 @@ const taskChildren: readonly NodeInput[] = [
     children: [
       {
         name: "integrate",
-        summary: "Merge the remote development head into the Task workspace.",
-        usage: "yui task upstream integrate <task> [--latest] [--project <project>]",
-        options: ["--latest", "--project"]
+        summary: "Rebase Task changes onto the remote development head through Integration.",
+        usage: "yui task upstream integrate <task> (--latest|--project <project>) [--check <command> ...]",
+        options: ["--latest", "--project", "--check"]
       }
     ]
   },
@@ -952,14 +952,15 @@ const taskChildren: readonly NodeInput[] = [
   },
   {
     name: "integration",
-    summary: "Safely integrate ChangeSets with Leader-owned conflict decisions.",
+    summary: "Integrate WorkItem results and upstream commits with Leader-owned decisions.",
     sections: [{ id: "manage", title: "Commands", entries: ["start", "continue", "resolve", "abort", "supersede", "list", "show", "cleanup", "queue"] }],
     children: [
       {
         name: "start",
         summary: "Build, validate, and CAS-commit an integration candidate.",
-        usage: "yui task integration start <task> [--project <project>] --change-set <id> [--change-set <id> ...] [--target <ref>] [--check <command> ...]",
-        options: ["--project", "--change-set", "--target", "--check"]
+        usage: "yui task integration start <task> --work-item <id> --strategy <ff|cherry-pick|merge|manual> [--project <project>] [--target <ref>] [--check <command> ...]",
+        options: ["--work-item", "--strategy", "--project", "--target", "--check"],
+        optionValues: { "--strategy": ["ff", "cherry-pick", "merge", "manual"] }
       },
       {
         name: "continue",

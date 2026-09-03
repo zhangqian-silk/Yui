@@ -317,7 +317,11 @@ export function latestTurnDurableProgressAt(
     }>[];
     listIntegrationAttempts?(taskId: string): readonly Readonly<{
       updatedAt: string;
-      changeSetIds: readonly string[];
+      source: Readonly<
+        | { kind: "work-item"; workItemId: string }
+        | { kind: "upstream" }
+        | { kind: "historical-change-sets" }
+      >;
     }>[];
     listInputRequests?(taskId: string): readonly Readonly<{
       updatedAt: string;
@@ -358,9 +362,10 @@ export function latestTurnDurableProgressAt(
   const changeSets = store.listChangeSets?.(taskId)
     .filter(({ workItemId }) => workItemId === run.workItemId)
     ?? [];
-  const changeSetIds = new Set(changeSets.map(({ id }) => id));
   const integrations = store.listIntegrationAttempts?.(taskId)
-    .filter(({ changeSetIds: ids }) => ids.some((id) => changeSetIds.has(id)))
+    .filter(({ source }) => (
+      source.kind === "work-item" && source.workItemId === run.workItemId
+    ))
     ?? [];
   const inputProgress = store.listInputRequests?.(taskId)
     .filter((request) => (
