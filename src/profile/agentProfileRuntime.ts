@@ -49,9 +49,10 @@ export function resolveAgentProfileView(
 
 /**
  * Resolve one Profile into a complete Role binding. Inherited Profiles copy
- * the current Global Worker active binding verbatim. An explicit Profile for
- * that same Agent preserves the Worker's complete binding and overlays its own
- * model/effort; another Agent starts from its provider defaults.
+ * the current Global Worker active binding verbatim. An explicit Profile with
+ * a matching Worker binding preserves that complete binding, whether active or
+ * dormant, and overlays its own model/effort; another Agent starts from its
+ * provider defaults.
  */
 export function resolveAgentProfileRuntime(
   profile: AgentProfile,
@@ -109,9 +110,7 @@ export function resolveAgentProfileRuntime(
     };
   }
   const worker = store.getGlobalRole("worker");
-  const workerBinding = worker?.activeAgentId === agent.id
-    ? worker.agentBindings[worker.activeAgentId]
-    : undefined;
+  const workerBinding = worker?.agentBindings[agent.id];
   if (workerBinding !== undefined && workerBinding.adapterId !== agent.adapterId) {
     return {
       status: "unavailable",

@@ -190,13 +190,14 @@ export type AgentProfileV2 = Readonly<{
 
 /**
  * Migrate the only supported historical Profile contract. Profiles that did
- * not carry runtime hints become Worker-inherited. A legacy model or effort was
- * applied to the then-current Worker Agent, so migration freezes that exact
- * Agent identity instead of keeping an Agent-less provider value.
+ * not carry runtime hints become Worker-inherited. A legacy model or effort
+ * followed the Role Agent selected at application time, so migration freezes
+ * the current Worker Agent when available, otherwise the configured default
+ * Agent, instead of keeping an Agent-less provider value.
  */
 export function migrateAgentProfileV2ToV3(
   profile: AgentProfileV2,
-  globalWorker?: Readonly<{ activeAgentId: string }>
+  runtimeAgent?: Readonly<{ agentId: string }>
 ): AgentProfile {
   validateAgentProfileV2(profile);
   const {
@@ -210,8 +211,8 @@ export function migrateAgentProfileV2ToV3(
     : {
         source: "explicit",
         agentId: requireIdentity(
-          globalWorker?.activeAgentId ?? "",
-          "Legacy Agent Profile Worker Agent id"
+          runtimeAgent?.agentId ?? "",
+          "Legacy Agent Profile runtime Agent id"
         ),
         ...(model === undefined ? {} : { model }),
         ...(effort === undefined ? {} : { effort })

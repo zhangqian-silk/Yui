@@ -2264,6 +2264,33 @@ test("Task Role Profiles preserve runtime and portable behavior across add and u
   assert.deepEqual(portableUpdated.agentBindings, portableRole.agentBindings);
   assert.equal(portableUpdated.description, "Portable inherited behavior");
   assert.equal(portableUpdated.defaultAccess, "write");
+
+  const claudeWorkerBinding = createRoleAgentBinding(claude, {
+    adapterId: "claude",
+    permission: { strategy: "bypass" },
+    model: "worker-claude-model",
+    effort: "max"
+  });
+  store.saveGlobalRole(createGlobalRole(
+    "worker",
+    [workerBinding, claudeWorkerBinding],
+    claude.id,
+    home,
+    new Date("2026-09-03T06:10:50.000Z")
+  ));
+  runTaskCommand(
+    ["role", "add", task.id, "dormant-worker-profile", "--profile", codexProfile.id],
+    store,
+    { now: () => new Date("2026-09-03T06:11:00.000Z"), environment: bareEnv }
+  );
+  assert.deepEqual(
+    store.getRole(task.id, "dormant-worker-profile").agentBindings[codex.id].config,
+    {
+      ...workerBinding.config,
+      model: "profile-model",
+      effort: "high"
+    }
+  );
 });
 
 test("a valid aggregate-21 Home upgrades through every adjacent record step", async (t) => {
@@ -2428,6 +2455,70 @@ test("a valid aggregate-21 Home upgrades through every adjacent record step", as
     { now: () => new Date("2026-09-02T01:02:00.000Z"), environment: bareEnv }
   );
   assert.equal(reopened.getActiveTurn(task.id, "producer").workItemId, newItem.id);
+});
+
+test("aggregate-24 Profile hints migrate through the configured default Agent without Worker", (t) => {
+  const home = mkdtempSync(join(tmpdir(), "yui-aggregate-24-profile-upgrade-smoke-"));
+  const upgradeEnvironment = { ...bareEnv, YUI_HOME: home };
+  t.after(() => rmSync(home, { recursive: true, force: true }));
+  ensureStorageSchema(home);
+  const now = new Date("2026-09-03T08:15:00.000Z");
+  const store = new SqliteTaskStore(home);
+  const configuredAgent = createConfiguredAgent("codex", "codex", "codex", [], [], now);
+  store.saveConfiguredAgent(configuredAgent);
+  store.saveConfig({
+    ...store.getConfig(),
+    defaultAgent: configuredAgent.id
+  });
+  const legacyProfile = createAgentProfile({
+    id: "workerless-legacy-profile",
+    runtime: {
+      source: "explicit",
+      agentId: configuredAgent.id,
+      model: "legacy-model",
+      effort: "high"
+    }
+  }, now);
+  store.saveAgentProfile(legacyProfile);
+  store.close();
+
+  const database = new Database(join(home, "yui.db"));
+  try {
+    const row = database.prepare(
+      "SELECT payload FROM agent_profiles WHERE id = ?"
+    ).get(legacyProfile.id);
+    const payload = JSON.parse(row.payload);
+    payload.schemaVersion = 2;
+    payload.model = payload.runtime.model;
+    payload.effort = payload.runtime.effort;
+    delete payload.runtime;
+    database.prepare("UPDATE agent_profiles SET payload = ? WHERE id = ?")
+      .run(JSON.stringify(payload), legacyProfile.id);
+  } finally {
+    database.close();
+  }
+  const manifestPath = join(home, "schema.json");
+  const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
+  manifest.aggregateSchemaVersion = 24;
+  manifest.recordVersions.agentProfile = 2;
+  writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+
+  const upgraded = JSON.parse(execFileSync(
+    process.execPath,
+    [join(root, "dist", "cli.js"), "--json", "upgrade"],
+    { cwd: root, encoding: "utf8", env: upgradeEnvironment }
+  ));
+  assert.equal(upgraded.ok, true);
+  assert.equal(upgraded.data.outcome, "upgraded");
+  const reopened = new SqliteTaskStore(home);
+  t.after(() => reopened.close());
+  assert.equal(reopened.getGlobalRole("worker"), null);
+  assert.deepEqual(reopened.getAgentProfile(legacyProfile.id).runtime, {
+    source: "explicit",
+    agentId: configuredAgent.id,
+    model: "legacy-model",
+    effort: "high"
+  });
 });
 
 test("an existing SQLite Home with missing singleton rows fails closed", (t) => {

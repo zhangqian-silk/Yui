@@ -22,6 +22,7 @@ import {
   writeCurrentStorageManifest,
   type ParsedStorageManifest
 } from "../storageSchema.js";
+import { validateYuiConfig, type YuiConfig } from "../taskStore.js";
 import type { StorageVersionState } from "./recordVersions.js";
 
 const CURRENT_DATABASE_FILENAME = "yui.db";
@@ -453,12 +454,14 @@ function migrateAgentProfiles2To3(database: Database.Database): void {
     id: string;
     payload: string;
   }[];
-  const needsWorker = rows.some(({ payload }) => {
+  const needsRuntimeAgent = rows.some(({ payload }) => {
     const profile = jsonRecord(payload, "AgentProfile");
     return profile.schemaVersion === 2
       && (profile.model !== undefined || profile.effort !== undefined);
   });
-  const worker = needsWorker ? migrationGlobalWorker(database) : undefined;
+  const runtimeAgent = needsRuntimeAgent
+    ? migrationProfileRuntimeAgent(database)
+    : undefined;
   for (const row of rows) {
     const profile = jsonRecord(row.payload, "AgentProfile");
     if (profile.schemaVersion === 3) continue;
@@ -469,47 +472,70 @@ function migrateAgentProfiles2To3(database: Database.Database): void {
     }
     const migrated = migrateAgentProfileV2ToV3(
       profile as AgentProfileV2,
-      worker
+      runtimeAgent
     );
     database.prepare("UPDATE agent_profiles SET payload = ? WHERE id = ?")
       .run(JSON.stringify(migrated), row.id);
   }
 }
 
-function migrationGlobalWorker(
+function migrationProfileRuntimeAgent(
   database: Database.Database
-): Readonly<{ activeAgentId: string }> {
+): Readonly<{ agentId: string }> {
   const row = database.prepare("SELECT payload FROM global_roles WHERE name = 'worker'")
     .get() as { payload?: unknown } | undefined;
-  if (typeof row?.payload !== "string") {
+  if (typeof row?.payload === "string") {
+    const worker = validateGlobalRole(
+      jsonRecord(row.payload, "Global Role worker") as GlobalRole
+    );
+    const binding = worker.agentBindings[worker.activeAgentId];
+    if (binding === undefined) {
+      throw new Error(
+        `AgentProfile migration Global Role worker active Agent is not bound: ${worker.activeAgentId}.`
+      );
+    }
+    const agent = migrationConfiguredAgent(database, binding.agentId, "Global Role worker");
+    if (agent.adapterId !== binding.adapterId) {
+      throw new Error(
+        `AgentProfile migration Global Role worker Agent adapter does not match its binding: `
+        + `${binding.agentId}.`
+      );
+    }
+    return { agentId: worker.activeAgentId };
+  }
+
+  const configRow = database.prepare("SELECT payload FROM config WHERE id = 1")
+    .get() as { payload?: unknown } | undefined;
+  if (typeof configRow?.payload !== "string") {
+    throw new Error("AgentProfile migration requires the Yui config singleton.");
+  }
+  const config = jsonRecord(configRow.payload, "Yui config") as YuiConfig;
+  validateYuiConfig(config);
+  if (config.defaultAgent === undefined) {
     throw new Error(
-      "AgentProfile migration requires Global Role worker for legacy model or effort values."
+      "AgentProfile migration requires Global Role worker or config.defaultAgent "
+      + "for legacy model or effort values."
     );
   }
-  const worker = validateGlobalRole(
-    jsonRecord(row.payload, "Global Role worker") as GlobalRole
-  );
-  const binding = worker.agentBindings[worker.activeAgentId];
-  if (binding === undefined) {
-    throw new Error(
-      `AgentProfile migration Global Role worker active Agent is not bound: ${worker.activeAgentId}.`
-    );
-  }
+  migrationConfiguredAgent(database, config.defaultAgent, "config.defaultAgent");
+  return { agentId: config.defaultAgent };
+}
+
+function migrationConfiguredAgent(
+  database: Database.Database,
+  agentId: string,
+  source: string
+): ConfiguredAgent {
   const agentRow = database.prepare("SELECT payload FROM configured_agents WHERE id = ?")
-    .get(binding.agentId) as { payload?: unknown } | undefined;
+    .get(agentId) as { payload?: unknown } | undefined;
   if (typeof agentRow?.payload !== "string") {
     throw new Error(
-      `AgentProfile migration Global Role worker Agent is not configured: ${binding.agentId}.`
+      `AgentProfile migration ${source} Agent is not configured: ${agentId}.`
     );
   }
   const agent = jsonRecord(agentRow.payload, "Configured Agent");
   validateConfiguredAgent(agent as ConfiguredAgent);
-  if (agent.adapterId !== binding.adapterId) {
-    throw new Error(
-      `AgentProfile migration Global Role worker Agent adapter does not match its binding: ${binding.agentId}.`
-    );
-  }
-  return { activeAgentId: worker.activeAgentId };
+  return agent as ConfiguredAgent;
 }
 
 function assertDatabaseHealthy(database: Database.Database): void {

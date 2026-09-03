@@ -278,14 +278,15 @@ yui task integration list <task-id>
 
 A Profile may select an explicit Agent or dynamically inherit the Global
 Worker. Read `profile show` to resolve its effective Agent and Worker revision.
-An explicit Profile for the current Worker Agent preserves that binding's
-non-model settings before applying its own model and effort; another Agent uses
-provider defaults. Applying it to a new Task Role freezes that complete
-binding; later Profile or Worker changes do not rewrite the Role. Preserve
-multiple Role Agent bindings and each binding's model and permission settings
-unless the user requests a change. Record additional provider constraints in
-the Task message so the Leader knows the requirement, but do not treat prose as
-a runtime binding.
+An explicit Profile with a matching Worker binding preserves that binding's
+non-model settings whether it is active or dormant before applying its own
+model and effort; an unbound Agent uses provider defaults. The matching Worker
+binding cannot be unbound while the Profile references it. Applying the Profile
+to a new Task Role freezes that complete binding; later Profile or Worker
+changes do not rewrite the Role. Preserve multiple Role Agent bindings and each
+binding's model and permission settings unless the user requests a change.
+Record additional provider constraints in the Task message so the Leader knows
+the requirement, but do not treat prose as a runtime binding.
 
 Treat Agent/model/effort and provider settings as launch configuration, not
 Task prose. When the user requests a binding change, update only a dormant Role,

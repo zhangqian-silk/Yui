@@ -141,10 +141,12 @@ one explicit Agent with optional model and effort. `profile list` and `profile
 show` resolve the effective Agent from current configuration and display the
 Global Worker launch revision when inherited; that read does not rewrite or
 revise the Profile. Profiles do not own Sessions or workspaces.
-When an explicit Profile names the current Worker Agent, its other binding
-settings come from that Worker binding; another Agent uses provider defaults.
-The Profile still owns model and effort, and omitting either means the provider
-default rather than the Worker's value.
+When an explicit Profile's Agent has a Global Worker binding, active or
+dormant, its other binding settings come from that binding; an unbound Agent
+uses provider defaults. A Worker binding referenced this way cannot be unbound
+until the Profile is updated, changed to inheritance, or removed. The Profile
+still owns model and effort, and omitting either means the provider default
+rather than the Worker's value.
 
 Creating a Task Role from a Profile freezes the Profile behavior and its fully
 resolved runtime binding into the Role. Later Profile or Global Worker changes

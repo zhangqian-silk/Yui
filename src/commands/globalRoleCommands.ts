@@ -378,6 +378,14 @@ function unbindRole(args: string[], store: GlobalRoleStore): string {
   assertNoArguments(rest, "Role unbind usage: yui config role unbind <role> <agent-id>");
   store.transaction((tx) => {
     const role = requireRole(name, tx);
+    const profileId = profileUsingWorkerBinding(tx, role, agentId);
+    if (profileId !== null) {
+      throw usageError(
+        `Agent ${agentId} cannot be unbound from Global Role worker because Agent Profile `
+        + `${profileId} derives non-model settings from that binding. `
+        + "Update, inherit, or remove that Profile first."
+      );
+    }
     try {
       const result = unbindRoleAgent(
         role,
@@ -391,6 +399,19 @@ function unbindRole(args: string[], store: GlobalRoleStore): string {
     }
   });
   return `Unbound Agent ${agentId} from role ${name}\n`;
+}
+
+function profileUsingWorkerBinding(
+  store: GlobalRoleTransactionStore,
+  role: GlobalRole,
+  agentId: string
+): string | null {
+  if (role.name !== "worker") return null;
+  const profile = store.listAgentProfiles().find((candidate) => (
+    candidate.runtime.source === "explicit"
+    && candidate.runtime.agentId === agentId
+  ));
+  return profile?.id ?? null;
 }
 
 function enterRole(
