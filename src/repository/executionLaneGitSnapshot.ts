@@ -1,9 +1,17 @@
 import { execFileSync } from "node:child_process";
 import { isDeepStrictEqual } from "node:util";
 
-import type { ExecutionLaneGitSnapshot } from "../execution/executionGroup.js";
 import type { TaskStore } from "../storage/taskStore.js";
 import type { ManagedWorkspace } from "../worktree/managedWorkspace.js";
+
+export type ExecutionLaneGitSnapshot = Readonly<{
+  schemaVersion: 1;
+  projects: readonly Readonly<{
+    projectId: string;
+    headCommit: string;
+    branch: string;
+  }>[];
+}>;
 
 /**
  * Freeze the exact committed heads of a durable managed Lane workspace at the

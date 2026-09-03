@@ -97,7 +97,7 @@ export const CURRENT_CONTEXT_SNAPSHOT_SCHEMA_VERSION = 1 as const;
 export const CURRENT_TASK_ROLE_SCHEMA_VERSION = 4 as const;
 export const CURRENT_MANAGED_WORKSPACE_SCHEMA_VERSION = 2 as const;
 export const CURRENT_WORK_ITEM_SCHEMA_VERSION = 14 as const;
-export const CURRENT_REVIEW_ROUND_SCHEMA_VERSION = 6 as const;
+export const CURRENT_REVIEW_ROUND_SCHEMA_VERSION = 7 as const;
 export const CURRENT_CHANGE_SET_SCHEMA_VERSION = 4 as const;
 export const CURRENT_INTEGRATION_ATTEMPT_SCHEMA_VERSION = 6 as const;
 export const CURRENT_MESSAGE_SCHEMA_VERSION = 3 as const;
@@ -205,7 +205,7 @@ export function executionLaneActiveTurnKeyParts(key: string):
  * Nested-record versions consumed by the current SQLite payload validators.
  */
 export const CURRENT_TASK_ROLE_SESSION_SET_SCHEMA_VERSION = 11 as const;
-export const CURRENT_TURN_SCHEMA_VERSION = 3 as const;
+export const CURRENT_TURN_SCHEMA_VERSION = 4 as const;
 export const CURRENT_INTEGRATION_QUEUE_SCHEMA_VERSION = 1 as const;
 export type TaskStore = {
   rootDirectory(): string;

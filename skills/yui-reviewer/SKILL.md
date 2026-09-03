@@ -30,6 +30,21 @@ frozen Project commits, and assigned workspace. Inspect those exact commits.
 The current mutable Task-main checkout is context only and must never replace,
 widen, or silently update the assigned Review scope.
 
+The Turn also identifies the execution shape. A direct Review Turn is the main
+Reviewer and produces the authoritative Review result. In replicated Review,
+a Producer Lane independently inspects the same frozen Assignment in its own
+Lane workspace and returns durable summary, checks, findings, evidence, and
+exact code references. A Producer result is non-authoritative: do not create a
+Candidate, ChangeSet, integration, ReviewResult, finding-ledger entry, semantic
+outcome, or completion decision.
+
+Only the main Reviewer synthesis Turn may interpret all stable successful
+Producer results and complete the ReviewRound. Inspect every supplied result,
+resolve disagreement through judgment against the frozen sources, and return
+one complete authoritative report. Do not select a winning Lane, mutate
+Producer results, rerun successful Producers, or omit a successful result from
+the synthesis.
+
 ## Separate infrastructure failure from review judgment
 
 Verify the exact Turn identity, Context Pack, frozen head, and ReviewRound-owned
@@ -41,8 +56,9 @@ binding fails before review begins:
 - return only the exact infrastructure diagnosis, with no semantic findings or
   checks, through the assigned Review Turn;
 - do not recommend a Repair WorkItem—the Leader must recover the same frozen
-  review boundary with `task review force-fresh` when Yui proves the outcome
-  non-semantic;
+  review boundary with Yui's projected same-Round `task review retry` or exact
+  `task turn retry`; `task review force-fresh` is reserved for an eligible
+  direct Round when the Leader deliberately chooses a distinct attempt;
 - if any candidate inspection or Reviewer output did occur, report it
   explicitly. Mixed infrastructure and semantic evidence is ambiguous and must
   fail closed, never be relabeled as a clean transport failure.

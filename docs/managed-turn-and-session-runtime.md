@@ -57,8 +57,11 @@ they share the Session.
 ## Task truth and Leader responsibility
 
 Worker and Reviewer Turns produce evidence and, where applicable, update their
-managed worktree. Their terminal output is stored automatically. Turn terminal
-never means that the WorkItem, Review, or Task is accepted or complete.
+managed worktree. Their terminal output is stored automatically. A replicated
+Producer Turn is non-authoritative evidence for its later main WorkItem or
+Reviewer synthesis Turn. Producer terminal never creates a Candidate, Review
+result, or finding-ledger decision, and Turn terminal alone never means that
+the WorkItem, Review, or Task is accepted or complete.
 
 The Leader is the only semantic authority that integrates accepted code and
 updates WorkItem or Task truth. This also covers Leader-owned execution: the

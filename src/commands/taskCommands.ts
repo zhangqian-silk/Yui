@@ -105,8 +105,10 @@ import {
   deltaRecheckBlocksAcceptance,
   finishReviewRound,
   recordReviewWorkspaceDisposition,
+  retryReviewRound,
   retryRunningReviewExecutionLane,
   retryTaskReviewRound,
+  startReplicatedReviewRound,
   startReviewRound,
   updateReviewExecutionGroup,
   validateTaskReviewCandidate,
@@ -198,7 +200,6 @@ import {
 } from "../profile/agentProfileRuntime.js";
 import { assertProjectActive, resolveProject, type Project } from "../repository/project.js";
 import type { TaskWorkspaceActivation } from "../repository/taskWorkspacePreparer.js";
-import type { ChangeSet } from "../integration/changeSet.js";
 import type { TmuxRolePaneState } from "../tmux/tmuxManager.js";
 import {
   currentWorkItemCandidate,
@@ -226,20 +227,12 @@ import {
   WorkItemDependencyGateError
 } from "../workItem/dependencyGate.js";
 import {
-  addExecutionLane,
   createExecutionGroup,
-  recordExecutionLaneResult,
-  resolveExecutionGroup,
-  updateExecutionLane,
-  type ExecutionGroup,
-  type ExecutionStrategy,
-  type ExecutionLaneWorkspace,
-  type ExecutionTarget
-} from "../execution/executionGroup.js";
-import {
+  createReviewExecutionAssignment,
   createWorkItemExecutionAssignment,
   createWorkItemExecutionGroup,
   MINIMUM_WORK_ITEM_SYNTHESIS_RESULTS,
+  updateExecutionLane as updateUnifiedExecutionLane,
   updateWorkItemExecutionLane,
   workItemExecutionGroupSettled,
   type WorkItemExecutionLaneWorkspace
@@ -248,19 +241,11 @@ import {
   reconcileWorkItemMainTurns,
   successfulWorkItemSynthesisProducers
 } from "../execution/workItemMainTurn.js";
+import { reconcileReviewMainTurns } from "../execution/reviewMainTurn.js";
 import {
   projectWorkItemExecution,
   type WorkItemExecutionProjection
 } from "../execution/workItemExecutionProjection.js";
-import {
-  planResourceAdmissions,
-  resolveResourceBrokerPolicy,
-  type ResourceLaneIdentity
-} from "../execution/resourceBroker.js";
-import {
-  resolveControllerTaskConcurrency,
-  resolveRuntimeHealth
-} from "../config/yuiConfig.js";
 import {
   type ManagedWorkspace
 } from "../worktree/managedWorkspace.js";
@@ -324,7 +309,6 @@ import { currentManagedRuntime } from "../runtime/managedCaller.js";
 import { enqueueOperatorEvent } from "../scheduler/operatorEvent.js";
 import { queueLeaderWakeup } from "../scheduler/wakeupQueue.js";
 import { renderWakeReason, wakeReason } from "../scheduler/wakeReason.js";
-import { projectQueuedResourceLaneIdentities } from "../scheduler/resourceQueueProjection.js";
 import {
   buildTaskOverview,
   parseTaskListOptions,
@@ -823,24 +807,75 @@ export function planReplicatedWorkItemLanes(
   };
 }
 
-function activeResourceLaneIdentities(store: TaskWorkflowStore): ResourceLaneIdentity[] {
-  return store.listActiveTaskIds().flatMap((taskId) => (
-    store.listTurns(taskId).flatMap((run): ResourceLaneIdentity[] => {
-      if (run.status !== "active"
-        || run.executionGroupId === undefined
-        || run.executionLaneId === undefined) return [];
-      return [{
-        taskId,
-        ...(run.workItemId === undefined ? {} : { workItemId: run.workItemId }),
-        executionGroupId: run.executionGroupId,
-        executionLaneId: run.executionLaneId,
-        providerId: run.effective.adapterId,
-        agentId: run.effective.agentId,
-        ...(run.effective.model === undefined ? {} : { model: run.effective.model }),
-        requestedAt: run.createdAt
-      }];
-    })
-  ));
+function validateReviewProducerRoles(
+  reviewerRoleName: string,
+  requestedRoles: readonly string[]
+): readonly string[] {
+  const roles = [...requestedRoles];
+  if (roles.length === 1) {
+    throw usageError("Replicated Review requires zero or at least two --lane-role values.");
+  }
+  if (new Set(roles).size !== roles.length) {
+    throw usageError("Each Review Producer Lane must use a distinct Task Role.");
+  }
+  if (roles.includes(reviewerRoleName)) {
+    throw usageError("The main Reviewer Role cannot also be a Review Producer Lane.");
+  }
+  return roles;
+}
+
+function workItemCandidateProducerRoles(
+  store: TaskWorkflowStore,
+  item: WorkItem,
+  candidate: WorkItemCandidate
+): ReadonlySet<string> {
+  const roles = new Set<string>();
+  if (item.assignee !== undefined) roles.add(item.assignee);
+  if (candidate.source.type === "direct") {
+    roles.add(LEADER_ROLE);
+    return roles;
+  }
+  const sourceTurn = store.getTurn(item.taskId, candidate.source.turnId);
+  if (sourceTurn === null
+    || sourceTurn.workItemId !== item.id
+    || sourceTurn.purpose !== "execution"
+    || sourceTurn.status !== "completed") {
+    throw dataError(
+      `WorkItem Candidate producer Turn is unavailable: ${item.id}/${candidate.source.turnId}.`
+    );
+  }
+  roles.add(sourceTurn.roleName);
+  if (sourceTurn.sourceExecutionGroupId !== undefined) {
+    const group = workItemExecutionGroupById(item, sourceTurn.sourceExecutionGroupId);
+    if (group === undefined) {
+      throw dataError(
+        `WorkItem Candidate ExecutionGroup is unavailable: `
+        + `${item.id}/${sourceTurn.sourceExecutionGroupId}.`
+      );
+    }
+    for (const producer of successfulWorkItemSynthesisProducers(store, item, group)) {
+      roles.add(producer.roleName);
+    }
+  }
+  return roles;
+}
+
+function assertCandidateReviewRoleIsolation(
+  producerRoles: ReadonlySet<string>,
+  reviewerRoleName: string,
+  laneRoleNames: readonly string[]
+): void {
+  if (producerRoles.has(reviewerRoleName)) {
+    throw usageError(
+      `Reviewer Role must be separate from the Candidate producer: ${reviewerRoleName}.`
+    );
+  }
+  const collidingLane = laneRoleNames.find((roleName) => producerRoles.has(roleName));
+  if (collidingLane !== undefined) {
+    throw usageError(
+      `Review Producer Role must be separate from the Candidate producer: ${collidingLane}.`
+    );
+  }
 }
 
 function taskProjectCommand(
@@ -3479,43 +3514,6 @@ function replicatedProducerAssignmentInput(input: string, requiresCodeRef: boole
 
 
 
-function executionTargetForReviewRound(
-  task: Task,
-  round: ReviewRound,
-  item?: WorkItem,
-  candidate?: WorkItemCandidate
-): ExecutionTarget {
-  const taskScope = (round.scope ?? "work-item") === "task";
-  if (!taskScope && (item === undefined || candidate === undefined)) {
-    throw dataError(`WorkItem ReviewRound target is missing its Candidate: ${round.id}.`);
-  }
-  const projects = taskScope
-    ? round.taskCandidate?.projects ?? []
-    : candidate!.gitSnapshot?.projects ?? [];
-  const fingerprint = JSON.stringify({
-    taskId: task.id,
-    reviewRoundId: round.id,
-    ...(taskScope ? {} : { workItemId: item!.id, candidateId: candidate!.id }),
-    scope: taskScope ? "task" : "work-item",
-    projects,
-    contractDigest: round.taskFinalReviewContract?.digest
-  });
-  return {
-    schemaVersion: 1,
-    kind: taskScope ? "task-final-review" : "work-item",
-    taskId: task.id,
-    ...(taskScope ? {} : { workItemId: item!.id, candidateId: candidate!.id }),
-    // A Task-final ReviewRound is itself the immutable semantic target. Turns
-    // retry that same revision; a changed frozen Task creates a new Round.
-    revision: taskScope ? 1 : candidate!.workItemRevision,
-    projects,
-    ...(round.taskFinalReviewContract === undefined
-      ? {}
-      : { contractDigest: round.taskFinalReviewContract.digest }),
-    fingerprint
-  };
-}
-
 function acceptWork(
   args: string[],
   store: TaskWorkflowStore,
@@ -3908,10 +3906,25 @@ function reviewWork(
   store: TaskWorkflowStore,
   options: TaskCommandOptions
 ): TaskCommandExecution {
-  exactPositionals(args, 1, "Task work review usage: yui task work review <task>/<work>.");
+  const usage = "Task work review usage: yui task work review <task>/<work> "
+    + "[--lane-role <producer-role> ...].";
+  const parsed = parseMultiValueTail(
+    args,
+    new Set(),
+    new Set(["--lane-role"]),
+    usage
+  );
+  exactPositionals(parsed.positionals, 1, usage);
+  const requestedLaneRoles = parsed.multiOptions.get("--lane-role") ?? [];
+  if (requestedLaneRoles.length === 1) {
+    throw usageError("Replicated Review requires zero or at least two --lane-role values.");
+  }
+  if (new Set(requestedLaneRoles).size !== requestedLaneRoles.length) {
+    throw usageError("Each Review Producer Lane must use a distinct Task Role.");
+  }
   const now = clock(options);
   const result = store.transaction((tx) => {
-    const item = requireWorkItem(tx, args[0], options);
+    const item = requireWorkItem(tx, parsed.positionals[0], options);
     const task = requireTask(tx, item.taskId);
     if (task.status !== "active") {
       throw usageError(`Task is not active: ${task.id}/${task.status}.`);
@@ -3930,6 +3943,7 @@ function reviewWork(
         `Final review policy is Task-scoped; complete Task ${task.id} to request its final Review.`
       );
     }
+    const laneRoles = validateReviewProducerRoles(config.roleName, requestedLaneRoles);
     const activeRound = reviewRoundsByIdentity(tx.listReviewRounds(task.id)
       .filter((round) => (
         round.workItemId === item.id
@@ -3937,30 +3951,74 @@ function reviewWork(
         && (round.status === "pending" || round.status === "running")
       ))).at(-1);
     if (activeRound !== undefined) {
-      const resourceQueued = activeRound.executionGroup !== undefined
-        && activeRound.executionGroup.resolution === undefined
-        && activeRound.executionGroup.lanes.some((lane) => (
-          lane.status === "pending"
-          && lane.turnId === undefined
-        ));
+      const producerDispatchPending = activeRound.executionGroup?.lanes.some((lane) => (
+        lane.disposition === "open"
+        && (lane.currentTurnId === undefined
+          || tx.getTurn(task.id, lane.currentTurnId)?.status === "failed")
+      )) === true;
       if ((activeRound.status === "pending" && activeRound.reviewerTurnId === undefined)
-        || (activeRound.status === "running" && resourceQueued)) {
-        return { round: activeRound, resumed: true as const };
+        || (activeRound.status === "running" && producerDispatchPending)) {
+        const persistedRoles = activeRound.executionGroup?.lanes
+          .map(({ roleName }) => roleName) ?? [];
+        if (!isDeepStrictEqual(persistedRoles, laneRoles)) {
+          throw usageError(`ReviewRound ${activeRound.id} has a different frozen execution shape.`);
+        }
+        return { kind: "round" as const, round: activeRound, resumed: true as const };
       }
       throw usageError(`ReviewRound is already active: ${activeRound.id}/${activeRound.status}.`);
+    }
+    const producerRoles = workItemCandidateProducerRoles(tx, item, candidate);
+    assertCandidateReviewRoleIsolation(
+      producerRoles,
+      config.roleName,
+      laneRoles
+    );
+    for (const roleName of [config.roleName, ...laneRoles]) {
+      if (tx.getRole(task.id, roleName) === null && tx.getGlobalRole(roleName) === null) {
+        throw usageError(`Global Role not found: ${roleName}.`);
+      }
+      const availability = projectReviewerAvailability(tx, task.id, roleName);
+      if (availability.kind === "busy") {
+        return { kind: "busy" as const, availability };
+      }
+    }
+    for (const roleName of [config.roleName, ...laneRoles]) {
+      if (tx.getRole(task.id, roleName) === null) {
+        tx.saveRole(task.id, createTaskRole(
+          tx,
+          task,
+          roleName,
+          undefined,
+          now,
+          roleName
+        ));
+      }
     }
     const queued = queueReviewRound(
       tx,
       item,
       config,
       requestedBy,
-      now
+      now,
+      laneRoles
     );
-    return { ...queued, resumed: false as const };
+    return { kind: "round" as const, ...queued, resumed: false as const };
   });
+  if (result.kind === "busy") {
+    const busy = result.availability;
+    return output(
+      `Reviewer ${busy.reviewerRoleName} is busy (${busy.phase}`
+        + `${busy.activeTurnId === undefined ? "" : `; Turn ${busy.activeTurnId}`}); `
+        + `${busy.activeReviewRoundId === undefined
+          ? ""
+          : `active ReviewRound ${busy.activeReviewRoundId}; `}`
+        + `retry after ${busy.retryAfterSeconds}s or choose another Reviewer.\n`,
+      { reviewRequest: busy }
+    );
+  }
   if (result.resumed) {
     return output(
-      `Review request ${result.round.id} has pending Lanes; resuming dispatch.\n`,
+      `Review request ${result.round.id} has pending execution; resuming dispatch.\n`,
       { reviewRound: result.round }
     );
   }
@@ -3990,119 +4048,10 @@ function taskReviewCommand(
   if (command === "request") return requestTaskReviewRound(rest, store, options);
   if (command === "force-fresh") return forceFreshTaskReviewRound(rest, store, options);
   if (command === "retry") return retryFailedTaskReviewRound(rest, store, options);
-  if (command === "group") return resolveReviewExecutionGroup(rest, store, options);
   if (command === "finding") return reviewFindingCommand(rest, store, options);
   throw usageError(command === undefined
     ? "Task review command is required."
     : `Unknown command: task review ${command}`);
-}
-
-function resolveReviewExecutionGroup(
-  args: string[],
-  store: TaskWorkflowStore,
-  options: TaskCommandOptions
-): TaskCommandExecution {
-  const usage = "Task review group resolve usage: yui task review group resolve <task>/<review-round> --decision <accept|reject|blocked> --summary <text> [--lane <lane-id> ...].";
-  if (args[0] !== "resolve") throw usageError(usage);
-  const parsed = parseMultiValueTail(
-    args.slice(1),
-    new Set(["--decision", "--summary"]),
-    new Set(["--lane"]),
-    usage
-  );
-  exactPositionals(parsed.positionals, 1, usage);
-  const decision = parseExecutionResolutionDecision(parsed.options.get("--decision"), usage);
-  const summary = requiredOption(parsed.options, "--summary");
-  const selectedLaneIds = parsed.multiOptions.get("--lane");
-  const now = clock(options);
-  const result = store.transaction((tx) => {
-    const round = requireReviewRound(tx, parsed.positionals[0], options);
-    const task = requireTask(tx, round.taskId);
-    if (task.status !== "active") throw usageError(inactiveTaskMessage(task, "resolving a Review ExecutionGroup"));
-    taskActor(tx, options, task.id);
-    const group = round.executionGroup;
-    if (group === undefined
-      || (group.lanes.length < 2 && group.strategy.mode !== "adaptive")) {
-      throw usageError(`ReviewRound ${round.id} has no resolvable ExecutionGroup.`);
-    }
-    if (round.status !== "running") {
-      throw usageError(`ReviewRound ${round.id} cannot resolve from ${round.status}.`);
-    }
-    const resolved = resolveExecutionGroup(group, {
-      decision,
-      summary,
-      ...(decision === "accept"
-        ? {
-            selectedLaneIds: selectedLaneIds ?? group.lanes
-              .filter((lane) => lane.status === "completed")
-              .map(({ id }) => id)
-          }
-        : selectedLaneIds === undefined ? {} : { selectedLaneIds })
-    }, now);
-    const withGroup = updateReviewExecutionGroup(round, resolved);
-    const selectedLanes = resolved.lanes
-      .filter((lane) => resolved.resolution?.selectedLaneIds.includes(lane.id) ?? false);
-    const laneReports = selectedLanes
-      .map((lane) => lane.result?.report ?? lane.result?.summary ?? "")
-      .filter((report) => report.length > 0);
-    const checks = selectedLanes
-      .flatMap((lane) => lane.result?.checks ?? [])
-      .map(({ name, outcome, details }) => ({
-        name,
-        outcome,
-        ...(details === undefined ? {} : { details })
-      }));
-    const findings = selectedLanes
-      .flatMap((lane) => lane.result?.findings ?? []);
-    const evidence = selectedLanes
-      .flatMap((lane) => lane.result?.evidence ?? []);
-    const evidenceCommits = [...new Set(selectedLanes
-      .map((lane) => lane.result?.evidenceCommit)
-      .filter((commit): commit is string => commit !== undefined))];
-    // A Round attests a single tree only when EVERY selected Lane attests it.
-    // A dirty Lane (no evidenceCommit) ran checks on an uncommitted tree, so its
-    // checks cannot be covered by another Lane's base attestation.
-    const allLanesAttest = selectedLanes.every(
-      (lane) => lane.result?.evidenceCommit !== undefined
-    );
-    const evidenceCommit = allLanesAttest && evidenceCommits.length === 1
-      ? evidenceCommits[0]
-      : undefined;
-    const terminal = finishReviewRound(
-      withGroup,
-      decision === "accept" ? "completed" : "failed",
-      summary,
-      now,
-      {
-        report: [
-          laneReports.join("\n\n") || summary,
-          ...(findings.length === 0
-            ? []
-            : [`Findings: ${findings.map(({ id, severity, status, summary: findingSummary }) => `${id} [${severity}/${status}] ${findingSummary}`).join("; ")}`]),
-          ...(evidence.length === 0 ? [] : [`Evidence: ${evidence.join("; ")}`]),
-          ...(evidenceCommits.length <= 1
-            ? []
-            : [`Lane evidence commits: ${evidenceCommits.join(", ")}`])
-        ].join("\n\n"),
-        checks,
-        ...(evidenceCommit === undefined ? {} : { evidenceCommit })
-      }
-    );
-    tx.saveReviewRound(task.id, terminal);
-    // Issue 06: a panel-resolved completed Round feeds the finding ledger;
-    // a rejected Round is an execution-attempt failure and is skipped.
-    if (terminal.status === "completed") {
-      reconcileReviewFindingsAfterReview(tx, task.id, terminal.id, now);
-    }
-    enqueueWork(tx, leaderMailbox(task.id), "review-group-resolved", now, [
-      ...(round.workItemId === undefined ? [] : [workItemRef(task.id, round.workItemId)])
-    ]);
-    return terminal;
-  });
-  return output(
-    `Resolved Review ExecutionGroup ${result.executionGroup?.id ?? "unknown"} as ${decision}; ReviewRound ${result.id} is ${result.status}.\n`,
-    { reviewRound: result }
-  );
 }
 
 /**
@@ -4333,19 +4282,24 @@ function requestTaskReviewRound(
   options: TaskCommandOptions
 ): TaskCommandExecution {
   const usage = "Task review request usage: yui task review request <task> --role <global-role> "
-    + "[--strategy fixed:<count>|adaptive:<max>] [--lane-role <role> ...] [--delta-recheck].";
+    + "[--lane-role <producer-role> ...] [--delta-recheck].";
   const parsed = parseMultiValueTail(
     args,
-    new Set(["--role", "--strategy"]),
+    new Set(["--role"]),
     new Set(["--lane-role"]),
     usage,
     new Set(["--delta-recheck"])
   );
   exactPositionals(parsed.positionals, 1, usage);
   const reviewerRoleName = requiredOption(parsed.options, "--role");
-  const requestedStrategy = parseExecutionStrategy(parsed.options.get("--strategy"), usage);
-  const requestedLaneRoles = parsed.multiOptions.get("--lane-role") ?? [];
+  const requestedLaneRoles = validateReviewProducerRoles(
+    reviewerRoleName,
+    parsed.multiOptions.get("--lane-role") ?? []
+  );
   const deltaRecheckRequested = parsed.options.has("--delta-recheck");
+  if (deltaRecheckRequested && requestedLaneRoles.length > 0) {
+    throw usageError("Delta-recheck supports only direct Review.");
+  }
   const now = clock(options);
   const round = store.transaction((tx) => {
     const task = requireTask(tx, parsed.positionals[0]);
@@ -4398,95 +4352,16 @@ function requestTaskReviewRound(
     if (exact !== undefined
       && (exact.status === "pending" || exact.status === "running")) {
       assertNoConflictingTaskReviewRound(taskRounds, exact.id, reviewerRoleName);
-      if (requestedLaneRoles.length === 0) {
-        if (exact.status === "running"
-          && exact.executionGroup?.resolution === undefined
-          && exact.executionGroup?.lanes.some((lane) => (
-            lane.status === "pending" && lane.turnId === undefined
-          ))) return exact;
-        assertTaskReviewRequestLane(tx, task.id, reviewerRoleName, exact);
-        return exact;
+      const persistedRoles = exact.executionGroup?.lanes.map(({ roleName }) => roleName) ?? [];
+      if (!isDeepStrictEqual(persistedRoles, requestedLaneRoles)) {
+        throw usageError(`ReviewRound ${exact.id} has a different frozen execution shape.`);
       }
-      if (exact.status !== "running"
-        || exact.executionGroup?.strategy.mode !== "adaptive"
-        || exact.executionGroup.resolution !== undefined) {
-        throw usageError(`ReviewRound ${exact.id} cannot append Reviewer Lanes from ${exact.status}.`);
-      }
-      // Expansion receives only the newly requested Roles; the existing
-      // reviewer Role is already represented by its persisted first Lane.
-      const laneRoles = requestedLaneRoles;
-      if (new Set(laneRoles).size !== laneRoles.length) {
-        throw usageError("Each Reviewer Lane must use a distinct Task Role.");
-      }
-      const strategy = requestedStrategy ?? exact.executionGroup.strategy;
-      if (!sameExecutionStrategy(strategy, exact.executionGroup.strategy)) {
-        throw usageError(`Review ExecutionGroup strategy is frozen: ${exact.executionGroup.id}.`);
-      }
-      if (strategy.mode !== "adaptive") {
-        throw usageError(`Review ExecutionGroup ${exact.executionGroup.id} is not adaptive.`);
-      }
-      if (exact.executionGroup.lanes.length + laneRoles.filter((role) => (
-        !exact.executionGroup!.lanes.some((lane) => lane.roleName === role)
-      )).length > strategy.max) {
-        throw usageError(`Reviewer Lane count exceeds adaptive capacity ${strategy.max}.`);
-      }
-      for (const laneRoleName of laneRoles) {
-        const existingLane = exact.executionGroup.lanes.find(({ roleName }) => (
-          roleName === laneRoleName
-        ));
-        if (existingLane !== undefined) {
-          if (existingLane.turnId === undefined) continue;
-          if (existingLane.status !== "running") continue;
-          if (laneRoleName === reviewerRoleName) {
-            assertTaskReviewRequestLane(tx, task.id, laneRoleName, exact);
-          } else {
-            throw usageError(`Reviewer Role already has a Lane: ${laneRoleName}.`);
-          }
-        } else {
-          if (tx.getGlobalRole(laneRoleName) === null && tx.getRole(task.id, laneRoleName) === null) {
-            throw usageError(`Global Role not found: ${laneRoleName}.`);
-          }
-          if (taskReviewProducerCollision(provenance, laneRoleName) !== null) {
-            throw usageError(`Reviewer Role must be separate from the Candidate producer: ${laneRoleName}.`);
-          }
-          const availability = projectReviewerAvailability(tx, task.id, laneRoleName);
-          if (availability.kind === "busy") return availability;
-        }
-      }
-      let appended = exact.executionGroup;
-      for (const laneRoleName of laneRoles) {
-        if (appended.lanes.some(({ roleName }) => roleName === laneRoleName)) continue;
-        let laneRole = tx.getRole(task.id, laneRoleName);
-        if (laneRole === null) {
-          laneRole = createTaskRole(tx, task, laneRoleName, undefined, now, laneRoleName);
-          tx.saveRole(task.id, laneRole);
-        }
-        appended = addExecutionLane(appended, {
-          roleName: laneRole.name,
-          reviewRoundId: exact.id
-        }, now);
-      }
-      const updated = updateReviewExecutionGroup(exact, appended);
-      tx.saveReviewRound(task.id, updated);
-      return updated;
+      assertTaskReviewRequestLane(tx, task.id, reviewerRoleName, exact);
+      return exact;
     }
     const primaryAvailability = projectReviewerAvailability(tx, task.id, reviewerRoleName);
     if (primaryAvailability.kind === "busy") return primaryAvailability;
-    const laneRoles = requestedLaneRoles.length === 0
-      ? [reviewerRoleName]
-      : requestedLaneRoles[0] === reviewerRoleName
-        ? requestedLaneRoles
-        : [reviewerRoleName, ...requestedLaneRoles];
-    if (new Set(laneRoles).size !== laneRoles.length) {
-      throw usageError("Each Reviewer Lane must use a distinct Task Role.");
-    }
-    const strategy = requestedStrategy ?? { mode: "fixed", count: laneRoles.length };
-    const capacity = strategy.mode === "fixed" ? strategy.count : strategy.max;
-    if (laneRoles.length > capacity
-      || strategy.mode === "fixed" && laneRoles.length !== strategy.count) {
-      throw usageError(`Reviewer Lane count must match the ${strategy.mode} strategy capacity.`);
-    }
-    for (const laneRoleName of laneRoles) {
+    for (const laneRoleName of requestedLaneRoles) {
       if (tx.getGlobalRole(laneRoleName) === null && tx.getRole(task.id, laneRoleName) === null) {
         throw usageError(`Global Role not found: ${laneRoleName}.`);
       }
@@ -4496,7 +4371,7 @@ function requestTaskReviewRound(
         throw usageError(`Reviewer Role must be separate from the Candidate producer: ${laneRoleName}.`);
       }
     }
-    for (const laneRoleName of laneRoles) {
+    for (const laneRoleName of [reviewerRoleName, ...requestedLaneRoles]) {
       if (tx.getRole(task.id, laneRoleName) === null) {
         tx.saveRole(task.id, createTaskRole(
           tx,
@@ -4510,9 +4385,6 @@ function requestTaskReviewRound(
     }
     let deltaRecord: DeltaRecheckPreflight["record"] | undefined;
     if (deltaRecheckRequested) {
-      if (requestedLaneRoles.length > 0 || requestedStrategy !== undefined) {
-        throw usageError("Delta-recheck supports only the default single Reviewer Lane.");
-      }
       deltaRecord = validateDeltaRecheckRequest(
         tx,
         task.id,
@@ -4540,22 +4412,42 @@ function requestTaskReviewRound(
           now,
           taskFinalContract
         );
-    let group = createExecutionGroup(
-      `execution-group-${created.id}`,
-      task.id,
-      {
-        purpose: "review",
-        target: executionTargetForReviewRound(task, created),
-        strategy,
-        lanes: laneRoles.map((roleName) => ({ roleName, reviewRoundId: created.id }))
-      },
-      now
-    );
-    created = {
-      ...created,
-      executionGroup: group
-    };
     tx.saveReviewRound(task.id, created);
+    if (requestedLaneRoles.length > 0) {
+      const groupId = `execution-group-${created.id}`;
+      const baseline = freezeReviewStageContextSnapshot(tx, {
+        taskId: task.id,
+        reviewRoundId: created.id,
+        executionGroupId: groupId
+      }, now);
+      const assignment = createReviewExecutionAssignment({
+        input: `Review the frozen Task candidate for ReviewRound ${created.id}.`,
+        objective: task.title,
+        acceptance: [
+          "Inspect every bound Project at the frozen Task heads.",
+          "Report only reachable, material, actionable findings or bounded verification gaps.",
+          "Return durable checks, findings, evidence, and exact code references."
+        ],
+        contextSnapshotRef: contextSnapshotRef(baseline),
+        taskId: task.id,
+        reviewRoundId: created.id,
+        reviewBaseCommit: created.reviewBaseCommit,
+        scope: "task",
+        projects: created.taskCandidate!.projects.map(({ projectId, commit }) => ({
+          projectId,
+          baseCommit: commit
+        }))
+      });
+      const group = createExecutionGroup(
+        groupId,
+        task.id,
+        assignment,
+        requestedLaneRoles.map((roleName) => ({ roleName })),
+        now
+      );
+      created = attachReviewExecutionGroup(created, group);
+      tx.saveReviewRound(task.id, created);
+    }
     // Issue 07: when a full Review is created after a non-accepting delta
     // disposition, record the escalation lineage on the delta Round.
     if (latestNonAcceptingDelta !== undefined
@@ -4684,13 +4576,9 @@ function forceFreshTaskReviewRound(
     if (!sameTaskFinalReviewContract(source.taskFinalReviewContract, taskFinalContract)) {
       throw usageError(`Task final-review contract does not match ReviewRound ${source.id}.`);
     }
-    if (source.executionGroup !== undefined
-      && (source.executionGroup.strategy.mode !== "fixed"
-        || source.executionGroup.strategy.count !== 1
-        || source.executionGroup.lanes.length !== 1
-        || source.executionGroup.lanes[0]!.roleName !== source.reviewerRoleName)) {
+    if (source.executionGroup !== undefined) {
       throw usageError(
-        `ReviewRound ${source.id} is not a single-Reviewer full Review; force-fresh is refused.`
+        `ReviewRound ${source.id} used replicated producers; force-fresh is refused.`
       );
     }
 
@@ -4728,7 +4616,7 @@ function forceFreshTaskReviewRound(
       tx.saveRole(task.id, reviewer);
     }
 
-    let created = createTaskReviewRound(
+    const created = createTaskReviewRound(
       tx.nextReviewRoundId(task.id),
       task.id,
       source.reviewerRoleName,
@@ -4737,18 +4625,6 @@ function forceFreshTaskReviewRound(
       now,
       taskFinalContract
     );
-    const group = createExecutionGroup(
-      `execution-group-${created.id}`,
-      task.id,
-      {
-        purpose: "review",
-        target: executionTargetForReviewRound(task, created),
-        strategy: { mode: "fixed", count: 1 },
-        lanes: [{ roleName: reviewer.name, reviewRoundId: created.id }]
-      },
-      now
-    );
-    created = { ...created, executionGroup: group };
     tx.saveReviewRound(task.id, created);
     recordTaskEvent(tx, task.id, TASK_FINAL_FORCE_FRESH_EVENT, {
       sourceReviewRoundId: source.id,
@@ -4867,21 +4743,26 @@ function assertTaskReviewRequestLane(
   const activeTurns = store.listTurns(taskId).filter((entry) => (
     entry.roleName === reviewerRoleName && entry.status === "active"
   ));
-  if (reusableRound === undefined || reusableRound.status === "pending") {
+  const assertReviewerIdle = (): void => {
     if (activePointer !== null || activeTurns.length > 0
       || hasMailboxWork(reviewerMailbox) || hasMailboxWork(runtimeMailbox)) {
       throw usageError(`Reviewer has unrelated active execution: ${reviewerRoleName}.`);
     }
+  };
+  if (reusableRound === undefined || reusableRound.status === "pending") {
+    assertReviewerIdle();
     return;
   }
   if (reusableRound.status === "completed") {
-    if (activePointer !== null || activeTurns.length > 0
-      || hasMailboxWork(reviewerMailbox) || hasMailboxWork(runtimeMailbox)) {
-      throw usageError(`Reviewer has unrelated active execution: ${reviewerRoleName}.`);
-    }
+    assertReviewerIdle();
     return;
   }
   const reviewerTurnId = reusableRound.reviewerTurnId;
+  if (reviewerTurnId === undefined
+    && reusableRound.executionGroup?.lanes.some(({ disposition }) => disposition === "open")) {
+    assertReviewerIdle();
+    return;
+  }
   const activeMatches = reviewerTurnId !== undefined
     && activePointer?.id === reviewerTurnId
     && activePointer.status === "active"
@@ -5020,7 +4901,7 @@ function retryFailedTaskReviewRound(
     // Issue 06: infra retry resets the same semantic Round to pending instead
     // of manufacturing a new Round, so Round count and finding identity stay
     // stable across execution-attempt failures.
-    const resetRound = retryTaskReviewRound(round, requestedBy);
+    const resetRound = retryTaskReviewRound(round, requestedBy, now);
     tx.saveReviewRound(task.id, resetRound);
     recordTaskEvent(tx, task.id, "review.task-final-retried", {
       reviewRoundId: round.id
@@ -5061,9 +4942,105 @@ function settleTurn(
   exactPositionals(args, 1, "Task turn settle usage: yui task turn settle <task>/<turn>.");
   const previous = store.transaction((tx) => requireTurn(tx, args[0], options));
   if (previous.purpose === "review") {
+    if (previous.executionGroupId !== undefined
+      && previous.executionLaneId !== undefined) {
+      return settleFailedReviewExecutionLaneTurn(previous, store, options);
+    }
     return settleStaleFinalReviewTurn(args, store, options);
   }
   return settleFailedExecutionLaneTurn(previous, store, options);
+}
+
+function settleFailedReviewExecutionLaneTurn(
+  previous: Turn,
+  store: TaskWorkflowStore,
+  options: TaskCommandOptions
+): TaskCommandExecution {
+  const now = clock(options);
+  const result = store.transaction((tx) => {
+    const run = tx.getTurn(previous.taskId, previous.id);
+    if (run === null || run.status !== "failed" || run.purpose !== "review") {
+      throw usageError(`Turn ${previous.id} is not a failed review Turn.`);
+    }
+    if (run.reviewRoundId === undefined
+      || run.executionGroupId === undefined
+      || run.executionLaneId === undefined
+      || run.sourceExecutionGroupId !== undefined) {
+      throw usageError(`Turn ${run.id} is not a failed Review Producer Lane Turn.`);
+    }
+    const task = requireTask(tx, run.taskId);
+    if (task.status !== "active") throw usageError(`Task is not active: ${task.id}.`);
+    const actor = taskActor(tx, options, task.id);
+    const round = tx.getReviewRound(task.id, run.reviewRoundId);
+    if (round === null) {
+      throw dataError(`ReviewRound not found for Turn ${run.id}: ${run.reviewRoundId}.`);
+    }
+    const group = round.executionGroup;
+    if (group === undefined || group.id !== run.executionGroupId) {
+      throw usageError(`Turn ${run.id} no longer belongs to the Review ExecutionGroup.`);
+    }
+    const lane = group.lanes.find(({ id }) => id === run.executionLaneId);
+    if (lane === undefined || lane.currentTurnId !== run.id || lane.roleName !== run.roleName) {
+      throw usageError(`Turn ${run.id} no longer owns its Review Producer Lane.`);
+    }
+    if (lane.disposition === "failed") {
+      return {
+        turn: run,
+        reviewRound: round,
+        changed: false,
+        mainTurns: [] as readonly Turn[]
+      } as const;
+    }
+    if (round.status !== "running" || lane.disposition !== "open") {
+      throw usageError(
+        `Turn ${run.id} cannot settle ${round.id}/${group.id}/${lane.id} from `
+        + `${round.status}/${lane.disposition}.`
+      );
+    }
+    const validation = validateExactTurnReviewRound(tx, run, { allowTerminal: true });
+    if (validation.disposition !== "applied") {
+      throw usageError(
+        `Review Turn ${run.id} no longer matches its frozen Review Lane: `
+        + `${validation.reason ?? "mismatch"}.`
+      );
+    }
+    if (tx.getActiveExecutionLaneTurn(task.id, group.id, lane.id) !== null) {
+      throw usageError(`Review Producer Lane still has an active Turn: ${group.id}/${lane.id}.`);
+    }
+    const settledGroup = updateUnifiedExecutionLane(group, lane.id, {
+      currentTurnId: run.id,
+      disposition: "failed"
+    }, now);
+    tx.saveReviewRound(task.id, updateReviewExecutionGroup(round, settledGroup));
+    recordTaskEvent(tx, task.id, "turn.review-settled", {
+      turnId: run.id,
+      reviewRoundId: round.id,
+      executionGroupId: group.id,
+      executionLaneId: lane.id,
+      settledBy: actor,
+      ...(actor === "leader" ? leaderActionEventPayload(tx, task.id, options) : {})
+    }, now);
+    const reconciliation = reconcileReviewMainTurns(tx, task.id, now);
+    return {
+      turn: run,
+      reviewRound: tx.getReviewRound(task.id, round.id)!,
+      changed: true,
+      mainTurns: reconciliation.createdTurns
+    } as const;
+  });
+  for (const turn of result.mainTurns) {
+    notifyMailbox(options.runtime, roleMailbox(turn.taskId, turn.roleName), turn.taskId);
+  }
+  return output(
+    result.changed
+      ? `Settled failed Review Producer Lane from Turn ${result.turn.id}\n`
+      : `Failed Review Producer Lane already settled from Turn ${result.turn.id}\n`,
+    {
+      turn: result.turn,
+      reviewRound: result.reviewRound,
+      ...(result.mainTurns.length === 0 ? {} : { mainTurns: result.mainTurns })
+    }
+  );
 }
 
 function settleFailedExecutionLaneTurn(
@@ -6035,6 +6012,25 @@ function taskReviewProvenance(
         );
       }
       recordProducer(sourceRun.roleName, item.id);
+      if (sourceRun.sourceExecutionGroupId !== undefined) {
+        const executionGroup = workItemExecutionGroupById(
+          item,
+          sourceRun.sourceExecutionGroupId
+        );
+        if (executionGroup === undefined) {
+          throw dataError(
+            `Committed producer ExecutionGroup is unavailable: `
+            + `${item.id}/${sourceRun.sourceExecutionGroupId}.`
+          );
+        }
+        for (const producer of successfulWorkItemSynthesisProducers(
+          store,
+          item,
+          executionGroup
+        )) {
+          recordProducer(producer.roleName, item.id);
+        }
+      }
     }
   }
   return { candidate, producerRoles, producerWorkItemIds };
@@ -6054,24 +6050,6 @@ function latestCommittedIntegration(
       left.id.localeCompare(right.id, undefined, { numeric: true })
     ))
     .at(-1);
-}
-
-function assertTaskReviewChangeSetProvenance(
-  task: Task,
-  projectId: string,
-  integrationId: string,
-  changeSet: ChangeSet
-): void {
-  if (changeSet.taskId !== task.id) {
-    throw dataError(
-      `Committed Integration ChangeSet provenance is invalid: ${integrationId}/${changeSet.id}.`
-    );
-  }
-  if (changeSet.projectId !== projectId) {
-    throw dataError(
-      `Committed Integration ChangeSet provenance is invalid: ${integrationId}/${changeSet.id}.`
-    );
-  }
 }
 
 function isSameTaskReviewCandidate(
@@ -6310,8 +6288,8 @@ function assertPendingFinalReviewWorkspaceEvidence(
 }
 
 /**
- * Task-control retry of an exact failed Task-final review Turn. The old failed
- * Turn remains the attempt trail, while the semantic ReviewRound is reset to
+ * Task-control retry of an exact failed review Turn. The old failed Turn
+ * remains the attempt trail, while the semantic ReviewRound is reset to
  * pending under its existing identity. Every identity and frozen-head fence is
  * checked inside one transaction so a partial fail-old-without-reset state can
  * never be committed.
@@ -6337,79 +6315,126 @@ function retryFailedReviewRun(
     if (round === null) {
       throw dataError(`ReviewRound not found for run ${run.id}: ${run.reviewRoundId}.`);
     }
-    if ((round.scope ?? "work-item") !== "task") {
-      throw usageError(
-        `Review Turn ${run.id} is not a Task-final review; request a new WorkItem review `
-        + "for a new Candidate."
-      );
-    }
+    const taskScope = (round.scope ?? "work-item") === "task";
     const retryLane = run.executionLaneId === undefined
       ? undefined
       : round.executionGroup?.lanes.find(({ id }) => id === run.executionLaneId);
     if (run.executionGroupId !== undefined && (
       round.executionGroup?.id !== run.executionGroupId
       || retryLane === undefined
-      || retryLane.turnId !== run.id
+      || retryLane.currentTurnId !== run.id
       || retryLane.roleName !== run.roleName
     )) {
       throw usageError(
         `Review Turn ${run.id} no longer owns its exact Review Lane attempt.`
       );
     }
-    const panelGroup = round.executionGroup !== undefined
-      && (round.executionGroup.lanes.length > 1
-        || round.executionGroup.strategy.mode === "adaptive");
+    const panelGroup = round.executionGroup !== undefined;
     const runningPanelLaneRetry = round.status === "running"
       && panelGroup
-      && retryLane?.status === "failed";
+      && retryLane?.disposition === "open";
     if (round.status === "running" && panelGroup && !runningPanelLaneRetry) {
       throw usageError(
         `Review Turn ${run.id} is not the current failed Lane attempt in running Round ${round.id}.`
       );
     }
     const retryReviewerRoleName = retryLane?.roleName ?? round.reviewerRoleName;
-    const taskFinalContract = taskFinalReviewContractForMutation(tx, task.id, options);
-    if (!sameTaskFinalReviewContract(round.taskFinalReviewContract, taskFinalContract)) {
-      throw usageError(`Task final-review contract does not match ReviewRound ${round.id}.`);
-    }
     if (round.status !== "failed"
       && round.status !== "running"
       && round.status !== "pending"
       && round.status !== "completed") {
       throw usageError(`ReviewRound ${round.id} is not retryable from ${round.status}.`);
     }
-    const currentTaskCandidate = actualTaskReviewCandidateForMutation(tx, task, options);
-    if (!isSameTaskReviewCandidate(currentTaskCandidate, round.taskCandidate!)) {
-      throw usageError(
-        `Task-final ReviewRound ${round.id} no longer matches the frozen Task heads.`
+    const allRounds = tx.listReviewRounds(task.id);
+    if (taskScope) {
+      const taskFinalContract = taskFinalReviewContractForMutation(tx, task.id, options);
+      if (!sameTaskFinalReviewContract(round.taskFinalReviewContract, taskFinalContract)) {
+        throw usageError(`Task final-review contract does not match ReviewRound ${round.id}.`);
+      }
+      const currentTaskCandidate = actualTaskReviewCandidateForMutation(tx, task, options);
+      if (!isSameTaskReviewCandidate(currentTaskCandidate, round.taskCandidate!)) {
+        throw usageError(
+          `Task-final ReviewRound ${round.id} no longer matches the frozen Task heads.`
+        );
+      }
+      const taskRounds = reviewRoundsByIdentity(allRounds
+        .filter((entry) => (entry.scope ?? "work-item") === "task"));
+      const roundIndex = taskRounds.findIndex(({ id }) => id === round.id);
+      if (roundIndex < 0) {
+        throw dataError(`Final ReviewRound is not in Task history: ${round.id}.`);
+      }
+      const laterRound = taskRounds.slice(roundIndex + 1).find((entry) => (
+        entry.reviewerRoleName === retryReviewerRoleName
+      ));
+      if (laterRound !== undefined && !isSameTaskReviewCandidate(
+        laterRound.taskCandidate,
+        round.taskCandidate!
+      )) {
+        throw usageError(
+          `A newer final Task candidate already has ReviewRound ${laterRound.id}.`
+        );
+      }
+      assertNoConflictingTaskReviewRound(
+        allRounds,
+        round.id,
+        retryReviewerRoleName
       );
-    }
-    const taskRounds = reviewRoundsByIdentity(tx.listReviewRounds(task.id)
-      .filter((entry) => (entry.scope ?? "work-item") === "task"));
-    const roundIndex = taskRounds.findIndex(({ id }) => id === round.id);
-    if (roundIndex < 0) {
-      throw dataError(`Final ReviewRound is not in Task history: ${round.id}.`);
-    }
-    const laterRound = taskRounds.slice(roundIndex + 1).find((entry) => (
-      entry.reviewerRoleName === retryReviewerRoleName
-    ));
-    if (laterRound !== undefined && !isSameTaskReviewCandidate(
-      laterRound.taskCandidate,
-      round.taskCandidate!
-    )) {
-      throw usageError(
-        `A newer final Task candidate already has ReviewRound ${laterRound.id}.`
-      );
+    } else {
+      if (round.workItemId === undefined || round.candidateId === undefined) {
+        throw dataError(`WorkItem ReviewRound has no Candidate anchor: ${round.id}.`);
+      }
+      if (run.workItemId !== round.workItemId) {
+        throw usageError(`Review Turn ${run.id} does not match WorkItem ${round.workItemId}.`);
+      }
+      const item = tx.getWorkItem(task.id, round.workItemId);
+      if (item === null || item.status !== "awaiting_acceptance") {
+        throw usageError(
+          `WorkItem ReviewRound ${round.id} no longer has an awaiting Candidate.`
+        );
+      }
+      const candidate = currentWorkItemCandidate(item);
+      if (candidate === undefined || candidate.id !== round.candidateId) {
+        throw usageError(
+          `WorkItem ReviewRound ${round.id} no longer matches the current Candidate.`
+        );
+      }
+      if (candidate.gitSnapshot?.reviewBaseCommit !== round.reviewBaseCommit) {
+        throw usageError(`ReviewRound Candidate snapshot changed: ${round.id}.`);
+      }
+      if (candidate.reviewPolicy === undefined
+        || candidate.reviewPolicy.trigger === "final"
+        || candidate.reviewPolicy.roleName !== round.reviewerRoleName) {
+        throw usageError(`Candidate review policy no longer matches ReviewRound ${round.id}.`);
+      }
+      const candidateRounds = reviewRoundsByIdentity(allRounds.filter((entry) => (
+        entry.workItemId === round.workItemId
+        && entry.candidateId === round.candidateId
+      )));
+      const roundIndex = candidateRounds.findIndex(({ id }) => id === round.id);
+      if (roundIndex < 0) {
+        throw dataError(`ReviewRound is not in Candidate history: ${round.id}.`);
+      }
+      const laterRound = candidateRounds[roundIndex + 1];
+      if (laterRound !== undefined) {
+        throw usageError(
+          `A newer ReviewRound already exists for Candidate ${round.candidateId}: `
+          + `${laterRound.id}.`
+        );
+      }
+      const activeCandidateRound = candidateRounds.find((entry) => (
+        entry.id !== round.id
+        && (entry.status === "pending" || entry.status === "running")
+      ));
+      if (activeCandidateRound !== undefined) {
+        throw usageError(
+          `Candidate already has an active ReviewRound: ${activeCandidateRound.id}.`
+        );
+      }
     }
     const allReviewerRounds = reviewRoundsByIdentity(
-      tx.listReviewRounds(task.id).filter((entry) => (
+      allRounds.filter((entry) => (
         entry.reviewerRoleName === retryReviewerRoleName
       ))
-    );
-    assertNoConflictingTaskReviewRound(
-      tx.listReviewRounds(task.id),
-      round.id,
-      retryReviewerRoleName
     );
     const activeRound = allReviewerRounds.find((entry) => (
       entry.id !== round.id
@@ -6541,8 +6566,7 @@ function retryFailedReviewRun(
       const resetRound = retryRunningReviewExecutionLane(
         round,
         retryLane!.id,
-        run.id,
-        now
+        run.id
       );
       tx.saveReviewRound(task.id, resetRound);
       recordTaskEvent(tx, task.id, "turn.review-retried", {
@@ -6575,7 +6599,7 @@ function retryFailedReviewRun(
     // Issue 06: infra retry resets the same semantic Round to pending instead
     // of manufacturing a new Round, so Round count and finding identity stay
     // stable across execution-attempt failures.
-    const resetRound = retryTaskReviewRound(roundToReset, requestedBy, run.executionLaneId);
+    const resetRound = retryReviewRound(roundToReset, requestedBy, now);
     tx.saveReviewRound(task.id, resetRound);
     recordTaskEvent(tx, task.id, "turn.review-retried", {
       turnId: run.id,
@@ -6705,65 +6729,179 @@ export function queueReviewRound(
   item: WorkItem,
   config: ReviewConfig,
   requestedBy: ReviewRequestSource,
-  now: Date
+  now: Date,
+  requestedLaneRoles: readonly string[] = []
 ): Readonly<{ round: ReviewRound }> {
   const candidate = requireWorkItemCandidate(item);
   if (candidate.gitSnapshot === undefined) {
     throw usageError(`Candidate has no frozen managed Git snapshot: ${candidate.id}.`);
   }
-  const pending = createReviewRound(
+  const gitSnapshot = candidate.gitSnapshot;
+  const laneRoles = validateReviewProducerRoles(config.roleName, requestedLaneRoles);
+  const producerRoles = workItemCandidateProducerRoles(store, item, candidate);
+  const collidingLane = laneRoles.find((roleName) => producerRoles.has(roleName));
+  const collision = producerRoles.has(config.roleName)
+    ? `Reviewer Role must be separate from the Candidate producer: ${config.roleName}.`
+    : collidingLane === undefined
+      ? null
+      : `Review Producer Role must be separate from the Candidate producer: `
+        + `${collidingLane}.`;
+  const createPending = (): ReviewRound => createReviewRound(
     store.nextReviewRoundId(item.taskId),
     item.taskId,
     item.id,
     candidate.id,
     config.roleName,
     requestedBy,
-    candidate.gitSnapshot.reviewBaseCommit,
+    gitSnapshot.reviewBaseCommit,
     now
   );
-  store.saveReviewRound(item.taskId, pending);
-  const producerRoleName = item.assignee
-    ?? (candidate.source.type === "turn"
-      ? store.getTurn(item.taskId, candidate.source.turnId)?.roleName
-      : LEADER_ROLE);
-  if (producerRoleName === config.roleName) {
+  if (collision !== null) {
+    const pending = createPending();
+    store.saveReviewRound(item.taskId, pending);
     const failed = finishReviewRound(
       pending,
       "failed",
-      `Reviewer Role must be separate from the Candidate producer: ${config.roleName}.`,
+      collision,
       now
     );
     store.saveReviewRound(item.taskId, failed);
     return { round: failed };
   }
-  let reviewer = store.getRole(item.taskId, config.roleName);
-  if (reviewer === null) {
-    const globalRole = store.getGlobalRole(config.roleName);
-    if (globalRole === null) {
+  for (const roleName of [config.roleName, ...laneRoles]) {
+    let reviewer = store.getRole(item.taskId, roleName);
+    if (reviewer === null) {
+      const globalRole = store.getGlobalRole(roleName);
+      if (globalRole === null) {
+        const pending = createPending();
+        store.saveReviewRound(item.taskId, pending);
+        const failed = finishReviewRound(
+          pending,
+          "failed",
+          `Global Role not found: ${roleName}.`,
+          now
+        );
+        store.saveReviewRound(item.taskId, failed);
+        return { round: failed };
+      }
+      const task = requireTask(store, item.taskId);
+      reviewer = createTaskRole(store, task, roleName, undefined, now, roleName);
+      store.saveRole(task.id, reviewer);
+    }
+    if (store.getActiveTurn(item.taskId, reviewer.name) !== null) {
+      const pending = createPending();
+      store.saveReviewRound(item.taskId, pending);
       const failed = finishReviewRound(
         pending,
         "failed",
-        `Global Role not found: ${config.roleName}.`,
+        `Reviewer Role already has an active Turn: ${reviewer.name}.`,
         now
       );
       store.saveReviewRound(item.taskId, failed);
       return { round: failed };
     }
-    const task = requireTask(store, item.taskId);
-    reviewer = createTaskRole(store, task, config.roleName, undefined, now, config.roleName);
-    store.saveRole(task.id, reviewer);
   }
-  if (store.getActiveTurn(item.taskId, reviewer.name) !== null) {
-    const failed = finishReviewRound(
+  let pending = createPending();
+  store.saveReviewRound(item.taskId, pending);
+  if (laneRoles.length > 0) {
+    const groupId = `execution-group-${pending.id}`;
+    const baseline = freezeReviewStageContextSnapshot(store, {
+      taskId: item.taskId,
+      reviewRoundId: pending.id,
+      executionGroupId: groupId
+    }, now);
+    const assignment = createReviewExecutionAssignment({
+      input: `Review the frozen WorkItem Candidate for ReviewRound ${pending.id}.`,
+      objective: item.objective,
+      acceptance: item.acceptance,
+      contextSnapshotRef: contextSnapshotRef(baseline),
+      taskId: item.taskId,
+      reviewRoundId: pending.id,
+      reviewBaseCommit: pending.reviewBaseCommit,
+      scope: "work-item",
+      workItemId: item.id,
+      candidateId: candidate.id,
+      projects: gitSnapshot.projects.map(({ projectId, commit }) => ({
+        projectId,
+        baseCommit: commit
+      }))
+    });
+    pending = attachReviewExecutionGroup(
       pending,
-      "failed",
-      `Reviewer Role already has an active Turn: ${reviewer.name}.`,
-      now
+      createExecutionGroup(
+        groupId,
+        item.taskId,
+        assignment,
+        laneRoles.map((roleName) => ({ roleName })),
+        now
+      )
     );
-    store.saveReviewRound(item.taskId, failed);
-    return { round: failed };
+    store.saveReviewRound(item.taskId, pending);
   }
   return { round: pending };
+}
+
+function requireIsolatedReviewLaneWorkspaces(
+  store: TaskWorkflowStore,
+  round: ReviewRound,
+  lanes: readonly Readonly<{ id: string }>[],
+  workspaces: ReadonlyMap<string, ManagedWorkspace> | undefined
+): ReadonlyMap<string, ManagedWorkspace> {
+  const prepared = new Map<string, ManagedWorkspace>();
+  const frozenProjects = new Map(
+    round.executionGroup?.assignment.projects.map(({ projectId, baseCommit }) => (
+      [projectId, baseCommit]
+    )) ?? []
+  );
+  const durableByRoot = new Map(
+    store.listManagedWorkspaces(round.taskId).map((workspace) => (
+      [workspace.root, managedWorkspaceKey(workspace.owner)]
+    ))
+  );
+  const preparedByRoot = new Map<string, string>();
+  for (const lane of lanes) {
+    const workspace = workspaces?.get(lane.id);
+    if (workspace === undefined) {
+      throw usageError(
+        `Review Lane workspace preflight is missing: `
+        + `${round.executionGroup?.id ?? "unknown"}/${lane.id}.`
+      );
+    }
+    const ownerKey = managedWorkspaceKey(workspace.owner);
+    if (workspace.owner.type !== "execution-lane"
+      || workspace.owner.taskId !== round.taskId
+      || workspace.owner.purpose !== "review"
+      || workspace.owner.reviewRoundId !== round.id
+      || workspace.owner.executionGroupId !== round.executionGroup?.id
+      || workspace.owner.executionLaneId !== lane.id) {
+      throw usageError(
+        `Review Lane workspace identity does not match dispatch: `
+        + `${round.executionGroup?.id ?? "unknown"}/${lane.id}.`
+      );
+    }
+    if (workspace.entries.length !== frozenProjects.size
+      || workspace.entries.some((entry) => (
+        entry.access !== "write"
+        || frozenProjects.get(entry.projectId) !== entry.baseCommit
+        || entry.baseRef !== entry.baseCommit
+      ))) {
+      throw usageError(
+        `Review Lane workspace does not match the frozen Assignment: `
+        + `${round.executionGroup?.id ?? "unknown"}/${lane.id}.`
+      );
+    }
+    const preparedOwner = preparedByRoot.get(workspace.root);
+    if (preparedOwner !== undefined && preparedOwner !== ownerKey) {
+      throw usageError(`Review Producer workspaces collide at ${workspace.root}.`);
+    }
+    const durableOwner = durableByRoot.get(workspace.root);
+    if (durableOwner !== undefined && durableOwner !== ownerKey) {
+      throw usageError(`Review Producer workspace collides with ${durableOwner}.`);
+    }
+    preparedByRoot.set(workspace.root, ownerKey);
+    prepared.set(lane.id, workspace);
+  }
+  return prepared;
 }
 
 export function dispatchPreparedReviewRound(
@@ -6898,15 +7036,19 @@ export function dispatchPreparedReviewRound(
     }
     if (taskScope) {
       const requestedReviewers = new Set(
-        round.executionGroup?.lanes.map(({ roleName }) => roleName)
-          ?? [round.reviewerRoleName]
+        [
+          round.reviewerRoleName,
+          ...(round.executionGroup?.lanes.map(({ roleName }) => roleName) ?? [])
+        ]
       );
       const conflicting = tx.listReviewRounds(task.id).find((entry) => (
         entry.id !== round.id
         && (entry.scope ?? "work-item") === "task"
         && (entry.status === "pending" || entry.status === "running")
-        && (entry.executionGroup?.lanes.some(({ roleName }) => requestedReviewers.has(roleName))
-          ?? requestedReviewers.has(entry.reviewerRoleName))
+        && (requestedReviewers.has(entry.reviewerRoleName)
+          || entry.executionGroup?.lanes.some(({ roleName }) => (
+            requestedReviewers.has(roleName)
+          )) === true)
         && !(entry.status === "running"
           && entry.reviewerTurnId !== undefined
           && tx.getTurn(task.id, entry.reviewerTurnId)?.status === "failed")
@@ -7020,134 +7162,134 @@ export function dispatchPreparedReviewRound(
       "Report reviewBaseCommit, exact checks/results, material findings, and uncertainty. This Turn result completes only the Round and creates no Candidate or ChangeSet.",
       "The Leader alone interprets and routes evidence: original Worker when open, a small Repair WorkItem when needed, or Leader/Integration for merge and local fixes; never merge review evidence yourself."
     ].join("\n");
-    const executionTarget = executionTargetForReviewRound(task, round, item, candidate);
-    let runningGroup = round.executionGroup ?? createExecutionGroup(
-      `execution-group-${round.id}`,
-      taskId,
-      {
-        purpose: "review",
-        target: executionTarget,
-        strategy: { mode: "fixed", count: 1 },
-        lanes: [{ roleName: reviewer.name, reviewRoundId: round.id }]
-      },
-      now
-    );
-    const dispatchLanes = runningGroup.lanes.filter((lane) => (
-      lane.status === "pending" && lane.turnId === undefined
-    ));
-    const laneRoles = dispatchLanes.map(({ roleName }) => roleName);
-    const reviewers = laneRoles.map((roleName) => {
-      const laneReviewer = tx.getRole(taskId, roleName);
-      if (laneReviewer === null) {
-        throw usageError(`Reviewer Role not found: ${taskId}/${roleName}.`);
-      }
-      if (tx.getActiveTurn(taskId, roleName) !== null) {
-        throw usageError(`Reviewer Role already has an active Turn: ${roleName}.`);
-      }
-      return laneReviewer;
-    });
     const createdTurns: Turn[] = [];
-    const config = tx.getConfig();
-    const controllerConcurrency = resolveControllerTaskConcurrency(config.controllerTaskConcurrency);
-    const capacity = runningGroup.strategy.mode === "fixed"
-      ? runningGroup.strategy.count
-      : runningGroup.strategy.max;
-    const brokerPolicy = resolveResourceBrokerPolicy({
-      maxActiveLanes: controllerConcurrency,
-      maxActiveLanesPerProvider: controllerConcurrency,
-      maxQueuedLanesPerGroup: Math.max(controllerConcurrency, capacity)
-    });
-    const activeResources = activeResourceLaneIdentities(tx);
-    const queuedResources = projectQueuedResourceLaneIdentities(tx, now);
-    const reviewBaseline = dispatchLanes.length === 0
-      ? undefined
-      : freezeReviewStageContextSnapshot(tx, {
-          taskId,
-          reviewRoundId: round.id,
-          executionGroupId: runningGroup.id
-        }, now);
-    for (let index = 0; index < reviewers.length; index += 1) {
-      const lane = dispatchLanes[index]!;
-      const laneReviewer = reviewers[index]!;
-      const laneManagedWorkspace = runningGroup.lanes.length > 1 || runningGroup.strategy.mode === "adaptive"
-        ? options.executionLaneWorkspaces?.get(lane.id)
-        : round.workspace;
-      if (laneManagedWorkspace === undefined && options.yuiHome !== undefined) {
-        throw usageError(`Review Lane workspace preflight is missing: ${runningGroup.id}/${lane.id}.`);
+    if (round.executionGroup === undefined) {
+      if (round.status !== "pending") return createdTurns;
+      if (tx.getActiveTurn(taskId, reviewer.name) !== null) {
+        throw usageError(`Reviewer Role already has an active Turn: ${reviewer.name}.`);
       }
-      const effective = lane.effective ?? resolveEffectiveLaunch({
-        role: laneReviewer,
+      const turnId = tx.nextTurnId(taskId);
+      const effective = resolveEffectiveLaunch({
+        role: reviewer,
         purpose: "review",
-        workspace: laneManagedWorkspace ?? round.workspace,
+        workspace: round.workspace,
         reviewRoundId: round.id,
         reviewBaseCommit: round.reviewBaseCommit
       });
-      const sessions = tx.getTaskRoleSessionSet(taskId, laneReviewer.name);
-      const laneWorkspace = laneManagedWorkspace === undefined
-        ? undefined
-        : {
-            root: laneManagedWorkspace.root,
-            writableProjectIds: laneManagedWorkspace.entries
-              .filter(({ access }) => access === "write")
-              .map(({ projectId }) => projectId)
-          };
-      const request: ResourceLaneIdentity = {
+      const snapshot = freezeTurnContextSnapshot(tx, {
         taskId,
+        roleName: reviewer.name,
+        purpose: "review",
         ...(item === undefined ? {} : { workItemId: item.id }),
-        executionGroupId: runningGroup.id,
-        executionLaneId: lane.id,
-        providerId: effective.adapterId,
-        agentId: effective.agentId,
-        ...(effective.model === undefined ? {} : { model: effective.model }),
-        requestedAt: lane.effective === undefined ? now.toISOString() : lane.updatedAt
-      };
-      const admission = planResourceAdmissions({
-        policy: brokerPolicy,
-        active: activeResources,
-        queued: queuedResources.filter(({ taskId: queuedTaskId, executionGroupId, executionLaneId }) => !(
-          queuedTaskId === request.taskId
-          && executionGroupId === request.executionGroupId
-          && executionLaneId === request.executionLaneId
-        )),
-        requests: [request]
-      })[0]!;
-      if (admission.decision !== "admitted") {
-        if (lane.effective === undefined) {
-          runningGroup = updateExecutionLane(runningGroup, lane.id, {
-            reviewRoundId: round.id,
-            effective,
-            workspace: laneWorkspace
-          }, now);
+        reviewRoundId: round.id
+      }, now, "controller");
+      const created = createTurn(
+        turnId,
+        taskId,
+        reviewer.name,
+        roleAgentSessionResumeMode(
+          tx.getTaskRoleSessionSet(taskId, reviewer.name),
+          effective.agentId,
+          effective
+        ),
+        createTurnInput({
+          source: {
+            type: "yui",
+            channel: item === undefined ? "task-dispatch" : "workitem-dispatch"
+          },
+          directive: rawInput,
+          contextSnapshotRef: contextSnapshotRef(snapshot),
+          deltaRefIds: contextSnapshotDeltaRefIds(tx, snapshot)
+        }),
+        now,
+        {
+          ...(item === undefined ? {} : { workItemId: item.id }),
+          purpose: "review",
+          reviewRoundId: round.id,
+          workspace: round.workspace,
+          effective
         }
-        if (!queuedResources.some(({ taskId: queuedTaskId, executionGroupId, executionLaneId }) => (
-          queuedTaskId === request.taskId
-          && executionGroupId === request.executionGroupId
-          && executionLaneId === request.executionLaneId
-        ))) queuedResources.push(request);
-        continue;
+      );
+      tx.saveTurn(created);
+      tx.saveReviewRound(taskId, startReviewRound(round, created.id));
+      tx.saveActiveTurn(created);
+      enqueueWork(tx, roleMailbox(taskId, reviewer.name), "review-requested", now, [
+        turnRef(taskId, created.id),
+        ...(item === undefined ? [] : [workItemRef(taskId, item.id)])
+      ]);
+      recordTaskEvent(tx, taskId, "turn.review-dispatched", turnLaunchEventPayload(created), now);
+      createdTurns.push(created);
+      return createdTurns;
+    }
+
+    let runningGroup = round.executionGroup;
+    const dispatchLanes = runningGroup.lanes.filter((lane) => {
+      if (lane.disposition !== "open") return false;
+      if (lane.currentTurnId === undefined) return true;
+      return tx.getTurn(taskId, lane.currentTurnId)?.status === "failed";
+    });
+    const preparedLaneWorkspaces = requireIsolatedReviewLaneWorkspaces(
+      tx,
+      round,
+      dispatchLanes,
+      options.executionLaneWorkspaces
+    );
+    for (const lane of dispatchLanes) {
+      const laneReviewer = tx.getRole(taskId, lane.roleName);
+      if (laneReviewer === null) {
+        throw usageError(`Review Producer Role not found: ${taskId}/${lane.roleName}.`);
       }
-      activeResources.push(request);
+      if (tx.getActiveTurn(taskId, lane.roleName) !== null) {
+        throw usageError(`Review Producer Role already has an active Turn: ${lane.roleName}.`);
+      }
+      const laneManagedWorkspace = preparedLaneWorkspaces.get(lane.id)!;
+      const effective = lane.effective ?? resolveEffectiveLaunch({
+        role: laneReviewer,
+        purpose: "review",
+        workspace: laneManagedWorkspace,
+        reviewRoundId: round.id,
+        reviewBaseCommit: round.reviewBaseCommit
+      });
       const turnId = tx.nextTurnId(taskId);
       const input = createTurnInput({
         source: {
           type: "yui",
           channel: item === undefined ? "task-dispatch" : "workitem-dispatch"
         },
-        directive: `${rawInput}\nFrozen target: ${runningGroup.target.fingerprint}.`,
+        directive: [
+          rawInput,
+          "",
+          "You are a non-authoritative Review Producer.",
+          "Return one durable JSON result with summary, checks, findings, evidence, and evidenceCommit.",
+          "Do not create a Candidate, ChangeSet, integration, ReviewResult, or authoritative Review finding.",
+          JSON.stringify({
+            schemaVersion: 1,
+            executionGroupId: runningGroup.id,
+            executionLaneId: lane.id,
+            assignment: runningGroup.assignment
+          }, null, 2)
+        ].join("\n"),
         deltaRefIds: []
       });
-      runningGroup = updateExecutionLane(runningGroup, lane.id, {
-        status: "running",
-        turnId,
-        reviewRoundId: round.id,
+      runningGroup = updateUnifiedExecutionLane(runningGroup, lane.id, {
+        currentTurnId: turnId,
         effective,
-        workspace: laneWorkspace
+        workspace: {
+          root: laneManagedWorkspace.root,
+          writableProjectIds: laneManagedWorkspace.entries
+            .filter(({ access }) => access === "write")
+            .map(({ projectId }) => projectId)
+        }
       }, now);
       createdTurns.push(createTurn(
         turnId,
         taskId,
         laneReviewer.name,
-        roleAgentSessionResumeMode(sessions, effective.agentId, effective),
+        roleAgentSessionResumeMode(
+          tx.getTaskRoleSessionSet(taskId, laneReviewer.name),
+          effective.agentId,
+          effective
+        ),
         input,
         now,
         {
@@ -7156,29 +7298,19 @@ export function dispatchPreparedReviewRound(
           reviewRoundId: round.id,
           executionGroupId: runningGroup.id,
           executionLaneId: lane.id,
-          workspace: laneManagedWorkspace ?? round.workspace,
+          workspace: laneManagedWorkspace,
           effective
         }
       ));
     }
-    const roundWithGroup = round.executionGroup === undefined
-      ? attachReviewExecutionGroup(round, runningGroup)
-      : updateReviewExecutionGroup(round, runningGroup);
-    const persistedRound = round.status === "pending" && createdTurns.length > 0
-      ? startReviewRound(roundWithGroup, createdTurns[0]!.id)
+    const roundWithGroup = updateReviewExecutionGroup(round, runningGroup);
+    const persistedRound = round.status === "pending"
+      ? startReplicatedReviewRound(roundWithGroup)
       : roundWithGroup;
-    // Save the aggregate before adopting prepared Lane workspaces.  The
-    // managed-workspace validator deliberately requires durable Group/Lane
-    // lineage, so a new Review Group cannot own a Lane until this write lands.
     tx.saveReviewRound(taskId, persistedRound);
     for (const lane of runningGroup.lanes) {
-      const prepared = options.executionLaneWorkspaces?.get(lane.id);
+      const prepared = preparedLaneWorkspaces.get(lane.id);
       if (prepared !== undefined) {
-        if (prepared.owner.type !== "execution-lane"
-          || prepared.owner.executionGroupId !== runningGroup.id
-          || prepared.owner.executionLaneId !== lane.id) {
-          throw usageError(`Review Lane workspace identity does not match dispatch: ${runningGroup.id}/${lane.id}.`);
-        }
         if (tx.getManagedWorkspace(prepared.owner) === null) tx.saveManagedWorkspace(prepared);
       }
     }
@@ -7190,9 +7322,7 @@ export function dispatchPreparedReviewRound(
         purpose: "review",
         ...(item === undefined ? {} : { workItemId: item.id }),
         reviewRoundId: round.id
-      }, now, "controller", reviewBaseline === undefined
-        ? undefined
-        : contextSnapshotRef(reviewBaseline));
+      }, now, "controller", runningGroup.assignment.contextSnapshotRef);
       const created = withTurnContextSnapshot(
         unboundTurn,
         contextSnapshotRef(snapshot),
@@ -7208,6 +7338,8 @@ export function dispatchPreparedReviewRound(
       ]);
       recordTaskEvent(tx, taskId, "turn.review-dispatched", turnLaunchEventPayload(created), now);
     }
+    const reconciliation = reconcileReviewMainTurns(tx, taskId, now);
+    createdTurns.push(...reconciliation.createdTurns);
     return createdTurns;
   });
   for (const run of runs) {
@@ -8585,46 +8717,6 @@ function requiredText(value: string | undefined, label: string): string {
   const normalized = value?.trim();
   if (normalized === undefined || normalized.length === 0) throw usageError(`${label} is required.`);
   return normalized;
-}
-
-function parseExecutionStrategy(
-  value: string | undefined,
-  usage: string
-): ExecutionStrategy | undefined {
-  if (value === undefined) return undefined;
-  const normalized = value.trim().toLowerCase();
-  const fixed = /^fixed:([1-9]\d*)$/u.exec(normalized);
-  if (fixed !== null) {
-    return { mode: "fixed", count: Number(fixed[1]) };
-  }
-  const adaptive = /^adaptive:([1-9]\d*)$/u.exec(normalized);
-  if (adaptive !== null) {
-    return { mode: "adaptive", max: Number(adaptive[1]) };
-  }
-  throw usageError(
-    `Invalid execution strategy: ${value}. Use fixed:<count> or adaptive:<max>.`,
-    usage
-  );
-}
-
-function sameExecutionStrategy(
-  left: ExecutionStrategy,
-  right: ExecutionStrategy
-): boolean {
-  return left.mode === right.mode
-    && (left.mode === "fixed"
-      ? right.mode === "fixed" && left.count === right.count
-      : right.mode === "adaptive" && left.max === right.max);
-}
-
-function parseExecutionResolutionDecision(
-  value: string | undefined,
-  usage: string
-): "accept" | "reject" | "retry" | "blocked" {
-  if (value === "accept" || value === "reject" || value === "retry" || value === "blocked") {
-    return value;
-  }
-  throw usageError("--decision must be accept, reject, retry, or blocked.", usage);
 }
 
 function trimmed(value: string | undefined): string | undefined {

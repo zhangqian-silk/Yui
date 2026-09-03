@@ -20,6 +20,18 @@ finding count, completeness validator, or Review-admission gate.
 The rule improves batching but cannot guarantee that a model discovers every
 possible defect. A later Review may still find something new.
 
+Review execution has two shapes over that same semantic contract:
+
+- direct Review creates one authoritative main Reviewer Turn and no Group or
+  Lane;
+- replicated Review freezes one Assignment for at least two isolated Producer
+  Lanes, waits for every Lane to settle, then creates one authoritative main
+  Reviewer synthesis Turn from all successful durable Producer results.
+
+Producer results never create Review findings, classifications, completion, or
+delivery artifacts. They are evidence for the main Reviewer, not competing
+Review verdicts.
+
 ## Why task-58 produced repeated findings
 
 The existing `ReviewResultReport` can already contain multiple findings. The
@@ -43,6 +55,9 @@ ending its Provider Turn.
 - Keep each ReviewRound bound to one exact frozen candidate.
 - Reuse the same Reviewer native Conversation across ordinary rounds.
 - Keep infrastructure failure separate from semantic Review results.
+- Preserve one authoritative Review result whether execution is direct or
+  replicated.
+- Make Producer retry and main retry reuse successful immutable Lane results.
 
 ## Non-goals
 
@@ -53,6 +68,8 @@ ending its Provider Turn.
 - Adding a semantic Review budget or forced acceptance rule.
 - Blocking Review requests based on prose, round count, or elapsed time.
 - Creating a new Reviewer Session for every ReviewRound.
+- Selecting a winning Producer Lane or resolving a Group by policy.
+- Treating Producer findings as authoritative ledger entries.
 
 ## Review behavior
 
@@ -74,18 +91,26 @@ Finding one valid defect does not end the review or its Provider Turn.
 The Reviewer decides how much inspection is appropriate and when the review is
 complete. Yui does not prescribe an internal checklist or additional sweep.
 
-### 3. Submit one completed result
+### 3. Submit one authoritative completed result
 
-After the Reviewer judges the review complete, it returns one
-`ReviewResultReport` containing:
+For direct Review, the main Reviewer returns the complete result after judging
+the review complete.
+
+For replicated Review, each Producer returns durable summary, checks, findings,
+evidence, and exact code references for its isolated attempt. After all Lanes
+settle, at least two successful Producer results create one idempotent main
+Reviewer synthesis Turn. The main Reviewer inspects every stable successful
+result, resolves disagreement against the frozen sources, and returns the one
+authoritative Review result containing:
 
 - the overall verdict and summary;
 - every material finding accumulated during the review;
 - checks and evidence actually used, when any; and
 - the exact reviewed candidate evidence required by the existing contract.
 
-The existing report shape remains authoritative. `findings` is already an
-array, so no new persistent field or schema version is expected.
+The main report shape remains authoritative. `findings` is already an array;
+Producer findings remain embedded in Producer Turn evidence until the main
+Reviewer chooses and supports an authoritative finding.
 
 ### 4. Keep non-semantic failure separate
 
@@ -101,8 +126,11 @@ semantic evidence and the infrastructure failure, but does not label that
 partial batch as a completed Review verdict. The Leader diagnoses the ambiguous
 boundary before deciding whether to retry review or plan a repair.
 
-Retry remains a Leader-owned decision. A failed attempt does not automatically
-create another ReviewRound or another Reviewer Session.
+Retry remains a Leader-owned decision. A failed Producer Turn leaves its
+logical Lane open for exact retry or explicit settlement, while successful
+siblings remain reusable. A failed main synthesis Turn preserves the settled
+Group and Producer results for one later main retry. Neither path creates
+another ReviewRound or reruns successful Producers.
 
 ## Leader behavior
 
@@ -146,6 +174,9 @@ Review orchestration follows these shared rules:
    boundaries.
 6. Review duration, finding count, verdict, and round count are not Session
    replacement evidence.
+7. Producer terminalization updates only the exact Lane and queues normal
+   reconciliation. Only the main Reviewer Turn terminalizes the ReviewRound and
+   reconciles the finding ledger.
 
 ## Skill changes
 
@@ -171,19 +202,21 @@ scheduler gate.
 
 ## Engineering impact
 
-No Review-domain schema or migration is expected.
+ReviewRound schema v7 stores only the current direct/replicated execution unit
+plus the existing authoritative terminal Review fields. Turn schema v4 permits
+a main Review Turn to record the settled source ExecutionGroup while remaining
+outside every Lane.
 
-- `ReviewResultReport.findings` already carries multiple findings.
-- Review terminalization and the finding ledger retain their existing identity
-  and atomicity rules.
-- No canonical `ReviewCheck` values are added.
-- No semantic-completeness validator is added.
-- No Review-count or finding-family admission rule is added.
+The adjacent aggregate migration preserves valid terminal pre-v7 Review
+history as opaque legacy evidence. An active legacy strategy/resolution Group
+cannot be reinterpreted as the new immutable producer unit, so migration
+explicitly fails the Round and its active Turns and appends an audit event. No
+adapter, repair worker, or dual runtime behavior remains.
 
-Production-code changes for Turn delivery and Session continuity belong to the
-companion runtime design. If implementation inspection confirms that one
-Review result already reconciles multiple findings correctly, the semantic
-Review change is limited to the two Skills.
+The finding ledger, semantic classifier, Candidate, ChangeSet, Integration, and
+acceptance paths consume only the main Reviewer result. No canonical
+`ReviewCheck`, semantic-completeness validator, Review-count admission rule,
+selected-Lane resolution, or resource-budget protocol is added.
 
 ## Verification
 
@@ -194,6 +227,12 @@ No real Provider or shared Home is required.
   review completion, not after the first finding.
 - Inspect the final Leader Skill to confirm that it consumes the complete
   submitted result before planning repairs.
+- Exercise direct Review with no Group/Lane and replicated Review with at least
+  two isolated Producer Roles followed by one main synthesis Turn.
+- Verify Producer terminalization cannot update the ReviewRound result or
+  finding ledger, and main retry preserves successful Producer results.
+- Exercise the adjacent migration for preserved terminal history and audited
+  terminalization of an active legacy Group.
 - Use a small deterministic report/ledger check only if current evidence does
   not already prove that one result can carry multiple findings.
 - Validate Session continuity and no-precreated-Leader-Turn behavior under the
@@ -212,8 +251,13 @@ The design is implemented when:
 - All findings collected before completion are submitted in one existing
   `ReviewResultReport`.
 - Leader guidance consumes the complete submitted batch before repair planning.
+- Direct Review has one main Turn and no Group or Lane.
+- Replicated Review waits for all Lanes, requires at least two successes, and
+  creates at most one initial main synthesis Turn.
+- Only the main Reviewer result is authoritative; Producer results are durable
+  non-authoritative evidence.
 - No checklist, final sweep, completion validator, Review budget, or new
-  persistent state is introduced.
+  independently writable resolution state is introduced.
 - Ordinary re-review reuses the Reviewer Conversation.
 - Review completion does not pre-create or interrupt a Leader Turn.
 - Infrastructure failure before semantic inspection remains non-semantic;

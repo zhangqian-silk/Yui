@@ -15,7 +15,7 @@ import {
   type EffectiveLaunchSnapshot
 } from "../executor/effectiveLaunch.js";
 
-/** The one execution abstraction used by both the one-lane and panel paths. */
+/** Retired pre-unification execution protocol retained only to validate migration and cleanup evidence. */
 export const EXECUTION_GROUP_SCHEMA_VERSION = 1 as const;
 export const EXECUTION_LANE_SCHEMA_VERSION = 1 as const;
 

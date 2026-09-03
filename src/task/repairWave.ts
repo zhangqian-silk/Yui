@@ -1,5 +1,4 @@
 import type { ReviewRound } from "../review/reviewRound.js";
-import type { ExecutionFinding } from "../execution/executionGroup.js";
 
 /**
  * Issue 07 (Leader convergence): minimal repair-wave planning.
@@ -47,23 +46,10 @@ const SEVERITY_RANK: Record<RepairSeverity, number> = {
 const PATH_PATTERN = /(?:[\w.-]+\/)+[\w.-]+\.(?:ts|tsx|js|mjs|cjs|json|md|py|sh|yml|yaml|toml|css|html)(?::\d+)?/gu;
 
 /**
- * Extract open findings from a ReviewRound. Structured ExecutionFindings on
- * the Review's ExecutionGroup lanes win; when none exist, fall back to
- * parsing P1/P2 lines from the Review report text.
+ * Extract open findings from the authoritative main Review report.
+ * Producer Lane output is deliberately excluded.
  */
 export function extractReviewFindings(round: ReviewRound): RepairFinding[] {
-  const structured = (round.executionGroup?.lanes ?? [])
-    .flatMap((lane) => lane.result?.findings ?? [])
-    .filter((finding) => finding.status === "open");
-  if (structured.length > 0) {
-    return structured.map((finding) => ({
-      id: finding.id,
-      severity: finding.severity,
-      summary: finding.summary,
-      paths: extractPaths(finding.summary),
-      source: "structured" as const
-    }));
-  }
   return parseReportFindings(round.report ?? "");
 }
 
@@ -196,5 +182,3 @@ export function parseReportFindings(report: string): RepairFinding[] {
   }
   return findings;
 }
-
-export type { ExecutionFinding };

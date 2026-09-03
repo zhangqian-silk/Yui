@@ -1,5 +1,5 @@
 import { createTaskEvent } from "../event/taskEvent.js";
-import { recordExecutionLaneResult } from "../execution/executionGroup.js";
+import { updateExecutionLane } from "../execution/workItemExecution.js";
 import { usageError } from "../errors/cliError.js";
 import { requestDurableJobCancel } from "../job/durableJob.js";
 import { finishReviewRound, updateReviewExecutionGroup } from "../review/reviewRound.js";
@@ -257,19 +257,22 @@ function failExecutionAttempts(
   const affectedReviewRoundIds = new Set<string>();
 
   for (const turn of turns) {
-    if (turn.executionGroupId === undefined || turn.executionLaneId === undefined) continue;
     if (turn.reviewRoundId !== undefined) {
       affectedReviewRoundIds.add(turn.reviewRoundId);
+      if (turn.executionGroupId === undefined || turn.executionLaneId === undefined) continue;
       const round = reviewRounds.get(turn.reviewRoundId);
       const group = round?.executionGroup?.id === turn.executionGroupId
         ? round.executionGroup
         : undefined;
       const lane = group?.lanes.find(({ id }) => id === turn.executionLaneId);
       if (round !== undefined && group !== undefined && lane !== undefined
-        && !["completed", "failed", "skipped"].includes(lane.status)) {
+        && lane.disposition === "open") {
         reviewRounds.set(round.id, updateReviewExecutionGroup(
           round,
-          recordExecutionLaneResult(group, lane.id, { summary }, "failed", now)
+          updateExecutionLane(group, lane.id, {
+            currentTurnId: turn.id,
+            disposition: "failed"
+          }, now)
         ));
       }
     }

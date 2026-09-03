@@ -8,11 +8,6 @@ import { isRoleTurnStalled, latestStallProgressAt } from "../scheduler/roleTurnS
 import { buildTaskExecutionProjection } from "../scheduler/taskExecutionProjection.js";
 import type { WorkItemObservabilityProjection } from "../scheduler/taskObservabilityProjection.js";
 import { projectNextAction } from "../task/nextAction.js";
-import {
-  summarizeExecutionGroup,
-  type ExecutionGroup,
-  type ExecutionGroupSummary
-} from "../execution/executionGroup.js";
 import type { ExecutionGroupHealthSummary } from "../execution/executionHealth.js";
 import {
   projectWorkItemExecution,
@@ -596,10 +591,14 @@ function renderReviewRounds(
       : [`      Review summary: ${compactText(latest.summary)}`]),
     ...(latest.executionGroup === undefined
       ? []
-      : renderExecutionGroup(
-          latest.executionGroup,
-          executionGroupsById.get(latest.executionGroup.id)
-        ).map((line) => `    ${line.trimStart()}`))
+      : [
+          `      Execution shape: replicated`,
+          `      Execution Group: ${latest.executionGroup.id}`,
+          ...latest.executionGroup.lanes.map((lane) => (
+            `      Producer ${lane.id} (#${lane.ordinal}, ${lane.roleName}): `
+            + `${lane.disposition}; turn=${lane.currentTurnId ?? "not dispatched"}`
+          ))
+        ])
   ];
 }
 
@@ -706,67 +705,6 @@ function managedWorkspaceLabel(
     case "execution-lane":
       return `execution-lane ${workspace.owner.executionGroupId}/${workspace.owner.executionLaneId}`;
   }
-}
-
-function renderExecutionGroup(
-  group: ExecutionGroup,
-  projected?: ExecutionGroupHealthSummary
-): string[] {
-  const summary: ExecutionGroupSummary | ExecutionGroupHealthSummary = projected
-    ?? summarizeExecutionGroup(group);
-  const health = projected?.health;
-  const resources = projected?.resources;
-  return [
-    `    Execution Group ${summary.groupId} [${summary.purpose}/${summary.strategy.mode}]: ${summary.activeLaneCount} active / ${summary.terminalLaneCount} terminal; ${summary.failedLaneCount} failed; ${summary.skippedLaneCount} skipped`,
-    ...(health === undefined
-      ? []
-      : [
-          `      Health: active=${health.activeLaneCount}, silent=${health.silentLaneCount}, suspected-stalled=${health.suspectedStalledLaneCount}, confirmed-dead=${health.confirmedDeadLaneCount}`,
-          `      Recovery: reusable=${health.reusableLaneIds.length}, retryable=${health.retryableLaneIds.length}`
-        ]),
-    ...(resources === undefined
-      ? []
-      : [
-          `      Resources: tokens=${resourceUsageLabel(resources.tokens, resources.tokensRemaining, resources.tokensObservable)}; tools=${resourceUsageLabel(resources.toolCalls, resources.toolCallsRemaining, resources.toolCallsObservable)}; wall=${resources.wallClockSeconds}s${resources.wallClockSecondsRemaining === undefined ? "" : `, remaining=${resources.wallClockSecondsRemaining}s`}`,
-          `      Completion: usable=${resources.usableLaneCount}/${group.stage?.resources?.quorum ?? "legacy"}; quorum=${resources.quorumMet ? "met" : "open"}; deadline=${resources.deadlineReached ? "reached" : "open"}; budgets=${resources.exhaustedBudgets.join(",") || "open"}; queued=${resources.pendingLaneIds.length}; stragglers=${resources.stragglerLaneIds.length}`
-        ]),
-    ...summary.laneSummaries.flatMap((lane) => {
-      const laneHealth = projected?.laneSummaries.find(({ laneId }) => laneId === lane.laneId);
-      return [
-        `      Lane ${lane.laneId} (#${lane.ordinal}, ${lane.roleName}${
-          lane.turnId === undefined ? "" : `, run ${lane.turnId}`
-          }) [${lane.status}${
-          laneHealth?.runtimeHealth === undefined ? "" : `/${laneHealth.runtimeHealth}`
-          }]${lane.summary === undefined ? "" : `: ${compactText(lane.summary)}`}`,
-        ...(lane.effective === undefined
-          ? []
-          : [`        Config: ${lane.effective.adapterId}/${lane.effective.model ?? "default"}/${lane.effective.effort ?? "default"}; profile=${lane.effective.profileAccess}`]),
-        ...(laneHealth !== undefined && laneHealth.recovery !== "none"
-          ? [`        Recovery: ${laneHealth.recovery}; ${compactText(laneHealth.reason)}`]
-          : []),
-        ...(lane.report === undefined ? [] : [`        Report: ${compactText(lane.report)}`]),
-        ...(lane.checks === undefined || lane.checks.length === 0
-          ? []
-          : [`        Checks: ${lane.checks.map(({ name, outcome }) => `${name}:${outcome}`).join(", ")}`]),
-        ...(lane.findings === undefined || lane.findings.length === 0
-          ? []
-          : [`        Findings: ${lane.findings.map(({ id, severity, status }) => `${id}:${severity}/${status}`).join(", ")}`]),
-        ...(lane.evidence === undefined || lane.evidence.length === 0
-          ? []
-          : [`        Evidence: ${lane.evidence.length} item(s)`]),
-        ...(lane.evidenceCommit === undefined
-          ? []
-          : [`        Evidence commit: ${lane.evidenceCommit}`]),
-        ...(lane.decision === undefined ? [] : [`        Decision: ${lane.decision}`])
-      ];
-    }),
-    ...(summary.openHighPriorityFindingIds.length === 0
-      ? []
-      : [`      Open high findings: ${summary.openHighPriorityFindingIds.join(", ")}`]),
-    ...(summary.resolution === undefined
-      ? []
-      : [`      Resolution: ${summary.resolution.decision} — ${compactText(summary.resolution.summary)}`])
-  ];
 }
 
 function renderWorkItemExecution(projection: WorkItemExecutionProjection): string[] {

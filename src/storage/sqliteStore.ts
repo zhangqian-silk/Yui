@@ -65,7 +65,7 @@ import {
 } from "../runtime/runtimeSessionCandidate.js";
 import type { SessionOwnerIdentity } from "../runtime/sessionOwnerIdentity.js";
 import type { ReviewConfig } from "../review/reviewConfig.js";
-import type { ReviewRound } from "../review/reviewRound.js";
+import { validateReviewRound, type ReviewRound } from "../review/reviewRound.js";
 import {
   validateReviewFinding,
   type ReviewFinding
@@ -2288,6 +2288,7 @@ export class SqliteTaskStore implements TaskStore {
   }
 
   saveReviewRound(taskId: string, round: ReviewRound): void {
+    validateReviewRound(round);
     if (round.taskId !== taskId) throw new StorageRecordError(`Review round belongs to another Task: ${round.taskId}`);
     this.#requireTask(taskId);
     this.#mutate(() => {

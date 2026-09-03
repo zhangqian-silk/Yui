@@ -635,6 +635,9 @@ export function reviewCard(round, t, locale) {
   head.append(titleRow);
   const headPills = node("div", "record-pills");
   if (round.scope) headPills.append(pill(t, "review.scope", round.scope));
+  headPills.append(chip(t(round.executionGroup
+    ? "reviewExec.replicated"
+    : "reviewExec.direct"), round.executionGroup ? "is-active" : ""));
   headPills.append(pill(t, "review", round.status));
   head.append(headPills);
   card.append(head);
@@ -656,6 +659,29 @@ export function reviewCard(round, t, locale) {
       + t("disposition." + round.workspaceDisposition.kind)));
   }
   card.append(meta);
+  if (round.executionGroup) {
+    const group = round.executionGroup;
+    const execution = node("div", "record-block exec-group");
+    const groupMeta = node("div", "record-meta execution-resource-meta");
+    groupMeta.append(node("span", "mono", group.id));
+    groupMeta.append(node("span", "", t("reviewExec.assignment") + " · "
+      + group.assignment.contextSnapshotRef.id));
+    groupMeta.append(node("span", "", t("reviewExec.main") + " · "
+      + (round.reviewerTurnId || t("detail.unobserved"))));
+    execution.append(groupMeta);
+    const lanes = node("div", "lane-list");
+    group.lanes.forEach(function (lane) {
+      const row = node("div", "lane-row");
+      row.append(statusDot(lane.disposition === "open" ? "running" : lane.disposition));
+      row.append(node("span", "lane-role", t("reviewExec.producer") + " " + lane.ordinal
+        + " · " + lane.roleName));
+      row.append(node("span", "lane-status", t("reviewExec.status." + lane.disposition)));
+      row.append(node("span", "mono", lane.currentTurnId || t("detail.unobserved")));
+      lanes.append(row);
+    });
+    execution.append(lanes);
+    card.append(execution);
+  }
   if (round.checks && round.checks.length) {
     card.append(richText(t("detail.checks"), round.checks.map(function (check) {
       return check.name + "=" + check.outcome;

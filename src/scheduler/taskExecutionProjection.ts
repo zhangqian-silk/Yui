@@ -15,10 +15,7 @@ import type { ReviewRound } from "../review/reviewRound.js";
 import type { IntegrationAttempt } from "../integration/integrationAttempt.js";
 import type { ChangeSet } from "../integration/changeSet.js";
 import { mailboxBatches, type WorkMailbox } from "../coordination/workMailbox.js";
-import {
-  type ExecutionGroup
-} from "../execution/executionGroup.js";
-import type { WorkItemExecutionGroup } from "../execution/workItemExecution.js";
+import type { ExecutionGroup } from "../execution/workItemExecution.js";
 import {
   actionableExecutionLaneRecoveries,
   summarizeExecutionGroupHealth,
@@ -316,7 +313,9 @@ export function projectTaskExecution(
       sessions: roleSessions,
       events,
       now,
-      policy: facts.runtimeHealthPolicy
+      ...(facts.runtimeHealthPolicy === undefined
+        ? {}
+        : { policy: facts.runtimeHealthPolicy })
     });
   });
   const observabilityGroups = uniqueExecutionGroups(executionGroups);
@@ -727,44 +726,20 @@ function uniqueExecutionGroups(groups: readonly ExecutionGroup[]): ExecutionGrou
 function collectExecutionGroups(
   workItems: readonly WorkItem[],
   reviewRounds: readonly ReviewRound[],
-  turns: readonly Turn[]
+  _turns: readonly Turn[]
 ): ExecutionGroup[] {
-  const workItemsById = new Map(workItems.map((item) => [item.id, item]));
-  const orderedRounds = [...reviewRounds].sort((left, right) => (
-    left.id.localeCompare(right.id, undefined, { numeric: true })
-  ));
-  const latestTaskRound = orderedRounds
-    .filter((round) => (round.scope ?? "work-item") === "task")
-    .at(-1);
-  const latestWorkItemRounds = new Map<string, ReviewRound>();
-  for (const round of orderedRounds) {
-    if ((round.scope ?? "work-item") === "task"
-      || round.workItemId === undefined
-      || round.candidateId === undefined) continue;
-    const item = workItemsById.get(round.workItemId);
-    if (item === undefined
-      || item.status === "retired"
-      || item.candidates.at(-1)?.id !== round.candidateId) continue;
-    latestWorkItemRounds.set(`${round.workItemId}\0${round.candidateId}`, round);
-  }
-  const operationalReviewRoundIds = new Set([
-    ...(latestTaskRound === undefined ? [] : [latestTaskRound.id]),
-    ...[...latestWorkItemRounds.values()].map(({ id }) => id)
-  ]);
-  const groups = [
+  const groups: ExecutionGroup[] = [
     ...workItems.flatMap((item) => {
       const group = item.status === "retired"
         ? undefined
         : currentWorkItemExecutionGroup(item);
-      return group === undefined
-        || !group.lanes.some(({ disposition }) => disposition === "open")
-        ? []
-        : [projectWorkItemExecutionGroup(group, turns)];
+      return group === undefined ? [] : [group];
     }),
     ...reviewRounds.flatMap((round) => (
-      !operationalReviewRoundIds.has(round.id) || round.executionGroup === undefined
-        ? []
-        : [round.executionGroup]
+      (round.status === "pending" || round.status === "running")
+        && round.executionGroup !== undefined
+        ? [round.executionGroup]
+        : []
     ))
   ];
   const seen = new Set<string>();
@@ -773,81 +748,6 @@ function collectExecutionGroups(
     seen.add(group.id);
     return true;
   });
-}
-
-/**
- * Present the current WorkItem producer Group through the shared Task health
- * read model. The WorkItem aggregate remains the sole writable Lane authority.
- */
-function projectWorkItemExecutionGroup(
-  group: WorkItemExecutionGroup,
-  turns: readonly Turn[]
-): ExecutionGroup {
-  // Explicitly settled failed Lanes are immutable and not retry candidates;
-  // the shared health model only needs reusable successes plus open slots.
-  const lanes = group.lanes
-    .filter(({ disposition }) => disposition !== "failed")
-    .map((lane) => {
-      const turn = lane.currentTurnId === undefined
-        ? undefined
-        : turns.find((candidate) => (
-            candidate.taskId === group.taskId
-            && candidate.id === lane.currentTurnId
-            && candidate.executionGroupId === group.id
-            && candidate.executionLaneId === lane.id
-          ));
-      const status = lane.disposition === "succeeded"
-        ? "completed" as const
-        : lane.currentTurnId === undefined
-          ? "pending" as const
-          : "running" as const;
-      const terminal = status === "completed";
-      return {
-        schemaVersion: 1 as const,
-        id: lane.id,
-        groupId: group.id,
-        ordinal: lane.ordinal,
-        roleName: lane.roleName,
-        effective: lane.effective,
-        ...(lane.currentTurnId === undefined ? {} : { turnId: lane.currentTurnId }),
-        workspace: lane.workspace,
-        directive: group.assignment.input,
-        status,
-        ...(terminal
-          ? {
-              result: {
-                summary: turn?.result?.output
-                  ?? `WorkItem producer Lane ${lane.id} ${status}.`
-              },
-              endedAt: lane.endedAt ?? group.updatedAt
-            }
-          : {}),
-        createdAt: lane.createdAt,
-        updatedAt: lane.updatedAt
-      };
-    });
-  return {
-    schemaVersion: 1,
-    id: group.id,
-    taskId: group.taskId,
-    purpose: "execution",
-    strategy: { mode: "fixed", count: group.lanes.length },
-    target: {
-      schemaVersion: 1,
-      kind: "work-item",
-      taskId: group.taskId,
-      workItemId: group.assignment.workItemId,
-      revision: group.assignment.workItemRevision,
-      projects: group.assignment.projects.map(({ projectId, baseCommit }) => ({
-        projectId,
-        commit: baseCommit
-      })),
-      fingerprint: `work-item-execution:${group.id}:${group.assignment.contextSnapshotRef.digest}`
-    },
-    lanes,
-    createdAt: group.createdAt,
-    updatedAt: group.updatedAt
-  };
 }
 
 function collectAttention(input: Readonly<{

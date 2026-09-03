@@ -21,6 +21,10 @@ export const WORK_ITEM_EXECUTION_GROUP_SCHEMA_VERSION = 2 as const;
 export const WORK_ITEM_EXECUTION_LANE_SCHEMA_VERSION = 2 as const;
 export const WORK_ITEM_EXECUTION_ASSIGNMENT_SCHEMA_VERSION = 1 as const;
 export const MINIMUM_WORK_ITEM_SYNTHESIS_RESULTS = 2;
+export const EXECUTION_GROUP_SCHEMA_VERSION = WORK_ITEM_EXECUTION_GROUP_SCHEMA_VERSION;
+export const EXECUTION_LANE_SCHEMA_VERSION = WORK_ITEM_EXECUTION_LANE_SCHEMA_VERSION;
+export const EXECUTION_ASSIGNMENT_SCHEMA_VERSION = WORK_ITEM_EXECUTION_ASSIGNMENT_SCHEMA_VERSION;
+export const MINIMUM_SYNTHESIS_RESULTS = MINIMUM_WORK_ITEM_SYNTHESIS_RESULTS;
 
 export type WorkItemExecutionProjectBase = Readonly<{
   projectId: string;
@@ -49,22 +53,44 @@ export type WorkItemExecutionAssignment = Readonly<{
   dependencyFacts: readonly WorkItemExecutionDependencyFact[];
 }>;
 
+/** The immutable Review target shared by every replicated producer. */
+export type ReviewExecutionAssignment = Readonly<{
+  schemaVersion: typeof EXECUTION_ASSIGNMENT_SCHEMA_VERSION;
+  input: string;
+  objective: string;
+  acceptance: readonly string[];
+  contextSnapshotRef: ContextSnapshotRef;
+  taskId: string;
+  reviewRoundId: string;
+  reviewBaseCommit: string;
+  scope: "work-item" | "task";
+  workItemId?: string;
+  candidateId?: string;
+  projects: readonly WorkItemExecutionProjectBase[];
+}>;
+
+export type ExecutionAssignment =
+  | WorkItemExecutionAssignment
+  | ReviewExecutionAssignment;
+
 export type WorkItemExecutionLaneDisposition = "open" | "succeeded" | "failed";
+export type ExecutionLaneDisposition = WorkItemExecutionLaneDisposition;
 
 export type WorkItemExecutionLaneWorkspace = Readonly<{
   root: string;
   writableProjectIds: readonly string[];
 }>;
+export type ExecutionLaneWorkspace = WorkItemExecutionLaneWorkspace;
 
 /** A recoverable logical producer slot; immutable attempts live in Turn. */
-export type WorkItemExecutionLane = Readonly<{
+export type ExecutionLane = Readonly<{
   schemaVersion: typeof WORK_ITEM_EXECUTION_LANE_SCHEMA_VERSION;
   id: string;
   groupId: string;
   ordinal: number;
   roleName: string;
-  effective: EffectiveLaunchSnapshot;
-  workspace: WorkItemExecutionLaneWorkspace;
+  effective?: EffectiveLaunchSnapshot;
+  workspace?: WorkItemExecutionLaneWorkspace;
   currentTurnId?: string;
   successfulTurnId?: string;
   disposition: WorkItemExecutionLaneDisposition;
@@ -72,16 +98,26 @@ export type WorkItemExecutionLane = Readonly<{
   updatedAt: string;
   endedAt?: string;
 }>;
+export type WorkItemExecutionLane = ExecutionLane & Readonly<{
+  effective: EffectiveLaunchSnapshot;
+  workspace: WorkItemExecutionLaneWorkspace;
+}>;
 
-export type WorkItemExecutionGroup = Readonly<{
+export type ExecutionGroup<
+  Assignment extends ExecutionAssignment = ExecutionAssignment,
+  Lane extends ExecutionLane = ExecutionLane
+> = Readonly<{
   schemaVersion: typeof WORK_ITEM_EXECUTION_GROUP_SCHEMA_VERSION;
   id: string;
   taskId: string;
-  assignment: WorkItemExecutionAssignment;
-  lanes: readonly WorkItemExecutionLane[];
+  assignment: Assignment;
+  lanes: readonly Lane[];
   createdAt: string;
   updatedAt: string;
 }>;
+export type WorkItemExecutionGroup =
+  ExecutionGroup<WorkItemExecutionAssignment, WorkItemExecutionLane>;
+export type ReviewExecutionGroup = ExecutionGroup<ReviewExecutionAssignment>;
 
 export type WorkItemExecutionGroupSummary = Readonly<{
   groupId: string;
@@ -97,16 +133,18 @@ export type WorkItemExecutionGroupSummary = Readonly<{
     disposition: WorkItemExecutionLaneDisposition;
     currentTurnId?: string;
     successfulTurnId?: string;
-    effective: EffectiveLaunchSnapshot;
+    effective?: EffectiveLaunchSnapshot;
   }>[];
 }>;
+export type ExecutionGroupSummary = WorkItemExecutionGroupSummary;
 
 export type WorkItemExecutionLaneInput = Readonly<{
   roleName: string;
-  effective: EffectiveLaunchSnapshot;
-  workspace: WorkItemExecutionLaneWorkspace;
+  effective?: EffectiveLaunchSnapshot;
+  workspace?: WorkItemExecutionLaneWorkspace;
   currentTurnId?: string;
 }>;
+export type ExecutionLaneInput = WorkItemExecutionLaneInput;
 
 export function createWorkItemExecutionAssignment(input: Readonly<{
   input: string;
@@ -125,36 +163,55 @@ export function createWorkItemExecutionAssignment(input: Readonly<{
   });
 }
 
-export function createWorkItemExecutionGroup(
+export function createReviewExecutionAssignment(input: Readonly<{
+  input: string;
+  objective: string;
+  acceptance: readonly string[];
+  contextSnapshotRef: ContextSnapshotRef;
+  taskId: string;
+  reviewRoundId: string;
+  reviewBaseCommit: string;
+  scope: "work-item" | "task";
+  workItemId?: string;
+  candidateId?: string;
+  projects: readonly WorkItemExecutionProjectBase[];
+}>): ReviewExecutionAssignment {
+  return validateReviewExecutionAssignment({
+    schemaVersion: EXECUTION_ASSIGNMENT_SCHEMA_VERSION,
+    ...input
+  });
+}
+
+export function createExecutionGroup<Assignment extends ExecutionAssignment>(
   id: string,
   taskId: string,
-  assignment: WorkItemExecutionAssignment,
-  laneInputs: readonly WorkItemExecutionLaneInput[],
+  assignment: Assignment,
+  laneInputs: readonly ExecutionLaneInput[],
   now: Date
-): WorkItemExecutionGroup {
-  if (laneInputs.length < 2) {
-    throw new Error("A replicated WorkItem ExecutionGroup requires at least two Lanes.");
+): ExecutionGroup<Assignment> {
+  if (laneInputs.length < MINIMUM_SYNTHESIS_RESULTS) {
+    throw new Error("A replicated ExecutionGroup requires at least two Lanes.");
   }
   const groupId = requireIdentity(id, "ExecutionGroup id");
   const normalizedTaskId = requireIdentity(taskId, "Task id");
-  const frozenAssignment = validateWorkItemExecutionAssignment(assignment);
+  const frozenAssignment = validateExecutionAssignment(assignment) as Assignment;
   if (frozenAssignment.taskId !== normalizedTaskId) {
     throw new Error("ExecutionGroup Assignment belongs to another Task.");
   }
   const timestamp = now.toISOString();
-  return validateWorkItemExecutionGroup({
-    schemaVersion: WORK_ITEM_EXECUTION_GROUP_SCHEMA_VERSION,
+  return validateExecutionGroup({
+    schemaVersion: EXECUTION_GROUP_SCHEMA_VERSION,
     id: groupId,
     taskId: normalizedTaskId,
     assignment: frozenAssignment,
     lanes: laneInputs.map((lane, index) => ({
-      schemaVersion: WORK_ITEM_EXECUTION_LANE_SCHEMA_VERSION,
+      schemaVersion: EXECUTION_LANE_SCHEMA_VERSION,
       id: `${groupId}-lane-${index + 1}`,
       groupId,
       ordinal: index + 1,
       roleName: lane.roleName,
-      effective: lane.effective,
-      workspace: lane.workspace,
+      ...(lane.effective === undefined ? {} : { effective: lane.effective }),
+      ...(lane.workspace === undefined ? {} : { workspace: lane.workspace }),
       ...(lane.currentTurnId === undefined ? {} : { currentTurnId: lane.currentTurnId }),
       disposition: "open" as const,
       createdAt: timestamp,
@@ -162,20 +219,33 @@ export function createWorkItemExecutionGroup(
     })),
     createdAt: timestamp,
     updatedAt: timestamp
-  });
+  }) as ExecutionGroup<Assignment>;
 }
 
-export function updateWorkItemExecutionLane(
-  group: WorkItemExecutionGroup,
+export function createWorkItemExecutionGroup(
+  id: string,
+  taskId: string,
+  assignment: WorkItemExecutionAssignment,
+  laneInputs: readonly WorkItemExecutionLaneInput[],
+  now: Date
+): WorkItemExecutionGroup {
+  const group = createExecutionGroup(id, taskId, assignment, laneInputs, now);
+  return validateWorkItemExecutionGroup(group as WorkItemExecutionGroup);
+}
+
+export function updateExecutionLane<Assignment extends ExecutionAssignment>(
+  group: ExecutionGroup<Assignment>,
   laneId: string,
   patch: Readonly<{
     currentTurnId?: string;
     successfulTurnId?: string;
-    disposition?: WorkItemExecutionLaneDisposition;
+    disposition?: ExecutionLaneDisposition;
+    effective?: EffectiveLaunchSnapshot;
+    workspace?: ExecutionLaneWorkspace;
   }>,
   now: Date
-): WorkItemExecutionGroup {
-  validateWorkItemExecutionGroup(group);
+): ExecutionGroup<Assignment> {
+  validateExecutionGroup(group);
   const index = group.lanes.findIndex(({ id }) => id === laneId);
   if (index < 0) throw new Error(`ExecutionGroup Lane not found: ${laneId}.`);
   const current = group.lanes[index]!;
@@ -185,6 +255,11 @@ export function updateWorkItemExecutionLane(
   const disposition = patch.disposition ?? current.disposition;
   const currentTurnId = patch.currentTurnId ?? current.currentTurnId;
   const successfulTurnId = patch.successfulTurnId ?? current.successfulTurnId;
+  const effective = patch.effective ?? current.effective;
+  const workspace = patch.workspace ?? current.workspace;
+  if ((effective === undefined) !== (workspace === undefined)) {
+    throw new Error("ExecutionLane launch facts are incomplete.");
+  }
   if (disposition === "succeeded") {
     if (successfulTurnId === undefined || successfulTurnId !== currentTurnId) {
       throw new Error("A succeeded Lane must identify its current successful Turn.");
@@ -193,21 +268,71 @@ export function updateWorkItemExecutionLane(
     throw new Error("Only a succeeded Lane may identify a successful Turn.");
   }
   const timestamp = now.toISOString();
-  const updated: WorkItemExecutionLane = {
+  const updated: ExecutionLane = {
     ...current,
+    ...(effective === undefined ? {} : { effective }),
+    ...(workspace === undefined ? {} : { workspace }),
     ...(currentTurnId === undefined ? {} : { currentTurnId }),
     ...(successfulTurnId === undefined ? {} : { successfulTurnId }),
     disposition,
     updatedAt: timestamp,
     ...(disposition === "open" ? {} : { endedAt: timestamp })
   };
-  const candidate = validateWorkItemExecutionGroup({
+  const candidate = validateExecutionGroup({
     ...group,
     lanes: group.lanes.map((lane, laneIndex) => laneIndex === index ? updated : lane),
     updatedAt: timestamp
-  });
-  assertWorkItemExecutionGroupTransition(group, candidate);
+  }) as ExecutionGroup<Assignment>;
+  assertExecutionGroupTransition(group, candidate);
   return candidate;
+}
+
+export function updateWorkItemExecutionLane(
+  group: WorkItemExecutionGroup,
+  laneId: string,
+  patch: Readonly<{
+    currentTurnId?: string;
+    successfulTurnId?: string;
+    disposition?: WorkItemExecutionLaneDisposition;
+    effective?: EffectiveLaunchSnapshot;
+    workspace?: WorkItemExecutionLaneWorkspace;
+  }>,
+  now: Date
+): WorkItemExecutionGroup {
+  return validateWorkItemExecutionGroup(
+    updateExecutionLane(group, laneId, patch, now) as WorkItemExecutionGroup
+  );
+}
+
+/**
+ * Reopen only failed Lanes for an explicit retry of the same semantic
+ * execution. Successful results remain settled, while each failed Lane
+ * returns to the same state produced by a naturally failed Turn: open and
+ * still pointing at the failed attempt that dispatch must replace.
+ *
+ * This is the sole terminal-to-open Lane transition. Normal Lane updates keep
+ * terminal records immutable.
+ */
+export function retryFailedExecutionLanes<Assignment extends ExecutionAssignment>(
+  group: ExecutionGroup<Assignment>,
+  now: Date
+): ExecutionGroup<Assignment> {
+  validateExecutionGroup(group);
+  if (!group.lanes.some(({ disposition }) => disposition === "failed")) return group;
+  const timestamp = now.toISOString();
+  return validateExecutionGroup({
+    ...group,
+    lanes: group.lanes.map((lane) => {
+      if (lane.disposition !== "failed") return lane;
+      const { endedAt: _endedAt, ...retryable } = lane;
+      return {
+        ...retryable,
+        disposition: "open" as const,
+        updatedAt: timestamp
+      };
+    }),
+    updatedAt: timestamp
+  }) as ExecutionGroup<Assignment>;
 }
 
 export function validateWorkItemExecutionAssignment(
@@ -266,9 +391,57 @@ export function validateWorkItemExecutionAssignment(
   return assignment;
 }
 
-export function validateWorkItemExecutionGroup(
-  group: WorkItemExecutionGroup
-): WorkItemExecutionGroup {
+export function validateReviewExecutionAssignment(
+  assignment: ReviewExecutionAssignment
+): ReviewExecutionAssignment {
+  rejectUnknownFields(assignment as unknown as Record<string, unknown>, [
+    "schemaVersion",
+    "input",
+    "objective",
+    "acceptance",
+    "contextSnapshotRef",
+    "taskId",
+    "reviewRoundId",
+    "reviewBaseCommit",
+    "scope",
+    "workItemId",
+    "candidateId",
+    "projects"
+  ], "Review ExecutionAssignment");
+  if (assignment.schemaVersion !== EXECUTION_ASSIGNMENT_SCHEMA_VERSION) {
+    throw new Error("Review ExecutionAssignment schemaVersion is invalid.");
+  }
+  requireText(assignment.input, "ExecutionAssignment input");
+  requireText(assignment.objective, "ExecutionAssignment objective");
+  normalizedUniqueText(assignment.acceptance, "ExecutionAssignment acceptance criterion");
+  validateContextSnapshotRef(assignment.contextSnapshotRef);
+  requireIdentity(assignment.taskId, "ExecutionAssignment Task id");
+  requireIdentity(assignment.reviewRoundId, "ExecutionAssignment ReviewRound id");
+  requireCommit(assignment.reviewBaseCommit, "ExecutionAssignment Review base commit");
+  if (assignment.scope !== "work-item" && assignment.scope !== "task") {
+    throw new Error("Review ExecutionAssignment scope is invalid.");
+  }
+  if (assignment.scope === "work-item") {
+    requireIdentity(assignment.workItemId ?? "", "ExecutionAssignment WorkItem id");
+    requireIdentity(assignment.candidateId ?? "", "ExecutionAssignment Candidate id");
+  } else if (assignment.workItemId !== undefined || assignment.candidateId !== undefined) {
+    throw new Error("A Task Review ExecutionAssignment cannot identify a WorkItem Candidate.");
+  }
+  validateExecutionProjects(assignment.projects);
+  return assignment;
+}
+
+export function validateExecutionAssignment(
+  assignment: ExecutionAssignment
+): ExecutionAssignment {
+  return "reviewRoundId" in assignment
+    ? validateReviewExecutionAssignment(assignment)
+    : validateWorkItemExecutionAssignment(assignment);
+}
+
+export function validateExecutionGroup(
+  group: ExecutionGroup
+): ExecutionGroup {
   rejectUnknownFields(group as unknown as Record<string, unknown>, [
     "schemaVersion",
     "id",
@@ -277,31 +450,31 @@ export function validateWorkItemExecutionGroup(
     "lanes",
     "createdAt",
     "updatedAt"
-  ], "WorkItem ExecutionGroup");
-  if (group.schemaVersion !== WORK_ITEM_EXECUTION_GROUP_SCHEMA_VERSION) {
-    throw new Error("WorkItem ExecutionGroup schemaVersion is invalid.");
+  ], "ExecutionGroup");
+  if (group.schemaVersion !== EXECUTION_GROUP_SCHEMA_VERSION) {
+    throw new Error("ExecutionGroup schemaVersion is invalid.");
   }
   requireIdentity(group.id, "ExecutionGroup id");
   requireIdentity(group.taskId, "ExecutionGroup Task id");
-  const assignment = validateWorkItemExecutionAssignment(group.assignment);
+  const assignment = validateExecutionAssignment(group.assignment);
   if (assignment.taskId !== group.taskId) {
     throw new Error("ExecutionGroup Assignment Task does not match its Group.");
   }
-  if (!Array.isArray(group.lanes) || group.lanes.length < 2) {
-    throw new Error("A replicated WorkItem ExecutionGroup requires at least two Lanes.");
+  if (!Array.isArray(group.lanes) || group.lanes.length < MINIMUM_SYNTHESIS_RESULTS) {
+    throw new Error("A replicated ExecutionGroup requires at least two Lanes.");
   }
   const ids = new Set<string>();
   const roles = new Set<string>();
   const assignmentProjectIds = assignment.projects.map(({ projectId }) => projectId).sort();
   group.lanes.forEach((lane, index) => {
     validateWorkItemExecutionLane(lane, group.id, index + 1);
-    if (!isDeepStrictEqual(
+    if (lane.workspace !== undefined && (!isDeepStrictEqual(
       [...lane.workspace.writableProjectIds].sort(),
       assignmentProjectIds
     ) || !isDeepStrictEqual(
-      [...lane.effective.writeProjectIds].sort(),
+      [...lane.effective!.writeProjectIds].sort(),
       assignmentProjectIds
-    )) {
+    ))) {
       throw new Error(`ExecutionLane Project scope differs from its Assignment: ${lane.id}.`);
     }
     if (ids.has(lane.id)) throw new Error(`ExecutionGroup Lane is duplicated: ${lane.id}.`);
@@ -319,12 +492,34 @@ export function validateWorkItemExecutionGroup(
   return group;
 }
 
+export function validateWorkItemExecutionGroup(
+  group: WorkItemExecutionGroup
+): WorkItemExecutionGroup {
+  validateExecutionGroup(group);
+  validateWorkItemExecutionAssignment(group.assignment);
+  if (group.lanes.some(({ effective, workspace }) => (
+    effective === undefined || workspace === undefined
+  ))) {
+    throw new Error("A WorkItem ExecutionGroup requires prepared Lane launch facts.");
+  }
+  return group;
+}
+
 export function assertWorkItemExecutionGroupTransition(
   existing: WorkItemExecutionGroup,
   candidate: WorkItemExecutionGroup
 ): void {
   validateWorkItemExecutionGroup(existing);
   validateWorkItemExecutionGroup(candidate);
+  assertExecutionGroupTransition(existing, candidate);
+}
+
+export function assertExecutionGroupTransition(
+  existing: ExecutionGroup,
+  candidate: ExecutionGroup
+): void {
+  validateExecutionGroup(existing);
+  validateExecutionGroup(candidate);
   if (isDeepStrictEqual(existing, candidate)) return;
   if (existing.id !== candidate.id
     || existing.taskId !== candidate.taskId
@@ -338,13 +533,16 @@ export function assertWorkItemExecutionGroupTransition(
   }
   existing.lanes.forEach((lane, index) => {
     const next = candidate.lanes[index]!;
+    const launchFactsChanged = lane.effective === undefined
+      ? (next.effective === undefined) !== (next.workspace === undefined)
+      : !isDeepStrictEqual(lane.effective, next.effective)
+        || !isDeepStrictEqual(lane.workspace, next.workspace);
     if (lane.id !== next.id
       || lane.groupId !== next.groupId
       || lane.ordinal !== next.ordinal
       || lane.roleName !== next.roleName
       || lane.createdAt !== next.createdAt
-      || !isDeepStrictEqual(lane.effective, next.effective)
-      || !isDeepStrictEqual(lane.workspace, next.workspace)) {
+      || launchFactsChanged) {
       throw new Error(`ExecutionLane identity changed: ${lane.id}.`);
     }
     if (lane.disposition !== "open" && !isDeepStrictEqual(lane, next)) {
@@ -355,6 +553,11 @@ export function assertWorkItemExecutionGroupTransition(
 
 export function workItemExecutionGroupSettled(group: WorkItemExecutionGroup): boolean {
   validateWorkItemExecutionGroup(group);
+  return executionGroupSettled(group);
+}
+
+export function executionGroupSettled(group: ExecutionGroup): boolean {
+  validateExecutionGroup(group);
   return group.lanes.every(({ disposition }) => disposition !== "open");
 }
 
@@ -362,6 +565,13 @@ export function summarizeWorkItemExecutionGroup(
   group: WorkItemExecutionGroup
 ): WorkItemExecutionGroupSummary {
   validateWorkItemExecutionGroup(group);
+  return summarizeExecutionGroup(group);
+}
+
+export function summarizeExecutionGroup(
+  group: ExecutionGroup
+): ExecutionGroupSummary {
+  validateExecutionGroup(group);
   return {
     groupId: group.id,
     kind: "replicated",
@@ -376,9 +586,29 @@ export function summarizeWorkItemExecutionGroup(
       disposition: lane.disposition,
       ...(lane.currentTurnId === undefined ? {} : { currentTurnId: lane.currentTurnId }),
       ...(lane.successfulTurnId === undefined ? {} : { successfulTurnId: lane.successfulTurnId }),
-      effective: lane.effective
+      ...(lane.effective === undefined ? {} : { effective: lane.effective })
     }))
   };
+}
+
+function validateExecutionProjects(
+  projects: readonly WorkItemExecutionProjectBase[]
+): readonly WorkItemExecutionProjectBase[] {
+  if (!Array.isArray(projects) || projects.length === 0) {
+    throw new Error("ExecutionAssignment projects are invalid.");
+  }
+  const projectIds = projects.map((project) => {
+    rejectUnknownFields(project as unknown as Record<string, unknown>, [
+      "projectId",
+      "baseCommit"
+    ], "ExecutionAssignment Project base");
+    const { projectId, baseCommit } = project;
+    requireIdentity(projectId, "ExecutionAssignment Project id");
+    requireCommit(baseCommit, "ExecutionAssignment Project base commit");
+    return projectId;
+  });
+  normalizedUniqueIdentities(projectIds, "ExecutionAssignment Project");
+  return projects;
 }
 
 function validateWorkItemExecutionLane(
@@ -408,16 +638,24 @@ function validateWorkItemExecutionLane(
   if (lane.groupId !== groupId) throw new Error("ExecutionLane Group does not match.");
   if (lane.ordinal !== ordinal) throw new Error("ExecutionLane ordinal is invalid.");
   requireIdentity(lane.roleName, "ExecutionLane Role name");
-  validateEffectiveLaunchSnapshot(lane.effective);
-  rejectUnknownFields(lane.workspace as unknown as Record<string, unknown>, [
-    "root",
-    "writableProjectIds"
-  ], "ExecutionLane workspace");
-  requireText(lane.workspace.root, "ExecutionLane workspace root");
-  normalizedUniqueIdentities(
-    lane.workspace.writableProjectIds,
-    "ExecutionLane writable Project"
-  );
+  if ((lane.effective === undefined) !== (lane.workspace === undefined)) {
+    throw new Error("ExecutionLane launch facts are incomplete.");
+  }
+  if (lane.effective !== undefined && lane.workspace !== undefined) {
+    validateEffectiveLaunchSnapshot(lane.effective);
+    rejectUnknownFields(lane.workspace as unknown as Record<string, unknown>, [
+      "root",
+      "writableProjectIds"
+    ], "ExecutionLane workspace");
+    requireText(lane.workspace.root, "ExecutionLane workspace root");
+    normalizedUniqueIdentities(
+      lane.workspace.writableProjectIds,
+      "ExecutionLane writable Project"
+    );
+  }
+  if (lane.currentTurnId !== undefined && lane.effective === undefined) {
+    throw new Error("A dispatched ExecutionLane requires launch facts.");
+  }
   if (lane.currentTurnId !== undefined) requireIdentity(lane.currentTurnId, "ExecutionLane current Turn id");
   if (lane.successfulTurnId !== undefined) requireIdentity(lane.successfulTurnId, "ExecutionLane successful Turn id");
   if (!["open", "succeeded", "failed"].includes(lane.disposition)) {

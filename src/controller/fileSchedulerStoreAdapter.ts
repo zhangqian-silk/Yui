@@ -2492,7 +2492,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
             reviewResult = { summary: input.summary, report: input.summary, checks: [] };
           }
         }
-        if (observedTurn.purpose === "execution"
+        if ((observedTurn.purpose === "execution" || observedTurn.purpose === "review")
           && observedTurn.executionGroupId !== undefined
           && observedTurn.executionLaneId !== undefined
           && observedTurn.workspace !== undefined
@@ -2776,11 +2776,11 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
             const existingNativeSessionId = existingSession?.nativeSessionId;
             const replacingNativeSession = existingNativeSessionId !== undefined
               && existingNativeSessionId !== decision.outcome.nativeSessionId;
-            const replacementBasis = replacingNativeSession
-              && run.mode === "new"
-              && existingSession?.status === "ended"
-              ? "terminal-session" as const
-              : null;
+            const replacementBasis = terminalSessionReplacementBasis(
+              sessions,
+              input,
+              run
+            ) ?? null;
             if (replacingNativeSession && replacementBasis === null) {
               recordCanonicalObservationObsolete(
                 store,
@@ -2830,13 +2830,27 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
             const run = input.fence.turnId === undefined
               ? null
               : store.getTurn(input.fence.taskId!, input.fence.turnId);
+            const replacementBasis = run === null
+              ? undefined
+              : terminalSessionReplacementBasis(current, input, run)
+                ?? terminalProviderReplacementBasis(current, input, run.mode);
+            if (current.providerBinding !== null
+              && currentProviderConversation(current.providerBinding).conversationId
+                !== (input.fence.conversationId ?? input.fence.nativeSessionId)
+              && replacementBasis === undefined) {
+              recordCanonicalObservationObsolete(
+                store,
+                input,
+                "session-replacement-not-terminal",
+                now
+              );
+              return "obsolete";
+            }
             store.saveTaskRoleSessionSet(bindOrSupersedeProviderRuntime(
               current,
               input,
               now,
-              run === null
-                ? undefined
-                : terminalProviderReplacementBasis(current, input, run.mode)
+              replacementBasis
             ));
           }
           return "applied";
@@ -4183,6 +4197,32 @@ function canonicalStructuredProviderTurnId(
     && turn.nativeTurnId !== undefined
     ? turn.nativeTurnId
     : observedTurnId;
+}
+
+function terminalSessionReplacementBasis(
+  sessions: TaskRoleSessionSet,
+  input: RuntimeObservation,
+  run: Turn
+): "terminal-session" | undefined {
+  const binding = sessions.providerBinding;
+  const session = sessions.sessions[input.fence.agentId];
+  const incomingConversationId = input.fence.conversationId ?? input.fence.nativeSessionId;
+  if (run.mode !== "new"
+    || binding === null
+    || session === undefined
+    || incomingConversationId === undefined
+    || currentProviderConversation(binding).conversationId === incomingConversationId
+    || currentProviderActivation(binding) !== null
+    || binding.authority.owner !== "none") {
+    return undefined;
+  }
+  // Pre-start persistence may already have replaced the terminal Role Session
+  // before Provider readiness arrives. A matching new Session plus the
+  // quiescent old Provider binding preserves the same terminal-session proof.
+  return session.status === "ended"
+    || session.nativeSessionId === input.fence.nativeSessionId
+    ? "terminal-session"
+    : undefined;
 }
 
 function bindOrSupersedeProviderRuntime(

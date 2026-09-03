@@ -35,6 +35,7 @@ import {
   stopTaskExecutionCommand
 } from "../../dist/commands/taskExecutionCommands.js";
 import {
+  dispatchPreparedReviewRound,
   previewTaskRoleAgentConfigurationMutation,
   runTaskCommand
 } from "../../dist/commands/taskCommands.js";
@@ -53,7 +54,6 @@ import { createExactControlPlaneDescriptor } from "../../dist/runtime/exactContr
 import { resolveManagedTaskCaller } from "../../dist/runtime/managedCaller.js";
 import { taskLeaderActionTurnId } from "../../dist/commands/taskActor.js";
 import { buildTurnContextPack } from "../../dist/context/turnContextPack.js";
-import { createTaskReviewRound } from "../../dist/review/reviewRound.js";
 import { startStructuredProviderSession } from "../../dist/runtime/structuredProviderHost.js";
 import {
   acceptProviderTurn,
@@ -87,6 +87,16 @@ import {
   createWorkItemExecutionAssignment,
   createWorkItemExecutionGroup
 } from "../../dist/execution/workItemExecution.js";
+import { reconcileReviewMainTurns } from "../../dist/execution/reviewMainTurn.js";
+import {
+  attachReviewRoundWorkspace,
+  createTaskReviewRound,
+  finishReviewRound,
+  startReviewRound
+} from "../../dist/review/reviewRound.js";
+import {
+  createExecutionGroup as createLegacyExecutionGroup
+} from "../../dist/execution/legacyExecutionGroup.js";
 import { projectReviewerAvailability } from "../../dist/review/reviewerAvailability.js";
 import { projectNextAction } from "../../dist/task/nextAction.js";
 import { projectTaskRemoteDelivery } from "../../dist/task/remoteDelivery.js";
@@ -117,7 +127,9 @@ import {
 } from "../../dist/task/task.js";
 import {
   attachWorkItemExecutionGroup,
+  createCandidateGitSnapshot,
   createWorkItem,
+  submitWorkItemCandidate,
   updateWorkItemStatus
 } from "../../dist/workItem/workItem.js";
 import { createManagedWorkspace } from "../../dist/worktree/managedWorkspace.js";
@@ -678,7 +690,7 @@ test("Turns record provider-visible input without delivery handshake state", () 
   );
   const mailbox = createWorkMailbox({ kind: "role", taskId: "task-1", roleName: role.name });
 
-  assert.equal(run.schemaVersion, 3);
+  assert.equal(run.schemaVersion, 4);
   assert.deepEqual(run.inputs[0].input.source, { type: "yui", channel: "task-dispatch" });
   assert.equal(run.inputs[0].input.directive, "Read the durable Task context and continue.");
   for (const legacyField of ["pushedAt", "deliveredAt", "deliveryReceiptId", "controlRequest"]) {
@@ -1266,35 +1278,75 @@ test("an unowned ended Provider binding does not block the next Turn", async (t)
     adapterId: agent.adapterId,
     mode: "new",
     sessionStarted: true,
-    session: null
+    session: {
+      agentId: agent.agentId,
+      adapterId: agent.adapterId,
+      nativeSessionId: "thread-new",
+      launchId: "activation-new",
+      status: "active",
+      effective
+    }
   };
+  const adapter = new FileSchedulerStoreAdapter(store);
   const delivery = {
-    prepareRoleSession: async () => {
+    prepareRoleSession: async (request) => {
       preparedCalls += 1;
-      return prepared;
-    },
-    waitUntilReady: async () => ({
-      prepared,
-      session: {
+      request.beforeHostStart({
+        owner: { scope: "task", taskId: task.id, roleName: leader.name },
+        launchId: "activation-new",
+        turnId: turn.id,
         agentId: agent.agentId,
         adapterId: agent.adapterId,
-        nativeSessionId: "thread-new",
-        launchId: "activation-new",
-        status: "active",
-        effective
-      }
-    }),
+        effective,
+        nativeSessionId: "thread-new"
+      });
+      return prepared;
+    },
+    waitUntilReady: async () => {
+      assert.equal(adapter.observeRuntimeObservation({
+        schemaVersion: 2,
+        eventId: "new-session-ready",
+        semanticKey: "new-session-ready",
+        kind: "session.ready",
+        authority: "provider-structured",
+        receivedAt: nextAt.toISOString(),
+        observedAt: nextAt.toISOString(),
+        sequence: 1,
+        ordinal: 0,
+        fence: {
+          taskId: task.id,
+          roleName: leader.name,
+          turnId: turn.id,
+          agentId: agent.agentId,
+          driverId: "openai/codex",
+          launchId: "activation-new",
+          sessionGenerationId: "activation-new",
+          nativeSessionId: "thread-new",
+          receiptId: "turn:task-1/turn-1",
+          conversationId: "thread-new",
+          activationId: "activation-new"
+        },
+        payload: {}
+      }, nextAt), "applied");
+      return { prepared, session: prepared.session };
+    },
     sendOnce: async () => "sent",
     inspectRole: async () => "present"
   };
 
   const [result] = await processActiveRoleTurnDeliveries(
-    new FileSchedulerStoreAdapter(store),
+    adapter,
     delivery,
     nextAt
   );
-  assert.equal(result.status, "delivered");
+  assert.equal(result.status, "delivered", JSON.stringify(result));
   assert.equal(preparedCalls, 1);
+  const replacedProvider = store.getTaskRoleSessionSet(task.id, leader.name).providerBinding;
+  assert.equal(replacedProvider.currentConversationEpoch, 2);
+  assert.equal(
+    replacedProvider.conversations.find(({ status }) => status === "current").conversationId,
+    "thread-new"
+  );
 });
 
 test("Task completion leaves its reusable Provider Session running", async (t) => {
@@ -1746,6 +1798,443 @@ test("direct and replicated WorkItem execution converge through exact Lane retry
   assert.equal(mainTurn.sourceExecutionGroupId, groupId);
   assert.equal(mainTurn.executionGroupId, undefined);
   assert.match(mainTurn.inputs[0].input.directive, new RegExp(groupId, "u"));
+});
+
+test("direct and replicated Review keep Producer results non-authoritative", (t) => {
+  const home = mkdtempSync(join(tmpdir(), "yui-review-execution-smoke-"));
+  t.after(() => rmSync(home, { recursive: true, force: true }));
+  ensureStorageSchema(home);
+  const store = new SqliteTaskStore(home);
+  t.after(() => store.close());
+  const now = new Date("2026-09-02T00:10:00.000Z");
+  const projectRoot = join(home, "project");
+  mkdirSync(projectRoot, { recursive: true });
+  const project = createProject(
+    "project-1",
+    "app",
+    projectRoot,
+    { stable: "main", development: "main" },
+    now
+  );
+  store.saveProject(project);
+  const taskIdentity = generateTaskWorkspaceIdentity({
+    home: store.getHomeIdentity(),
+    taskId: "task-1",
+    now,
+    entropy: Buffer.alloc(16, 8)
+  });
+  const commit = "a".repeat(40);
+  const task = activateTask(bindTaskWorkspaceIdentity(createTask(
+    "task-1",
+    "Review one frozen Task candidate",
+    now,
+    {
+      cwd: home,
+      projectBindings: [{
+        projectId: project.id,
+        directory: "app",
+        baseRef: "main",
+        baseCommit: commit,
+        currentCommit: commit
+      }]
+    }
+  ), taskIdentity, now), now);
+  store.saveTask(task);
+  const candidate = {
+    schemaVersion: 1,
+    projects: [{ projectId: project.id, commit }]
+  };
+  const taskRoot = join(home, "task-main");
+  mkdirSync(taskRoot, { recursive: true });
+  store.saveManagedWorkspace(createManagedWorkspace({
+    owner: { type: "task", taskId: task.id },
+    root: taskRoot,
+    entries: [{
+      projectId: project.id,
+      directory: "app",
+      access: "write",
+      path: projectRoot,
+      branch: "main",
+      baseRef: "main",
+      baseCommit: commit
+    }]
+  }, now));
+  const binding = createRoleAgentBinding({ id: "codex", adapterId: "codex" });
+  for (const roleName of [
+    "reviewer-direct",
+    "reviewer-main",
+    "producer-a",
+    "producer-b",
+    "candidate-main",
+    "candidate-a",
+    "candidate-b"
+  ]) {
+    store.saveGlobalRole(createGlobalRole(
+      roleName,
+      [binding],
+      binding.agentId,
+      home,
+      now
+    ));
+  }
+  const attachWorkspace = (round, label) => {
+    const rootPath = join(home, label);
+    const projectPath = join(rootPath, "app");
+    mkdirSync(projectPath, { recursive: true });
+    const workspace = createManagedWorkspace({
+      owner: { type: "review-round", taskId: task.id, reviewRoundId: round.id },
+      root: rootPath,
+      entries: [{
+        projectId: project.id,
+        directory: "app",
+        access: "write",
+        path: projectPath,
+        branch: label,
+        baseRef: commit,
+        baseCommit: commit
+      }]
+    }, now);
+    store.saveManagedWorkspace(workspace);
+    const attached = attachReviewRoundWorkspace(round, workspace);
+    store.saveReviewRound(task.id, attached);
+    return attached;
+  };
+  const laneWorkspacesFor = (round) => new Map(round.executionGroup.lanes.map((lane) => {
+    const laneRoot = join(home, lane.id);
+    return [lane.id, createManagedWorkspace({
+      owner: {
+        type: "execution-lane",
+        taskId: task.id,
+        executionGroupId: round.executionGroup.id,
+        executionLaneId: lane.id,
+        purpose: "review",
+        reviewRoundId: round.id
+      },
+      root: laneRoot,
+      entries: [{
+        projectId: project.id,
+        directory: "app",
+        access: "write",
+        path: join(laneRoot, "app"),
+        branch: lane.id,
+        baseRef: commit,
+        baseCommit: commit
+      }]
+    }, now)];
+  }));
+  const finish = (
+    turn,
+    status,
+    completedAt,
+    report,
+    producerLabel,
+    includeGitSnapshot = true
+  ) => {
+    const result = store.transaction((tx) => terminalizeExactTaskTurn(tx, {
+      taskId: task.id,
+      roleName: turn.roleName,
+      agentId: turn.effective.agentId,
+      turnId: turn.id,
+      outcome: {
+        status,
+        summary: status === "completed"
+          ? `${turn.roleName} completed.`
+          : `${turn.roleName} failed.`,
+        ...(status === "failed" ? { failureReason: "runtime-failed" } : {})
+      },
+      ...(status === "failed"
+        ? {}
+        : {
+            reviewResult: {
+              summary: `${turn.roleName} completed.`,
+              report,
+              checks: [{ name: "core", outcome: "passed" }],
+              ...(turn.executionLaneId === undefined || !includeGitSnapshot
+                ? {}
+                : {
+                    gitSnapshot: {
+                      schemaVersion: 1,
+                      projects: [{
+                        projectId: project.id,
+                        headCommit: commit,
+                        branch: producerLabel
+                      }]
+                    }
+                  })
+            }
+          })
+    }, completedAt));
+    assert.equal(result.disposition, "applied");
+    return result.turn;
+  };
+
+  const revisionBeforeInvalidCandidateRequest = store.getRevision();
+  assert.throws(() => runTaskCommand([
+    "review", "request", task.id,
+    "--role", "reviewer-main",
+    "--lane-role", "producer-a"
+  ], store, {
+    now: () => now,
+    environment: bareEnv,
+    actualTaskReviewCandidate: candidate
+  }), /zero or at least two --lane-role/u);
+  assert.equal(store.getRevision(), revisionBeforeInvalidCandidateRequest);
+  assert.deepEqual(store.listReviewRounds(task.id), []);
+
+  runTaskCommand([
+    "review", "request", task.id,
+    "--role", "reviewer-direct"
+  ], store, {
+    now: () => now,
+    environment: bareEnv,
+    actualTaskReviewCandidate: candidate
+  });
+  const directRound = attachWorkspace(store.listReviewRounds(task.id).at(-1), "review-direct");
+  assert.equal(directRound.executionGroup, undefined);
+  const directTurn = dispatchPreparedReviewRound(task.id, directRound.id, store, {
+    now: () => new Date("2026-09-02T00:11:00.000Z"),
+    environment: bareEnv,
+    actualTaskReviewCandidate: candidate
+  });
+  assert.ok(directTurn);
+  assert.equal(directTurn.executionGroupId, undefined);
+  assert.equal(directTurn.executionLaneId, undefined);
+  assert.equal(directTurn.sourceExecutionGroupId, undefined);
+  finish(
+    directTurn,
+    "completed",
+    new Date("2026-09-02T00:12:00.000Z"),
+    JSON.stringify({ summary: "Direct Review complete.", findings: [] }),
+    "direct"
+  );
+  assert.equal(store.getReviewRound(task.id, directRound.id).status, "completed");
+  assert.deepEqual(store.listReviewFindings(task.id), []);
+
+  runTaskCommand([
+    "review", "request", task.id,
+    "--role", "reviewer-main",
+    "--lane-role", "producer-a",
+    "--lane-role", "producer-b"
+  ], store, {
+    now: () => new Date("2026-09-02T00:13:00.000Z"),
+    environment: bareEnv,
+    actualTaskReviewCandidate: candidate
+  });
+  let replicatedRound = store.listReviewRounds(task.id).at(-1);
+  assert.ok(replicatedRound.executionGroup);
+  assert.deepEqual(
+    replicatedRound.executionGroup.lanes.map(({ roleName }) => roleName),
+    ["producer-a", "producer-b"]
+  );
+  assert.deepEqual(
+    replicatedRound.executionGroup.assignment.projects,
+    [{ projectId: project.id, baseCommit: commit }]
+  );
+  replicatedRound = attachWorkspace(replicatedRound, "review-main");
+  const groupId = replicatedRound.executionGroup.id;
+  const laneWorkspaces = laneWorkspacesFor(replicatedRound);
+  dispatchPreparedReviewRound(task.id, replicatedRound.id, store, {
+    now: () => new Date("2026-09-02T00:14:00.000Z"),
+    environment: bareEnv,
+    actualTaskReviewCandidate: candidate,
+    executionLaneWorkspaces: laneWorkspaces
+  });
+  const producerTurns = store.listTurns(task.id)
+    .filter(({ reviewRoundId, executionGroupId }) => (
+      reviewRoundId === replicatedRound.id && executionGroupId === groupId
+    ))
+    .sort((left, right) => left.executionLaneId.localeCompare(right.executionLaneId));
+  assert.equal(producerTurns.length, 2);
+  assert.equal(store.getReviewRound(task.id, replicatedRound.id).reviewerTurnId, undefined);
+  assert.equal(new Set(producerTurns.map(({ workspace }) => workspace.root)).size, 2);
+  for (const producer of producerTurns) {
+    assert.notEqual(producer.workspace.root, taskRoot);
+    assert.notEqual(producer.workspace.root, replicatedRound.workspace.root);
+    assert.equal(producer.effective.writeProjectIds[0], project.id);
+    assert.match(producer.inputs[0].input.directive, new RegExp(groupId, "u"));
+    assert.match(producer.inputs[0].input.directive, new RegExp(commit, "u"));
+  }
+
+  const producerReport = (label) => JSON.stringify({
+    summary: `${label} producer report.`,
+    checks: [{ name: "core", outcome: "passed" }],
+    findings: [{
+      id: `${label}-only`,
+      severity: "critical",
+      status: "open",
+      invariant: "producer-must-not-authorize",
+      title: `${label} producer-only finding`,
+      paths: [`src/${label}.ts`],
+      evidence: [`${label} evidence`]
+    }]
+  });
+  const firstProducer = finish(
+    producerTurns[0],
+    "completed",
+    new Date("2026-09-02T00:15:00.000Z"),
+    producerReport("producer-a"),
+    "producer-a",
+    false
+  );
+  assert.equal(firstProducer.status, "completed");
+  assert.deepEqual(firstProducer.result.producer.codeRefs, []);
+  assert.equal(store.getReviewRound(task.id, replicatedRound.id).reviewerTurnId, undefined);
+  assert.deepEqual(store.listReviewFindings(task.id), []);
+  finish(
+    producerTurns[1],
+    "completed",
+    new Date("2026-09-02T00:16:00.000Z"),
+    producerReport("producer-b"),
+    "producer-b"
+  );
+  const initialMain = store.getActiveTurn(task.id, "reviewer-main");
+  assert.ok(initialMain);
+  assert.equal(initialMain.sourceExecutionGroupId, groupId);
+  assert.equal(initialMain.executionGroupId, undefined);
+  assert.equal(initialMain.executionLaneId, undefined);
+  assert.deepEqual(store.listReviewFindings(task.id), []);
+  assert.deepEqual(
+    store.transaction((tx) => reconcileReviewMainTurns(
+      tx,
+      task.id,
+      new Date("2026-09-02T00:16:30.000Z")
+    )).createdTurns,
+    []
+  );
+
+  const authoritativeReport = JSON.stringify({
+    summary: "Main synthesis found one issue.",
+    checks: [{ name: "core", outcome: "passed" }],
+    findings: [{
+      id: "main-1",
+      severity: "high",
+      status: "open",
+      invariant: "main-review-authority",
+      title: "Only the main synthesis may create this finding",
+      paths: ["src/main.ts"],
+      evidence: ["Both Producer results were synthesized."]
+    }]
+  });
+  finish(
+    initialMain,
+    "completed",
+    new Date("2026-09-02T00:17:00.000Z"),
+    authoritativeReport,
+    "main"
+  );
+  const terminalRound = store.getReviewRound(task.id, replicatedRound.id);
+  assert.equal(terminalRound.status, "completed");
+  assert.equal(terminalRound.reviewerTurnId, initialMain.id);
+  assert.equal(terminalRound.report, authoritativeReport);
+  assert.equal(store.listReviewFindings(task.id).length, 1);
+  assert.equal(
+    store.listReviewFindings(task.id)[0].title,
+    "Only the main synthesis may create this finding"
+  );
+  assert.deepEqual(store.listWorkItems(task.id), []);
+  assert.deepEqual(store.listChangeSets(task.id), []);
+  assert.deepEqual(store.listIntegrationAttempts(task.id), []);
+  const candidateWorkspace = createManagedWorkspace({
+    owner: { type: "work-item", taskId: task.id, workItemId: "work-item-1" },
+    root: join(home, "candidate"),
+    entries: [{
+      projectId: project.id,
+      directory: "app",
+      access: "write",
+      path: join(home, "candidate", "app"),
+      branch: "candidate",
+      baseRef: commit,
+      baseCommit: commit
+    }]
+  }, now);
+  store.saveManagedWorkspace(candidateWorkspace);
+  let item = updateWorkItemStatus(createWorkItem("work-item-1", task.id, {
+    title: "Candidate implementation",
+    objective: "Review the exact submitted implementation.",
+    acceptance: ["Inspect the frozen Candidate."],
+    writeProjectIds: [project.id]
+  }, now), "running", now);
+  item = submitWorkItemCandidate(item, {
+    summary: "Candidate ready.",
+    source: { type: "direct" },
+    reviewPolicy: { roleName: "candidate-main", trigger: "leader" },
+    workspace: candidateWorkspace,
+    gitSnapshot: createCandidateGitSnapshot(candidateWorkspace, [{
+      projectId: project.id,
+      commit
+    }])
+  }, now);
+  store.saveWorkItem(task.id, item);
+
+  const revisionBeforeInvalidRequest = store.getRevision();
+  assert.throws(() => runTaskCommand([
+    "work", "review", `${task.id}/${item.id}`,
+    "--lane-role", "candidate-a"
+  ], store, {
+    now: () => now,
+    environment: bareEnv
+  }), /zero or at least two --lane-role/u);
+  assert.equal(store.getRevision(), revisionBeforeInvalidRequest);
+
+  const revisionBeforeProducerCollision = store.getRevision();
+  assert.throws(() => runTaskCommand([
+    "work", "review", `${task.id}/${item.id}`,
+    "--lane-role", "leader",
+    "--lane-role", "candidate-b"
+  ], store, {
+    now: () => now,
+    environment: bareEnv
+  }), /separate from the Candidate producer/u);
+  assert.equal(store.getRevision(), revisionBeforeProducerCollision);
+
+  runTaskCommand([
+    "work", "review", `${task.id}/${item.id}`,
+    "--lane-role", "candidate-a",
+    "--lane-role", "candidate-b"
+  ], store, {
+    now: () => now,
+    environment: bareEnv
+  });
+  let round = store.listReviewRounds(task.id).at(-1);
+  assert.equal(round.scope ?? "work-item", "work-item");
+  assert.deepEqual(
+    round.executionGroup.lanes.map(({ roleName }) => roleName),
+    ["candidate-a", "candidate-b"]
+  );
+  assert.deepEqual(round.executionGroup.assignment, {
+    schemaVersion: 1,
+    input: `Review the frozen WorkItem Candidate for ReviewRound ${round.id}.`,
+    objective: item.objective,
+    acceptance: item.acceptance,
+    contextSnapshotRef: round.executionGroup.assignment.contextSnapshotRef,
+    taskId: task.id,
+    reviewRoundId: round.id,
+    reviewBaseCommit: commit,
+    scope: "work-item",
+    workItemId: item.id,
+    candidateId: item.candidates.at(-1).id,
+    projects: [{ projectId: project.id, baseCommit: commit }]
+  });
+  assert.equal(
+    projectNextAction(store.readNextActionFacts(task.id)).recommendedCommand,
+    `yui task work review ${task.id}/${item.id}`
+      + " --lane-role candidate-a --lane-role candidate-b"
+  );
+  round = attachWorkspace(round, "candidate-review");
+  dispatchPreparedReviewRound(task.id, round.id, store, {
+    now: () => new Date("2026-09-03T00:01:00.000Z"),
+    environment: bareEnv,
+    executionLaneWorkspaces: laneWorkspacesFor(round)
+  });
+  const candidateProducerTurns = store.listTurns(task.id).filter(({ reviewRoundId }) => (
+    reviewRoundId === round.id
+  ));
+  assert.equal(candidateProducerTurns.length, 2);
+  assert.equal(new Set(candidateProducerTurns.map(({ workspace }) => workspace.root)).size, 2);
+  assert.ok(candidateProducerTurns.every(({ executionGroupId }) => (
+    executionGroupId === round.executionGroup.id
+  )));
+  assert.equal(store.getReviewRound(task.id, round.id).reviewerTurnId, undefined);
 });
 
 test("Leader replicated Lanes derive from Task main without a WorkItem workspace", async (t) => {
@@ -2550,7 +3039,7 @@ test("a valid aggregate-21 Home upgrades through every adjacent record step", as
     }, new Date(now.getTime() + index)));
   }
   const binding = createRoleAgentBinding({ id: "codex", adapterId: "codex" });
-  for (const roleName of ["leader", "producer"]) {
+  for (const roleName of ["leader", "producer", "reviewer"]) {
     store.saveRole(task.id, createRole(task.id, roleName, [binding], binding.agentId, home, now));
   }
   const oldItem = createWorkItem("work-item-1", task.id, {
@@ -2568,8 +3057,120 @@ test("a valid aggregate-21 Home upgrades through every adjacent record step", as
     { effective: resolveEffectiveLaunch({ role: store.getRole(task.id, "leader"), purpose: "execution" }) }
   ), "Existing result.", now);
   store.saveTurn(oldTurn);
+  const legacyReviewCommit = "d".repeat(40);
+  const legacyCandidate = {
+    schemaVersion: 1,
+    projects: [{ projectId: "project-legacy", commit: legacyReviewCommit }]
+  };
+  const pendingLegacyRound = createTaskReviewRound(
+    "review-round-1",
+    task.id,
+    "reviewer",
+    "user",
+    legacyCandidate,
+    now
+  );
+  const legacyReviewRoot = join(home, "legacy-review");
+  const legacyReviewProject = join(legacyReviewRoot, "project-legacy");
+  mkdirSync(legacyReviewProject, { recursive: true });
+  const legacyReviewWorkspace = createManagedWorkspace({
+    owner: {
+      type: "review-round",
+      taskId: task.id,
+      reviewRoundId: pendingLegacyRound.id
+    },
+    root: legacyReviewRoot,
+    entries: [{
+      projectId: "project-legacy",
+      directory: "project-legacy",
+      access: "write",
+      path: legacyReviewProject,
+      branch: "legacy-review",
+      baseRef: legacyReviewCommit,
+      baseCommit: legacyReviewCommit
+    }]
+  }, now);
+  store.saveManagedWorkspace(legacyReviewWorkspace);
+  const readyLegacyRound = attachReviewRoundWorkspace(
+    pendingLegacyRound,
+    legacyReviewWorkspace
+  );
+  const legacyReviewTurn = createTurn(
+    "turn-2",
+    task.id,
+    "reviewer",
+    "new",
+    turnInput("turn-2", task.id, "reviewer", "Existing active legacy Review."),
+    now,
+    {
+      purpose: "review",
+      reviewRoundId: readyLegacyRound.id,
+      workspace: legacyReviewWorkspace,
+      effective: resolveEffectiveLaunch({
+        role: store.getRole(task.id, "reviewer"),
+        purpose: "review",
+        workspace: legacyReviewWorkspace,
+        reviewRoundId: readyLegacyRound.id,
+        reviewBaseCommit: legacyReviewCommit
+      })
+    }
+  );
+  store.saveReviewRound(
+    task.id,
+    startReviewRound(readyLegacyRound, legacyReviewTurn.id)
+  );
+  store.saveActiveTurn(legacyReviewTurn);
+  const historicalLegacyReport = JSON.stringify({
+    summary: "Historical Review result.",
+    findings: []
+  });
+  const historicalLegacyRound = finishReviewRound(createTaskReviewRound(
+    "review-round-2",
+    task.id,
+    "reviewer",
+    "user",
+    legacyCandidate,
+    now
+  ), "completed", "Historical Review result.", now, {
+    report: historicalLegacyReport,
+    checks: [{ name: "core", outcome: "passed" }]
+  });
+  store.saveReviewRound(task.id, historicalLegacyRound);
   store.close();
 
+  const legacyTarget = {
+    schemaVersion: 1,
+    kind: "task-final-review",
+    taskId: task.id,
+    revision: 1,
+    projects: legacyCandidate.projects,
+    fingerprint: "legacy-task-review"
+  };
+  const activeLegacyGroup = createLegacyExecutionGroup(
+    "execution-group-review-round-1",
+    task.id,
+    {
+      purpose: "review",
+      target: legacyTarget,
+      strategy: { mode: "fixed", count: 2 },
+      lanes: [
+        { roleName: "reviewer", reviewRoundId: pendingLegacyRound.id },
+        { roleName: "producer", reviewRoundId: pendingLegacyRound.id }
+      ]
+    },
+    now
+  );
+  const historicalLegacyGroup = createLegacyExecutionGroup(
+    "execution-group-review-round-2",
+    task.id,
+    {
+      purpose: "review",
+      target: legacyTarget,
+      strategy: { mode: "fixed", count: 1 },
+      lanes: [{ roleName: "reviewer", reviewRoundId: historicalLegacyRound.id }]
+    },
+    now
+  );
   const database = new Database(join(home, "yui.db"));
   try {
     for (const table of ["work_items", "turns", "task_records"]) {
@@ -2582,6 +3183,18 @@ test("a valid aggregate-21 Home upgrades through every adjacent record step", as
         database.prepare(`UPDATE ${table} SET payload = ? WHERE rowid = ?`)
           .run(JSON.stringify(payload), row.rowid);
       }
+    }
+    const reviewRows = database.prepare(
+      "SELECT rowid, review_round_id, payload FROM review_rounds"
+    ).all();
+    for (const row of reviewRows) {
+      const payload = JSON.parse(row.payload);
+      payload.schemaVersion = 6;
+      payload.executionGroup = row.review_round_id === pendingLegacyRound.id
+        ? activeLegacyGroup
+        : historicalLegacyGroup;
+      database.prepare("UPDATE review_rounds SET payload = ? WHERE rowid = ?")
+        .run(JSON.stringify(payload), row.rowid);
     }
     const profileRows = database.prepare("SELECT rowid, payload FROM agent_profiles").all();
     for (const row of profileRows) {
@@ -2616,6 +3229,7 @@ test("a valid aggregate-21 Home upgrades through every adjacent record step", as
   manifest.aggregateSchemaVersion = 21;
   manifest.recordVersions.workItem = 13;
   manifest.recordVersions.turn = 1;
+  manifest.recordVersions.reviewRound = 6;
   manifest.recordVersions.task = 6;
   manifest.recordVersions.integrationAttempt = 5;
   manifest.recordVersions.agentProfile = 2;
@@ -2628,7 +3242,7 @@ test("a valid aggregate-21 Home upgrades through every adjacent record step", as
   ));
   assert.equal(preflight.ok, true);
   assert.equal(preflight.data.outcome, "upgrade-plan");
-  assert.equal(preflight.data.report.steps.length, 6);
+  assert.equal(preflight.data.report.steps.length, 8);
   const upgraded = JSON.parse(execFileSync(
     process.execPath,
     [join(root, "dist", "cli.js"), "--json", "upgrade"],
@@ -2640,7 +3254,25 @@ test("a valid aggregate-21 Home upgrades through every adjacent record step", as
   const reopened = new SqliteTaskStore(home);
   t.after(() => reopened.close());
   assert.equal(reopened.getWorkItem(task.id, oldItem.id).schemaVersion, 14);
-  assert.equal(reopened.getTurn(task.id, oldTurn.id).schemaVersion, 3);
+  assert.equal(reopened.getTurn(task.id, oldTurn.id).schemaVersion, 4);
+  const migratedActiveRound = reopened.getReviewRound(task.id, pendingLegacyRound.id);
+  assert.equal(migratedActiveRound.schemaVersion, 7);
+  assert.equal(migratedActiveRound.status, "failed");
+  assert.equal(migratedActiveRound.executionGroup, undefined);
+  assert.deepEqual(migratedActiveRound.legacyExecutionGroup, activeLegacyGroup);
+  assert.match(migratedActiveRound.summary, /pre-v7 Review ExecutionGroup protocol was retired/u);
+  assert.equal(reopened.getTurn(task.id, legacyReviewTurn.id).status, "failed");
+  assert.equal(reopened.getActiveTurn(task.id, "reviewer"), null);
+  const migratedHistoricalRound = reopened.getReviewRound(task.id, historicalLegacyRound.id);
+  assert.equal(migratedHistoricalRound.status, "completed");
+  assert.equal(migratedHistoricalRound.report, historicalLegacyReport);
+  assert.deepEqual(migratedHistoricalRound.legacyExecutionGroup, historicalLegacyGroup);
+  const migrationAudit = reopened.listEvents(task.id)
+    .find(({ type }) => type === "review.legacy-execution-terminalized");
+  assert.ok(migrationAudit);
+  assert.equal(migrationAudit.payload.reviewRoundId, pendingLegacyRound.id);
+  assert.equal(migrationAudit.payload.executionGroupId, activeLegacyGroup.id);
+  assert.equal(migrationAudit.payload.terminalizedTurnIds, legacyReviewTurn.id);
   assert.equal(reopened.getTask(task.id).schemaVersion, 7);
   assert.equal(reopened.getTask(task.id).projectBindings[0].baseCommit, baseCommit);
   assert.equal(
@@ -2728,6 +3360,8 @@ test("aggregate-24 Profile hints migrate through the sole configured Agent witho
   const manifestPath = join(home, "schema.json");
   const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
   manifest.aggregateSchemaVersion = 24;
+  manifest.recordVersions.turn = 3;
+  manifest.recordVersions.reviewRound = 6;
   manifest.recordVersions.task = 6;
   manifest.recordVersions.integrationAttempt = 5;
   manifest.recordVersions.agentProfile = 2;

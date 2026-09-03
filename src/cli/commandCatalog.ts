@@ -777,8 +777,9 @@ const taskChildren: readonly NodeInput[] = [
       },
       {
         name: "review",
-        summary: "Ask the configured reviewer to inspect a WorkItem candidate.",
-        usage: "yui task work review <task>/<work>",
+        summary: "Ask the configured reviewer to inspect a WorkItem candidate directly or with replicated Producers.",
+        usage: "yui task work review <task>/<work> [--lane-role <producer-role> --lane-role <producer-role> ...]",
+        options: ["--lane-role"],
         executable: true,
         sections: [
           { id: "retry", title: "Task-final recovery", entries: ["retry"] },
@@ -835,7 +836,7 @@ const taskChildren: readonly NodeInput[] = [
       },
       {
         name: "retry",
-        summary: "Retry a failed execution Turn or request a fresh Round for an exact failed final Review Turn.",
+        summary: "Retry an exact failed execution or review Turn while preserving its semantic unit.",
         usage: "yui task turn retry <task>/<turn>"
       },
       {
@@ -884,31 +885,18 @@ const taskChildren: readonly NodeInput[] = [
   {
     name: "review",
     summary: "Control Task-final ReviewRounds.",
-    sections: [{ id: "manage", title: "Commands", entries: ["request", "force-fresh", "group", "retry", "finding"] }],
+    sections: [{ id: "manage", title: "Commands", entries: ["request", "force-fresh", "retry", "finding"] }],
     children: [
       {
         name: "request",
-        summary: "Request one Task-local final ReviewRound from a Global Role.",
-        usage: "yui task review request <task> --role <global-role> [--strategy fixed:<count>|adaptive:<max>] [--lane-role <role> ...] [--delta-recheck]",
-        options: ["--role", "--strategy", "--lane-role", "--delta-recheck"]
+        summary: "Request a direct or replicated Task-local final ReviewRound.",
+        usage: "yui task review request <task> --role <main-role> [--lane-role <producer-role> --lane-role <producer-role> ...] [--delta-recheck]",
+        options: ["--role", "--lane-role", "--delta-recheck"]
       },
       {
         name: "force-fresh",
         summary: "Replace one exact terminal non-semantic Task-final Review with a distinct full Round.",
         usage: "yui task review force-fresh <task>/<review-round>"
-      },
-      {
-        name: "group",
-        summary: "Resolve a Reviewer ExecutionGroup after its Lanes finish.",
-        executable: true,
-        sections: [{ id: "manage", title: "Commands", entries: ["resolve"] }],
-        children: [{
-          name: "resolve",
-          summary: "Select Reviewer Lane evidence and resolve the group.",
-          usage: "yui task review group resolve <task>/<review-round> --decision <accept|reject|blocked> --summary <text> [--lane <lane-id> ...]",
-          options: ["--decision", "--summary", "--lane"],
-          optionValues: { "--decision": ["accept", "reject", "blocked"] }
-        }]
       },
       {
         name: "retry",

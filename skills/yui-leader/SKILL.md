@@ -36,9 +36,17 @@ and WorkItem count. Each replicated Lane gets its own durable workspace and
 exact Turn snapshot. Retry or settle the exact unresolved Lane, and never infer
 a Lane result from a shared or non-durable checkout.
 
-Keep Review execution separate. Its ExecutionGroup may use `fixed` or
-`adaptive` strategy, but default to one Reviewer Lane and choose a panel or
-adaptive Review only when the current review need explicitly justifies it.
+Use direct Review by default: one main Reviewer Turn owns the authoritative
+result and has no ExecutionGroup or Lane. Request replicated Review only when
+independent inspection of the same frozen Assignment materially improves the
+evidence. Provide at least two distinct Producer Lane Roles, never the main
+Reviewer Role. Yui waits for every Lane to settle and requires at least two
+successful results before creating one main Reviewer synthesis Turn. Retry or
+settle only unresolved exact Producer Turns; a main retry preserves the Group
+and never reruns successful Producers. Producers are evidence sources only:
+they never create Candidates, ChangeSets, integrations, authoritative findings,
+or the Review outcome. Read the main Reviewer's complete synthesis before
+planning repairs.
 
 ## Default to the Leader-first fast path
 
@@ -621,9 +629,13 @@ authorized expansions.
   then make the Leader-owned accept/reject decision. Do not create a Reviewer
   Role merely to satisfy an old setup convention.
 - `always`: keep the Candidate decision pending until its required ReviewRound
-  is terminal. The Review does not globally pause unrelated Leader work.
+  is terminal. Policy-triggered WorkItem Review uses direct execution. The
+  Review does not globally pause unrelated Leader work.
 - `leader`: decide whether the existing evidence is sufficient. Request Agent
   review with `yui task work review <work-id>` when it adds useful evidence.
+  Add at least two distinct `--lane-role` values only when independent
+  Producer inspections of that same frozen Candidate materially improve the
+  evidence; one value is invalid.
 - `final`: keep WorkItem acceptance and integration independent. After all
   results are integrated into Task main, decide whether risk warrants one
   Task-final ReviewRound over the frozen Task candidate. A Task contract may
@@ -674,28 +686,34 @@ authorized expansions.
   for merge or small local fixes, and create an architecture WorkItem only for
   a genuinely cross-cutting design issue. The Leader owns the decision and
   completion; routine retries and routing do not need an InputRequest.
-- A failed review is terminal evidence, not an automatic retry. Retry a
-  WorkItem review with a new `task work review`, accept with an explicit
-  rationale, or ask the user. `yui task turn retry <turn-id>` retries an exact
-  failed Task-final Reviewer execution under the same semantic ReviewRound. If
-  that immutable Round is durably proven non-semantic without any review
-  checks, evidence, finding, or ambiguous output—even when a pre-review
-  context/workspace failure historically terminalized it without a semantic result—
-  the Leader may run
+- A failed semantic review is terminal evidence, not an automatic retry. For a
+  WorkItem, request a new `task work review`, accept with an explicit rationale,
+  or ask the user. `yui task turn retry <turn-id>` is only for an exact failed
+  Candidate or Task-final review execution under the same semantic ReviewRound,
+  preserving settled Producer siblings. If a replicated Task-final Round fails
+  below quorum before it has a main Reviewer Turn, use
+  `yui task review retry <task>/<review-round>` to reopen only its settled failed
+  Producer Lanes and preserve successful siblings. If a main Reviewer Turn
+  failed, retry that exact Turn. If a direct immutable Round is durably proven
+  non-semantic without any review checks, evidence, finding, or ambiguous
+  output—even when a pre-review context/workspace failure historically
+  terminalized it without a semantic result—the Leader may instead run
   `yui task review force-fresh <task>/<review-round>` to create one distinct
   full Round over the identical frozen heads. It fails closed for every
-  semantic or ambiguous prior result; target the new failed Round explicitly
-  if another non-semantic failure occurs.
+  replicated, semantic, or ambiguous prior result; target the new failed Round
+  explicitly if another non-semantic failure occurs.
 - For `review.failed-to-start`, open the referenced ReviewRound and inspect its
   exact reason, frozen candidate, and workspace when present. Decide whether to
   retry, explicitly clean a conflicting workspace, select another Reviewer, or
   continue other work. Preserve the failed Round as request history and do not
   turn these choices into an automatic retry or cleanup loop.
 - Use `task next-action`'s derived Review outcome literally: non-semantic means
-  recover the same frozen head with `force-fresh`; ambiguous means diagnose the
-  inconsistent evidence without creating a Repair WorkItem; only semantic
-  negative evidence may create a repair wave. There is no semantic Review
-  budget; exact candidate/Reviewer/intent retries reuse existing evidence.
+  recover the same frozen head with the recommended same-Round retry, with
+  `force-fresh` available only for a direct Round when a distinct attempt is
+  justified; ambiguous means diagnose the inconsistent evidence without
+  creating a Repair WorkItem; only semantic negative evidence may create a
+  repair wave. There is no semantic Review budget; exact
+  candidate/Reviewer/intent retries reuse existing evidence.
 - If the same non-resource user choice or unavailable external fact repeats,
   persist context and create an InputRequest instead of looping. Never use an
   InputRequest to solicit authorization for an unrequested real-resource test;

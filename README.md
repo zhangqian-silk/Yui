@@ -341,9 +341,33 @@ to route evidence to the original Worker, accept, reject and redispatch that
 Worker in its existing Session, review again, or request user input.
 A failed review remains visible evidence and wakes the Leader, but does not
 take that decision away from the Leader.
-Task context and next-action expose direct Review facts: every frozen Project
-commit, its relation to the current candidate, the active Turn, and the Reviewer
-workspace. A request that fails after Round creation retains the ReviewRound
+
+An explicit WorkItem Candidate or Task-final Review is direct unless the
+Leader names Producer Roles. Policy-triggered WorkItem Review remains direct
+by default:
+
+```sh
+yui task work review <task-id>/<work-item-id>
+yui task work review <task-id>/<work-item-id> \
+  --lane-role security-reviewer --lane-role correctness-reviewer
+
+yui task review request <task-id> --role reviewer
+yui task review request <task-id> --role reviewer \
+  --lane-role security-reviewer --lane-role correctness-reviewer
+```
+
+Direct Review creates one main Reviewer Turn with no ExecutionGroup or Lane.
+Replicated Review requires at least two distinct Producer Roles, all inspecting
+the identical frozen Assignment in isolated Lane workspaces. Yui waits for
+every Lane to settle and requires at least two successful Producer results
+before creating one idempotent main Reviewer synthesis Turn. Successful
+Producers are never rerun during Lane or main retry. Producer output is durable
+non-authoritative evidence; only the main Reviewer result completes the Round,
+updates the finding ledger, and supplies the semantic Review outcome.
+
+Task context and next-action expose the Review shape, every frozen Project
+commit, its relation to the current candidate, Producer and main Turns, and
+their owned workspaces. A request that fails after Round creation retains the ReviewRound
 and reports its exact reason; the Leader opens that Round and decides whether
 to retry, inspect or clean the workspace, use another Reviewer, or continue
 other work.
@@ -559,7 +583,8 @@ set. Codex options are `sandbox` and `approval`; Claude options are `mode`,
 Profile behavior and Project write authority: only an exact WorkItem scope and
 matching managed workspace grant normal Project writes. A ReviewRound is the only non-WorkItem write
 purpose and must match its Turn, reviewRoundId, frozen base, and
-ReviewRound-owned workspace; every mismatch fails closed. Its diagnostic commit
+ReviewRound-owned main workspace or exact isolated Producer Lane workspace;
+every mismatch fails closed. Its diagnostic commit
 is visible history but is
 explicitly rejected by capture, ChangeSet, Integration, and acceptance paths.
 The Reviewer's final Provider response is its complete free-form Markdown or
@@ -990,7 +1015,7 @@ Its recovery reconciliation runs every 120 seconds by default. Normal durable st
 
 Automated input is sent only through tmux. Each pass performs one non-blocking process-state readiness check; a busy startup is retried through a small bounded mailbox timer, while later busy sessions are woken by canonical Agent Driver terminal observations. A pane-local receipt prevents the same Turn input from being typed twice after a Controller retry.
 
-If a Role process exits without a terminal Provider result, the Controller fails that Turn and queues the Leader. A replicated WorkItem Lane remains open for exact retry or explicit settlement; completed sibling results remain reusable. Recovery failures are exposed through the small Jobs view:
+If a Role process exits without a terminal Provider result, the Controller fails that Turn and queues the Leader. A replicated WorkItem or Review Producer Lane remains open for exact retry or explicit settlement; completed sibling results remain reusable. Recovery failures are exposed through the small Jobs view:
 
 ```sh
 yui jobs list
@@ -1003,9 +1028,9 @@ yui task turn settle <failed-turn-id>
 `jobs` is not a restored generic queue: it presents durable pending Leader wakes and Leader recovery failures only.
 
 `task turn settle` records that the Leader will no longer recover the exact
-current failed WorkItem Lane Turn. Only then does the Lane become failed and the
-settled Group become eligible for synthesis when at least two Producer results
-succeeded. The same command retains its narrow repair for an obsolete failed
+current failed Producer Lane Turn. Only then does the Lane become failed and the
+settled Group become eligible for WorkItem or Review synthesis when at least
+two Producer results succeeded. The same command retains its narrow repair for an obsolete failed
 Reviewer Turn whose Task-final ReviewRound is stranded on an old frozen
 candidate; that repair never creates a retry Round.
 
@@ -1046,7 +1071,8 @@ with an execution band that consolidates the Task's owner, current action,
 attention list, blockers, and fail-closed indicators; Work items surface
 their current ExecutionGroup with per-lane status, Candidates, and
 retirement disposition; Turns show purpose, execution lineage, final result,
-and Leader disposition.
+and Leader disposition; Reviews show direct or replicated shape, frozen
+Assignment, Producer Lane state, main synthesis Turn, and authoritative result.
 
 The control room supports English and Simplified Chinese, selecting an initial locale from the browser and remembering manual changes. The theme selector switches between the dark Control Room, the light Paper Ledger, and the dark-blue Atlas themes. Both choices are stored only in browser `localStorage`; they do not modify `YUI_HOME`.
 

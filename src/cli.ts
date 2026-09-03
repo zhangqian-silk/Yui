@@ -1695,7 +1695,9 @@ export async function main(): Promise<void> {
           || (requestedRound?.status === "running"
             && resumesReviewDispatch
             && persistedRequestedRound?.executionGroup?.lanes.some((lane) => (
-              lane.status === "pending" && lane.turnId === undefined
+              lane.disposition === "open"
+              && (lane.currentTurnId === undefined
+                || store.getTurn(requestedRound.taskId, lane.currentTurnId)?.status === "failed")
             )) === true);
         if (reviewDispatchNeeded) {
           try {
@@ -1752,17 +1754,15 @@ export async function main(): Promise<void> {
               }
             );
             reviewOutput = run === null
-              ? `Review ${requestedRound.id} retained pending by Resource Broker\n`
+              ? `Review ${requestedRound.id} remains running\n`
               : `Review queued as ${requestedRound.id} (${run.id})\n`;
             reviewData = {
               reviewRequest: run === null
                 ? {
-                    kind: "busy",
+                    kind: "running",
                     reviewerRoleName: requestedRound.reviewerRoleName,
-                    phase: "resource-broker",
                     activeReviewRoundId: requestedRound.id,
-                    retryable: true,
-                    retryAfterSeconds: 5
+                    retryable: false
                   }
                 : {
                     kind: "started",
@@ -2551,10 +2551,9 @@ async function prepareReviewLaneWorkspaces(
   const round = store.getReviewRound(taskId, reviewRoundId);
   const group = round?.executionGroup;
   if (round === null || round === undefined || group === undefined) return undefined;
-  if (group.lanes.length < 2 && group.strategy.mode !== "adaptive") return undefined;
   const map = new Map<string, import("./worktree/managedWorkspace.js").ManagedWorkspace>();
   try {
-    for (const lane of group.lanes.filter((candidate) => candidate.status === "pending" || candidate.status === "running")) {
+    for (const lane of group.lanes.filter(({ disposition }) => disposition === "open")) {
       map.set(lane.id, await preparer.prepareExecutionLaneWorkspace(taskId, group.id, lane.id, {
         purpose: "review",
         reviewRoundId

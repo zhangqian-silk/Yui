@@ -9,7 +9,7 @@ import type { ReviewRound } from "../review/reviewRound.js";
 import {
   validateExecutionGroup,
   type ExecutionGroup
-} from "../execution/executionGroup.js";
+} from "../execution/legacyExecutionGroup.js";
 import type { TaskStore } from "../storage/taskStore.js";
 import type { Task } from "../task/task.js";
 import type {
@@ -504,7 +504,8 @@ export class TaskWorkspaceCoordinator {
   #reviewRoundRoleNames(round: ReviewRound): readonly string[] {
     return [
       round.reviewerRoleName,
-      ...(round.executionGroup?.lanes.map(({ roleName }) => roleName) ?? [])
+      ...(round.executionGroup?.lanes.map(({ roleName }) => roleName) ?? []),
+      ...(legacyReviewExecutionGroup(round)?.lanes.map(({ roleName }) => roleName) ?? [])
     ];
   }
 
@@ -597,6 +598,12 @@ function legacyExecutionGroups(item: WorkItem): readonly ExecutionGroup[] {
   return (item.legacyExecutionGroups ?? []).map((group) => (
     validateExecutionGroup(group as ExecutionGroup)
   ));
+}
+
+function legacyReviewExecutionGroup(round: ReviewRound): ExecutionGroup | undefined {
+  return round.legacyExecutionGroup === undefined
+    ? undefined
+    : validateExecutionGroup(round.legacyExecutionGroup as ExecutionGroup);
 }
 
 function sameProjectScope(

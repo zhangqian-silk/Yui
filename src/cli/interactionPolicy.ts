@@ -566,7 +566,7 @@ export const INTERACTION_POLICIES: readonly InteractionPolicy[] = Object.freeze(
         actionTarget: false
       }
     ],
-    trailingOptions: { "--role": "value", "--strategy": "value", "--lane-role": "value" }
+    trailingOptions: { "--role": "value", "--lane-role": "value" }
   },
   {
     commandPath: ["task", "integration", "start"],

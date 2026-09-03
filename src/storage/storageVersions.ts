@@ -16,5 +16,5 @@
  */
 export const CURRENT_STORAGE_LAYOUT_VERSION = 8;
 
-/** Aggregate 27 migrates AgentProfile v2 after Task and Integration source migrations. */
-export const CURRENT_AGGREGATE_SCHEMA_VERSION = 27;
+/** Aggregate 29 unifies Review execution after Task, Integration, and AgentProfile migrations. */
+export const CURRENT_AGGREGATE_SCHEMA_VERSION = 29;
