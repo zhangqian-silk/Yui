@@ -177,11 +177,13 @@ yui task publication upsert <task> --project <project> \
 
 Write only the repository identity, URL, state, and commit or merge evidence
 already available to you. Omitted metadata inherits the current record.
-Omitted verification and merge evidence inherit only while the local commit
-and state are unchanged. Changing only the local commit resets the Publication
-to `open` and `reported`; changing either the local commit or state clears
-omitted remote commit, evidence, and `mergedAt`. For a reported merge, include
-the exact local commit, remote commit, `mergedAt`, and evidence when available.
+Omitted verification and merge evidence inherit only while the complete
+evidence context is unchanged: local commit, state, remote commit, evidence,
+and `mergedAt`. Changing any explicitly supplied context value resets omitted
+verification to `reported` and clears omitted merge-evidence fields; changing
+only the local commit also defaults the Publication to `open`. For a reported
+merge, include the exact local commit, remote commit, `mergedAt`, and evidence
+when available.
 When you execute an authorized GitHub PR merge yourself, immediately upsert
 that merge result and run
 `yui task publication verify <task>/<publication>` before ending the same work
@@ -208,6 +210,9 @@ before proposing archive. `--integrated --force` may override only that
 verification gap and requires explicit user authorization for the exact Task;
 it never overrides missing, stale, open, or closed merge evidence. Deliberate
 non-merge uses the existing explicit `--abandon` path.
+If an older completed Task lacks frozen completion heads, reopen and complete
+it again to record them; never infer the missing head from a Publication or
+worktree.
 
 ## Lead with judgment
 

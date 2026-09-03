@@ -332,7 +332,17 @@ function inheritPublicationInput(
   const localCommitChanged = input.localCommit !== undefined
     && normalizeCommitForComparison(input.localCommit) !== existing.localCommit;
   const stateChanged = input.state !== undefined && input.state !== existing.state;
-  const evidenceContextChanged = localCommitChanged || stateChanged;
+  const remoteCommitChanged = input.remoteCommit !== undefined
+    && normalizeCommitForComparison(input.remoteCommit) !== existing.remoteCommit;
+  const evidenceChanged = input.evidence !== undefined
+    && input.evidence.trim() !== existing.evidence;
+  const mergedAtChanged = input.mergedAt !== undefined
+    && input.mergedAt !== existing.mergedAt;
+  const evidenceContextChanged = localCommitChanged
+    || stateChanged
+    || remoteCommitChanged
+    || evidenceChanged
+    || mergedAtChanged;
   const inherited: PublicationReferenceInput = {
     projectId: input.projectId,
     provider: input.provider,

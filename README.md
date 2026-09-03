@@ -689,16 +689,18 @@ yui task publication upsert <task-id> --project <project> \
 ```
 
 The required provider/repository/external ID selects the current Publication.
-The first upsert creates it. Later upserts inherit omitted metadata and, while
-the local commit and PR/MR state remain unchanged, omitted merge evidence.
-Changing the local commit without an explicit state resets the Publication to
-`open` and `reported`; changing either the local commit or state clears omitted
-remote commit, evidence, merge time, and verification so facts from an earlier
-head or state cannot remain current. Each semantic change appends a new
-immutable record linked to the previous version, while identical input creates
-no event. `list`, `show`, and `task context` retain the complete history. This
-records facts already known to the caller; it does not query a provider or
-replace Review, Integration, or Task completion gates.
+The first upsert creates it. Later upserts inherit omitted metadata and omitted
+merge evidence only while the full evidence context remains unchanged. That
+context is the local commit, PR/MR state, remote commit, evidence text, and
+merge time. If any explicitly supplied context value differs, omitted
+verification resets to `reported` and omitted merge-evidence fields are
+cleared; changing the local commit without an explicit state also resets the
+Publication to `open`. Resupplying identical values remains idempotent. Each
+semantic change appends a new immutable record linked to the previous version,
+while identical input creates no event. `list`, `show`, and `task context`
+retain the complete history. This records facts already known to the caller;
+it does not query a provider or replace Review, Integration, or Task completion
+gates.
 
 Verify one current GitHub Publication against the real PR state:
 
@@ -730,8 +732,9 @@ flag. Active and reopened Tasks use the current clean Task-main heads and mark
 them provisional; completed and archived Tasks use the latest frozen
 `task.completed` heads. For each Project, Yui reports the expected local
 commit, the matching current unsuperseded Publication, PR/MR state,
-verification, and remote commit. Aggregate coverage is `none`, `pending`,
-`partial`, or `merged`, with independent `allMerged` and `allVerified` values.
+verification, and remote commit. Aggregate coverage is `none`, `unavailable`,
+`pending`, `partial`, or `merged`, with independent `allMerged` and
+`allVerified` values.
 Only a current Publication whose `localCommit` exactly matches the expected
 head and whose state is `merged` contributes merged coverage. Missing commits,
 open/closed records, stale heads, and superseded Publications never imply
@@ -740,6 +743,12 @@ Publication. `task show`, `task context`, `task next-action`, and the Web detail
 projection use this same selector.
 `Archive --integrated coverage` requires both `allMerged=true` and
 `allVerified=true`.
+
+When a valid older completed Task has no frozen completion heads, Yui reports
+`unavailable` and keeps integrated archive fail-closed. Reopen and complete the
+Task again to record exact heads, then retry archive. Yui does not guess the
+missing head from a Publication or worktree, and `--force` never overrides
+missing head evidence.
 
 When the requested outcome is finished, complete the Task to stop automatic Leader wakes without deleting its sessions or Task main worktree:
 

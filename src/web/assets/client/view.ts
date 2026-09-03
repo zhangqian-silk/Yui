@@ -308,13 +308,20 @@ export function renderTaskDetail(detail, data, t, locale, actions) {
         + (remote.provisional ? " · " + t("detail.provisional") : "")
     ));
     const facts = node("div", "record-meta");
+    const unavailable = remote.status === "unavailable";
     facts.append(
       node("span", "", t("detail.allMerged") + " · "
-        + (remote.allMerged ? t("common.yes") : t("common.no"))),
+        + (unavailable
+          ? t("detail.unavailable")
+          : remote.allMerged ? t("common.yes") : t("common.no"))),
       node("span", "", t("detail.allVerified") + " · "
-        + (remote.allVerified ? t("common.yes") : t("common.no"))),
+        + (unavailable
+          ? t("detail.unavailable")
+          : remote.allVerified ? t("common.yes") : t("common.no"))),
       node("span", "", t("detail.integratedCoverage") + " · "
-        + (remote.integratedCoverageSatisfied ? t("detail.satisfied") : t("detail.blocked")))
+        + (unavailable
+          ? t("detail.unavailable")
+          : remote.integratedCoverageSatisfied ? t("detail.satisfied") : t("detail.blocked")))
     );
     card.append(facts);
     remote.projects.forEach(function (project) {

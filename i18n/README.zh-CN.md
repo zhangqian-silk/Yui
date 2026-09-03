@@ -489,14 +489,14 @@ yui task publication upsert <task-id> --project <project> \
 ```
 
 必需的 provider/repository/external ID 会定位当前 Publication。首次 upsert
-创建记录。后续 upsert 会继承未指定的元数据；只有 local commit 和 PR/MR state
-都未改变时，才继承未指定的合入证据。仅改变 local commit 会默认把 Publication
-重置为 `open`、`reported`；local commit 或 state 任一改变时，未重新提供的
-remote commit、evidence、mergedAt 与验证结果都会失效，避免旧 head 或旧状态的
-事实继续被当作当前证据。只有语义发生变化时才追加新的不可变记录，并由 Yui 自动关联
-上一版本；相同输入不会新增事件。`list`、`show` 和 `task context` 继续保留完整历史。
-该命令只记录调用方已经掌握的事实，不会自行查询 Provider，也不替代 Review、
-Integration 或 Task completion 门禁。
+创建记录。后续 upsert 会继承未指定的元数据；只有完整证据上下文不变时才继承未指定的
+合入证据。证据上下文包括 local commit、PR/MR state、remote commit、evidence 文本
+和 mergedAt。任一显式提供的上下文值真正变化时，未显式提供的 verification 会重置为
+`reported`，未重新提供的合入证据字段会清除；仅改变 local commit 且未显式提供 state
+时还会把 Publication 重置为 `open`。重复提供相同值仍保持幂等。只有语义发生变化时才
+追加新的不可变记录，并由 Yui 自动关联上一版本；相同输入不会新增事件。`list`、`show`
+和 `task context` 继续保留完整历史。该命令只记录调用方已经掌握的事实，不会自行查询
+Provider，也不替代 Review、Integration 或 Task completion 门禁。
 
 可针对当前 GitHub Publication 查询真实 PR 状态并记录验证结果：
 
@@ -523,14 +523,20 @@ yui task remote-delivery <task-id> --json
 active 或 reopened Task 使用当前干净的 Task main heads，并明确标记为 provisional；
 completed 或 archived Task 使用最近一次 `task.completed` 冻结的 heads。每个 Project
 都会展示预期 local commit、匹配的当前未 supersede Publication、PR/MR state、
-verification 与 remote commit。聚合状态为 `none`、`pending`、`partial` 或
-`merged`，并分别暴露 `allMerged` 与 `allVerified`。只有 `localCommit` 精确匹配
+verification 与 remote commit。聚合状态为 `none`、`unavailable`、`pending`、
+`partial` 或 `merged`，并分别暴露 `allMerged` 与 `allVerified`。只有
+`localCommit` 精确匹配
 预期 head 且 state 为 `merged` 的当前 Publication 才贡献 merged 覆盖；缺 commit、
 open/closed、陈旧 head 与已 supersede 记录都不会被推断为已合入。Task head 与
 managed base 相同的 Project 不需要 Publication。`task show`、`task context`、
 `task next-action` 和 Web detail 共用同一个 selector。
 `Archive --integrated coverage` 同时要求 `allMerged=true` 和
 `allVerified=true`。
+
+有效旧版本 completed Task 如果没有冻结的 completion heads，Yui 会报告
+`unavailable`，并继续对 integrated archive fail closed。先 reopen，再重新 complete
+以记录精确 heads，之后重试 archive。Yui 不会从 Publication 或 worktree 猜测缺失的
+head，`--force` 也不能绕过缺失 head 证据。
 
 完成目标后，可将 Task 标记为 completed，从而停止自动唤醒，同时保留 session 和 Task main worktree：
 

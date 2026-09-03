@@ -338,14 +338,15 @@ requires its head to equal the Task delivery head, and appends an immutable
 verified superseding record. Do not query merely to refresh state when the
 current authorization does not cover that real external resource. Omitted
 metadata inherits the current record. Omitted verification and merge evidence
-inherit only while the local commit and state are unchanged. Changing only
-the local commit resets the Publication to `open` and `reported`; changing
-either the local commit or state clears omitted remote commit, evidence, and
-`mergedAt`, so include any newly confirmed replacement evidence in that
-upsert. After successful synchronization and verification, briefly tell the
-user which Task and PR state changed. If either command fails, say that Yui is
-not verified and report the error; never claim the evidence was recorded. A
-Publication records external delivery state and never replaces Candidate,
+inherit only while the complete evidence context is unchanged: local commit,
+state, remote commit, evidence, and `mergedAt`. Changing any explicitly
+supplied context value resets omitted verification to `reported` and clears
+omitted merge-evidence fields; changing only the local commit also defaults the
+Publication to `open`. Include any newly confirmed replacement evidence in
+that upsert. After successful synchronization and verification, briefly tell
+the user which Task and PR state changed. If either command fails, say that Yui
+is not verified and report the error; never claim the evidence was recorded.
+A Publication records external delivery state and never replaces Candidate,
 Review, Integration, or Task completion gates.
 
 Use `yui task remote-delivery <task>` when the user asks whether all Task code
@@ -362,6 +363,9 @@ must have explicit user authorization for the exact Task; it never overrides
 missing, stale, open, or closed merge evidence. An intentional non-merge
 remains the explicit `--abandon` path and still requires user authorization
 for the exact archive.
+If an older completed Task lacks frozen completion heads, reopen and complete
+it again to record them; never infer the missing head from a Publication or
+worktree.
 
 ## Enter and administer
 

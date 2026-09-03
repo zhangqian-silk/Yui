@@ -122,6 +122,18 @@ export function assertTaskRemoteDeliveryIntegrated(
   options: Readonly<{ forceUnverified?: boolean }> = {}
 ): void {
   if (!delivery.allMerged) {
+    const headUnavailable = delivery.projects.filter((project) => (
+      project.codeDelivery !== "none"
+      && project.coverage === "head-unavailable"
+    ));
+    if (headUnavailable.length > 0 && delivery.source === "task-completed") {
+      throw usageError(
+        `Task ${delivery.taskId} has no frozen completion heads for: ${
+          headUnavailable.map(({ projectId }) => projectId).join(", ")
+        }. Reopen and complete it again to record exact heads before archiving; `
+        + "--force cannot override missing head evidence."
+      );
+    }
     const uncovered = delivery.projects
       .filter((project) => project.codeDelivery !== "none" && !project.merged)
       .map((project) => (

@@ -33,6 +33,7 @@ import {
   startTaskExecutionCommand,
   stopTaskExecutionCommand
 } from "../../dist/commands/taskExecutionCommands.js";
+import { upsertTaskPublication } from "../../dist/commands/taskPublicationCommands.js";
 import { runTaskCommand } from "../../dist/commands/taskCommands.js";
 import {
   createGlobalRole,
@@ -155,58 +156,110 @@ test("the packaged CLI starts and exposes the core workflow", () => {
   assert.equal(commands.includes("task role session switch"), false);
 });
 
-test("remote delivery projects exact merged Task heads without conflating verification", () => {
+test("publication evidence changes stay exact across upsert and remote delivery", () => {
   const baseCommit = "1".repeat(40);
   const headCommit = "2".repeat(40);
-  const projection = projectTaskRemoteDelivery({
-    task: {
-      schemaVersion: 6,
-      id: "task-1",
-      title: "Publish exact head",
-      status: "active",
-      executionGate: { state: "enabled" },
-      projectBindings: [{
-        projectId: "project-1",
-        directory: "Repo",
-        baseRef: "master"
-      }],
-      createdAt: "2026-09-02T00:00:00.000Z",
-      updatedAt: "2026-09-02T00:00:00.000Z"
-    },
-    events: [],
-    publications: [{
-      schemaVersion: 1,
-      id: "publication-1",
-      taskId: "task-1",
+  const originalRemoteCommit = "3".repeat(40);
+  const replacementRemoteCommit = "4".repeat(40);
+  const task = {
+    schemaVersion: 6,
+    id: "task-1",
+    title: "Publish exact head",
+    status: "active",
+    executionGate: { state: "enabled" },
+    projectBindings: [{
       projectId: "project-1",
-      provider: "github",
-      repository: "example/repo",
-      externalKind: "pull-request",
-      externalId: "17",
-      localCommit: headCommit,
-      remoteCommit: "3".repeat(40),
-      state: "merged",
-      verification: "reported",
-      recordedBy: "operator",
-      source: "manual",
-      createdAt: "2026-09-02T00:01:00.000Z"
+      directory: "Repo",
+      baseRef: "master"
     }],
-    managedWorkspaces: [{
-      schemaVersion: 2,
-      owner: { type: "task", taskId: "task-1" },
-      root: "/tmp/task-1",
-      entries: [{
-        projectId: "project-1",
-        directory: "Repo",
-        access: "write",
-        path: "/tmp/task-1/Repo",
-        branch: "yui/task-1/main",
-        baseRef: "master",
-        baseCommit
-      }],
-      createdAt: "2026-09-02T00:00:00.000Z",
-      updatedAt: "2026-09-02T00:00:00.000Z"
+    createdAt: "2026-09-02T00:00:00.000Z",
+    updatedAt: "2026-09-02T00:00:00.000Z"
+  };
+  const verifiedPublication = {
+    schemaVersion: 1,
+    id: "publication-1",
+    taskId: task.id,
+    projectId: "project-1",
+    provider: "github",
+    repository: "example/repo",
+    externalKind: "pull-request",
+    externalId: "17",
+    localCommit: headCommit,
+    remoteCommit: originalRemoteCommit,
+    state: "merged",
+    verification: "verified",
+    evidence: "provider-confirmed merge",
+    mergedAt: "2026-09-02T00:01:00.000Z",
+    recordedBy: "operator",
+    source: "manual",
+    createdAt: "2026-09-02T00:01:00.000Z"
+  };
+  const publicationIdentity = {
+    projectId: "project-1",
+    provider: "github",
+    repository: "example/repo",
+    externalKind: "pull-request",
+    externalId: "17"
+  };
+  const applyUpsert = (input) => {
+    const publications = [verifiedPublication];
+    const events = [];
+    const reference = upsertTaskPublication({
+      findPublicationReferenceByExternalKey: () => publications.at(-1),
+      nextPublicationReferenceId: () => `publication-${publications.length + 1}`,
+      savePublicationReference: (_taskId, publication) => publications.push(publication),
+      nextEventId: () => `event-${events.length + 1}`,
+      saveEvent: (_taskId, event) => events.push(event)
+    }, task, { ...publicationIdentity, ...input }, "leader", new Date(
+      "2026-09-02T00:02:00.000Z"
+    ));
+    return { reference, publications, events };
+  };
+  const replay = applyUpsert({
+    remoteCommit: originalRemoteCommit.toUpperCase()
+  }).reference;
+  assert.equal(replay.idempotent, true);
+  const changedResult = applyUpsert({
+    remoteCommit: replacementRemoteCommit
+  });
+  const changed = changedResult.reference;
+  assert.equal(changed.reference.verification, "reported");
+  assert.equal(changed.reference.evidence, undefined);
+  assert.equal(changed.reference.mergedAt, undefined);
+  const evidenceChanged = applyUpsert({ evidence: "replacement evidence" }).reference;
+  assert.equal(evidenceChanged.reference.verification, "reported");
+  assert.equal(evidenceChanged.reference.remoteCommit, undefined);
+  assert.equal(evidenceChanged.reference.mergedAt, undefined);
+  const mergedAtChanged = applyUpsert({
+    mergedAt: "2026-09-02T00:04:00.000Z"
+  }).reference;
+  assert.equal(mergedAtChanged.reference.verification, "reported");
+  assert.equal(mergedAtChanged.reference.remoteCommit, undefined);
+  assert.equal(mergedAtChanged.reference.evidence, undefined);
+  const publications = changedResult.publications;
+  const events = changedResult.events;
+
+  const managedWorkspaces = [{
+    schemaVersion: 2,
+    owner: { type: "task", taskId: task.id },
+    root: "/tmp/task-1",
+    entries: [{
+      projectId: "project-1",
+      directory: "Repo",
+      access: "write",
+      path: "/tmp/task-1/Repo",
+      branch: "yui/task-1/main",
+      baseRef: "master",
+      baseCommit
     }],
+    createdAt: "2026-09-02T00:00:00.000Z",
+    updatedAt: "2026-09-02T00:00:00.000Z"
+  }];
+  const projection = projectTaskRemoteDelivery({
+    task,
+    events,
+    publications,
+    managedWorkspaces,
     turns: [],
     currentCandidate: {
       projects: [{ projectId: "project-1", commit: headCommit }]
@@ -217,7 +270,18 @@ test("remote delivery projects exact merged Task heads without conflating verifi
   assert.equal(projection.allVerified, false);
   assert.equal(projection.integratedCoverageSatisfied, false);
   assert.equal(projection.projects[0].expectedLocalCommit, headCommit);
-  assert.equal(projection.projects[0].remoteCommit, "3".repeat(40));
+  assert.equal(projection.projects[0].remoteCommit, replacementRemoteCommit);
+
+  const unavailable = projectTaskRemoteDelivery({
+    task,
+    events,
+    publications,
+    managedWorkspaces,
+    turns: [],
+    currentCandidate: null
+  });
+  assert.equal(unavailable.status, "unavailable");
+  assert.equal(unavailable.allMerged, false);
 });
 
 test("update quiesces the exact Controller before an adjacent storage migration", () => {

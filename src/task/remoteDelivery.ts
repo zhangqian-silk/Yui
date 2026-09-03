@@ -4,7 +4,12 @@ import type { ManagedWorkspace } from "../worktree/managedWorkspace.js";
 import type { PublicationReference } from "./publicationReference.js";
 import type { Task } from "./task.js";
 
-export type RemoteDeliveryStatus = "none" | "pending" | "partial" | "merged";
+export type RemoteDeliveryStatus =
+  | "none"
+  | "unavailable"
+  | "pending"
+  | "partial"
+  | "merged";
 export type RemoteDeliverySource =
   | "current-task-main"
   | "task-completed"
@@ -139,9 +144,11 @@ export function projectTaskRemoteDelivery(
   const allVerified = codeProjects.every((project) => project.verified);
   const status: RemoteDeliveryStatus = codeProjects.length === 0
     ? "none"
-    : allMerged
-      ? "merged"
-      : mergedProjectCount > 0 ? "partial" : "pending";
+    : codeProjects.some((project) => project.coverage === "head-unavailable")
+      ? "unavailable"
+      : allMerged
+        ? "merged"
+        : mergedProjectCount > 0 ? "partial" : "pending";
   return {
     taskId: facts.task.id,
     source: expected.source,
