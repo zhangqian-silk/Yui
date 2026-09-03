@@ -501,7 +501,10 @@ When `--agent` is present, any model, effort, permission, or other Agent
 settings form one explicit binding; those settings are invalid without
 `--agent` during Role creation. On Role update, Agent settings without
 `--agent` target the active binding; with `--agent`, they target that binding
-without switching it. Use `task role bind` as the only active-Agent switch.
+without switching it. A Profile used during update must resolve to that same
+target Agent; its runtime is the base binding and explicit Agent settings
+override corresponding fields. Use `task role bind` as the only active-Agent
+switch.
 Before dispatch, inspect `task role show`; if Agent, model, effort, Profile, or
 workspace scope is missing or inconsistent, do not dispatch or guess it.
 

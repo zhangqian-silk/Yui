@@ -89,7 +89,8 @@ import {
   unbindRoleAgent,
   updateRole,
   type GlobalRole,
-  type Role
+  type Role,
+  type RoleAgentBinding
 } from "../role/role.js";
 import {
   createTurn,
@@ -277,7 +278,8 @@ import {
   parseRoleOptions,
   patchRoleAgentBinding,
   roleOptionSpecs,
-  roleProfilePatch
+  roleProfilePatch,
+  type ParsedRoleOptions
 } from "./roleConfiguration.js";
 import {
   hasRoleLaunchContextOptions,
@@ -583,30 +585,18 @@ export function previewTaskRoleAgentConfigurationMutation(
     if (parsed.has("--agent") && (parsed.one("--agent")?.trim().length ?? 0) === 0) {
       throw usageError("--agent is required.", usage);
     }
-    if (parsed.has("--agent") && parsed.has("--profile") && !hasAgentConfigOptions(parsed)) {
-      throw usageError(
-        "--agent requires at least one Agent setting when --profile is also provided.",
-        usage
-      );
-    }
     const role = requireRole(store, taskId, roleName);
-    if (hasAgentConfigOptions(parsed)) {
-      const agentId = parsed.one("--agent")?.trim() || role.activeAgentId;
-      const agent = requireAgent(store, agentId);
-      const binding = role.agentBindings[agentId]
-        ?? createRoleAgentBinding({ id: agent.id, adapterId: agent.adapterId });
-      return {
-        agentId,
-        config: patchRoleAgentBinding(binding, parsed).config,
-        cwd: role.workspace
-      };
-    }
     const profileId = parsed.one("--profile");
-    if (profileId === undefined) return undefined;
-    const runtime = resolvedAgentProfileRuntime(requireAgentProfile(store, profileId), store);
+    const bindingUpdate = resolveTaskRoleAgentBindingUpdate(
+      parsed,
+      role,
+      profileId === undefined ? undefined : requireAgentProfile(store, profileId),
+      store
+    );
+    if (bindingUpdate === undefined) return undefined;
     return {
-      agentId: runtime.binding.agentId,
-      config: runtime.binding.config,
+      agentId: bindingUpdate.agentId,
+      config: bindingUpdate.binding.config,
       cwd: role.workspace
     };
   }
@@ -2319,12 +2309,6 @@ function updateTaskRole(
   if (parsed.has("--agent") && (parsed.one("--agent")?.trim().length ?? 0) === 0) {
     throw usageError("--agent is required.", usage);
   }
-  if (parsed.has("--agent") && parsed.has("--profile") && !hasAgentConfigOptions(parsed)) {
-    throw usageError(
-      "--agent requires at least one Agent setting when --profile is also provided.",
-      usage
-    );
-  }
   if ([...parsed.seen].every((option) => option === "--agent")) {
     throw usageError("At least one role update option is required.", usage);
   }
@@ -2347,36 +2331,28 @@ function updateTaskRole(
     const agentProfile = profileId === undefined
       ? undefined
       : requireAgentProfile(tx, profileId);
+    const bindingUpdate = resolveTaskRoleAgentBindingUpdate(
+      parsed,
+      role,
+      agentProfile,
+      tx
+    );
     const withProfileBehavior = agentProfile === undefined
       ? role
       : applyWorkerAgentProfileBehavior(role, agentProfile, now);
-    let withProfile = withProfileBehavior;
-    let changedBindingAgentId: string | undefined;
-    if (agentProfile !== undefined && !changesAgentConfig) {
-      const runtime = resolvedAgentProfileRuntime(agentProfile, tx);
-      withProfile = updateRole(withProfileBehavior, {
+    const withBinding = bindingUpdate === undefined
+      ? withProfileBehavior
+      : updateRole(withProfileBehavior, {
         agentBindings: {
           ...withProfileBehavior.agentBindings,
-          [runtime.binding.agentId]: runtime.binding
+          [bindingUpdate.agentId]: bindingUpdate.binding
         }
       }, now);
-      changedBindingAgentId = runtime.binding.agentId;
-    }
-    let bindings = withProfile.agentBindings;
-    if (changesAgentConfig) {
-      const agentId = parsed.one("--agent")?.trim() || withProfile.activeAgentId;
-      const agent = requireAgent(tx, agentId);
-      const binding = bindings[agentId]
-        ?? createRoleAgentBinding({ id: agent.id, adapterId: agent.adapterId });
-      bindings = { ...bindings, [agentId]: patchRoleAgentBinding(binding, parsed) };
-      changedBindingAgentId = agentId;
-    }
-    const next = updateRole(withProfile, {
-      ...(bindings === withProfile.agentBindings ? {} : { agentBindings: bindings }),
+    const next = updateRole(withBinding, {
       ...roleProfilePatch(parsed)
     }, now);
-    if (changedBindingAgentId !== undefined) {
-      validateTaskRoleAgentBinding(next, changedBindingAgentId, options);
+    if (bindingUpdate !== undefined) {
+      validateTaskRoleAgentBinding(next, bindingUpdate.agentId, options);
     }
     if (changesLaunchContext) {
       validateConfiguredRoleSkills(options.yuiHome, next.skills ?? []);
@@ -7363,6 +7339,47 @@ function resolvedAgentProfileRuntime(
   } catch (error) {
     throw usageError(error instanceof Error ? error.message : String(error));
   }
+}
+
+type TaskRoleAgentBindingUpdate = Readonly<{
+  agentId: string;
+  binding: RoleAgentBinding;
+}>;
+
+function resolveTaskRoleAgentBindingUpdate(
+  parsed: ParsedRoleOptions,
+  role: Role,
+  profile: AgentProfile | undefined,
+  store: TaskWorkflowStore
+): TaskRoleAgentBindingUpdate | undefined {
+  const changesAgentConfig = hasAgentConfigOptions(parsed);
+  const explicitAgentId = parsed.one("--agent")?.trim();
+  const targetAgentId = explicitAgentId || role.activeAgentId;
+
+  let binding: RoleAgentBinding;
+  if (profile !== undefined) {
+    const profileRuntime = resolvedAgentProfileRuntime(profile, store);
+    if (profileRuntime.binding.agentId !== targetAgentId) {
+      const target = explicitAgentId === undefined
+        ? `active Agent ${role.activeAgentId}`
+        : `--agent ${explicitAgentId}`;
+      throw usageError(
+        `Agent Profile ${profile.id} resolves to Agent ${profileRuntime.binding.agentId}, `
+        + `but Task Role update targets ${target}. Use --agent ${profileRuntime.binding.agentId} `
+        + "to update that binding, or task role bind to activate it."
+      );
+    }
+    binding = profileRuntime.binding;
+  } else {
+    if (!changesAgentConfig) return undefined;
+    const agent = requireAgent(store, targetAgentId);
+    binding = role.agentBindings[targetAgentId]
+      ?? createRoleAgentBinding({ id: agent.id, adapterId: agent.adapterId });
+  }
+  if (changesAgentConfig) {
+    binding = patchRoleAgentBinding(binding, parsed);
+  }
+  return { agentId: targetAgentId, binding };
 }
 
 function workerProfileRolePatch(profile: AgentProfile) {

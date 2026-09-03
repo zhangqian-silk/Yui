@@ -355,8 +355,10 @@ Task Role 在创建时同时不传 `--profile` 和 `--agent`，会复制全局 W
 effort、权限和其他 Agent 设置必须与 `--agent` 同时提供，以便在任何持久化前
 完成能力校验并原子写入一套完整 binding。更新 Task Role 时，不传 `--agent`
 会更新 active binding；传入 `--agent` 则只更新指定 binding 而不激活它，只有
-`task role bind` 会切换 active Agent。创建回执与 `task context` 分别记录
-Profile intent、精确可写 Project 与实际 permission strategy。
+`task role bind` 会切换 active Agent。更新时如果传入 `--profile`，该 Profile
+解析出的 Agent 必须与更新目标一致；Profile runtime 作为基础 binding，显式
+Agent 设置覆盖对应字段。创建回执与 `task context` 分别记录 Profile intent、
+精确可写 Project 与实际 permission strategy。
 
 ReviewRound 从冻结 Candidate SHA 创建独立的可写 worktree。只有 exact
 ReviewRound owner、reviewRoundId、冻结 base 与 workspace 全部匹配时，才获得

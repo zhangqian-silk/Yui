@@ -152,9 +152,11 @@ do not rewrite existing Task Roles. On `task role add`, model, effort, and
 other Agent settings require `--agent` so Yui can validate and persist one
 complete explicit binding atomically. On `task role update`, omitted `--agent`
 updates the active binding, while a provided `--agent` updates that binding
-without activating it; only `task role bind` switches the active Agent. This
-Yui Agent Profile is separate from a Codex native config profile also named
-`--profile`.
+without activating it; only `task role bind` switches the active Agent. When
+`--profile` is present, its resolved Agent must match that update target. The
+Profile runtime is the base binding, and explicit Agent settings override its
+corresponding fields. This Yui Agent Profile is separate from a Codex native
+config profile also named `--profile`.
 
 ## Quick start
 
