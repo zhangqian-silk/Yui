@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -45,6 +46,8 @@ import { builtinAgentDriverRegistry } from "../../dist/runtime/builtinAgentDrive
 import { serializeAgentErrorRaw, standardAgentError } from "../../dist/runtime/agentError.js";
 import { runtimeLifecycleTarget } from "../../dist/runtime/lifecycleReservation.js";
 import { createExactControlPlaneDescriptor } from "../../dist/runtime/exactControlPlane.js";
+import { resolveManagedTaskCaller } from "../../dist/runtime/managedCaller.js";
+import { taskLeaderActionTurnId } from "../../dist/commands/taskActor.js";
 import { startStructuredProviderSession } from "../../dist/runtime/structuredProviderHost.js";
 import {
   acceptProviderTurn,
@@ -2614,4 +2617,73 @@ test("Claude global Stop hooks publish the native completion boundary", async (t
   assert.equal(event.adapterId, "claude");
   assert.equal(event.summary, "Done.");
   assert.deepEqual(signal, { key: "global-role:operator" });
+});
+
+test("managed Session authority follows durable state, not a frozen environment", (t) => {
+  const home = mkdtempSync(join(tmpdir(), "yui-managed-caller-smoke-"));
+  t.after(() => rmSync(home, { recursive: true, force: true }));
+  ensureStorageSchema(home);
+  const store = new SqliteTaskStore(home);
+  t.after(() => store.close());
+  const now = new Date("2026-09-03T00:00:00.000Z");
+  const workspace = join(home, "main");
+  const task = activateTask(createTask("task-1", "Outlive a control-plane change", now), now);
+  store.saveTask(task);
+  const binding = createRoleAgentBinding({ id: "codex", adapterId: "codex" });
+  const role = createRole(task.id, "leader", [binding], binding.agentId, workspace, now);
+  store.saveRole(task.id, role);
+  const callerKey = "a".repeat(64);
+  store.setJobCallerKeyHash(
+    task.id,
+    role.name,
+    binding.agentId,
+    createHash("sha256").update(callerKey).digest("hex")
+  );
+
+  // A native pane's environment is frozen at launch. It names only the
+  // process's own immutable identity: no Turn, no launch generation, and no
+  // descriptor path that a Yui upgrade or workspace move could invalidate.
+  const environment = {
+    YUI_SESSION_SCOPE: "task",
+    YUI_HOME: home,
+    YUI_TASK_ID: task.id,
+    YUI_ROLE: role.name,
+    YUI_WORKSPACE: workspace,
+    YUI_JOB_CALLER_KEY: callerKey
+  };
+
+  const betweenTurns = resolveManagedTaskCaller(store, environment);
+  assert.equal(betweenTurns.agentId, "codex");
+  assert.equal(betweenTurns.adapterId, "codex");
+  assert.equal(betweenTurns.currentTurnId, undefined);
+
+  store.saveActiveTurn(createTurn(
+    "turn-7",
+    task.id,
+    role.name,
+    "new",
+    turnInput("turn-7", task.id, role.name, "Do the work."),
+    now,
+    { effective: resolveEffectiveLaunch({ role, purpose: "execution" }) }
+  ));
+
+  // The same unchanged environment now reports the current Turn, so a Turn
+  // advance can never strand a live Session.
+  assert.equal(resolveManagedTaskCaller(store, environment).currentTurnId, "turn-7");
+  assert.equal(taskLeaderActionTurnId(store, task.id, environment), "turn-7");
+
+  // Replacing the native Session rotates the durable caller key. The
+  // superseded process loses authority with a bounded diagnosis instead of
+  // silently acting as the current runtime.
+  store.setJobCallerKeyHash(
+    task.id,
+    role.name,
+    binding.agentId,
+    createHash("sha256").update("b".repeat(64)).digest("hex")
+  );
+  assert.throws(
+    () => resolveManagedTaskCaller(store, environment),
+    /no longer the current runtime of task-1\/leader/u
+  );
+  assert.equal(taskLeaderActionTurnId(store, task.id, environment), undefined);
 });

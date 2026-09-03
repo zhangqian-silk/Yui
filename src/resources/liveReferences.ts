@@ -12,7 +12,6 @@ import { existsSync, readFileSync, readdirSync, readlinkSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { promisify } from "node:util";
 
-import { parseExactTaskRuntimeDescriptor } from "../runtime/exactControlPlane.js";
 import {
   readRuntimeIdentity,
   releasesDirectory,
@@ -151,20 +150,18 @@ export async function scanLiveReferences(
   }
   if (discovery.diagnostic !== undefined) diagnostics.push(discovery.diagnostic);
 
-  // 4. Runtime identity and exact Task descriptors are durable live-ownership
-  //    claims. Resolved runtime paths and descriptor workspaces stay protected
-  //    while their owning process identity is alive.
+  // 4. Runtime identity is a durable live-ownership claim. Resolved runtime
+  //    paths stay protected while their owning process identity is alive.
+  //    Managed workspaces are claimed from their durable records below, which
+  //    is the same authority the Controller schedules from.
   const runtimeClaims = readRuntimeIdentityClaims(home);
   diagnostics.push(...runtimeClaims.diagnostics);
-  const descriptorClaims = readExactTaskRuntimeClaims(home);
-  diagnostics.push(...descriptorClaims.diagnostics);
   const activeReleaseClaims = readActiveReleaseClaims(home);
   diagnostics.push(...activeReleaseClaims.diagnostics);
   const sessionOwnerClaims = readSessionOwnerClaims(home);
   diagnostics.push(...sessionOwnerClaims.diagnostics);
   for (const claim of [
     ...runtimeClaims.claims,
-    ...descriptorClaims.claims,
     ...activeReleaseClaims.claims,
     ...sessionOwnerClaims.claims
   ]) {
@@ -263,51 +260,6 @@ function readRuntimeIdentityClaims(home: string): ClaimReadResult {
       }])
     });
   }
-}
-
-function readExactTaskRuntimeClaims(home: string): ClaimReadResult {
-  const directory = join(home, "runtime", "exact-task-runtime");
-  let entries: readonly import("node:fs").Dirent[];
-  try {
-    entries = readdirSync(directory, { withFileTypes: true });
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
-      return Object.freeze({ claims: Object.freeze([]), diagnostics: Object.freeze([]) });
-    }
-    return Object.freeze({
-      claims: Object.freeze([]),
-      diagnostics: Object.freeze([{
-        source: "controller" as const,
-        severity: "error" as const,
-        message: `exact Task runtime descriptors are unreadable: ${error instanceof Error ? error.message : "unknown error"}`
-      }])
-    });
-  }
-
-  const claims: PathClaim[] = [];
-  const diagnostics: LiveReferenceDiagnostic[] = [];
-  for (const entry of entries) {
-    if (!entry.isFile() || !entry.name.endsWith(".json")) continue;
-    const path = join(directory, entry.name);
-    try {
-      const descriptor = parseExactTaskRuntimeDescriptor(readFileSync(path, "utf8"));
-      claims.push({ path, token: `exact-task-runtime:${descriptor.taskId}` });
-      claims.push({
-        path: resolve(descriptor.workspace),
-        token: `exact-task-runtime:workspace:${descriptor.taskId}`
-      });
-    } catch (error) {
-      diagnostics.push({
-        source: "controller" as const,
-        severity: "error" as const,
-        message: `exact Task runtime descriptor is unreadable at ${path}: ${error instanceof Error ? error.message : "unknown error"}`
-      });
-    }
-  }
-  return Object.freeze({
-    claims: Object.freeze(claims),
-    diagnostics: Object.freeze(diagnostics)
-  });
 }
 
 function readActiveReleaseClaims(home: string): ClaimReadResult {

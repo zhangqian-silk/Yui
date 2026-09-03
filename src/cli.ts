@@ -212,11 +212,8 @@ import { YUI_VERSION, yuiVersionIdentity } from "./version.js";
 import { SqliteSchemaMigrationError } from "./storage/sqliteSchema.js";
 import {
   YUI_CONTROL_PLANE_DESCRIPTOR,
-  YUI_TASK_RUNTIME_DESCRIPTOR,
   assertCompatibleControlPlanePreflight,
   assertExactControlPlanePreflight,
-  assertExactTaskRuntimeEnvironment,
-  assertExactTaskRuntimeState,
   exactControlPlaneDigest,
   extractExactControlArgument,
   createExactControlPlaneDescriptor,
@@ -224,10 +221,13 @@ import {
   type ExactControlPlaneDescriptor
 } from "./runtime/exactControlPlane.js";
 import {
+  requireManagedTaskCaller,
+  type ManagedTaskCaller
+} from "./runtime/managedCaller.js";
+import {
   readSessionBootstrapManifest,
   refreshManagedSessionCliWrappers
 } from "./context/sessionBootstrapManifest.js";
-import { builtinAgentDriverRegistry } from "./runtime/builtinAgentDrivers.js";
 import {
   createTaskFinalReviewContract,
   extractTaskFinalReviewRequest,
@@ -288,8 +288,7 @@ export async function main(): Promise<void> {
   const routedForFence = args.length === 0 ? undefined : routeInvocation(args);
   const managedInvocation = process.env.YUI_SESSION_SCOPE === "task"
     || process.env.YUI_SESSION_SCOPE === "global"
-    || process.env[YUI_CONTROL_PLANE_DESCRIPTOR] !== undefined
-    || process.env[YUI_TASK_RUNTIME_DESCRIPTOR] !== undefined;
+    || process.env[YUI_CONTROL_PLANE_DESCRIPTOR] !== undefined;
   const homeFreeInvocation = args.length === 0
     || (args[0] === "version" && args.length === 1)
     || routedForFence?.kind === "help"
@@ -2087,11 +2086,10 @@ async function preflightManagedTaskControlPlane(): Promise<ManagedTaskControlPla
     throw new Error(taskFinalReviewInvocation.error);
   }
   const serializedControl = process.env[YUI_CONTROL_PLANE_DESCRIPTOR];
-  const serializedRuntime = process.env[YUI_TASK_RUNTIME_DESCRIPTOR];
-  const exactAgentRuntime = serializedControl !== undefined || serializedRuntime !== undefined;
+  const exactAgentRuntime = serializedControl !== undefined;
   if (process.env.YUI_SESSION_SCOPE === "task" && !exactAgentRuntime) {
     throw new Error(
-      "Exact control-plane invocation requires both frozen descriptors in a managed Task runtime."
+      "Exact control-plane invocation requires its frozen descriptor in a managed Task runtime."
     );
   }
   if (!exactAgentRuntime) {
@@ -2109,7 +2107,7 @@ async function preflightManagedTaskControlPlane(): Promise<ManagedTaskControlPla
   if (process.env.YUI_SESSION_SCOPE !== "task") {
     throw new Error("Exact Task control-plane invocation requires a managed Task runtime.");
   }
-  if (serializedControl === undefined || serializedRuntime === undefined) {
+  if (serializedControl === undefined) {
     throw new Error("Exact control-plane invocation is required for this managed Task runtime.");
   }
   const control = parseExactControlPlaneDescriptor(serializedControl);
@@ -2147,25 +2145,16 @@ async function preflightManagedTaskControlPlane(): Promise<ManagedTaskControlPla
     commandControl = control;
     digest = frozenDigest;
   }
-  const runtime = assertExactTaskRuntimeEnvironment(
-    serializedRuntime,
-    process.env,
-    frozenDigest,
-    control.yuiHome
-  );
-  const runtimeDriverCallback = args[0] === "internal"
-    && args[1] === "runtime-hook"
-    && process.env.YUI_DRIVER_ID !== undefined
-    ? builtinAgentDriverRegistry().require(process.env.YUI_DRIVER_ID)
-    : undefined;
   const verifiedStore = openCurrentTaskStore(control.yuiHome);
-  // Runtime Hooks have their own event-aware fence, including the valid case
-  // where a Provider terminal arrives after its Yui Turn has completed and a
-  // later wake is pending. Ordinary managed commands still require the exact
-  // current mutable runtime before routing.
-  if (runtimeDriverCallback === undefined) {
-    assertExactTaskRuntimeState(runtime, verifiedStore);
-  }
+  // One authority for "may this process act as this Task Role?". Yui's own
+  // internal callbacks run in the Host process and authenticate through the
+  // exact control-plane digest verified above; an Agent command proves it is
+  // the Role's current runtime with its per-Session caller key. Nothing here
+  // gates on the current Turn: which Turn is active is durable state that the
+  // command needing it reads, never a fact frozen into a process environment.
+  const runtime: ManagedTaskCaller | undefined = internalCallback
+    ? undefined
+    : requireManagedTaskCaller(verifiedStore, process.env);
   const request = taskFinalReviewInvocation.request;
   if (request === undefined) {
     return {
@@ -2174,7 +2163,7 @@ async function preflightManagedTaskControlPlane(): Promise<ManagedTaskControlPla
       verifiedStore
     };
   }
-  if (runtime.roleName !== "leader") {
+  if (runtime === undefined || runtime.roleName !== "leader") {
     throw new Error("Only the exact Task Leader invocation may establish a final-review contract.");
   }
   if (request.taskId !== runtime.taskId) {
