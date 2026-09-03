@@ -489,10 +489,14 @@ yui task publication upsert <task-id> --project <project> \
 ```
 
 必需的 provider/repository/external ID 会定位当前 Publication。首次 upsert
-创建记录；后续 upsert 继承未指定的可选字段，只有语义发生变化时才追加新的不可变记录，
-并由 Yui 自动关联上一版本；相同输入不会新增事件。`list`、`show` 和 `task context`
-继续保留完整历史。该命令只记录调用方已经掌握的事实，不会自行查询 Provider，也不替代
-Review、Integration 或 Task completion 门禁。
+创建记录。后续 upsert 会继承未指定的元数据；只有 local commit 和 PR/MR state
+都未改变时，才继承未指定的合入证据。仅改变 local commit 会默认把 Publication
+重置为 `open`、`reported`；local commit 或 state 任一改变时，未重新提供的
+remote commit、evidence、mergedAt 与验证结果都会失效，避免旧 head 或旧状态的
+事实继续被当作当前证据。只有语义发生变化时才追加新的不可变记录，并由 Yui 自动关联
+上一版本；相同输入不会新增事件。`list`、`show` 和 `task context` 继续保留完整历史。
+该命令只记录调用方已经掌握的事实，不会自行查询 Provider，也不替代 Review、
+Integration 或 Task completion 门禁。
 
 可针对当前 GitHub Publication 查询真实 PR 状态并记录验证结果：
 

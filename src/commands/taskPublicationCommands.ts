@@ -27,12 +27,13 @@ import type {
 const PROVIDERS = new Set(["github", "gitlab"]);
 const EXTERNAL_KINDS = new Set(["pull-request", "merge-request"]);
 const STATES = new Set(["open", "merged", "closed"]);
-const INHERITED_OPTIONAL_FIELDS = [
+const INHERITED_METADATA_FIELDS = [
   "externalUrl",
   "title",
   "sourceBranch",
-  "targetBranch",
-  "localCommit",
+  "targetBranch"
+] as const satisfies readonly (keyof PublicationReferenceInput)[];
+const INHERITED_EVIDENCE_FIELDS = [
   "remoteCommit",
   "evidence",
   "mergedAt"
@@ -328,20 +329,39 @@ function inheritPublicationInput(
   existing: PublicationReference,
   input: PublicationReferenceInput
 ): PublicationReferenceInput {
+  const localCommitChanged = input.localCommit !== undefined
+    && normalizeCommitForComparison(input.localCommit) !== existing.localCommit;
+  const stateChanged = input.state !== undefined && input.state !== existing.state;
+  const evidenceContextChanged = localCommitChanged || stateChanged;
   const inherited: PublicationReferenceInput = {
     projectId: input.projectId,
     provider: input.provider,
     repository: input.repository,
     externalKind: input.externalKind,
     externalId: input.externalId,
-    state: input.state ?? existing.state,
-    verification: input.verification ?? existing.verification
+    state: input.state ?? (localCommitChanged ? "open" : existing.state),
+    verification: input.verification ?? (
+      evidenceContextChanged ? "reported" : existing.verification
+    ),
+    ...(input.localCommit === undefined
+      ? (existing.localCommit === undefined ? {} : { localCommit: existing.localCommit })
+      : { localCommit: input.localCommit })
   };
-  for (const field of INHERITED_OPTIONAL_FIELDS) {
+  for (const field of INHERITED_METADATA_FIELDS) {
     const value = input[field] ?? existing[field];
     if (value !== undefined) Object.assign(inherited, { [field]: value });
   }
+  for (const field of INHERITED_EVIDENCE_FIELDS) {
+    const value = input[field] ?? (
+      evidenceContextChanged ? undefined : existing[field]
+    );
+    if (value !== undefined) Object.assign(inherited, { [field]: value });
+  }
   return inherited;
+}
+
+function normalizeCommitForComparison(value: string): string {
+  return value.trim().toLowerCase();
 }
 
 function publicationSemantics(reference: PublicationReference) {

@@ -337,10 +337,14 @@ stage. The verifier uses local `gh` authentication to query the real PR,
 requires its head to equal the Task delivery head, and appends an immutable
 verified superseding record. Do not query merely to refresh state when the
 current authorization does not cover that real external resource. Omitted
-optional fields inherit the current record, so send only the confirmed delta.
-After successful synchronization and verification, briefly tell the user which
-Task and PR state changed. If either command fails, say that Yui is not
-verified and report the error; never claim the evidence was recorded. A
+metadata inherits the current record. Omitted verification and merge evidence
+inherit only while the local commit and state are unchanged. Changing only
+the local commit resets the Publication to `open` and `reported`; changing
+either the local commit or state clears omitted remote commit, evidence, and
+`mergedAt`, so include any newly confirmed replacement evidence in that
+upsert. After successful synchronization and verification, briefly tell the
+user which Task and PR state changed. If either command fails, say that Yui is
+not verified and report the error; never claim the evidence was recorded. A
 Publication records external delivery state and never replaces Candidate,
 Review, Integration, or Task completion gates.
 

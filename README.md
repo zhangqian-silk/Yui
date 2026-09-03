@@ -689,10 +689,14 @@ yui task publication upsert <task-id> --project <project> \
 ```
 
 The required provider/repository/external ID selects the current Publication.
-The first upsert creates it; later upserts inherit omitted optional fields and
-append a new immutable record only when the semantics change. Yui links that
-record to the previous version automatically, while identical input creates no
-event. `list`, `show`, and `task context` retain the complete history. This
+The first upsert creates it. Later upserts inherit omitted metadata and, while
+the local commit and PR/MR state remain unchanged, omitted merge evidence.
+Changing the local commit without an explicit state resets the Publication to
+`open` and `reported`; changing either the local commit or state clears omitted
+remote commit, evidence, merge time, and verification so facts from an earlier
+head or state cannot remain current. Each semantic change appends a new
+immutable record linked to the previous version, while identical input creates
+no event. `list`, `show`, and `task context` retain the complete history. This
 records facts already known to the caller; it does not query a provider or
 replace Review, Integration, or Task completion gates.
 

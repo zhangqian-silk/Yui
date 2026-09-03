@@ -176,10 +176,14 @@ yui task publication upsert <task> --project <project> \
 ```
 
 Write only the repository identity, URL, state, and commit or merge evidence
-already available to you; omitted optional fields inherit the current record.
-For a reported merge, include the exact local commit, remote commit,
-`mergedAt`, and evidence when available. When you execute an authorized GitHub
-PR merge yourself, immediately upsert that merge result and run
+already available to you. Omitted metadata inherits the current record.
+Omitted verification and merge evidence inherit only while the local commit
+and state are unchanged. Changing only the local commit resets the Publication
+to `open` and `reported`; changing either the local commit or state clears
+omitted remote commit, evidence, and `mergedAt`. For a reported merge, include
+the exact local commit, remote commit, `mergedAt`, and evidence when available.
+When you execute an authorized GitHub PR merge yourself, immediately upsert
+that merge result and run
 `yui task publication verify <task>/<publication>` before ending the same work
 stage. The verifier queries the exact GitHub PR through local `gh`, checks its
 head against the Task delivery head, and appends the verified superseding
