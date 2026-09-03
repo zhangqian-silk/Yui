@@ -15,6 +15,7 @@ import {
 } from "../worktree/managedWorkspace.js";
 import {
   assertExecutionGroupTransition,
+  retryFailedExecutionLanes,
   validateExecutionGroup,
   validateReviewExecutionAssignment,
   type ReviewExecutionGroup
@@ -338,7 +339,8 @@ export function finishReviewRound(
  */
 export function retryReviewRound(
   round: ReviewRound,
-  requestedBy: TaskCompletedBy
+  requestedBy: TaskCompletedBy,
+  now: Date
 ): ReviewRound {
   validateReviewRound(round);
   if (round.status !== "failed") {
@@ -382,9 +384,12 @@ export function retryReviewRound(
             deletedLines: round.deltaRecheck.deletedLines
           })
         }),
-    // A replicated retry preserves the exact settled successful producer set.
-    // Only the main Reviewer Turn is retried; successful Lanes never rerun.
-    ...(round.executionGroup === undefined ? {} : { executionGroup: round.executionGroup }),
+    // A replicated retry preserves settled successful Producers and reopens
+    // only failed Lanes. If every Producer succeeded, only the main Reviewer
+    // Turn is retried.
+    ...(round.executionGroup === undefined
+      ? {}
+      : { executionGroup: retryFailedExecutionLanes(round.executionGroup, now) }),
     ...(round.legacyExecutionGroup === undefined
       ? {}
       : { legacyExecutionGroup: round.legacyExecutionGroup }),
@@ -398,12 +403,13 @@ export function retryReviewRound(
 /** Task-final compatibility wrapper for callers that require that scope. */
 export function retryTaskReviewRound(
   round: ReviewRound,
-  requestedBy: TaskCompletedBy
+  requestedBy: TaskCompletedBy,
+  now: Date
 ): ReviewRound {
   if ((round.scope ?? "work-item") !== "task") {
     throw new Error(`Only a Task-final ReviewRound can be retried in place: ${round.id}.`);
   }
-  return retryReviewRound(round, requestedBy);
+  return retryReviewRound(round, requestedBy, now);
 }
 
 /** A failed producer attempt leaves its logical Lane open for another Turn. */

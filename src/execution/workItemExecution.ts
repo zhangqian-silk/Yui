@@ -304,6 +304,37 @@ export function updateWorkItemExecutionLane(
   );
 }
 
+/**
+ * Reopen only failed Lanes for an explicit retry of the same semantic
+ * execution. Successful results remain settled, while each failed Lane
+ * returns to the same state produced by a naturally failed Turn: open and
+ * still pointing at the failed attempt that dispatch must replace.
+ *
+ * This is the sole terminal-to-open Lane transition. Normal Lane updates keep
+ * terminal records immutable.
+ */
+export function retryFailedExecutionLanes<Assignment extends ExecutionAssignment>(
+  group: ExecutionGroup<Assignment>,
+  now: Date
+): ExecutionGroup<Assignment> {
+  validateExecutionGroup(group);
+  if (!group.lanes.some(({ disposition }) => disposition === "failed")) return group;
+  const timestamp = now.toISOString();
+  return validateExecutionGroup({
+    ...group,
+    lanes: group.lanes.map((lane) => {
+      if (lane.disposition !== "failed") return lane;
+      const { endedAt: _endedAt, ...retryable } = lane;
+      return {
+        ...retryable,
+        disposition: "open" as const,
+        updatedAt: timestamp
+      };
+    }),
+    updatedAt: timestamp
+  }) as ExecutionGroup<Assignment>;
+}
+
 export function validateWorkItemExecutionAssignment(
   assignment: WorkItemExecutionAssignment
 ): WorkItemExecutionAssignment {

@@ -149,6 +149,7 @@ function failedRoundSemanticEvidence(
     ).find((run) => (
       run.purpose === "review"
       && run.reviewRoundId === round.id
+      && run.executionLaneId === undefined
       && (run.status === "completed"
         || runtimeFailureSummaryHasReviewerOutput(run.result?.output ?? ""))
     ));

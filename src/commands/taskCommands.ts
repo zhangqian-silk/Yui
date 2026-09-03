@@ -4713,7 +4713,7 @@ function retryFailedTaskReviewRound(
     // Issue 06: infra retry resets the same semantic Round to pending instead
     // of manufacturing a new Round, so Round count and finding identity stay
     // stable across execution-attempt failures.
-    const resetRound = retryTaskReviewRound(round, requestedBy);
+    const resetRound = retryTaskReviewRound(round, requestedBy, now);
     tx.saveReviewRound(task.id, resetRound);
     recordTaskEvent(tx, task.id, "review.task-final-retried", {
       reviewRoundId: round.id
@@ -6456,7 +6456,7 @@ function retryFailedReviewRun(
     // Issue 06: infra retry resets the same semantic Round to pending instead
     // of manufacturing a new Round, so Round count and finding identity stay
     // stable across execution-attempt failures.
-    const resetRound = retryReviewRound(roundToReset, requestedBy);
+    const resetRound = retryReviewRound(roundToReset, requestedBy, now);
     tx.saveReviewRound(task.id, resetRound);
     recordTaskEvent(tx, task.id, "turn.review-retried", {
       turnId: run.id,
