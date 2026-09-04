@@ -18,7 +18,6 @@ import {
   markIntegrationQueueRequeued,
   markIntegrationQueueRunning,
   markIntegrationQueueSuperseded,
-  markIntegrationQueueValidated,
   recordIntegrationQueueAffectedPaths,
   recordIntegrationQueueAttempt,
   type IntegrationQueueEntry
@@ -27,7 +26,6 @@ import {
   GitIntegrationService,
   type IntegrationResult
 } from "./gitIntegrationService.js";
-import { gateArtifactCoversCheckCommands } from "../verification/verificationGateService.js";
 import type { ChangeSet } from "./changeSet.js";
 import type { WorkItemCandidate } from "../workItem/workItem.js";
 import type { TaskCompletedBy } from "../task/task.js";
@@ -35,10 +33,9 @@ import type { TaskCompletedBy } from "../task/task.js";
 /**
  * The serialized integration queue.  Every item gets a fresh apply on the
  * current target; a conflict or gate failure blocks only that item.  After
- * each target advance the remaining items recompute their overlap, and an
- * item whose own paths became affected loses any evidence coverage.  Path
- * disjointness never rebinds evidence to a new target: a gate may read any
- * file, so each item runs its checks against the exact target it integrates.
+ * each target advance the remaining items recompute their overlap for
+ * diagnostics. Every item runs its checks against the exact target it
+ * integrates; Agent reports and ChangeSets never waive a Core gate.
  */
 
 export type IntegrationQueueGitPort = GitWorkspacePort & {
@@ -53,11 +50,6 @@ export type IntegrationQueueGitPort = GitWorkspacePort & {
     rightCommit: string;
     paths: readonly string[];
   }>) => Promise<boolean>;
-  changedFilesBetween?: (input: Readonly<{
-    repositoryPath: string;
-    fromCommit: string;
-    toCommit: string;
-  }>) => Promise<readonly string[]>;
 };
 
 export type EnqueueIntegrationQueueOutcome =
@@ -412,25 +404,14 @@ export async function enqueueIntegrationQueueEntry(
       }
     }
     if (equivalent === null || requestedChecks.length > 0) {
-      let entry = createIntegrationQueueEntry({
+      const entry = createIntegrationQueueEntry({
         id,
         taskId: task.id,
         projectId: input.projectId,
         changeSetId: input.changeSetId,
         targetRef: canonicalTargetRef,
-        checkCommands: requestedChecks,
-        evidenceRefs: changeSet.manifest.evidenceRefs
+        checkCommands: requestedChecks
       }, now());
-      // Durable positive exact-SHA evidence on an unchanged target, at the lane
-      // head, validates the entry so processing skips its checks.  The process-
-      // path evidence fence still invalidates the binding if the target moves
-      // before this entry runs, so a non-empty advance never rebinds old
-      // evidence.  A converged ChangeSet with explicit gates queues normally:
-      // the no-op apply still runs the caller's checks against the current
-      // target instead of waiving them.
-      if (await canReuseEvidenceAtHead(tx, task.id, tx.listIntegrationQueueEntries(task.id), entry, changeSet, effectiveTargetHead)) {
-        entry = markIntegrationQueueValidated(entry, now(), effectiveTargetHead);
-      }
       tx.saveIntegrationQueueEntry(task.id, entry);
       return { entry, outcome: "queued" as const };
     }
@@ -501,8 +482,7 @@ export async function enqueueIntegrationQueueEntry(
         projectId: input.projectId,
         changeSetId: input.changeSetId,
         targetRef: canonicalTargetRef,
-        checkCommands: requestedChecks,
-        evidenceRefs: changeSet.manifest.evidenceRefs
+        checkCommands: requestedChecks
       }, now());
       tx.saveIntegrationQueueEntry(task.id, queuedEntry);
       return { entry: queuedEntry, outcome: "queued" as const };
@@ -525,74 +505,6 @@ function findActiveQueueDuplicate(
       && entry.status !== "superseded");
 }
 
-/**
- * Whether a freshly queued entry may start `validated` (skipping its checks):
- * its ChangeSet carries durable positive exact-SHA evidence, the target is
- * unchanged since the ChangeSet was based (so integrating fast-forwards to
- * the reviewed head), no earlier lane entry will advance the target first,
- * and the evidence covers every requested check command.  Entries behind a
- * lane mate stay `queued`: the mate's commit moves the target, so the
- * evidence would not cover their integration anyway.  A review check that
- * passed for command X never waives a different gate Y.
- */
-async function canReuseEvidenceAtHead(
-  store: TaskStore,
-  taskId: string,
-  entries: readonly IntegrationQueueEntry[],
-  entry: IntegrationQueueEntry,
-  changeSet: ChangeSet,
-  targetHead: string
-): Promise<boolean> {
-  if (entry.evidenceRefs.length === 0) return false;
-  if (targetHead !== changeSet.baseCommit) return false;
-  const lane = queueLaneKey(entry);
-  if (entries.some((existing) => queueLaneKey(existing) === lane
-    && existing.status !== "committed"
-    && existing.status !== "superseded")) return false;
-  return evidenceCoversCheckCommands(
-    store,
-    taskId,
-    entry.evidenceRefs,
-    entry.checkCommands,
-    changeSet.headCommit,
-    entry.projectId
-  );
-}
-
-/**
- * Resolve reusable Core-owned gate artifacts. Agent-authored review text is
- * never interpreted as check evidence and therefore cannot waive a gate.
- */
-async function evidenceCoversCheckCommands(
-  store: TaskStore,
-  taskId: string,
-  evidenceRefs: readonly string[],
-  checkCommands: readonly string[],
-  candidateCommit: string,
-  projectId: string
-): Promise<boolean> {
-  if (checkCommands.length === 0) return true;
-  const covered = new Set<string>();
-  for (const ref of evidenceRefs) {
-    // Issue 08: a `gate-artifact:` ref covers the exact commands its L2
-    // artifact passed on the exact candidate commit. The store resolves the
-    // artifact through its persistence backend (SQLite or file).
-    if (ref.startsWith("gate-artifact:")) {
-      if (await gateArtifactCoversCheckCommands(
-        store,
-        projectId,
-        ref,
-        checkCommands,
-        candidateCommit
-      )) {
-        for (const command of checkCommands) covered.add(command);
-      }
-      continue;
-    }
-  }
-  return checkCommands.every((cmd) => covered.has(cmd));
-}
-
 export type ProcessIntegrationQueueOptions = Readonly<{
   projectId?: string;
   limit?: number;
@@ -608,11 +520,10 @@ export type ProcessIntegrationQueueItem = Readonly<{
 }>;
 
 /**
- * Process queued items in id order.  Each item gets a fresh IntegrationAttempt
+ * Process queued items in id order. Each item gets a fresh IntegrationAttempt
  * on the exact current target; conflicts and gate failures map the item to
  * `conflicted` without touching the others.  After every commit the remaining
- * items recompute overlap, and an item whose own paths became affected loses
- * its evidence coverage and runs its checks again.
+ * items recompute overlap diagnostics.
  *
  * A lane (one Project/targetRef pair) integrates one item at a time: while an
  * item is `running` — claimed by this or another processor — no other item of
@@ -655,23 +566,6 @@ export async function processIntegrationQueue(
       repositoryPath,
       exactBranchRef(candidate.targetRef)
     )).baseCommit;
-    // Evidence fence: a validated entry's reusable evidence only covers the
-    // exact target head it was validated against.  An out-of-band target
-    // advance (another Task) that touches the entry's paths, or whose impact
-    // cannot be proven, invalidates the evidence: requeue and run its checks.
-    if (candidate.status === "validated"
-      && await evidenceTargetAdvanced(
-        git, repositoryPath, candidate, targetBefore, store, task.id
-      )) {
-      store.transaction((tx) => {
-        assertTaskActive(tx, task.id);
-        const current = tx.getIntegrationQueueEntry(task.id, candidate.id);
-        if (current !== null && current.status === "validated") {
-          tx.saveIntegrationQueueEntry(task.id, markIntegrationQueueRequeued(current, now()));
-        }
-      });
-      continue;
-    }
     // CAS claim: re-read the entry inside the write transaction.  Another
     // store instance may have taken it since selection; if the status changed,
     // do not create an Attempt and re-select instead.  The running barrier is
@@ -679,8 +573,7 @@ export async function processIntegrationQueue(
     // between selection and claim serializes this entry behind it.
     const claimed = store.transaction((tx) => {
       const current = tx.getIntegrationQueueEntry(task.id, candidate.id);
-      if (current === null
-        || (current.status !== "queued" && current.status !== "validated")) {
+      if (current === null || current.status !== "queued") {
         return { skipped: true as const };
       }
       if (laneBlockedByRunningEntry(tx.listIntegrationQueueEntries(task.id), current)) {
@@ -727,7 +620,7 @@ export async function processIntegrationQueue(
           resultCommit: changeSet.headCommit,
           strategy: "cherry-pick"
         },
-        checkCommands: current.status === "validated" ? [] : current.checkCommands
+        checkCommands: current.checkCommands
       }, now());
       tx.saveIntegrationAttempt(task.id, attempt);
       const entry = recordIntegrationQueueAttempt(
@@ -802,7 +695,7 @@ function queueLaneKey(entry: IntegrationQueueEntry): string {
 }
 
 /**
- * The first entry a processor may claim: the earliest queued/validated entry
+ * The first entry a processor may claim: the earliest queued entry
  * whose lane has no running entry anywhere in it.  A running entry serializes
  * its whole lane — predecessors and successors alike — so a requeued
  * predecessor cannot slip past a successor that is already running.
@@ -820,7 +713,7 @@ function firstClaimableQueueEntry(
   }
   for (const entry of entries) {
     if (projectId !== undefined && entry.projectId !== projectId) continue;
-    if ((entry.status === "queued" || entry.status === "validated")
+    if (entry.status === "queued"
       && !blockedLanes.has(queueLaneKey(entry))) {
       return entry;
     }
@@ -842,52 +735,6 @@ function laneBlockedByRunningEntry(
   return entries.some((entry) => entry.id !== candidate.id
     && entry.status === "running"
     && queueLaneKey(entry) === lane);
-}
-
-/**
- * Whether a validated entry's reusable evidence no longer covers the current
- * target.  The evidence only proves the gate as of `entry.evidenceTargetHead`;
- * an out-of-band target advance (another Task) on the entry's own paths, or any
- * advance whose impact on the entry's gate cannot be proven, invalidates it.
- * Returns false (evidence still covers the target) only when proven unaffected.
- */
-async function evidenceTargetAdvanced(
-  git: IntegrationQueueGitPort,
-  repositoryPath: string,
-  entry: IntegrationQueueEntry,
-  currentTargetHead: string,
-  store: TaskStore,
-  taskId: string
-): Promise<boolean> {
-  const boundary = entry.evidenceTargetHead;
-  if (boundary === undefined) return true;
-  if (boundary === currentTargetHead) return false;
-  // The target advanced out of band since the evidence boundary.  Compute the
-  // real path delta and re-run the gate unless the entry is provably unaffected.
-  if (git.changedFilesBetween === undefined) return true;
-  let delta: readonly string[];
-  try {
-    delta = await git.changedFilesBetween({
-      repositoryPath,
-      fromCommit: boundary,
-      toCommit: currentTargetHead
-    });
-  } catch {
-    return true;
-  }
-  const changeSet = store.getChangeSet(taskId, entry.changeSetId);
-  if (changeSet === null) return true;
-  const ownPaths = new Set([
-    ...changeSet.changedPaths,
-    ...changeSet.manifest.deletedPaths
-  ]);
-  if (delta.some((path) => ownPaths.has(path))) return true;
-  // The delta does not touch the entry's own paths, but the entry's gate may
-  // read any file — including the exact target SHA the evidence is bound to.
-  // A changed target SHA invalidates exact-SHA evidence regardless of tree
-  // identity, so any entry with checks must re-run its gate.  An entry
-  // without checks has nothing to re-run and may commit directly.
-  return entry.checkCommands.length > 0;
 }
 
 /**
@@ -1114,7 +961,7 @@ async function recomputeAffectedPaths(
   for (const entry of store.listIntegrationQueueEntries(taskId)) {
     if (entry.projectId !== committed.projectId) continue;
     if (canonicalizeTargetRef(entry.targetRef) !== canonicalizeTargetRef(committed.targetRef)) continue;
-    if (entry.status !== "queued" && entry.status !== "validated") continue;
+    if (entry.status !== "queued") continue;
     const changeSet = store.getChangeSet(taskId, entry.changeSetId);
     if (changeSet === null) continue;
     // A committed entry whose targetAfter is already an ancestor of the
@@ -1131,20 +978,15 @@ async function recomputeAffectedPaths(
     store.transaction((tx) => {
       const current = tx.getIntegrationQueueEntry(taskId, entry.id);
       if (current === null) return;
-      if (current.status !== "queued" && current.status !== "validated") return;
-      let updated = recordIntegrationQueueAffectedPaths(current, affected, now());
-      if (updated.status === "validated" && (updated.affectedPaths?.length ?? 0) > 0) {
-        // The target advanced onto this entry's own paths: its evidence no
-        // longer covers the target, so the gate must run again.
-        updated = markIntegrationQueueRequeued(updated, now());
-      }
+      if (current.status !== "queued") return;
+      const updated = recordIntegrationQueueAffectedPaths(current, affected, now());
       // A queued entry keeps its place and runs its checks against the exact
       // current target at process time.  Disjoint changedPaths must never
       // rebind its evidence to the new target head: a gate may read any file,
       // so a non-empty target increment cannot be proven irrelevant from path
       // metadata alone.
-      if (updated.status !== current.status
-        || (updated.affectedPaths ?? []).join("\n") !== (current.affectedPaths ?? []).join("\n")) {
+      if ((updated.affectedPaths ?? []).join("\n")
+        !== (current.affectedPaths ?? []).join("\n")) {
         tx.saveIntegrationQueueEntry(taskId, updated);
       }
     });

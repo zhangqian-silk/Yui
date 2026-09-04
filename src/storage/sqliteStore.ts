@@ -3045,10 +3045,9 @@ function validIntegrationQueueTransition(
     || before.createdAt !== after.createdAt
   ) return false;
   const allowed: Readonly<Record<IntegrationQueueStatus, readonly IntegrationQueueStatus[]>> = {
-    queued: ["queued", "running", "validated", "superseded"],
+    queued: ["queued", "running", "superseded"],
     running: ["running", "conflicted", "committed"],
     conflicted: ["conflicted", "running", "committed", "queued", "superseded"],
-    validated: ["validated", "running", "queued", "superseded"],
     committed: ["committed"],
     superseded: ["superseded"]
   };

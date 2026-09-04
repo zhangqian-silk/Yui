@@ -16,6 +16,15 @@ import {
 } from "../context/turnInputContract.js";
 import type { ContextSnapshotRef } from "../context/contextSnapshot.js";
 import type { ExecutionLaneGitSnapshot } from "../repository/executionLaneGitSnapshot.js";
+import {
+  MAX_TURN_RESULT_OUTPUT_BYTES,
+  transportAgentResult
+} from "../domain/agentResultTransport.js";
+export {
+  MAX_TURN_RESULT_OUTPUT_BYTES,
+  transportAgentResult,
+  type TransportedAgentResult
+} from "../domain/agentResultTransport.js";
 
 export type DispatchMode = "new" | "resume";
 export type TurnStatus = "active" | "completed" | "failed";
@@ -536,8 +545,12 @@ function requireText(value: string, label: string): string {
 function requireResultText(value: string, label: string): string {
   if (typeof value !== "string" || value.includes("\0")) throw new Error(`${label} is invalid.`);
   if (value.trim().length === 0) throw new Error(`${label} is required.`);
+  if (Buffer.byteLength(value, "utf8") > MAX_TURN_RESULT_OUTPUT_BYTES) {
+    throw new Error(`${label} exceeds ${MAX_TURN_RESULT_OUTPUT_BYTES} bytes.`);
+  }
   return value;
 }
+
 
 function requireTimestamp(value: string, label: string): void {
   if (typeof value !== "string" || !Number.isFinite(Date.parse(value))) {

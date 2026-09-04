@@ -62,7 +62,12 @@ import {
   type EffectiveLaunchSnapshot
 } from "../executor/effectiveLaunch.js";
 import { SYSTEM_OPERATOR_ROLE } from "../role/systemRoles.js";
-import { appendTurnInput, createTurn, type Turn } from "../turn/turn.js";
+import {
+  appendTurnInput,
+  createTurn,
+  type Turn
+} from "../turn/turn.js";
+import { transportAgentResult } from "../domain/agentResultTransport.js";
 import { createTurnInput } from "../context/turnInputContract.js";
 import {
   classifyRuntimeProcessExit,
@@ -179,6 +184,7 @@ import {
   contextSnapshotDeltaRefIds,
   freezeTurnContextSnapshot
 } from "../context/turnContextPack.js";
+import type { RuntimeTurnTerminalOutcome } from "./runtimeEventInbox.js";
 
 /**
  * One durable revision's read-only facts for one Task. A scheduler pass reads
@@ -271,30 +277,15 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
       case "input.accepted":
         outcome = this.observeRuntimePromptAccepted(input, adapterId, now);
         break;
-      case "turn.completed": {
-        const classification = this.classifyRuntimeTurnCompleted({
-          taskId,
-          roleName: input.fence.roleName,
-          agentId: input.fence.agentId,
-          adapterId,
-          runtimeGenerationId: input.fence.runtimeGenerationId,
-          nativeSessionId: input.fence.nativeSessionId!,
-          nativeTurnId: input.fence.nativeTurnId!,
-          attemptId: input.fence.receiptId,
-          turnId: input.fence.turnId
-        });
-        if (classification !== "apply") return classification;
+      case "turn.completed":
         outcome = this.foldProviderTurnBoundary(
           input,
           adapterId,
           "completed",
-          input.payload.output ?? "Agent turn completed without a workflow outcome.",
           now
         );
         break;
-      }
       case "turn.failed": {
-        const failureEvidence = input.payload.failure!;
         // A Provider Turn is an activation boundary, not a Task outcome.
         // Keep the Turn and Session identity available for Agent-directed
         // restore + submit, even when a provider marks its Turn terminal.
@@ -302,7 +293,6 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
           input,
           adapterId,
           "failed",
-          input.payload.summary ?? `Agent Turn failed: ${failureEvidence.error.message}`,
           now
         );
         break;
@@ -325,7 +315,6 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
           input,
           adapterId,
           "cancelled",
-          input.payload.summary ?? "Provider Turn was cancelled.",
           now
         );
         break;
@@ -432,9 +421,19 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
     input: RuntimeObservation,
     adapterId: string,
     providerStatus: "completed" | "failed" | "cancelled",
-    output: string,
     now: Date
   ): ProviderLifecycleObservation {
+    const outcome = providerStatus === "completed"
+      ? transportAgentResult(input.payload.output)
+      : {
+          status: "failed" as const,
+          output: providerStatus === "cancelled"
+            ? "Provider cancelled the Agent Turn."
+            : `Provider Agent Turn failed: ${input.payload.failure?.error.message ?? "unknown provider failure"}`,
+          failureReason: providerStatus === "cancelled"
+            ? "cancelled" as const
+            : "runtime-failed" as const
+        };
     const completed = {
       taskId: input.fence.taskId!,
       roleName: input.fence.roleName,
@@ -446,12 +445,12 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
       attemptId: input.fence.receiptId,
       turnId: input.fence.turnId,
       ...(input.payload.input === undefined ? {} : { input: input.payload.input }),
-      output,
-      providerStatus
+      providerStatus,
+      outcome
     };
-    const classification = this.classifyRuntimeTurnCompleted(completed);
+    const classification = this.classifyRuntimeTurnTerminal(completed);
     if (classification !== "apply") return classification;
-    const result = this.observeRuntimeTurnCompleted(completed, now);
+    const result = this.observeRuntimeTurnTerminal(completed, now);
     return result.disposition === "obsolete" ? "obsolete" : "applied";
   }
 
@@ -2251,7 +2250,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
    * retained as an intermediate child wait or recorded as a ready boundary
    * for later mailbox input. It never performs tmux, workspace, or Controller I/O.
    */
-  classifyRuntimeTurnCompleted(input: Readonly<{
+  classifyRuntimeTurnTerminal(input: Readonly<{
     taskId: string;
     roleName: string;
     agentId: string;
@@ -2261,6 +2260,8 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
     nativeTurnId: string;
     attemptId?: string;
     turnId?: string;
+    providerStatus: "completed" | "failed" | "cancelled";
+    outcome: RuntimeTurnTerminalOutcome;
   }>): "apply" | "deferred" | "obsolete" {
     const task = this.store.getTask(input.taskId);
     const role = this.store.getRole(input.taskId, input.roleName);
@@ -2320,7 +2321,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
     return active?.id === input.turnId ? "apply" : "obsolete";
   }
 
-  observeRuntimeTurnCompleted(input: Readonly<{
+  observeRuntimeTurnTerminal(input: Readonly<{
     taskId: string;
     roleName: string;
     agentId: string;
@@ -2331,8 +2332,8 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
     attemptId?: string;
     turnId?: string;
     input?: string;
-    output: string;
-    providerStatus?: "completed" | "failed" | "cancelled";
+    providerStatus: "completed" | "failed" | "cancelled";
+    outcome: RuntimeTurnTerminalOutcome;
   }>, now = new Date()): Readonly<{
     session: RoleAgentSession;
     duplicate: boolean;
@@ -2433,7 +2434,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
       sessions = settleStructuredProviderTurn(
         sessions,
         canonicalTurnId,
-        input.providerStatus ?? "completed",
+        input.providerStatus,
         now
       );
       sessions = recordTaskRoleTurnBoundary(sessions, {
@@ -2454,13 +2455,13 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
         if (activation === undefined) {
           throw new Error("Provider Turn result has no matching Activation.");
         }
-        const providerStatus = input.providerStatus ?? "completed";
+        const providerStatus = input.providerStatus;
         let systemEvidence: Parameters<typeof terminalizeExactTaskTurn>[1]["systemEvidence"];
         if ((observedTurn.purpose === "execution" || observedTurn.purpose === "review")
           && observedTurn.executionGroupId !== undefined
           && observedTurn.executionLaneId !== undefined
           && observedTurn.workspace !== undefined
-          && providerStatus === "completed") {
+          && input.outcome.status === "completed") {
           const gitSnapshot = this.snapshotExecutionLaneWorkspace(store, observedTurn.workspace);
           if (gitSnapshot !== undefined) {
             systemEvidence = { workspaceSnapshot: gitSnapshot };
@@ -2474,15 +2475,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
           nativeSessionId: input.nativeSessionId,
           ...(input.runtimeGenerationId === undefined ? {} : { runtimeGenerationId: input.runtimeGenerationId }),
           outcome: {
-            status: providerStatus === "completed" ? "completed" : "failed",
-            output: input.output,
-            ...(providerStatus === "completed"
-              ? {}
-              : {
-                  failureReason: providerStatus === "cancelled"
-                    ? "cancelled" as const
-                    : "runtime-failed" as const
-                }),
+            ...input.outcome,
             provider: {
               providerNamespace: binding.providerNamespace,
               accountScope: binding.accountScope,
@@ -3142,7 +3135,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
     ));
   }
 
-  observeGlobalRuntimeTurnCompleted(input: Readonly<{
+  observeGlobalRuntimeTurnTerminal(input: Readonly<{
     roleName: string;
     agentId: string;
     adapterId: string;
@@ -3150,7 +3143,8 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
     nativeSessionId: string;
     nativeTurnId: string;
     title?: string;
-    output?: string;
+    providerStatus: "completed" | "failed" | "cancelled";
+    outcome: RuntimeTurnTerminalOutcome;
   }>, now = new Date()): RoleAgentSession {
     return this.store.transaction((store) => {
       const role = store.getGlobalRole(input.roleName);
@@ -3194,9 +3188,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
         nativeSessionId,
         ...(input.runtimeGenerationId === undefined ? {} : { runtimeGenerationId: input.runtimeGenerationId }),
         title: effectiveExisting?.title ?? input.title,
-        preview: effectiveExisting?.preview ?? (
-          input.output === undefined ? undefined : sessionPreview(input.output)
-        ),
+        preview: effectiveExisting?.preview ?? sessionPreview(input.outcome.output),
         policy: "fixed",
         status: completedStatus,
         ...(effectiveExisting?.endReason === undefined
@@ -3235,12 +3227,14 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
     });
   }
 
-  classifyGlobalRuntimeTurnCompleted(input: Readonly<{
+  classifyGlobalRuntimeTurnTerminal(input: Readonly<{
     roleName: string;
     agentId: string;
     adapterId: string;
     runtimeGenerationId?: string;
     nativeSessionId: string;
+    providerStatus: "completed" | "failed" | "cancelled";
+    outcome: RuntimeTurnTerminalOutcome;
   }>): "apply" | "obsolete" {
     const role = this.store.getGlobalRole(input.roleName);
     if (role === null) return "obsolete";

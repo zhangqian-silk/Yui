@@ -60,10 +60,7 @@ function renderChangeSet(changeSet: ChangeSet): string {
     `  Tags: ${manifest.tags.join(", ")}`,
     `  Deleted paths: ${manifest.deletedPaths.length}`,
     ...manifest.deletedPaths.map((path) => `    ${path}`),
-    `  Target: ${manifest.targetRef ?? "-"}`,
-    `  Evidence: ${manifest.evidenceRefs.length === 0
-      ? "-"
-      : manifest.evidenceRefs.join(", ")}`
+    `  Target: ${manifest.targetRef ?? "-"}`
   );
   return `${lines.join("\n")}\n`;
 }

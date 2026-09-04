@@ -6065,7 +6065,7 @@ function renderTurnShow(
     ...(run.result === undefined ? [] : [`Ended: ${run.result.completedAt}`]),
     ...(run.result === undefined || run.result.output.trim().length === 0
       ? []
-      : [`Summary: ${run.result.output}`])
+      : [`Result: ${run.result.output}`])
   ];
   return `${lines.join("\n")}\n`;
 }

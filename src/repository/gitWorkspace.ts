@@ -332,10 +332,8 @@ export class NodeGitWorkspace implements GitWorkspacePort {
   }
 
   /**
-   * Every path changed between two commits.  The integration queue uses this
-   * to fence a validated entry: a target advance whose real path delta
-   * overlaps the entry's own paths (or whose impact cannot be proven)
-   * invalidates the entry's reusable evidence.
+   * Every path changed between two commits. Freshness and delta-review
+   * projections use this as objective Git evidence.
    */
   async changedFilesBetween(input: Readonly<{
     repositoryPath: string;

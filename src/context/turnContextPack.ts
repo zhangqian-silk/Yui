@@ -15,6 +15,7 @@ import {
   type ContextSnapshotRef,
   type ContextSnapshotScope
 } from "./contextSnapshot.js";
+import { sourceTurnContextValue } from "./sourceTurnContext.js";
 
 export const TURN_CONTEXT_PACK_SCHEMA_VERSION = 1 as const;
 export const TURN_CONTEXT_PACK_MAX_REFS = 256;
@@ -554,7 +555,12 @@ function collectAuthorizedContext(
         );
       }
       result.push(materialize("L3", "review-round", previous.id, previous));
-      result.push(materialize("L4", "source-turn", previousTurn.id, previousTurn));
+      result.push(materialize(
+        "L4",
+        "source-turn",
+        previousTurn.id,
+        sourceTurnContextValue(previousTurn)
+      ));
     }
   }
   for (const binding of task.projectBindings) {
@@ -696,7 +702,12 @@ function collectSourceTurnContext(
         || source.roleName !== lane.roleName) {
         throw new Error(`Successful source Turn is missing or drifted: ${group.id}/${lane.id}.`);
       }
-      return [materialize("L4", "source-turn", source.id, source)];
+      return [materialize(
+        "L4",
+        "source-turn",
+        source.id,
+        sourceTurnContextValue(source)
+      )];
     });
 }
 

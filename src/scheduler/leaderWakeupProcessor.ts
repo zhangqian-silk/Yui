@@ -213,12 +213,19 @@ async function forceLeaderSteer(
   }
   const batch = processing.batch;
   const envelope = store.getTaskWakeEnvelope?.(taskId) ?? null;
+  const referencedTurnIds = envelope?.referencedTurnIds ?? [];
+  const displayedTurnIds = referencedTurnIds.slice(0, 4);
   const directive = [
     `Aggregated Leader events: ${batch.reasons.join(", ")}.`,
     `The first event arrived at ${batch.firstQueuedAt} and has waited at least 10 minutes while this Leader Turn remained active.`,
-    ...(envelope?.referencedTurnIds.map(
+    ...displayedTurnIds.map(
       (turnId) => `Read the complete result: yui task turn show ${taskId}/${turnId}.`
-    ) ?? []),
+    ),
+    ...(referencedTurnIds.length > displayedTurnIds.length
+      ? [
+          `${referencedTurnIds.length - displayedTurnIds.length} additional result Turns are listed in yui task wake show ${taskId} ${envelope!.wakeId}.`
+        ]
+      : []),
     "Process these events now and update durable Task or WorkItem facts when needed.",
     "After the events are handled, continue the work you were doing before this interruption.",
     `Load the current exact context for ${taskId}/${active.id}; the event batch may have grown while this input was delivered.`

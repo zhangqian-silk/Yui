@@ -854,7 +854,6 @@ export function runExecutionAudit(
           integrations: withinWindow(store.listIntegrationAttempts(taskId), options),
           durableJobs: withinWindow(store.listDurableJobs(taskId), options),
           publications: withinWindow(store.listPublicationReferences(taskId), options),
-          decisions: withinWindow(store.listDecisions(taskId), options),
           events: withinWindow(store.listEvents(taskId), options),
           managedWorkspaces: withinWindow(store.listManagedWorkspaces(taskId), options)
         })];

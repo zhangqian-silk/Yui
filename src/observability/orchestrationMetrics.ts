@@ -1,6 +1,5 @@
 import { isDeepStrictEqual } from "node:util";
 
-import type { Decision } from "../decision/decision.js";
 import type { TaskRoleSessionSet } from "../executor/agentExecutor.js";
 import type { TaskEvent } from "../event/taskEvent.js";
 import type { DurableJob } from "../job/durableJob.js";
@@ -64,7 +63,6 @@ export type TaskOrchestrationFacts = Readonly<{
   integrations: readonly IntegrationAttempt[];
   durableJobs: readonly DurableJob[];
   publications: readonly PublicationReference[];
-  decisions: readonly Decision[];
   events: readonly TaskEvent[];
   managedWorkspaces: readonly ManagedWorkspace[];
 }>;

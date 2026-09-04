@@ -169,10 +169,12 @@ Task, so normal delivery does not pay for a complete review of every WorkItem.
 Review Turns complete only their exact ReviewRound, leave the WorkItem awaiting
 acceptance, and never trigger another review or append a Candidate. Successful
 and failed review attempts both wake the Leader and remain evidence for
-judgment, not a machine verdict. The ReviewRound stores its frozen Candidate
-base, isolated workspace provenance, complete free-form report, optional
-structured checks, and optional diagnostic commit. The Leader may route that evidence to the original Worker, but Yui
-never merges it automatically.
+judgment, not a machine verdict. The ReviewRound stores only Core-owned
+identity, frozen Candidate, workspace provenance, execution topology, main
+Reviewer Turn reference, lifecycle, and failure diagnostics. The complete
+free-form Reviewer result lives only on that exact Turn. The Leader may route
+that result to the original Worker, but Yui never parses or merges it
+automatically.
 
 Roles describe Agent capability, but they do not own repository workspaces. A
 `ManagedWorkspace` is keyed by its durable owner (`Task`, `WorkItem`,
@@ -238,7 +240,7 @@ An isolated result is handled in this order:
 1. the Worker Provider Turn ends and its Turn result is recorded;
 2. the Leader reviews semantics and evidence;
 3. Yui captures each writable Project HEAD as an immutable Project ChangeSet;
-4. each Project integration applies its latest reviewed ChangeSet in a candidate worktree;
+4. each Project integration applies the governing Candidate's ChangeSet in a candidate worktree;
 5. configured checks run;
 6. compare-and-swap advances the target only if its HEAD is unchanged;
 7. the Leader accepts the WorkItem;
@@ -252,14 +254,14 @@ project-specific engineering rules; and the Task Contract owns the requested
 outcome. Yui injects only its own generic Role Skills. It never scans or copies
 Project Skills into managed context; the selected Agent discovers them through
 its native project mechanism. Execution and review select their generic Skill
-by durable Turn purpose. A Reviewer finding routes to the original Worker while
-open, one consolidated Repair WorkItem when closed, Leader/Integration for
-merge or local fixes, and an architecture WorkItem only for a genuinely
-cross-cutting design change. Parallel repair is explicit and requires
-independently acceptable ownership.
+by durable Turn purpose. A Reviewer result returns as the exact source Turn
+text. The Leader decides whether to send feedback to the existing Worker,
+accept, review again, handle a local or Integration issue, or create genuinely
+independent follow-up work. Core neither parses findings nor creates repair
+topology from Reviewer prose.
 
 Capture at the same HEAD reuses the existing ChangeSet. A repaired HEAD creates
-a new candidate; only the latest reviewed candidate may satisfy acceptance.
+a new candidate; only the latest governing candidate may satisfy acceptance.
 An isolated WorkItem cannot be accepted, or a Task with WorkItems completed,
 while any writable Project's latest result is uncaptured or unintegrated.
 Leader-owned completion instead requires a clean committed exact Task-main snapshot.

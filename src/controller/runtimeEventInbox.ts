@@ -23,8 +23,12 @@ import {
   isRuntimeTokenEvidence,
   type RuntimeObservation
 } from "../runtime/runtimeObservation.js";
+import type { TurnFailureReason } from "../turn/turn.js";
+import {
+  boundedTurnFailureDiagnostic,
+  transportAgentResult
+} from "../domain/agentResultTransport.js";
 
-export const MAX_RUNTIME_TURN_OUTPUT_BYTES = 512 * 1024;
 export const MAX_RUNTIME_EVENT_FILE_BYTES = 16 * 1024 * 1024;
 
 const RUNTIME_EVENT_DIRECTORY = join("runtime", "inbox");
@@ -41,7 +45,15 @@ export type RuntimeObservationInboxEvent = Readonly<{
   observation: RuntimeObservation;
 }>;
 
-export type RuntimeTurnCompletedInput = Readonly<{
+export type RuntimeTurnTerminalOutcome =
+  | Readonly<{ status: "completed"; output: string }>
+  | Readonly<{
+      status: "failed";
+      output: string;
+      failureReason: TurnFailureReason;
+    }>;
+
+export type RuntimeTurnTerminalInput = Readonly<{
   scope: "task" | "global";
   taskId?: string;
   roleName: string;
@@ -52,15 +64,16 @@ export type RuntimeTurnCompletedInput = Readonly<{
   nativeTurnId: string;
   turnId?: string;
   title?: string;
-  output: string;
+  providerStatus: "completed" | "failed" | "cancelled";
+  outcome: RuntimeTurnTerminalOutcome;
 }>;
 
-export type RuntimeTurnCompletedEvent = Readonly<{
-  schemaVersion: 2;
+export type RuntimeTurnTerminalEvent = Readonly<{
+  schemaVersion: 1;
   id: string;
-  type: "native-turn-completed";
+  type: "native-turn-terminal";
   receivedAt: string;
-}> & RuntimeTurnCompletedInput;
+}> & RuntimeTurnTerminalInput;
 
 /**
  * f7/rr5: A DurableJob reached a terminal state. The supervisor delivers
@@ -85,7 +98,7 @@ export type RuntimeDurableJobTerminalEvent = Readonly<{
 
 export type RuntimeLifecycleEvent =
   | RuntimeObservationInboxEvent
-  | RuntimeTurnCompletedEvent
+  | RuntimeTurnTerminalEvent
   | RuntimeDurableJobTerminalEvent;
 
 export type RuntimeEventEnqueueResult<TEvent extends RuntimeLifecycleEvent = RuntimeLifecycleEvent> =
@@ -135,14 +148,14 @@ export class FileRuntimeEventInbox {
     return this.publish(event);
   }
 
-  enqueueTurnCompleted(
-    input: RuntimeTurnCompletedInput
-  ): RuntimeEventEnqueueResult<RuntimeTurnCompletedEvent> {
-    const normalized = normalizeNativeTurnCompletedInput(input);
+  enqueueTurnTerminal(
+    input: RuntimeTurnTerminalInput
+  ): RuntimeEventEnqueueResult<RuntimeTurnTerminalEvent> {
+    const normalized = normalizeNativeTurnTerminalInput(input);
     return this.publish(Object.freeze({
-      schemaVersion: 2,
-      id: runtimeEventId("native-turn-completed", normalized),
-      type: "native-turn-completed",
+      schemaVersion: 1,
+      id: runtimeEventId("native-turn-terminal", normalized),
+      type: "native-turn-terminal",
       receivedAt: this.now().toISOString(),
       ...normalized
     }));
@@ -359,7 +372,7 @@ export class RuntimeEventInboxError extends Error {
 
 function runtimeEventId(
   type: RuntimeLifecycleEvent["type"],
-  input: RuntimeTurnCompletedInput
+  input: RuntimeTurnTerminalInput
     | RuntimeDurableJobTerminalInput
     | Readonly<{ observation: RuntimeObservation }>
 ): string {
@@ -385,7 +398,7 @@ function runtimeEventId(
       job.outcome
     ])).digest("hex")}`;
   }
-  const provider = input as RuntimeTurnCompletedInput;
+  const provider = input as RuntimeTurnTerminalInput;
   const common = [
     1,
     type,
@@ -402,16 +415,15 @@ function runtimeEventId(
   return `turn-${createHash("sha256").update(JSON.stringify(common)).digest("hex")}`;
 }
 
-function normalizeNativeTurnCompletedInput(
-  input: RuntimeTurnCompletedInput
-): RuntimeTurnCompletedInput {
+function normalizeNativeTurnTerminalInput(
+  input: RuntimeTurnTerminalInput
+): RuntimeTurnTerminalInput {
   const scope = input.scope;
   if (scope !== "task" && scope !== "global") throw invalidEvent();
-  if (typeof input.output !== "string"
-    || input.output.includes("\0")
-    || input.output.trim().length === 0
-    || Buffer.byteLength(input.output, "utf8") > MAX_RUNTIME_TURN_OUTPUT_BYTES) {
-    throw invalidEvent();
+  if (!["completed", "failed", "cancelled"].includes(input.providerStatus)) throw invalidEvent();
+  const outcome = normalizeRuntimeTurnTerminalOutcome(input.outcome);
+  if (outcome.status === "completed" && input.providerStatus !== "completed") {
+    throw invalidEvent("Only a completed Provider Turn may carry a completed Agent result.");
   }
   const common = {
     scope,
@@ -429,13 +441,32 @@ function normalizeNativeTurnCompletedInput(
     ...(input.title === undefined
       ? {}
       : { title: requireIdentityText(input.title, "Session title") }),
-    output: input.output
+    providerStatus: input.providerStatus,
+    outcome
   } as const;
-  if ((common.adapterId !== "codex" && common.adapterId !== "claude")
-    || common.output.length === 0) throw invalidEvent();
+  if (common.adapterId !== "codex" && common.adapterId !== "claude") throw invalidEvent();
   return scope === "task"
     ? { ...common, taskId: requireIdentityText(input.taskId, "Task id") }
     : common;
+}
+
+function normalizeRuntimeTurnTerminalOutcome(
+  input: unknown
+): RuntimeTurnTerminalOutcome {
+  if (!isObject(input)) {
+    throw invalidEvent("Runtime Turn terminal outcome is invalid.");
+  }
+  if (input.status === "completed") return transportAgentResult(input.output);
+  if (input.status !== "failed"
+    || !["startup-failed", "runtime-failed", "delivery-unknown", "missing-result", "cancelled"]
+      .includes(input.failureReason)) {
+    throw invalidEvent("Runtime Turn failure outcome is invalid.");
+  }
+  return {
+    status: "failed",
+    output: boundedTurnFailureDiagnostic(input.output),
+    failureReason: input.failureReason
+  };
 }
 
 function normalizeDurableJobTerminalInput(
@@ -461,7 +492,7 @@ function parseRuntimeEvent(value: unknown): RuntimeLifecycleEvent {
   if (!isObject(value)) throw invalidEvent();
   switch (value.type) {
     case "runtime-observation": return parseRuntimeObservationEvent(value);
-    case "native-turn-completed": return parseNativeTurnCompletedEvent(value);
+    case "native-turn-terminal": return parseNativeTurnTerminalEvent(value);
     case "durable-job-terminal": return parseDurableJobTerminalEvent(value);
     default: throw invalidEvent();
   }
@@ -513,28 +544,30 @@ function parseDurableJobTerminalEvent(
   });
 }
 
-function parseNativeTurnCompletedEvent(value: Record<string, any>): RuntimeTurnCompletedEvent {
+function parseNativeTurnTerminalEvent(value: Record<string, any>): RuntimeTurnTerminalEvent {
   const scope = value.scope;
   const expected = scope === "task"
     ? [
         "schemaVersion", "id", "type", "receivedAt", "scope", "taskId",
-        "roleName", "agentId", "adapterId", "nativeSessionId", "nativeTurnId", "output",
+        "roleName", "agentId", "adapterId", "nativeSessionId", "nativeTurnId",
+        "providerStatus", "outcome",
         ...(value.runtimeGenerationId === undefined ? [] : ["runtimeGenerationId"]),
         ...(value.turnId === undefined ? [] : ["turnId"]),
         ...(value.title === undefined ? [] : ["title"])
       ]
     : [
         "schemaVersion", "id", "type", "receivedAt", "scope",
-        "roleName", "agentId", "adapterId", "nativeSessionId", "nativeTurnId", "output",
+        "roleName", "agentId", "adapterId", "nativeSessionId", "nativeTurnId",
+        "providerStatus", "outcome",
         ...(value.runtimeGenerationId === undefined ? [] : ["runtimeGenerationId"]),
         ...(value.turnId === undefined ? [] : ["turnId"]),
         ...(value.title === undefined ? [] : ["title"])
       ];
   if ((scope !== "task" && scope !== "global")
-    || value.schemaVersion !== 2
+    || value.schemaVersion !== 1
     || !hasExactKeys(value, expected)) throw invalidEvent();
   const receivedAt = requireTimestamp(value.receivedAt);
-  const normalized = normalizeNativeTurnCompletedInput({
+  const normalized = normalizeNativeTurnTerminalInput({
     scope,
     ...(scope === "task" ? { taskId: value.taskId } : {}),
     roleName: value.roleName,
@@ -545,12 +578,13 @@ function parseNativeTurnCompletedEvent(value: Record<string, any>): RuntimeTurnC
     nativeTurnId: value.nativeTurnId,
     ...(value.turnId === undefined ? {} : { turnId: value.turnId }),
     ...(value.title === undefined ? {} : { title: value.title }),
-    output: value.output
+    providerStatus: value.providerStatus,
+    outcome: value.outcome
   });
   return Object.freeze({
-    schemaVersion: 2,
+    schemaVersion: 1,
     id: requireIdentityText(value.id, "Event id"),
-    type: "native-turn-completed",
+    type: "native-turn-terminal",
     receivedAt,
     ...normalized
   });
@@ -603,7 +637,6 @@ function hasSameIdentity(left: RuntimeLifecycleEvent, right: RuntimeLifecycleEve
     && (!("nativeSessionId" in left)
       || !("nativeSessionId" in right)
       || left.nativeSessionId === right.nativeSessionId)
-    && (!("turnId" in left) || !("turnId" in right) || left.turnId === right.turnId)
     && (!("turnId" in left) || !("turnId" in right) || left.turnId === right.turnId)
     && (!("jobId" in left) || !("jobId" in right) || left.jobId === right.jobId);
 }

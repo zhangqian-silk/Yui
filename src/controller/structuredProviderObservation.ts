@@ -3,6 +3,7 @@ import { randomUUID } from "node:crypto";
 import { callController } from "../core/controllerClient.js";
 import { builtinAgentDriverRegistry } from "../runtime/builtinAgentDrivers.js";
 import { standardAgentError } from "../runtime/agentError.js";
+import { transportAgentResult } from "../domain/agentResultTransport.js";
 import {
   createRuntimeObservation,
   runtimeObservationSemanticKey,
@@ -309,10 +310,11 @@ export async function publishStructuredProviderTerminal(input: Readonly<{
   const kind: RuntimeObservationKind = input.terminal.status === "completed"
     ? "turn.completed"
     : input.terminal.status === "cancelled" ? "turn.cancelled" : "turn.failed";
+  const transported = transportAgentResult(input.terminal.output);
   const payload: RuntimeObservationPayload = kind === "turn.completed"
     ? {
         ...(input.terminal.input === undefined ? {} : { input: input.terminal.input }),
-        ...(input.terminal.output === undefined ? {} : { output: input.terminal.output })
+        ...(transported.status === "completed" ? { output: transported.output } : {})
       }
     : kind === "turn.failed"
       ? {

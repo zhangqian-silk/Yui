@@ -4,7 +4,8 @@ import type {
   RuntimeDurableJobTerminalEvent,
   RuntimeLifecycleEvent,
   RuntimeObservationInboxEvent,
-  RuntimeTurnCompletedEvent
+  RuntimeTurnTerminalEvent,
+  RuntimeTurnTerminalOutcome
 } from "./runtimeEventInbox.js";
 import {
   isRuntimeTokenEvidence,
@@ -15,7 +16,7 @@ import { builtinAgentDriverRegistry } from "../runtime/builtinAgentDrivers.js";
 
 export type ProviderLifecycleObservation = "applied" | "obsolete" | "deferred";
 
-export type TaskRuntimeTurnCompleted = Readonly<{
+export type TaskRuntimeTurnTerminal = Readonly<{
   eventId?: string;
   taskId: string;
   roleName: string;
@@ -26,10 +27,11 @@ export type TaskRuntimeTurnCompleted = Readonly<{
   nativeTurnId: string;
   turnId?: string;
   input?: string;
-  output: string;
+  providerStatus: "completed" | "failed" | "cancelled";
+  outcome: RuntimeTurnTerminalOutcome;
 }>;
 
-export type GlobalRuntimeTurnCompleted = Readonly<{
+export type GlobalRuntimeTurnTerminal = Readonly<{
   eventId?: string;
   roleName: string;
   agentId: string;
@@ -38,7 +40,8 @@ export type GlobalRuntimeTurnCompleted = Readonly<{
   nativeSessionId: string;
   nativeTurnId: string;
   title?: string;
-  output: string;
+  providerStatus: "completed" | "failed" | "cancelled";
+  outcome: RuntimeTurnTerminalOutcome;
 }>;
 
 export type RuntimeTurnEventObserver = Readonly<{
@@ -50,19 +53,19 @@ export type RuntimeTurnEventObserver = Readonly<{
     input: RuntimeObservation,
     now?: Date
   ): ProviderLifecycleObservation;
-  observeRuntimeTurnCompleted(
-    input: TaskRuntimeTurnCompleted,
+  observeRuntimeTurnTerminal(
+    input: TaskRuntimeTurnTerminal,
     now?: Date
   ): unknown;
-  observeGlobalRuntimeTurnCompleted(
-    input: GlobalRuntimeTurnCompleted,
+  observeGlobalRuntimeTurnTerminal(
+    input: GlobalRuntimeTurnTerminal,
     now?: Date
   ): unknown;
-  classifyRuntimeTurnCompleted?(
-    input: TaskRuntimeTurnCompleted
+  classifyRuntimeTurnTerminal?(
+    input: TaskRuntimeTurnTerminal
   ): "apply" | "deferred" | "obsolete";
-  classifyGlobalRuntimeTurnCompleted?(
-    input: GlobalRuntimeTurnCompleted
+  classifyGlobalRuntimeTurnTerminal?(
+    input: GlobalRuntimeTurnTerminal
   ): "apply" | "obsolete";
   observeObsoleteRuntimeEvent?(
     input: Readonly<{
@@ -273,8 +276,8 @@ export class FileRuntimeEventProcessor implements RuntimeEventProcessorPort {
   ): FoldedRuntimeEvent {
     const event = candidate.event;
     let outcome: "applied" | "deferred" | "obsolete" = "applied";
-    if (event.type === "native-turn-completed") {
-      outcome = this.applyNativeTurnCompleted(event, now);
+    if (event.type === "native-turn-terminal") {
+      outcome = this.applyNativeTurnTerminal(event, now);
     } else if (event.type === "runtime-observation") {
       outcome = this.applyRuntimeObservation(event, now);
     } else {
@@ -335,13 +338,13 @@ export class FileRuntimeEventProcessor implements RuntimeEventProcessorPort {
     void event;
   }
 
-  private applyNativeTurnCompleted(
-    event: RuntimeTurnCompletedEvent,
+  private applyNativeTurnTerminal(
+    event: RuntimeTurnTerminalEvent,
     now: Date
   ): "applied" | "deferred" | "obsolete" {
     if (event.scope === "task") {
       const task = this.observer.getTask(event.taskId!);
-      const input: TaskRuntimeTurnCompleted = {
+      const input: TaskRuntimeTurnTerminal = {
         eventId: event.id,
         taskId: event.taskId!,
         roleName: event.roleName,
@@ -351,7 +354,8 @@ export class FileRuntimeEventProcessor implements RuntimeEventProcessorPort {
         nativeSessionId: event.nativeSessionId,
         nativeTurnId: event.nativeTurnId,
         ...(event.turnId === undefined ? {} : { turnId: event.turnId }),
-        output: event.output
+        providerStatus: event.providerStatus,
+        outcome: event.outcome
       };
       if (task === null) return "obsolete";
       if (task.status !== "active" || task.executionGate.state !== "enabled") {
@@ -362,20 +366,20 @@ export class FileRuntimeEventProcessor implements RuntimeEventProcessorPort {
         );
         return "obsolete";
       }
-      const disposition = this.observer.classifyRuntimeTurnCompleted?.(input) ?? "apply";
+      const disposition = this.observer.classifyRuntimeTurnTerminal?.(input) ?? "apply";
       if (disposition === "deferred") return disposition;
       if (disposition === "obsolete") {
         this.recordObsolete(event, "identity-mismatch-or-terminal", now);
         return disposition;
       }
-      const observed = this.observer.observeRuntimeTurnCompleted(input, now);
+      const observed = this.observer.observeRuntimeTurnTerminal(input, now);
       if (isObsoleteRuntimeTurnObservation(observed)) {
         this.recordObsolete(event, "runtime-cleanup-or-stopped-session", now);
         return "obsolete";
       }
       return "applied";
     }
-    const input: GlobalRuntimeTurnCompleted = {
+    const input: GlobalRuntimeTurnTerminal = {
       eventId: event.id,
       roleName: event.roleName,
       agentId: event.agentId,
@@ -384,10 +388,11 @@ export class FileRuntimeEventProcessor implements RuntimeEventProcessorPort {
       nativeSessionId: event.nativeSessionId,
       nativeTurnId: event.nativeTurnId,
       ...(event.title === undefined ? {} : { title: event.title }),
-      output: event.output
+      providerStatus: event.providerStatus,
+      outcome: event.outcome
     };
-    if (this.observer.classifyGlobalRuntimeTurnCompleted?.(input) !== "obsolete") {
-      this.observer.observeGlobalRuntimeTurnCompleted(input, now);
+    if (this.observer.classifyGlobalRuntimeTurnTerminal?.(input) !== "obsolete") {
+      this.observer.observeGlobalRuntimeTurnTerminal(input, now);
       return "applied";
     }
     return "obsolete";
@@ -703,19 +708,19 @@ export type AsyncRuntimeTurnEventObserver = Readonly<{
     input: RuntimeObservation,
     now?: Date
   ): Promise<ProviderLifecycleObservation>;
-  observeRuntimeTurnCompleted(
-    input: TaskRuntimeTurnCompleted,
+  observeRuntimeTurnTerminal(
+    input: TaskRuntimeTurnTerminal,
     now?: Date
   ): Promise<unknown>;
-  observeGlobalRuntimeTurnCompleted(
-    input: GlobalRuntimeTurnCompleted,
+  observeGlobalRuntimeTurnTerminal(
+    input: GlobalRuntimeTurnTerminal,
     now?: Date
   ): Promise<unknown>;
-  classifyRuntimeTurnCompleted?(
-    input: TaskRuntimeTurnCompleted
+  classifyRuntimeTurnTerminal?(
+    input: TaskRuntimeTurnTerminal
   ): Promise<"apply" | "deferred" | "obsolete">;
-  classifyGlobalRuntimeTurnCompleted?(
-    input: GlobalRuntimeTurnCompleted
+  classifyGlobalRuntimeTurnTerminal?(
+    input: GlobalRuntimeTurnTerminal
   ): Promise<"apply" | "obsolete">;
   observeObsoleteRuntimeEvent?(
     input: Readonly<{
@@ -750,13 +755,13 @@ export function createAsyncRuntimeObserver(invoke: AsyncObserverInvoker): AsyncR
     getTask: (taskId) => call("getTask", [taskId]) as Promise<SchedulerTask | null>,
     observeRuntimeObservation: (input, now) =>
       withNow("observeRuntimeObservation", input, now) as Promise<ProviderLifecycleObservation>,
-    observeRuntimeTurnCompleted: (input, now) => withNow("observeRuntimeTurnCompleted", input, now),
-    observeGlobalRuntimeTurnCompleted: (input, now) => withNow("observeGlobalRuntimeTurnCompleted", input, now),
-    classifyRuntimeTurnCompleted: (input) => (
-      call("classifyRuntimeTurnCompleted", [input]) as Promise<"apply" | "deferred" | "obsolete">
+    observeRuntimeTurnTerminal: (input, now) => withNow("observeRuntimeTurnTerminal", input, now),
+    observeGlobalRuntimeTurnTerminal: (input, now) => withNow("observeGlobalRuntimeTurnTerminal", input, now),
+    classifyRuntimeTurnTerminal: (input) => (
+      call("classifyRuntimeTurnTerminal", [input]) as Promise<"apply" | "deferred" | "obsolete">
     ),
-    classifyGlobalRuntimeTurnCompleted: (input) => (
-      call("classifyGlobalRuntimeTurnCompleted", [input]) as Promise<"apply" | "obsolete">
+    classifyGlobalRuntimeTurnTerminal: (input) => (
+      call("classifyGlobalRuntimeTurnTerminal", [input]) as Promise<"apply" | "obsolete">
     ),
     observeObsoleteRuntimeEvent: (input, now) => withNow("observeObsoleteRuntimeEvent", input, now)
   };
@@ -804,8 +809,8 @@ export class AsyncRuntimeEventProcessor {
       if (isTaskCandidateBlocked(event, failedTaskIds)) continue;
       try {
         let outcome: "applied" | "deferred" | "obsolete" = "applied";
-        if (event.type === "native-turn-completed") {
-          outcome = await this.applyNativeTurnCompleted(event, now);
+        if (event.type === "native-turn-terminal") {
+          outcome = await this.applyNativeTurnTerminal(event, now);
         } else if (event.type === "runtime-observation") {
           outcome = await this.applyRuntimeObservation(event, now);
         } else {
@@ -874,13 +879,13 @@ export class AsyncRuntimeEventProcessor {
     return outcome;
   }
 
-  private async applyNativeTurnCompleted(
-    event: RuntimeTurnCompletedEvent,
+  private async applyNativeTurnTerminal(
+    event: RuntimeTurnTerminalEvent,
     now: Date
   ): Promise<"applied" | "deferred" | "obsolete"> {
     if (event.scope === "task") {
       const task = await this.observer.getTask(event.taskId!);
-      const input: TaskRuntimeTurnCompleted = {
+      const input: TaskRuntimeTurnTerminal = {
         eventId: event.id,
         taskId: event.taskId!,
         roleName: event.roleName,
@@ -890,7 +895,8 @@ export class AsyncRuntimeEventProcessor {
         nativeSessionId: event.nativeSessionId,
         nativeTurnId: event.nativeTurnId,
         ...(event.turnId === undefined ? {} : { turnId: event.turnId }),
-        output: event.output
+        providerStatus: event.providerStatus,
+        outcome: event.outcome
       };
       if (task === null) return "obsolete";
       if (task.status !== "active" || task.executionGate.state !== "enabled") {
@@ -901,20 +907,20 @@ export class AsyncRuntimeEventProcessor {
         );
         return "obsolete";
       }
-      const disposition = (await this.observer.classifyRuntimeTurnCompleted?.(input)) ?? "apply";
+      const disposition = (await this.observer.classifyRuntimeTurnTerminal?.(input)) ?? "apply";
       if (disposition === "deferred") return disposition;
       if (disposition === "obsolete") {
         await this.recordObsolete(event, "identity-mismatch-or-terminal", now);
         return disposition;
       }
-      const observed = await this.observer.observeRuntimeTurnCompleted(input, now);
+      const observed = await this.observer.observeRuntimeTurnTerminal(input, now);
       if (isObsoleteRuntimeTurnObservation(observed)) {
         await this.recordObsolete(event, "runtime-cleanup-or-stopped-session", now);
         return "obsolete";
       }
       return "applied";
     }
-    const input: GlobalRuntimeTurnCompleted = {
+    const input: GlobalRuntimeTurnTerminal = {
       eventId: event.id,
       roleName: event.roleName,
       agentId: event.agentId,
@@ -923,10 +929,11 @@ export class AsyncRuntimeEventProcessor {
       nativeSessionId: event.nativeSessionId,
       nativeTurnId: event.nativeTurnId,
       ...(event.title === undefined ? {} : { title: event.title }),
-      output: event.output
+      providerStatus: event.providerStatus,
+      outcome: event.outcome
     };
-    if ((await this.observer.classifyGlobalRuntimeTurnCompleted?.(input)) !== "obsolete") {
-      await this.observer.observeGlobalRuntimeTurnCompleted(input, now);
+    if ((await this.observer.classifyGlobalRuntimeTurnTerminal?.(input)) !== "obsolete") {
+      await this.observer.observeGlobalRuntimeTurnTerminal(input, now);
       return "applied";
     }
     return "obsolete";

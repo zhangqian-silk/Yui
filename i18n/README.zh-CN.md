@@ -200,9 +200,10 @@ review。冻结头变化时创建新的语义 Round；同一 Reviewer 的兼容�
 
 显式 WorkItem Candidate Review 与 Task-final Review 默认都直接创建一个 main
 Reviewer Turn；只有 Leader 明确提供至少两个不同的 `--lane-role` 时才使用复制执行。
-所有 Producer Lane 在隔离 workspace 中检查同一冻结 Assignment，全部 settle 且至少
+复制执行最多支持八个 Lane。所有 Producer Lane 在隔离 workspace 中检查同一冻结 Assignment，全部 settle 且至少
 两个成功后，才创建一个权威 main synthesis Turn。自动 policy 触发的 Candidate
-Review 始终保持直接执行。
+Review 始终保持直接执行。主 Reviewer 通过冻结 Context 按 Lane 顺序读取每个成功
+Producer Turn 的原始结果；Core 不复制其 prompt/workspace/runtime，也不解析结果语义。
 
 ```sh
 yui task work review <task-id>/<work-item-id>
@@ -388,17 +389,19 @@ ReviewRound 从冻结 Candidate SHA 创建独立的可写 worktree。只有 exac
 ReviewRound owner、reviewRoundId、冻结 base 与 workspace 全部匹配时，才获得
 该 workspace 的写入授权；Skill 仍禁止 push、Integration、Task state、其他
 workspace 与真实 YUI_HOME 变更。Reviewer 以最终 Provider 回复交付当前 Turn，
-Yui 自动保存其完整的自由格式 Markdown 或 JSON 报告。如果 JSON 含已知的 `checks` 或
-`evidenceCommit` 字段，Yui 会把它们记录为结构化证据，并核验 commit 是否等于
-managed Review branch HEAD；未知字段仍保留在完整报告中。
+Yui 原样保存其完整的自由格式 Markdown、JSON 或普通文本结果，不解析标题、字段、
+checks、severity、finding、verdict 或 evidence commit。Skill 和派发消息可以建议
+输出结构，但该结构不是 Core 协议；格式缺失或 JSON 无效由 Leader 阅读原文后判断。
+Core 自己观测的 workspace 与 Git 证据独立保存。
 
 Reviewer 可以修改文件并在不提交的情况下结束 Turn；脏字节不会被推断为 evidence。
 该 Round 仍会精确终结且不产生 Candidate/ChangeSet，workspace 会为 Leader 判断而
 保留，cleanup 会在其重新变干净前拒绝删除。
 
 Provider 原生 Turn 终态会结束 Turn，Yui 保存最终回复，将 WorkItem 提交给 Leader 审查，并追加结果消息和
-唤醒 Leader；它不会验收或完成 WorkItem。Leader 不会自唤醒，pending wake
-会保留到 Leader 空闲。
+唤醒 Leader；它不会验收或完成 WorkItem。有效结果在 512 KiB 限制内逐字保留；
+缺失、空白、含 NUL 或超限结果不会伪造成功文本，而是以 `missing-result` 和
+Core 诊断失败终结该 Turn。Leader 不会自唤醒，pending wake 会保留到 Leader 空闲。
 
 如果无法最终判断结果，交接必须明确标为 `uncertain`、`incomplete`、
 `blocked` 或 `requiring Leader judgment`，并提交最完整且真实的身份、已执行

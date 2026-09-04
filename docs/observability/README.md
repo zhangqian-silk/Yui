@@ -106,22 +106,18 @@ Stable taxonomy for execution failures (`src/observability/faultClassification.t
 
 | Class | Basis | Typical evidence |
 | --- | --- | --- |
-| `provider-transient` | text-historical | StopFailure 500/504, connection lost, rate limit |
-| `policy-denied` | text-historical | policy, permission denied, 403 |
-| `session-dead` | text-historical | tmux session exited, pane dead |
-| `delivery-uncertain` | text-historical | delivery uncertain |
-| `storage-backend-lock` | text-historical | SQLITE_BUSY, lock timeout |
-| `review-infra` | structured | ReviewRound failed to execute |
-| `review-semantic-negative` | structured | ReviewRound completed with failed checks |
-| `integration-environment` | text-historical | tsc: not found, ENOENT |
-| `integration-candidate-failure` | structured | Integration check failed |
-| `stale-base-target-cas` | structured | Integration conflict |
-| `archive-resource-leak` | structured | archived task with live resources |
+| `session-dead` | core-fact | startup failure |
+| `delivery-uncertain` | core-fact | exact delivery-unknown reason |
+| `review-infra` | core-fact | ReviewRound failed to execute |
+| `integration-environment` | core-diagnostic | `tsc: not found`, `ENOENT`, dirty target |
+| `integration-candidate-failure` | core-fact | Core-run Integration check failed |
+| `stale-base-target-cas` | core-fact | Integration conflict |
 | `other` | none | unclassified |
 
-Text-derived classifications carry `basis: "text-historical"` so consumers can
-distinguish them from structured outcomes. A future capability provider (other
-Issues) may supply `StructuredFaultHint` to override text matching.
+`core-diagnostic` is intentionally honest about bounded regex attribution over
+Core-run command diagnostics. Agent-authored Worker or Reviewer results are
+never classified. A caller with narrower Core evidence may supply a
+`CoreFaultHint`.
 
 ## `yui execution audit`
 
@@ -170,7 +166,7 @@ Advisories are derived from existing records and never write state or block a
 legal action. Current
 advisories cover direct-path protocol overhead, initial integrated WorkItem
 fan-out, unexplained review-repair fan-out, repeated exact Integration checks,
-same-Reviewer/same-candidate full Review repetition without new findings, and
+same-Reviewer/same-candidate full Review repetition, and
 the two-generation first-progress advisory threshold. No Review advisory is a
 budget or blocks a legal action; the first-progress threshold never chooses
 Agent recovery.
@@ -181,8 +177,8 @@ Agent recovery.
 2. Establish the production baseline: run `yui controller status` and
    `yui execution audit` against the current Home, confirm consistency with
    manual `ps`/filesystem checks.
-3. Classify existing outcomes/receipts using the taxonomy; future structured
-   fields plug in via capability providers.
+3. Classify existing Core-owned outcomes and diagnostics using the taxonomy;
+   narrower facts plug in through `CoreFaultHint`.
 4. If collection overhead exceeds budget, disable high-cost inventory
    gates; the basic identity and audit remain. No business-state rollback is
    needed.

@@ -50,9 +50,12 @@ decides Task or WorkItem completion.
 
 A Turn stores `inputs[]` because a running Provider Turn may receive a forced
 Leader wake as a later input. Its terminal `result` stores the Provider's final
-visible response and exact native identity. Direct Provider Turns are recorded
-in the same history. They do not claim a managed execution lane merely because
-they share the Session.
+visible response unchanged and exact native identity. Missing, empty, invalid,
+or oversized response text does not strand the Turn: Yui records the Provider
+terminal boundary and fails the Turn as `missing-result` with a bounded
+Core-owned diagnostic. Direct Provider Turns are recorded in the same history.
+They do not claim a managed execution lane merely because they share the
+Session.
 
 ## Task truth and Leader responsibility
 
@@ -60,7 +63,7 @@ Worker and Reviewer Turns produce evidence and, where applicable, update their
 managed worktree. Their terminal output is stored automatically. A replicated
 Producer Turn is non-authoritative evidence for its later main WorkItem or
 Reviewer synthesis Turn. Producer terminal never creates a Candidate, Review
-result, or finding-ledger decision, and Turn terminal alone never means that
+result, or acceptance decision, and Turn terminal alone never means that
 the WorkItem, Review, or Task is accepted or complete.
 
 The Leader is the only semantic authority that integrates accepted code and
@@ -73,8 +76,10 @@ Leader wake batch. The first event opens a one-minute aggregation window; new
 events join the same window without resetting it. If the Leader is still in an
 active Turn after that minute, the batch waits. At ten minutes from the first
 event, Yui steers one forced input into that exact active Leader Turn. The input
-lists the aggregate, states that it waited ten minutes, and instructs the
-Leader to handle the events before resuming its interrupted work.
+lists the aggregate, states that it waited ten minutes, includes up to four
+exact result-Turn read commands, points to the Wake record for any remainder,
+and instructs the Leader to handle the events before resuming its interrupted
+work.
 
 Native child continuation reports follow the same ownership boundary. While
 their parent Yui Turn is active, `continuation.reported` and

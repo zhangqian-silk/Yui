@@ -5,14 +5,6 @@ export type ReviewCompletionEvidenceStore = Readonly<{
   listTurns(taskId: string): readonly Turn[];
 }>;
 
-/** Whether a ReviewRound has one exact completed main Reviewer Turn. */
-export function isCompletedReviewExecution(
-  store: ReviewCompletionEvidenceStore,
-  round: ReviewRound
-): boolean {
-  return isCompletedReviewExecutionFromTurns(round, store.listTurns(round.taskId));
-}
-
 export function isCompletedReviewExecutionFromTurns(
   round: ReviewRound,
   turns: readonly Turn[]

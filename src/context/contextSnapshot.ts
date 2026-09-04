@@ -8,6 +8,10 @@ import {
   requireText,
   requireTimestamp
 } from "../domain/validation.js";
+import {
+  MAX_CONTEXT_SOURCE_TURN_BYTES,
+  MAX_CONTEXT_SOURCE_TURNS
+} from "./sourceTurnContext.js";
 
 export const CONTEXT_SNAPSHOT_SCHEMA_VERSION = 1 as const;
 export const CONTEXT_SNAPSHOT_MAX_RESOURCES = 256;
@@ -269,7 +273,18 @@ function normalizeSnapshotResources(
   refs: readonly ContextRef[]
 ): readonly ContextSnapshotResource[] {
   if (!Array.isArray(values)) throw new Error("Context Snapshot resources must be an array.");
-  if (values.length > CONTEXT_SNAPSHOT_MAX_RESOURCES) {
+  const sourceTurnCount = values.filter((resource) => (
+    resource !== null
+    && typeof resource === "object"
+    && !Array.isArray(resource)
+    && resource.ref !== null
+    && typeof resource.ref === "object"
+    && resource.ref.store === "source-turn"
+  )).length;
+  if (sourceTurnCount > MAX_CONTEXT_SOURCE_TURNS) {
+    throw new Error(`Context Snapshot exceeds ${MAX_CONTEXT_SOURCE_TURNS} source Turns.`);
+  }
+  if (values.length - sourceTurnCount > CONTEXT_SNAPSHOT_MAX_RESOURCES) {
     throw new Error(`Context Snapshot exceeds ${CONTEXT_SNAPSHOT_MAX_RESOURCES} resources.`);
   }
   const byRef = new Map(refs.map((ref) => [contextRefKey(ref), ref]));
@@ -295,8 +310,15 @@ function normalizeSnapshotResources(
     || new Set(resources.map(({ ref }) => contextRefKey(ref))).size !== refs.length) {
     throw new Error("Context Snapshot resources must cover every ref exactly once.");
   }
-  if (Buffer.byteLength(JSON.stringify(resources), "utf8") > CONTEXT_SNAPSHOT_MAX_BYTES) {
+  const ordinary = resources.filter(({ ref }) => ref.store !== "source-turn");
+  const sourceTurns = resources.filter(({ ref }) => ref.store === "source-turn");
+  if (Buffer.byteLength(JSON.stringify(ordinary), "utf8") > CONTEXT_SNAPSHOT_MAX_BYTES) {
     throw new Error(`Context Snapshot resources exceed ${CONTEXT_SNAPSHOT_MAX_BYTES} bytes.`);
+  }
+  if (Buffer.byteLength(JSON.stringify(sourceTurns), "utf8") > MAX_CONTEXT_SOURCE_TURN_BYTES) {
+    throw new Error(
+      `Context Snapshot source Turns exceed ${MAX_CONTEXT_SOURCE_TURN_BYTES} bytes.`
+    );
   }
   return Object.freeze(resources);
 }

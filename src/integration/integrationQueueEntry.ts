@@ -16,7 +16,6 @@ export type IntegrationQueueStatus =
   | "queued"
   | "running"
   | "conflicted"
-  | "validated"
   | "committed"
   | "superseded";
 
@@ -38,18 +37,11 @@ export type IntegrationQueueEntry = Readonly<{
   conflictSummary?: string;
   /**
    * Paths landed on the target after this entry was enqueued that overlap the
-   * entry's own ChangeSet.  Recomputed after every target advance; a validated
-   * entry with any affected path loses its evidence coverage.
+   * entry's own ChangeSet. Recomputed after every target advance for
+   * diagnostics; it never waives the entry's integration checks.
    */
   affectedPaths?: readonly string[];
-  /**
-   * The exact target head the entry's reusable evidence was validated against.
-   * A `validated` entry only skips its checks while the target still equals
-   * this boundary; an out-of-band advance invalidates the evidence and the
-   * entry runs its checks again.
-   */
-  evidenceTargetHead?: string;
-  /** Durable verification evidence for the entry's exact head commit. */
+  /** Core-owned proof for terminal no-op convergence, if applicable. */
   evidenceRefs: readonly string[];
   supersedeReason?: string;
   createdAt: string;
@@ -129,7 +121,7 @@ export function markIntegrationQueueRunning(
   now: Date
 ): IntegrationQueueEntry {
   validateIntegrationQueueEntry(entry);
-  if (!["queued", "conflicted", "validated"].includes(entry.status)) {
+  if (!["queued", "conflicted"].includes(entry.status)) {
     throw new Error(`Integration queue entry cannot run from ${entry.status}: ${entry.id}.`);
   }
   const { conflictSummary: _previousConflict, ...rest } = entry;
@@ -193,44 +185,13 @@ export function markIntegrationQueueCommitted(
   });
 }
 
-/**
- * Records that this entry's reusable evidence was checked against an exact
- * target head.  The evidence only covers `evidenceTargetHead`; a target
- * advance invalidates it unless the delta is provably empty.  Path
- * disjointness alone never justifies this transition: a gate may read any
- * file, so a non-empty target increment cannot be proven irrelevant.
- */
-export function markIntegrationQueueValidated(
-  entry: IntegrationQueueEntry,
-  now: Date,
-  evidenceTargetHead?: string
-): IntegrationQueueEntry {
-  validateIntegrationQueueEntry(entry);
-  if (entry.status !== "queued") {
-    throw new Error(`Integration queue entry cannot validate from ${entry.status}: ${entry.id}.`);
-  }
-  if (entry.evidenceRefs.length === 0) {
-    throw new Error(`Integration queue entry has no reusable evidence: ${entry.id}.`);
-  }
-  return validateIntegrationQueueEntry({
-    ...entry,
-    status: "validated",
-    ...(evidenceTargetHead === undefined ? {} : { evidenceTargetHead }),
-    updatedAt: now.toISOString()
-  });
-}
-
-/**
- * A validated entry whose ChangeSet became affected by a later target advance
- * loses its evidence coverage and runs its checks again; a conflicted entry is
- * manually retried after its underlying issue was fixed.
- */
+/** A conflicted entry is manually retried after its underlying issue was fixed. */
 export function markIntegrationQueueRequeued(
   entry: IntegrationQueueEntry,
   now: Date
 ): IntegrationQueueEntry {
   validateIntegrationQueueEntry(entry);
-  if (entry.status !== "validated" && entry.status !== "conflicted") {
+  if (entry.status !== "conflicted") {
     throw new Error(
       `Integration queue entry cannot requeue from ${entry.status}: ${entry.id}.`
     );
@@ -248,7 +209,7 @@ export function recordIntegrationQueueAffectedPaths(
   now: Date
 ): IntegrationQueueEntry {
   validateIntegrationQueueEntry(entry);
-  if (!["queued", "validated"].includes(entry.status)) {
+  if (entry.status !== "queued") {
     throw new Error(
       `Integration queue entry cannot recompute overlap from ${entry.status}: ${entry.id}.`
     );
@@ -268,7 +229,7 @@ export function markIntegrationQueueSuperseded(
   now: Date
 ): IntegrationQueueEntry {
   validateIntegrationQueueEntry(entry);
-  if (!["queued", "conflicted", "validated"].includes(entry.status)) {
+  if (!["queued", "conflicted"].includes(entry.status)) {
     throw new Error(
       `Integration queue entry cannot be superseded from ${entry.status}: ${entry.id}.`
     );
@@ -302,7 +263,6 @@ export function validateIntegrationQueueEntry(
     "queued",
     "running",
     "conflicted",
-    "validated",
     "committed",
     "superseded"
   ].includes(entry.status)) {
@@ -310,9 +270,6 @@ export function validateIntegrationQueueEntry(
   }
   if (entry.targetBefore !== undefined) requireCommit(entry.targetBefore, "Integration queue targetBefore");
   if (entry.targetAfter !== undefined) requireCommit(entry.targetAfter, "Integration queue targetAfter");
-  if (entry.evidenceTargetHead !== undefined) {
-    requireCommit(entry.evidenceTargetHead, "Integration queue evidenceTargetHead");
-  }
   if (entry.integrationAttemptId !== undefined) {
     normalizedUniqueIdentities([entry.integrationAttemptId], "Integration attempt id");
   }

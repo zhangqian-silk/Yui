@@ -211,7 +211,7 @@ export function terminalizeExactTurnReviewRound(
     input.outcome.status,
     now,
     input.outcome.status === "failed"
-      ? { kind: "execution", message: input.outcome.failureReason ?? "runtime-failed" }
+      ? { kind: "execution", message: input.outcome.output }
       : undefined
   );
   store.saveReviewRound(input.taskId, terminal);

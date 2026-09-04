@@ -19,6 +19,7 @@ import {
   mapCodexAgentError
 } from "./builtinAgentErrorMappers.js";
 import { serializeAgentErrorRaw, standardAgentError } from "./agentError.js";
+import { transportAgentResult } from "../domain/agentResultTransport.js";
 
 export const CODEX_DRIVER_ID = "openai/codex";
 export const CLAUDE_CODE_DRIVER_ID = "anthropic/claude-code";
@@ -556,16 +557,10 @@ function optionalSummary(
 }
 
 function optionalResultOutput(
-  payload: Readonly<Record<string, unknown>>,
-  preferred = "last_assistant_message"
+  payload: Readonly<Record<string, unknown>>
 ): RuntimeObservationPayload {
-  for (const field of [preferred, "summary", "message"]) {
-    const value = payload[field];
-    if (typeof value === "string" && value.trim().length > 0 && !value.includes("\0")) {
-      return { output: value };
-    }
-  }
-  return {};
+  const result = transportAgentResult(payload.last_assistant_message);
+  return result.status === "completed" ? { output: result.output } : {};
 }
 
 function claudeFailure(

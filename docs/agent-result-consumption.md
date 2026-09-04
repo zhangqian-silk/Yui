@@ -59,7 +59,11 @@ type TurnSystemEvidence = Readonly<{
 ```
 
 `output` preserves the Provider's complete non-empty text, including its outer
-whitespace. `systemEvidence` is authored and validated by Core.
+whitespace, up to the 512 KiB durable result limit. Provider status and Yui
+outcome are separate: a Provider may report `completed`, while missing, empty,
+NUL-containing, or oversized result text terminalizes the Yui Turn as
+`missing-result`. Core stores a bounded diagnostic instead of truncating or
+inventing Agent prose. `systemEvidence` is authored and validated by Core.
 
 A useful, optional Agent layout is:
 
@@ -109,6 +113,7 @@ or complete action is the semantic decision.
 
 Replicated execution retains immutable Assignment, isolated Lanes, all-Lanes
 settlement, minimum successful Producer count, and one main synthesis Turn.
+One Group supports two through eight Lanes.
 
 Each Producer returns one opaque original result. A Producer succeeds when its
 Provider completes and its required Core workspace snapshot is valid. Core
@@ -124,9 +129,13 @@ type SynthesisSource = Readonly<{
 }>;
 ```
 
-Its frozen Context Snapshot materializes every successful source Turn,
-including the exact `TurnResult.output` and Core system evidence. The dispatch
-input contains references rather than copied or parsed Producer objects.
+Its frozen Context Snapshot materializes a compact source-Turn view for every
+successful Lane: exact identity, lineage, `TurnResult.output`, provider facts,
+and Core system evidence. It does not duplicate source prompt history,
+workspace descriptors, or launch configuration. Source results have a
+separate bounded Context budget, so eight maximum-size results cannot consume
+the ordinary 8 MiB snapshot budget. The dispatch input contains references
+rather than copied or parsed Producer objects.
 
 The main Agent reads every source result, resolves disagreement against the
 frozen source, and returns one new original result. For WorkItem execution the
@@ -146,10 +155,10 @@ to:
 yui task turn show <task>/<turn>
 ```
 
-A forced steer into an already active Leader Turn includes the exact
-referenced result Turn commands directly. In both paths the Leader reads the
-complete original result before accepting, retrying, repairing, reviewing
-again, or waiting.
+A forced steer into an already active Leader Turn includes commands for at
+most four referenced result Turns and points to `task wake show` for any
+remainder. In both paths the Leader reads the complete original result before
+accepting, retrying, repairing, reviewing again, or waiting.
 
 ## Review and completion
 
@@ -184,8 +193,10 @@ The current execution path has no:
 - `force-fresh` Review replacement path;
 - Review evidence reuse based on Agent claims.
 
-Core-owned GateArtifacts remain reusable because Yui ran and recorded those
-checks itself.
+Core-owned verification evidence remains reusable only inside the exact Core
+verification contract that produced it. ChangeSets do not carry Review or
+GateArtifact references into the Integration queue; each queued ChangeSet runs
+the checks requested for its current target.
 
 ## Storage boundary
 
@@ -208,6 +219,7 @@ The required deterministic evidence is:
 - arbitrary non-empty Worker or Reviewer prose is preserved unchanged;
 - missing headings, invalid JSON, or omitted reported checks do not fail a
   Turn;
+- missing and oversized Provider results still terminalize as `missing-result`;
 - dirty or mismatched writable Lane state still fails;
 - main synthesis receives every successful source Turn in stable Lane order;
 - Review completion depends on the exact completed main Turn, not its wording;

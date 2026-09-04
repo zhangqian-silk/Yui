@@ -4,16 +4,12 @@ import type { ReviewRound } from "../review/reviewRound.js";
 import type { IntegrationAttempt } from "../integration/integrationAttempt.js";
 
 export const FAULT_CLASSES = [
-  "provider-transient",
-  "policy-denied",
   "session-dead",
   "delivery-uncertain",
-  "storage-backend-lock",
   "review-infra",
   "integration-environment",
   "integration-candidate-failure",
   "stale-base-target-cas",
-  "archive-resource-leak",
   "other"
 ] as const;
 
@@ -21,7 +17,7 @@ export type FaultClass = (typeof FAULT_CLASSES)[number];
 
 export type FaultClassification = Readonly<{
   faultClass: FaultClass;
-  basis: "structured" | "none";
+  basis: "core-fact" | "core-diagnostic" | "none";
   /** Short excerpt or field name that justifies the class. */
   evidence: string;
 }>;
@@ -32,8 +28,8 @@ export const NO_FAULT: FaultClassification = Object.freeze({
   evidence: ""
 });
 
-/** Structured hint a future capability provider (other Issues) may supply. */
-export type StructuredFaultHint = Readonly<{
+/** Optional Core-owned fault fact supplied by a caller with narrower evidence. */
+export type CoreFaultHint = Readonly<{
   faultClass: FaultClass;
   evidence: string;
 }>;
@@ -49,34 +45,34 @@ function excerpt(text: string, max = 160): string {
 /** Classify a failed Turn without inspecting Agent-authored output. */
 export function classifyTurnFailure(
   run: Pick<Turn, "status" | "result">,
-  structured?: StructuredFaultHint
+  hint?: CoreFaultHint
 ): FaultClassification {
   if (run.status !== "failed") return NO_FAULT;
-  if (structured !== undefined) {
+  if (hint !== undefined) {
     return {
-      faultClass: structured.faultClass,
-      basis: "structured",
-      evidence: structured.evidence
+      faultClass: hint.faultClass,
+      basis: "core-fact",
+      evidence: hint.evidence
     };
   }
   const failureReason = run.result?.failureReason;
   if (failureReason === "delivery-unknown") {
     return {
       faultClass: "delivery-uncertain",
-      basis: "structured",
+      basis: "core-fact",
       evidence: failureReason
     };
   }
   if (failureReason === "startup-failed") {
     return {
       faultClass: "session-dead",
-      basis: "structured",
+      basis: "core-fact",
       evidence: failureReason
     };
   }
   return {
     faultClass: "other",
-    basis: "structured",
+    basis: "core-fact",
     evidence: failureReason ?? "failed without Core failure reason"
   };
 }
@@ -86,7 +82,7 @@ export function classifyReviewRound(round: ReviewRound): FaultClassification {
   if (round.status === "failed") {
     return {
       faultClass: "review-infra",
-      basis: "structured",
+      basis: "core-fact",
       evidence: round.failure?.message ?? "Review execution failed without Core failure detail."
     };
   }
@@ -95,8 +91,8 @@ export function classifyReviewRound(round: ReviewRound): FaultClassification {
 
 /**
  * Integration failure classes: environment/toolchain failure, stale base/CAS
- * conflict, or candidate failure. Conflict reports are structured; check
- * details are matched as historical text.
+ * conflict, or candidate failure. Conflict/check records are Core-owned, but
+ * environment attribution still uses a regex over their diagnostic text.
  */
 export function classifyIntegrationAttempt(
   attempt: Pick<IntegrationAttempt, "status" | "checks" | "conflict">
@@ -105,7 +101,7 @@ export function classifyIntegrationAttempt(
   if (attempt.conflict !== undefined) {
     return {
       faultClass: "stale-base-target-cas",
-      basis: "structured",
+      basis: "core-fact",
       evidence: excerpt(attempt.conflict.summary)
     };
   }
@@ -115,20 +111,20 @@ export function classifyIntegrationAttempt(
   if (INTEGRATION_ENVIRONMENT_PATTERN.test(checkText)) {
     return {
       faultClass: "integration-environment",
-      basis: "structured",
+      basis: "core-diagnostic",
       evidence: excerpt(checkText)
     };
   }
   if ((attempt.checks ?? []).some((c) => c.outcome === "failed")) {
     return {
       faultClass: "integration-candidate-failure",
-      basis: "structured",
+      basis: "core-fact",
       evidence: excerpt(checkText)
     };
   }
   return {
     faultClass: "other",
-    basis: "structured",
+    basis: "core-fact",
     evidence: "failed without checks or conflict"
   };
 }

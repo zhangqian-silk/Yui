@@ -275,7 +275,7 @@ export type TaskStore = {
   /**
    * Issue 06 (Task terminalization readiness): load the full record set the
    * completion readiness projection consumes, including managed workspaces,
-   * DurableJobs, integration queue entries, Review findings, and the event
+   * DurableJobs, integration queue entries, ReviewRounds, and the event
    * fold. Returns null when the Task does not exist.
    */
   readCompletionReadinessFacts(taskId: string): CompletionReadinessFacts | null;

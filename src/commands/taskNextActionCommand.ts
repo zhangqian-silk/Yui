@@ -126,7 +126,6 @@ export function runTaskNextActionCommand(
       integrations: reader.listIntegrationAttempts(taskId),
       durableJobs: reader.listDurableJobs(taskId),
       publications: reader.listPublicationReferences(taskId),
-      decisions: reader.listDecisions(taskId),
       events,
       managedWorkspaces: reader.listManagedWorkspaces(taskId)
     });

@@ -322,12 +322,7 @@ export class WorkItemChangeSetManager {
         deletedPaths: result.deletedPaths
       }),
       deletedPaths: result.deletedPaths,
-      ...(targetRef === undefined ? {} : { targetRef }),
-      evidenceRefs: this.#captureEvidenceRefs(
-        context.taskId,
-        context.workItemId,
-        result.headCommit
-      )
+      ...(targetRef === undefined ? {} : { targetRef })
     });
     return this.store.transaction((tx) => {
       assertCaptureStillCurrent(tx, context);
@@ -374,13 +369,6 @@ export class WorkItemChangeSetManager {
     });
   }
 
-  #captureEvidenceRefs(
-    _taskId: string,
-    _workItemId: string,
-    _headCommit: string
-  ): readonly string[] {
-    return [];
-  }
 }
 
 type CapturableContext = Readonly<{

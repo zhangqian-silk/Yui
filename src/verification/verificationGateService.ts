@@ -46,7 +46,7 @@ import {
  *
  * One place owns the gate lifecycle: identity tuple computation, reuse
  * lookup, artifact recording from a DurableJob or an in-process run, Review
- * verification, and evidence coverage. Integration, the queue, Review, and
+ * verification, and exact artifact reuse. Integration, the queue, Review, and
  * release consume through these functions; unconfigured Projects keep the
  * existing explicit check path untouched.
  */
@@ -474,36 +474,6 @@ export async function verifyGateArtifactForReview(
     };
   }
   return { ok: true, artifact };
-}
-
-/**
- * Whether a `gate-artifact:` evidence reference covers the requested check
- * commands for an exact candidate commit. Used by the integration queue's
- * evidence fence: a passed gate step covers only its own command, and the
- * artifact must bind the exact candidate tree.
- */
-export async function gateArtifactCoversCheckCommands(
-  store: GateArtifactStorePort,
-  projectId: string,
-  ref: string,
-  checkCommands: readonly string[],
-  candidateCommit: string
-): Promise<boolean> {
-  const key = parseGateArtifactRef(ref);
-  if (key === undefined) return false;
-  const artifact = loadGateArtifact(store, projectId, key);
-  if (artifact === null || !isReusableGateArtifact(artifact)) return false;
-  if (artifact.commit !== candidateCommit) return false;
-  const logs = store.getGateArtifactLogs(artifact.key);
-  const verification = verifyGateArtifactLogs(artifact, logs);
-  if (!verification.ok) return false;
-  if (checkCommands.length === 0) return true;
-  const covered = new Set(
-    artifact.steps
-      .filter((step) => step.outcome === "passed")
-      .map((step) => step.command)
-  );
-  return checkCommands.every((command) => covered.has(command));
 }
 
 /**

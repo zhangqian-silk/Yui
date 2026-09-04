@@ -87,7 +87,13 @@ import { runRuntimeObservationHookCommand } from "../../dist/controller/runtimeO
 import { callFileTaskController } from "../../dist/controller/clientRuntime.js";
 import { startControllerServer } from "../../dist/core/controllerServer.js";
 import { terminalizeExactTaskTurn } from "../../dist/lifecycle/exactTurnTerminalization.js";
-import { completeTurn, createTurn, validateTurn } from "../../dist/turn/turn.js";
+import {
+  MAX_TURN_RESULT_OUTPUT_BYTES,
+  completeTurn,
+  createTurn,
+  transportAgentResult,
+  validateTurn
+} from "../../dist/turn/turn.js";
 import { createTurnInput } from "../../dist/context/turnInputContract.js";
 import { processActiveRoleTurnDeliveries } from "../../dist/scheduler/activeRoleTurnDelivery.js";
 import { processOperatorInputNotifications } from "../../dist/scheduler/operatorInputNotificationProcessor.js";
@@ -1283,12 +1289,15 @@ test("a direct Provider Turn records visible input and output without workflow s
     attemptId: "direct:turn-ordinary-1",
     turnId: directTurn.id,
     input: "Please inspect the current code.",
-    output: "\nOrdinary conversation reply.\n",
-    providerStatus: "completed"
+    providerStatus: "completed",
+    outcome: {
+      status: "completed",
+      output: "\nOrdinary conversation reply.\n"
+    }
   };
 
-  assert.equal(adapter.classifyRuntimeTurnCompleted(terminal), "apply");
-  const observed = adapter.observeRuntimeTurnCompleted(terminal, completedAt);
+  assert.equal(adapter.classifyRuntimeTurnTerminal(terminal), "apply");
+  const observed = adapter.observeRuntimeTurnTerminal(terminal, completedAt);
   assert.equal(observed.duplicate, false);
   assert.equal(observed.turn.inputs[0].input.source.type, "user");
   assert.equal(observed.turn.inputs[0].input.source.channel, "direct");
@@ -1305,7 +1314,7 @@ test("a direct Provider Turn records visible input and output without workflow s
   }), continuationAt), "applied");
   const goalTurn = store.getActiveTurn(task.id, role.name);
   assert.notEqual(goalTurn, null);
-  const continued = adapter.observeRuntimeTurnCompleted({
+  const continued = adapter.observeRuntimeTurnTerminal({
     taskId: task.id,
     roleName: role.name,
     agentId: agent.agentId,
@@ -1315,8 +1324,11 @@ test("a direct Provider Turn records visible input and output without workflow s
     nativeTurnId: "turn-goal-2",
     attemptId: "direct:turn-goal-2",
     turnId: goalTurn.id,
-    output: "Goal-directed continuation reply.",
-    providerStatus: "completed"
+    providerStatus: "completed",
+    outcome: {
+      status: "completed",
+      output: "Goal-directed continuation reply."
+    }
   }, continuationAt);
   assert.deepEqual(continued.turn.inputs[0].input.source, {
     type: "provider",
@@ -2000,8 +2012,11 @@ test("the exact Provider Turn terminal atomically completes its Turn once", asyn
     nativeTurnId: "turn-1",
     attemptId: "run:task-1/turn-1",
     turnId: run.id,
-    output: "Managed execution finished.",
-    providerStatus: "completed"
+    providerStatus: "completed",
+    outcome: {
+      status: "completed",
+      output: "Managed execution finished."
+    }
   };
   runTaskCommand(
     ["message", "send", task.id, "A newer fact arrived during the current Turn."],
@@ -2009,7 +2024,7 @@ test("the exact Provider Turn terminal atomically completes its Turn once", asyn
     { now: () => new Date("2026-08-31T01:00:30.000Z"), environment: bareEnv }
   );
 
-  assert.deepEqual(adapter.observeRuntimeTurnCompleted(terminal, completedAt), {
+  assert.deepEqual(adapter.observeRuntimeTurnTerminal(terminal, completedAt), {
     session: store.getTaskRoleSessionSet(task.id, role.name).sessions[agent.agentId],
     duplicate: false,
     turn: store.getTurn(task.id, run.id)
@@ -2028,7 +2043,7 @@ test("the exact Provider Turn terminal atomically completes its Turn once", asyn
   assert.equal(store.getActiveTurn(task.id, role.name), null);
   assert.equal(store.getTaskRoleSessionSet(task.id, role.name).sessions[agent.agentId].status, "active");
 
-  const replay = adapter.observeRuntimeTurnCompleted(terminal, completedAt);
+  const replay = adapter.observeRuntimeTurnTerminal(terminal, completedAt);
   assert.equal(replay.duplicate, true);
   assert.equal(replay.turn.id, run.id);
   assert.equal(store.listTurns(task.id).length, 1);
@@ -2528,6 +2543,37 @@ test("direct and replicated Review keep Producer results non-authoritative", (t)
 
   runTaskCommand([
     "review", "request", task.id,
+    "--role", "reviewer-direct"
+  ], store, {
+    now: () => new Date("2026-09-02T00:12:10.000Z"),
+    environment: bareEnv,
+    actualTaskReviewCandidate: candidate
+  });
+  const failedRound = attachWorkspace(
+    store.listReviewRounds(task.id).at(-1),
+    "review-direct-failed"
+  );
+  const failedTurn = dispatchPreparedReviewRound(task.id, failedRound.id, store, {
+    now: () => new Date("2026-09-02T00:12:20.000Z"),
+    environment: bareEnv,
+    actualTaskReviewCandidate: candidate
+  });
+  const failureOutput = "Provider Agent Turn failed: reviewer process exited with status 17";
+  const terminalFailure = finish(
+    failedTurn,
+    "failed",
+    new Date("2026-09-02T00:12:30.000Z"),
+    failureOutput,
+    "direct-failed"
+  );
+  assert.equal(terminalFailure.result.failureReason, "runtime-failed");
+  assert.equal(
+    store.getReviewRound(task.id, failedRound.id).failure.message,
+    failureOutput
+  );
+
+  runTaskCommand([
+    "review", "request", task.id,
     "--role", "reviewer-main",
     "--lane-role", "producer-a",
     "--lane-role", "producer-b"
@@ -2616,6 +2662,11 @@ test("direct and replicated Review keep Producer results non-authoritative", (t)
     sourceTurns.map(({ result }) => result.output),
     producerOutputs
   );
+  for (const sourceTurn of sourceTurns) {
+    assert.equal(Object.hasOwn(sourceTurn, "inputs"), false);
+    assert.equal(Object.hasOwn(sourceTurn, "workspace"), false);
+    assert.equal(Object.hasOwn(sourceTurn, "effective"), false);
+  }
   assert.deepEqual(
     store.transaction((tx) => reconcileReviewMainTurns(
       tx,
@@ -2955,6 +3006,22 @@ test("Core freezes writable Lane state without parsing the Producer output", (t)
       })),
       dependencyFacts: []
     });
+    if (groupId === "execution-group-1") {
+      assert.throws(() => createWorkItemExecutionGroup(
+        "execution-group-too-wide",
+        task.id,
+        assignment,
+        Array.from({ length: 9 }, (_, index) => ({
+          roleName: `producer-${index + 1}`,
+          effective: effective[0],
+          workspace: {
+            root: laneWorkspaces[0].root,
+            writableProjectIds: writeProjectIds
+          }
+        })),
+        now
+      ), /at most 8 Lanes/u);
+    }
     const group = createWorkItemExecutionGroup(groupId, task.id, assignment, roles.map((role, index) => ({
       roleName: role.name,
       effective: effective[index],
@@ -3084,6 +3151,9 @@ test("Core freezes writable Lane state without parsing the Producer output", (t)
     headCommit
   );
   writeFileSync(join(snapshotPath, "dirty.txt"), "not committed\n");
+  assert.equal(snapshotExecutionLaneWorkspaceSync(store, actualWorkspace), undefined);
+  rmSync(join(snapshotPath, "dirty.txt"));
+  execFileSync("git", ["checkout", "-b", "wrong-lane"], { cwd: snapshotPath });
   assert.equal(snapshotExecutionLaneWorkspaceSync(store, actualWorkspace), undefined);
 });
 
@@ -3523,6 +3593,15 @@ test("the built-in Agent Drivers are available through the shared registry", () 
     });
     const observations = Array.isArray(mapped) ? mapped : [mapped];
     assert.deepEqual(observations.map(({ kind }) => kind), ["activation.ended"]);
+
+    const completed = drivers.requireByAdapterId(adapterId).runtime.mapHook({
+      hookEventName: "Stop",
+      payload: { summary: "Not the final Agent result." },
+      occurrenceId: "hook-2"
+    });
+    const terminal = (Array.isArray(completed) ? completed : [completed])
+      .find(({ kind }) => kind === "turn.completed");
+    assert.equal(terminal.payload.output, undefined);
   }
 });
 
@@ -3642,18 +3721,18 @@ test("Operator batches durable refs and defers the whole batch while busy", asyn
   assert.notEqual(mailbox.pending, null);
 });
 
-test("the async runtime observer preserves completion classification", async () => {
+test("the async runtime observer preserves terminal classification", async () => {
   const calls = [];
   const observer = createAsyncRuntimeObserver(async (method) => {
     calls.push(method);
-    return method === "classifyGlobalRuntimeTurnCompleted" ? "apply" : "deferred";
+    return method === "classifyGlobalRuntimeTurnTerminal" ? "apply" : "deferred";
   });
 
-  assert.equal(await observer.classifyRuntimeTurnCompleted({}), "deferred");
-  assert.equal(await observer.classifyGlobalRuntimeTurnCompleted({}), "apply");
+  assert.equal(await observer.classifyRuntimeTurnTerminal({}), "deferred");
+  assert.equal(await observer.classifyGlobalRuntimeTurnTerminal({}), "apply");
   assert.deepEqual(calls, [
-    "classifyRuntimeTurnCompleted",
-    "classifyGlobalRuntimeTurnCompleted"
+    "classifyRuntimeTurnTerminal",
+    "classifyGlobalRuntimeTurnTerminal"
   ]);
 });
 
@@ -3680,11 +3759,82 @@ test("Claude global Stop hooks publish the native completion boundary", async (t
   }, new Date("2026-08-28T00:00:00.000Z"), { sequence: () => 1 });
 
   const [event] = new FileRuntimeEventInbox(home).list();
-  assert.equal(event.type, "native-turn-completed");
+  assert.equal(event.type, "native-turn-terminal");
   assert.equal(event.scope, "global");
   assert.equal(event.adapterId, "claude");
-  assert.equal(event.output, "\nDone.\n");
+  assert.deepEqual(event.outcome, { status: "completed", output: "\nDone.\n" });
   assert.deepEqual(signal, { key: "global-role:operator" });
+});
+
+test("native terminal ingress preserves valid output and durably fails missing or oversized output", (t) => {
+  const home = mkdtempSync(join(tmpdir(), "yui-native-terminal-output-"));
+  t.after(() => rmSync(home, { recursive: true, force: true }));
+  const inbox = new FileRuntimeEventInbox(home);
+  const base = {
+    scope: "task",
+    taskId: "task-1",
+    roleName: "worker",
+    agentId: "codex",
+    adapterId: "codex",
+    runtimeGenerationId: "generation-1",
+    nativeSessionId: "session-1",
+    providerStatus: "completed"
+  };
+  const boundary = "x".repeat(MAX_TURN_RESULT_OUTPUT_BYTES);
+  const accepted = inbox.enqueueTurnTerminal({
+    ...base,
+    nativeTurnId: "native-turn-1",
+    turnId: "turn-1",
+    outcome: { status: "completed", output: boundary }
+  }).event;
+  assert.equal(accepted.outcome.status, "completed");
+  assert.equal(accepted.outcome.output, boundary);
+
+  const oversized = inbox.enqueueTurnTerminal({
+    ...base,
+    nativeTurnId: "native-turn-2",
+    turnId: "turn-2",
+    outcome: {
+      status: "completed",
+      output: `${boundary}x`
+    }
+  }).event;
+  assert.deepEqual(oversized.outcome, transportAgentResult(`${boundary}x`));
+  assert.equal(oversized.outcome.status, "failed");
+  assert.equal(oversized.outcome.failureReason, "missing-result");
+
+  const missing = inbox.enqueueTurnTerminal({
+    ...base,
+    nativeTurnId: "native-turn-3",
+    turnId: "turn-3",
+    outcome: { status: "completed", output: null }
+  }).event;
+  assert.deepEqual(missing.outcome, transportAgentResult(null));
+
+  const longDiagnostic = `failed:${"🔥".repeat(20_000)}`;
+  const failed = inbox.enqueueTurnTerminal({
+    ...base,
+    nativeTurnId: "native-turn-4",
+    turnId: "turn-4",
+    providerStatus: "failed",
+    outcome: {
+      status: "failed",
+      output: longDiagnostic,
+      failureReason: "runtime-failed"
+    }
+  }).event;
+  assert.equal(failed.outcome.status, "failed");
+  assert.ok(Buffer.byteLength(failed.outcome.output, "utf8") <= 16 * 1024);
+  assert.ok(longDiagnostic.startsWith(failed.outcome.output));
+
+  assert.throws(() => inbox.enqueueTurnTerminal({
+    ...base,
+    nativeTurnId: "native-turn-5",
+    turnId: "turn-5",
+    providerStatus: "failed",
+    outcome: { status: "completed", output: "Contradictory success." }
+  }), /Only a completed Provider Turn/u);
+  assert.equal(inbox.list().length, 4);
 });
 
 test("managed Session authority follows durable state, not a frozen environment", (t) => {

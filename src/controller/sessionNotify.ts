@@ -1,6 +1,10 @@
 import { callController } from "../core/controllerClient.js";
 import type { JsonValue } from "../core/protocol.js";
-import { FileRuntimeEventInbox } from "./runtimeEventInbox.js";
+import {
+  FileRuntimeEventInbox,
+  type RuntimeTurnTerminalOutcome
+} from "./runtimeEventInbox.js";
+import { transportAgentResult } from "../domain/agentResultTransport.js";
 import { runtimeLifecycleSignalKey } from "../runtime/lifecycleReservation.js";
 import {
   setCodexThreadName,
@@ -19,7 +23,7 @@ export type CodexSessionNotification = Readonly<{
   nativeSessionId: string;
   nativeTurnId: string;
   title?: string;
-  output: string;
+  outcome: RuntimeTurnTerminalOutcome;
 }>;
 
 type ControllerCall = (
@@ -30,9 +34,6 @@ type ControllerCall = (
 ) => Promise<JsonValue>;
 
 type CodexThreadNameSetter = (request: CodexThreadNameRequest) => Promise<void>;
-
-const NO_FINAL_ASSISTANT_MESSAGE_OUTPUT =
-  "Native Turn completed without a final assistant message.";
 
 /** Hidden CLI entrypoint used by Codex's structured notify hook. */
 export async function runSessionNotifyCommand(
@@ -47,7 +48,7 @@ export async function runSessionNotifyCommand(
   // Turn or runtime generation is current. Durable Session state answers both;
   // the envelope's runtime generation id is used only before a Session has been projected.
   const current = currentNotifyGeneration(home, params);
-  const enqueued = new FileRuntimeEventInbox(home).enqueueTurnCompleted({
+  const enqueued = new FileRuntimeEventInbox(home).enqueueTurnTerminal({
     scope: params.scope,
     ...(params.scope === "task" ? { taskId: params.taskId } : {}),
     roleName: params.roleName,
@@ -58,7 +59,8 @@ export async function runSessionNotifyCommand(
     nativeTurnId: params.nativeTurnId,
     ...(current.turnId === undefined ? {} : { turnId: current.turnId }),
     ...(params.title === undefined ? {} : { title: params.title }),
-    output: params.output
+    providerStatus: "completed",
+    outcome: params.outcome
   });
   // The durable write is authoritative. This short socket call is only a
   // wake-up hint and never starts or waits for a Controller process.
@@ -124,7 +126,7 @@ export function parseCodexSessionNotification(
   }
   const nativeSessionId = requireText(payload["thread-id"], "Codex thread-id");
   const nativeTurnId = requireText(payload["turn-id"], "Codex turn-id");
-  const output = requireAssistantMessage(payload["last-assistant-message"]);
+  const outcome = transportAgentResult(payload["last-assistant-message"]);
   const title = environment.YUI_SESSION_TITLE === undefined
     ? undefined
     : requireText(environment.YUI_SESSION_TITLE, "YUI_SESSION_TITLE");
@@ -143,7 +145,7 @@ export function parseCodexSessionNotification(
     nativeSessionId,
     nativeTurnId,
     ...(title === undefined ? {} : { title }),
-    output
+    outcome
   } as const;
   return scope === "task"
     ? {
@@ -178,17 +180,6 @@ function requireText(value: unknown, label: string): string {
   const text = value.trim();
   if (text.length === 0 || text.length > 1_024) throw new Error(`${label} is invalid.`);
   return text;
-}
-
-function requireAssistantMessage(value: unknown): string {
-  if (value === null) return NO_FINAL_ASSISTANT_MESSAGE_OUTPUT;
-  if (typeof value !== "string" || value.includes("\0")) {
-    throw new Error("Codex last assistant message is required.");
-  }
-  if (value.trim().length === 0 || Buffer.byteLength(value) > 524_288) {
-    throw new Error("Codex last assistant message is invalid.");
-  }
-  return value;
 }
 
 function shouldSetThreadName(

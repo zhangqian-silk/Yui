@@ -398,7 +398,7 @@ export function runTaskContextCommand(
                   `      Assignment: ${latestTurn.inputs[0]!.input.source.channel}${latestTurn.inputs[0]!.input.directive === undefined ? "" : ` · ${compactText(latestTurn.inputs[0]!.input.directive)}`}`,
                   ...(latestTurn.result === undefined
                     ? []
-                    : [`      Summary: ${compactText(latestTurn.result.output)}`])
+                    : [`      Result: ${compactText(latestTurn.result.output)}`])
                 ]),
             ...renderReviewRounds(reviewRounds.filter(
               (round) => round.workItemId === item.id
