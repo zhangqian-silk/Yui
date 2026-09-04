@@ -560,7 +560,9 @@ function optionalResultOutput(
   payload: Readonly<Record<string, unknown>>
 ): RuntimeObservationPayload {
   const result = transportAgentResult(payload.last_assistant_message);
-  return result.status === "completed" ? { output: result.output } : {};
+  return result.status === "completed"
+    ? { output: result.output }
+    : { resultTransportDiagnostic: result.diagnostic };
 }
 
 function claudeFailure(

@@ -3928,6 +3928,25 @@ test("the built-in Agent Drivers are available through the shared registry", () 
     const terminal = (Array.isArray(completed) ? completed : [completed])
       .find(({ kind }) => kind === "turn.completed");
     assert.equal(terminal.payload.output, undefined);
+    assert.equal(
+      terminal.payload.resultTransportDiagnostic,
+      "Provider terminal event did not include an Agent result."
+    );
+
+    const boundary = "x".repeat(MAX_TURN_RESULT_OUTPUT_BYTES);
+    const oversized = drivers.requireByAdapterId(adapterId).runtime.mapHook({
+      hookEventName: "Stop",
+      payload: { last_assistant_message: `${boundary}x` },
+      occurrenceId: "hook-3"
+    });
+    const oversizedTerminal = (Array.isArray(oversized) ? oversized : [oversized])
+      .find(({ kind }) => kind === "turn.completed");
+    assert.equal(oversizedTerminal.payload.output, undefined);
+    assert.match(oversizedTerminal.payload.resultTransportDiagnostic, /524289 bytes/u);
+    assert.match(
+      oversizedTerminal.payload.resultTransportDiagnostic,
+      /524288-byte durable result limit/u
+    );
   }
 });
 
