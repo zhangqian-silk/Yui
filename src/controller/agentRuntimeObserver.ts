@@ -148,7 +148,7 @@ export class AgentRuntimeObserver implements AgentRuntimeObserverPort {
               ? tokenObservationIdentity("baseline", fence, source.sourceId, baselineKey)
               : usageObservationIdentity(fence, source.sourceId, latestOccurrence!);
             this.inbox.enqueueObservation(createRuntimeObservation({
-              schemaVersion: 2,
+              schemaVersion: 3,
               eventId: identity.eventId,
               semanticKey: identity.semanticKey,
               kind: "activity.observed",
@@ -181,7 +181,7 @@ export class AgentRuntimeObserver implements AgentRuntimeObserverPort {
         const health = JSON.stringify([sample.status, sample.detail ?? null]);
         if (state.health !== health) {
           this.inbox.enqueueObservation(createRuntimeObservation({
-            schemaVersion: 2,
+            schemaVersion: 3,
             eventId: observationId("health", fence, source.sourceId, health),
             semanticKey: observationId("health", fence, source.sourceId, health),
             kind: "observer.health",
@@ -228,7 +228,7 @@ export class AgentRuntimeObserver implements AgentRuntimeObserverPort {
         usages.forEach((occurrence, usageIndex) => {
           const identity = usageObservationIdentity(fence, source.sourceId, occurrence);
           this.inbox.enqueueObservation(createRuntimeObservation({
-            schemaVersion: 2,
+            schemaVersion: 3,
             eventId: identity.eventId,
             semanticKey: identity.semanticKey,
             kind: "activity.observed",
@@ -258,7 +258,7 @@ export class AgentRuntimeObserver implements AgentRuntimeObserverPort {
         });
         if (activityChanged && state.cursor !== undefined) {
           this.inbox.enqueueObservation(createRuntimeObservation({
-            schemaVersion: 2,
+            schemaVersion: 3,
             eventId: observationId("activity", fence, source.sourceId, sample.activityId!),
             semanticKey: observationId("activity", fence, source.sourceId, sample.activityId!),
             kind: "activity.observed",
@@ -353,7 +353,7 @@ export class AgentRuntimeObserver implements AgentRuntimeObserverPort {
         const fence = accepted.fence as RuntimeObservationFence
           & Required<Pick<RuntimeObservationFence, "taskId" | "turnId">>;
         const generation = taskObservations.filter((observation) => (
-          sessionGenerationFenceMatches(fence, observation.fence)
+          sessionRuntimeGenerationFenceMatches(fence, observation.fence)
           && observation.payload.sourceId === source.sourceId
         ));
         const persistedUsage = generation.filter((observation) => (
@@ -379,8 +379,7 @@ export class AgentRuntimeObserver implements AgentRuntimeObserverPort {
             fence.turnId,
             fence.agentId,
             fence.driverId,
-            fence.launchId,
-            fence.sessionGenerationId,
+            fence.runtimeGenerationId,
             fence.nativeSessionId,
             source.sourceId
           ]),
@@ -571,15 +570,14 @@ function tokenObservationId(
     fence.roleName,
     fence.agentId,
     fence.driverId,
-    fence.launchId,
-    fence.sessionGenerationId,
+    fence.runtimeGenerationId,
     fence.nativeSessionId ?? null,
     sourceId,
     value
   ])).digest("hex")}`;
 }
 
-function sessionGenerationFenceMatches(
+function sessionRuntimeGenerationFenceMatches(
   expected: RuntimeObservationFence,
   actual: RuntimeObservationFence
 ): boolean {
@@ -588,8 +586,7 @@ function sessionGenerationFenceMatches(
     "roleName",
     "agentId",
     "driverId",
-    "launchId",
-    "sessionGenerationId",
+    "runtimeGenerationId",
     "nativeSessionId"
   ] as const) {
     if (expected[field] !== actual[field]) return false;

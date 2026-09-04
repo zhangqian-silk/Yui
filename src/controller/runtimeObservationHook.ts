@@ -120,7 +120,7 @@ async function runGlobalRuntimeTurnHook(
     roleName,
     agentId: requireIdentity(environment.YUI_AGENT_ID, "Agent id"),
     adapterId: "claude",
-    launchId: requireIdentity(environment.YUI_LAUNCH_ID, "Launch id"),
+    runtimeGenerationId: requireIdentity(environment.YUI_RUNTIME_GENERATION_ID, "Runtime generation id"),
     nativeSessionId,
     nativeTurnId: optionalIdentity(driver.runtime.nativeTurnId(nativeHook)) ?? occurrenceId,
     ...(environment.YUI_SESSION_TITLE === undefined
@@ -204,10 +204,9 @@ export function parseRuntimeObservationHook(
       turnId: fence.turnId,
       agentId: fence.agentId,
       driverId,
-      launchId: fence.launchId,
-      sessionGenerationId: fence.launchId,
+      runtimeGenerationId: fence.runtimeGenerationId,
       conversationId: fence.nativeSessionId,
-      activationId: fence.launchId,
+      activationId: fence.runtimeGenerationId,
       nativeSessionId: fence.nativeSessionId,
       nativeTurnId: nativeTurnId ?? fence.turnId,
       receiptId: fence.receiptId ?? formatTurnReceiptId(fence.taskId, fence.turnId)

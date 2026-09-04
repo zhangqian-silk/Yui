@@ -157,7 +157,7 @@ function sameStopCandidate(
   return session.agentId === candidate.agentId
     && session.adapterId === candidate.adapterId
     && session.nativeSessionId === candidate.nativeSessionId
-    && session.launchId === candidate.launchId
+    && session.runtimeGenerationId === candidate.runtimeGenerationId
     && session.sessionUpdatedAt === candidate.sessionUpdatedAt;
 }
 

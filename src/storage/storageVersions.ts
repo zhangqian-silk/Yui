@@ -16,5 +16,5 @@
  */
 export const CURRENT_STORAGE_LAYOUT_VERSION = 8;
 
-/** Aggregate 29 unifies Review execution after Task, Integration, and AgentProfile migrations. */
-export const CURRENT_AGGREGATE_SCHEMA_VERSION = 29;
+/** Aggregate 30 canonicalizes reusable runtime-generation identity across persisted records. */
+export const CURRENT_AGGREGATE_SCHEMA_VERSION = 30;

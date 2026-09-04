@@ -235,7 +235,7 @@ export type ExactTurnTerminalizationInput = Readonly<{
   agentId: string;
   turnId: string;
   nativeSessionId?: string;
-  launchId?: string;
+  runtimeGenerationId?: string;
   /** Aggregate retirement owns every queued Role signal, not only this Turn. */
   mailboxDisposition?: "exact" | "discard";
   outcome: Readonly<{
@@ -270,7 +270,7 @@ export type ExactTurnRetirementInput = Readonly<{
   agentId: string;
   adapterId: string;
   nativeSessionId?: string;
-  launchId?: string;
+  runtimeGenerationId?: string;
   /** Exact semantic progress fence observed before the retirement request. */
   expectedProgressAt: string;
   reason: string;
@@ -343,7 +343,7 @@ export function retireExactActiveTurn(
     agentId: input.agentId,
     turnId: input.turnId,
     ...(input.nativeSessionId === undefined ? {} : { nativeSessionId: input.nativeSessionId }),
-    ...(input.launchId === undefined ? {} : { launchId: input.launchId }),
+    ...(input.runtimeGenerationId === undefined ? {} : { runtimeGenerationId: input.runtimeGenerationId }),
     outcome: { status: "failed", summary: input.reason, failureReason: "missing-result" }
   };
   const session = sessions?.sessions[input.agentId];
@@ -583,12 +583,12 @@ function settleLaunchReservation(
   const mailbox = store.getWorkMailbox(target);
   const reservation = mailbox?.processing;
   const session = sessions?.sessions[input.agentId] as
-    | (TaskRoleSessionSet["sessions"][string] & { launchId?: string })
+    | (TaskRoleSessionSet["sessions"][string] & { runtimeGenerationId?: string })
     | undefined;
-  const launchId = input.nativeSessionId === undefined
-    ? input.launchId ?? session?.launchId
-    : session?.launchId;
-  if (launchId === undefined || !isRuntimeLaunchReservation(reservation, launchId)) return;
+  const runtimeGenerationId = input.nativeSessionId === undefined
+    ? input.runtimeGenerationId ?? session?.runtimeGenerationId
+    : session?.runtimeGenerationId;
+  if (runtimeGenerationId === undefined || !isRuntimeLaunchReservation(reservation, runtimeGenerationId)) return;
   const settled = completeProcessing(mailbox!, reservation!.batchId);
   if (settled.processing === null && settled.pending === null) {
     store.removeWorkMailbox(target);

@@ -140,7 +140,7 @@ export function resolveJobCaller(
       role: env.YUI_ROLE,
       agentId: env.YUI_AGENT_ID,
       adapterId: env.YUI_ADAPTER_ID,
-      launchId: env.YUI_LAUNCH_ID,
+      runtimeGenerationId: env.YUI_RUNTIME_GENERATION_ID,
       nativeSessionId: env.YUI_NATIVE_SESSION_ID
     };
   }

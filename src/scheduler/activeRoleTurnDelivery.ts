@@ -133,9 +133,9 @@ async function deliverActiveTurn(
       mode,
       turnId: turn.id,
       ...(nativeSessionId === undefined ? {} : { nativeSessionId }),
-      ...(mode !== "resume" || existingSession?.launchId === undefined
+      ...(mode !== "resume" || existingSession?.runtimeGenerationId === undefined
         ? {}
-        : { hostActivationId: existingSession.launchId }),
+        : { hostActivationId: existingSession.runtimeGenerationId }),
       beforeHostStart: (preflight) => persistPreStartSession(
         store,
         task,
@@ -155,7 +155,7 @@ async function deliverActiveTurn(
       role,
       turn,
       session: preparedSession,
-      ...(prepared.launchId === undefined ? {} : { launchId: prepared.launchId }),
+      ...(prepared.runtimeGenerationId === undefined ? {} : { runtimeGenerationId: prepared.runtimeGenerationId }),
       now
     });
 
@@ -166,7 +166,7 @@ async function deliverActiveTurn(
       role,
       turn,
       session: readySession,
-      ...(ready.prepared.launchId === undefined ? {} : { launchId: ready.prepared.launchId }),
+      ...(ready.prepared.runtimeGenerationId === undefined ? {} : { runtimeGenerationId: ready.prepared.runtimeGenerationId }),
       now
     });
     submitted = true;
@@ -177,7 +177,7 @@ async function deliverActiveTurn(
     });
 
     if (outcome === "busy" || outcome === "unavailable") {
-      forget(delivery, task.id, role.name, turn.id, ready.prepared.launchId);
+      forget(delivery, task.id, role.name, turn.id, ready.prepared.runtimeGenerationId);
       return {
         ...base,
         status: "skipped",
@@ -185,7 +185,7 @@ async function deliverActiveTurn(
       };
     }
     if (outcome === "rejected" || outcome === "delivery-unknown") {
-      forget(delivery, task.id, role.name, turn.id, ready.prepared.launchId);
+      forget(delivery, task.id, role.name, turn.id, ready.prepared.runtimeGenerationId);
       return failTurnDelivery(
         store,
         turn,
@@ -196,7 +196,7 @@ async function deliverActiveTurn(
           : "Provider rejected the managed Turn."
       );
     }
-    forget(delivery, task.id, role.name, turn.id, ready.prepared.launchId);
+    forget(delivery, task.id, role.name, turn.id, ready.prepared.runtimeGenerationId);
     settleAcceptedRoleTurnDispatch(store, turn, dispatchToken);
     return {
       ...base,
@@ -225,7 +225,7 @@ async function deliverActiveTurn(
         error: message
       };
     }
-    forget(delivery, task.id, role.name, turn.id, prepared?.launchId);
+    forget(delivery, task.id, role.name, turn.id, prepared?.runtimeGenerationId);
     return failTurnDelivery(
       store,
       turn,
@@ -291,14 +291,14 @@ function persistPreStartSession(
     || preflight.owner.taskId !== task.id
     || preflight.owner.roleName !== role.name
     || preflight.turnId !== turn.id
-    || preflight.launchId.trim().length === 0) {
+    || preflight.runtimeGenerationId.trim().length === 0) {
     throw new Error(`Pre-start launch fence changed the active Role Turn: ${task.id}/${role.name}.`);
   }
   const session = preflight.nativeSessionId === undefined ? null : {
     agentId: preflight.agentId,
     adapterId: preflight.adapterId,
     nativeSessionId: preflight.nativeSessionId,
-    launchId: preflight.launchId,
+    runtimeGenerationId: preflight.runtimeGenerationId,
     ...(preflight.sessionTitle === undefined ? {} : { title: preflight.sessionTitle }),
     status: "active" as const,
     effective: preflight.effective
@@ -308,7 +308,7 @@ function persistPreStartSession(
     role,
     turn,
     session: validateRoleSession(role, turn, existing, mode, session),
-    launchId: preflight.launchId,
+    runtimeGenerationId: preflight.runtimeGenerationId,
     now
   });
 }
@@ -363,13 +363,13 @@ function forget(
   taskId: string,
   roleName: string,
   turnId: string,
-  launchId?: string
+  runtimeGenerationId?: string
 ): void {
   delivery.forgetPrepared?.({
     taskId,
     roleName,
     turnId,
-    ...(launchId === undefined ? {} : { launchId })
+    ...(runtimeGenerationId === undefined ? {} : { runtimeGenerationId })
   });
 }
 

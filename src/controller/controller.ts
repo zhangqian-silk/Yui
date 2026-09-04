@@ -379,7 +379,7 @@ export async function runControllerSchedulerPass(
     )));
     // Phase-one Leader Turns did not exist at the pass's liveness boundary.
     // Keep every newly claimed Turn outside destructive absence decisions until
-    // a later pass can observe its stable provider/session generation.
+    // a later pass can observe its stable provider/runtime generation.
     for (const result of initialWakeupResults) {
       if (
         result.turnId !== undefined
@@ -572,7 +572,7 @@ async function processSelectedRoleRuntimeCleanups(
         }
         if (target.kind === "role-runtime") {
           const session = store.getRoleSession(target.taskId, target.roleName);
-          const reservedLaunchId = isRuntimeLaunchReservation(mailbox.processing)
+          const reservedRuntimeGenerationId = isRuntimeLaunchReservation(mailbox.processing)
             ? mailbox.processing!.batchId
             : undefined;
           // A failed fresh-Conversation launch can leave two exact resource
@@ -580,19 +580,19 @@ async function processSelectedRoleRuntimeCleanups(
           // replacement reservation. They are not competing authorities. The
           // owner-wide stop has already proven physical zero, so clean both
           // exact launch roots idempotently before settling the mailbox.
-          const launchIds = new Set([
-            reservedLaunchId,
-            session?.launchId
-          ].filter((launchId): launchId is string => launchId !== undefined));
+          const runtimeGenerationIds = new Set([
+            reservedRuntimeGenerationId,
+            session?.runtimeGenerationId
+          ].filter((runtimeGenerationId): runtimeGenerationId is string => runtimeGenerationId !== undefined));
           if (lifecycleHost.cleanupTaskLaunch !== undefined) {
             const task = store.getTask(target.taskId);
             const reason: TaskRuntimeCleanupReason = task?.status === "completed"
               ? "completion"
               : "interruption";
-            for (const launchId of launchIds) {
+            for (const runtimeGenerationId of runtimeGenerationIds) {
               lifecycleHost.cleanupTaskLaunch({
                 taskId: target.taskId,
-                launchId,
+                runtimeGenerationId,
                 reason
               });
             }
@@ -718,7 +718,7 @@ async function reconcileDormantRuntimeOwners(
       byOwner.get(runtimeOwnerIdentity(candidate.owner))?.state
       === "stopped"
     ) {
-      if (candidate.launchId !== undefined) {
+      if (candidate.runtimeGenerationId !== undefined) {
         // The exact launch-owned resources must settle through the durable
         // cleanup lane before its Host fact is detached. The resumable Session
         // remains active; the candidate is the CAS fence against a concurrent
@@ -2235,9 +2235,9 @@ export class FileTaskController {
       taskId: failure.taskId,
       roleName: failure.roleName,
       turnId: failure.turnId,
-      ...(failure.launchId === undefined
+      ...(failure.runtimeGenerationId === undefined
         ? {}
-        : { launchId: failure.launchId })
+        : { runtimeGenerationId: failure.runtimeGenerationId })
     });
     if (!this.#stopped) this.signal(key);
   }

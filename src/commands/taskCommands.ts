@@ -419,7 +419,7 @@ export type TaskCommandExecution =
       agentId: string;
       adapterId: string;
       nativeSessionId: string;
-      launchId?: string;
+      runtimeGenerationId?: string;
       sessionUpdatedAt: string;
       reason: string;
       output: string;
@@ -436,7 +436,7 @@ export type TaskCommandExecution =
       action: "takeover" | "release";
       taskId: string;
       roleName: string;
-      launchId: string;
+      runtimeGenerationId: string;
       nativeSessionId: string;
       authority: ProviderAuthorityFence;
       output: string;
@@ -2186,7 +2186,7 @@ function taskRoleSessionCommand(
             `Session ${task.id}/${role.name}`,
             `Agent: ${active.agentId}/${active.adapterId}`,
             `Native id: ${active.nativeSessionId}`,
-            `Host activation: ${active.launchId ?? "none"}`,
+            `Host activation: ${active.runtimeGenerationId ?? "none"}`,
             `Session: ${active.status}${active.endReason === undefined ? "" : `/${active.endReason}`}`,
             `Turn: ${binding?.turn?.status ?? "none"}`
           ].join("\n") + "\n",
@@ -2236,7 +2236,7 @@ function taskRoleSessionCommand(
         agentId: session.agentId,
         adapterId: session.adapterId,
         nativeSessionId: session.nativeSessionId,
-        launchId: session.launchId ?? "",
+        runtimeGenerationId: session.runtimeGenerationId ?? "",
         reason,
         requestedBy: actor
       }, now);
@@ -2246,7 +2246,7 @@ function taskRoleSessionCommand(
         agentId: session.agentId,
         adapterId: session.adapterId,
         nativeSessionId: session.nativeSessionId,
-        ...(session.launchId === undefined ? {} : { launchId: session.launchId }),
+        ...(session.runtimeGenerationId === undefined ? {} : { runtimeGenerationId: session.runtimeGenerationId }),
         sessionUpdatedAt: session.updatedAt
       };
     });
@@ -2683,7 +2683,7 @@ function transferTaskRoleAuthority(
       const binding = sessions?.providerBinding;
       if (sessions === null || sessions === undefined || session === undefined
         || binding === null || binding === undefined
-        || session.launchId === undefined
+        || session.runtimeGenerationId === undefined
         || session.status === "ended") {
         throw new Error(`Task Role has no live managed Provider: ${task.id}/${role.name}.`);
       }
@@ -2736,7 +2736,7 @@ function transferTaskRoleAuthority(
         action,
         taskId: task.id,
         roleName: role.name,
-        launchId: session.launchId,
+        runtimeGenerationId: session.runtimeGenerationId,
         nativeSessionId: session.nativeSessionId,
         authority: {
           epoch: authority.epoch,
@@ -5171,13 +5171,13 @@ function retireTurn(
       const agentId = requiredOption(parsed.options, "--agent-id");
       const adapterId = requiredOption(parsed.options, "--adapter-id");
       const nativeSessionId = parsed.options.get("--native-session-id");
-      const launchId = parsed.options.get("--launch-id");
+      const runtimeGenerationId = parsed.options.get("--launch-id");
       const sessions = tx.getTaskRoleSessionSet(task.id, run.roleName);
       const session = sessions?.sessions[run.effective.agentId];
       if (session?.nativeSessionId !== undefined && nativeSessionId === undefined) {
         throw usageError("--native-session-id is required for this active Turn.", usage);
       }
-      if (session?.nativeSessionId === undefined && launchId === undefined) {
+      if (session?.nativeSessionId === undefined && runtimeGenerationId === undefined) {
         throw usageError("--launch-id is required for an opaque active Turn.", usage);
       }
       const terminal = retireExactActiveTurn(tx, {
@@ -5187,7 +5187,7 @@ function retireTurn(
         agentId,
         adapterId,
         ...(nativeSessionId === undefined ? {} : { nativeSessionId }),
-        ...(launchId === undefined ? {} : { launchId }),
+        ...(runtimeGenerationId === undefined ? {} : { runtimeGenerationId }),
         expectedProgressAt,
         reason: `Turn retired: ${reason}`
       }, now);
@@ -5215,7 +5215,7 @@ function retireTurn(
         : { nativeSessionId: parsed.options.get("--native-session-id")! }),
       ...(parsed.options.get("--launch-id") === undefined
         ? {}
-        : { launchId: parsed.options.get("--launch-id")! }),
+        : { runtimeGenerationId: parsed.options.get("--launch-id")! }),
       ...(actor === "leader"
         ? leaderActionEventPayload(tx, task.id, options)
         : { retiredBy: actor })

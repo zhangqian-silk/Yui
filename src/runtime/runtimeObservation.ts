@@ -58,8 +58,7 @@ export type RuntimeObservationFence = Readonly<{
   agentId: string;
   /** Open, namespaced Driver identity; never a closed provider union. */
   driverId: string;
-  launchId: string;
-  sessionGenerationId: string;
+  runtimeGenerationId: string;
   conversationId?: string;
   activationId?: string;
   continuationId?: string;
@@ -122,7 +121,7 @@ export type RuntimeObservationPayload = Readonly<{
 }>;
 
 export type RuntimeObservation = Readonly<{
-  schemaVersion: 2;
+  schemaVersion: 3;
   eventId: string;
   semanticKey: string;
   kind: RuntimeObservationKind;
@@ -228,7 +227,7 @@ const PROVIDER_STATE: ReadonlySet<RuntimeObservationKind> = new Set([
 ]);
 
 export function createRuntimeObservation(input: RuntimeObservation): RuntimeObservation {
-  if (input.schemaVersion !== 2) throw new Error("Runtime observation schemaVersion must be 2.");
+  if (input.schemaVersion !== 3) throw new Error("Runtime observation schemaVersion must be 3.");
   if (!KINDS.includes(input.kind)) throw new Error("Runtime observation kind is invalid.");
   if (!AUTHORITIES.includes(input.authority)) throw new Error("Runtime observation authority is invalid.");
   if (input.kind === "host.observed" && input.authority !== "host" && input.authority !== "controller") {
@@ -272,7 +271,7 @@ export function createRuntimeObservation(input: RuntimeObservation): RuntimeObse
     throw new Error("Runtime observation ordinal must be a non-negative safe integer.");
   }
   return Object.freeze({
-    schemaVersion: 2,
+    schemaVersion: 3,
     eventId: requireIdentity(input.eventId, "Runtime observation event id"),
     semanticKey: requireIdentity(input.semanticKey, "Runtime observation semantic key"),
     kind: input.kind,
@@ -298,8 +297,7 @@ export function runtimeObservationFenceMatches(
     "turnId",
     "agentId",
     "driverId",
-    "launchId",
-    "sessionGenerationId",
+    "runtimeGenerationId",
     "conversationId",
     "activationId",
     "continuationId",
@@ -315,7 +313,7 @@ export function runtimeObservationFenceMatches(
 }
 
 /**
- * Matches observations that belong to one durable Turn/Session generation.
+ * Matches observations that belong to one durable Turn/Runtime generation.
  * A provider may advance its native Turn while background subagents from an
  * earlier Turn are still active and later mailbox activations use their own
  * exactly-once receipt, so nativeTurnId and receiptId are intentionally
@@ -331,8 +329,7 @@ export function runtimeObservationTurnFenceMatches(
     "turnId",
     "agentId",
     "driverId",
-    "launchId",
-    "sessionGenerationId",
+    "runtimeGenerationId",
     "nativeSessionId"
   ] as const) {
     if (expected[field] !== actual[field]) return false;
@@ -351,7 +348,7 @@ export function runtimeObservationTaskEventPayload(
     roleName: observation.fence.roleName,
     agentId: observation.fence.agentId,
     driverId: observation.fence.driverId,
-    launchId: observation.fence.launchId,
+    runtimeGenerationId: observation.fence.runtimeGenerationId,
     ...(observation.fence.taskId === undefined ? {} : { taskId: observation.fence.taskId }),
     ...(observation.fence.turnId === undefined ? {} : { turnId: observation.fence.turnId }),
     ...(observation.fence.nativeSessionId === undefined
@@ -406,8 +403,7 @@ function normalizeFence(input: RuntimeObservationFence): RuntimeObservationFence
     ...(input.turnId === undefined ? {} : { turnId: requireIdentity(input.turnId, "Turn id") }),
     agentId: requireIdentity(input.agentId, "Agent id"),
     driverId: requireDriverId(input.driverId),
-    launchId: requireIdentity(input.launchId, "Launch id"),
-    sessionGenerationId: requireIdentity(input.sessionGenerationId, "Session generation id"),
+    runtimeGenerationId: requireIdentity(input.runtimeGenerationId, "Runtime generation id"),
     ...(input.nativeSessionId === undefined
       ? {}
       : { nativeSessionId: requireIdentity(input.nativeSessionId, "Native Session id") }),
@@ -629,8 +625,8 @@ export function runtimeObservationSemanticKey(input: Readonly<{
   const continuationIdentity = [
     fence.driverId,
     fence.agentId,
-    fence.conversationId ?? fence.nativeSessionId ?? fence.launchId,
-    fence.activationId ?? fence.launchId,
+    fence.conversationId ?? fence.nativeSessionId ?? fence.runtimeGenerationId,
+    fence.activationId ?? fence.runtimeGenerationId,
     fence.continuationId ?? "none",
     fence.continuationGeneration ?? "none"
   ];
@@ -655,7 +651,7 @@ export function runtimeObservationSemanticKey(input: Readonly<{
     return [
       "goal-state",
       fence.driverId,
-      fence.conversationId ?? fence.nativeSessionId ?? fence.launchId,
+      fence.conversationId ?? fence.nativeSessionId ?? fence.runtimeGenerationId,
       input.payload?.goalStatus ?? "unknown",
       input.payload?.goalUpdatedAt ?? "unknown"
     ].join(":");
@@ -684,8 +680,8 @@ export function runtimeObservationSemanticKey(input: Readonly<{
     return [
       "provider-sequence",
       fence.driverId,
-      fence.conversationId ?? fence.nativeSessionId ?? fence.launchId,
-      fence.activationId ?? fence.launchId,
+      fence.conversationId ?? fence.nativeSessionId ?? fence.runtimeGenerationId,
+      fence.activationId ?? fence.runtimeGenerationId,
       fence.continuationId ?? fence.nativeTurnId ?? "none",
       fence.continuationGeneration ?? "none",
       input.sequence,

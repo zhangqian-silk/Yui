@@ -20,6 +20,8 @@ import {
 } from "../scheduler/taskExecutionProjection.js";
 import { resolveRuntimeHealth } from "../config/yuiConfig.js";
 import { projectNextAction, type NextAction } from "../task/nextAction.js";
+import { projectTaskRemoteDeliveryFromStore } from "./taskRemoteDeliveryCommand.js";
+import type { TaskRemoteDelivery } from "../task/remoteDelivery.js";
 
 export type TaskListOptions = Readonly<{
   all: boolean;
@@ -111,6 +113,8 @@ export type TaskOverview = Task & Readonly<{
   runtime: TaskOverviewRuntime;
   /** One read-only Task-first fold shared with scheduler/web consumers. */
   execution: TaskExecutionProjection;
+  /** Persisted-head remote delivery projection; provider verification stays explicit. */
+  remoteDelivery: TaskRemoteDelivery;
 }>;
 
 export type TaskOverviewResult = Readonly<{
@@ -164,6 +168,7 @@ export function renderTaskOverview(
       { header: "Work", minWidth: 8, maxWidth: 38 },
       { header: "Blockers", minWidth: 9, maxWidth: 42 },
       { header: "Execution", minWidth: 14, maxWidth: 34 },
+      { header: "Delivery", minWidth: 12, maxWidth: 28 },
       { header: "Next action / owner", minWidth: 16, maxWidth: 42 }
     ],
     result.tasks.map((task) => [
@@ -177,6 +182,7 @@ export function renderTaskOverview(
       workCell(task.work.counts),
       blockersCell(task.blockers),
       `${task.execution.status} / ${task.execution.owner}`,
+      deliveryCell(task.remoteDelivery),
       nextCell(task.next)
     ]),
     width
@@ -284,6 +290,14 @@ function buildTaskOverviewEntry(
       executionGroups: execution.executionGroups
     })
   );
+  const persistedCandidate = task.status === "active" || task.status === "retired"
+    ? taskRemoteDeliveryCandidate(task)
+    : null;
+  const remoteDelivery = projectTaskRemoteDeliveryFromStore(
+    store,
+    task,
+    persistedCandidate
+  );
   return {
     ...task,
     brief,
@@ -302,7 +316,8 @@ function buildTaskOverviewEntry(
     nextAction: next?.action ?? null,
     nextOwner: next?.owner ?? null,
     runtime,
-    execution
+    execution,
+    remoteDelivery
   };
 }
 
@@ -493,6 +508,25 @@ function nextCell(next: TaskOverviewNext | null): string {
   return next === null ? "—" : `${next.action} / ${next.owner}`;
 }
 
+function deliveryCell(delivery: TaskRemoteDelivery): string {
+  if (delivery.status === "none") return "none";
+  return `${delivery.status} · ${delivery.mergedProjectCount}/${delivery.codeProjectCount} merged`
+    + (delivery.allMerged
+      ? ` · ${delivery.verifiedProjectCount}/${delivery.codeProjectCount} verified`
+      : "");
+}
+
+function taskRemoteDeliveryCandidate(
+  task: Task
+): Readonly<{ projects: readonly Readonly<{ projectId: string; commit: string }>[] }> | null {
+  const projects = task.projectBindings.flatMap(({ projectId, currentCommit }) => (
+    currentCommit === undefined ? [] : [{ projectId, commit: currentCommit }]
+  ));
+  return projects.length === task.projectBindings.length
+    ? { projects }
+    : null;
+}
+
 function compactText(value: string): string {
   const oneLine = value.replace(/\s+/g, " ").trim();
   return oneLine.length <= 240 ? oneLine : `${oneLine.slice(0, 237)}...`;
@@ -514,6 +548,7 @@ function renderVerboseDetails(
         ? "missing"
         : formatTimestamp(task.summaryUpdatedAt, timeZone)}`,
       `  Execution: ${task.execution.status} (${task.execution.owner}); ${task.execution.summary}`,
+      `  Remote delivery: ${deliveryCell(task.remoteDelivery)}; source=${task.remoteDelivery.source}${task.remoteDelivery.provisional ? " (provisional)" : ""}`,
       `  Monitoring: ${task.execution.monitoring}; attention: ${task.execution.attention.length}`,
       `  DAG: ${task.execution.observability.dag.nodes.length} nodes, ${task.execution.observability.dag.edges.length} edges; ready=${task.execution.observability.dag.readyIds.join(", ") || "none"}; blocked=${task.execution.observability.dag.blockedIds.join(", ") || "none"}`,
       `  Cost: tokens=${task.execution.observability.cost.tokens}${task.execution.observability.cost.tokensObservable ? "" : " (partial)"}; tools=${task.execution.observability.cost.toolCalls}${task.execution.observability.cost.toolCallsObservable ? "" : " (partial)"}; wall=${task.execution.observability.cost.wallClockSeconds}s; retries=${task.execution.observability.cost.retryCount}`,

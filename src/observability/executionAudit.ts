@@ -2,7 +2,7 @@
  * Read-only execution audit aggregator (Issue 11 §3).
  *
  * The audit answers "what happened in this Home" from durable records alone:
- * Turns/failures/durations, wake reasons, Session generations, Review execution
+ * Turns/failures/durations, wake reasons, Runtime generations, Review execution
  * vs semantic failures, Integration failure classes and gate reuse, telemetry
  * volume, and the longest/stale executions. It never writes Task state, never
  * wakes a Leader, and never takes the storage write lock — it only calls the

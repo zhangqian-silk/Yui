@@ -288,7 +288,7 @@ function readActiveReleaseClaims(home: string): ClaimReadResult {
 }
 
 /**
- * Read Session owner records (`runtime/session-owners/<launchId>.json`). A
+ * Read Session owner records (`runtime/session-owners/<runtimeGenerationId>.json`). A
  * record whose Provider root is physically alive with a matching start
  * identity protects its runtime root. A dead PID is stale (reconciliation
  * removes those records); an identity conflict or unreadable record fails
@@ -319,7 +319,7 @@ function readSessionOwnerClaims(home: string): ClaimReadResult {
     if (!entry.isFile() || !entry.name.endsWith(".json")) continue;
     const path = join(directory, entry.name);
     let record: {
-      launchId?: unknown;
+      runtimeGenerationId?: unknown;
       runtimeRoot?: unknown;
       providerRoot?: { pid?: unknown; startIdentity?: unknown };
     };
@@ -359,7 +359,7 @@ function readSessionOwnerClaims(home: string): ClaimReadResult {
     if (typeof record.runtimeRoot === "string" && record.runtimeRoot.length > 0) {
       claims.push({
         path: resolve(record.runtimeRoot),
-        token: `session-owner:${typeof record.launchId === "string" ? record.launchId : entry.name}`
+        token: `session-owner:${typeof record.runtimeGenerationId === "string" ? record.runtimeGenerationId : entry.name}`
       });
     }
   }

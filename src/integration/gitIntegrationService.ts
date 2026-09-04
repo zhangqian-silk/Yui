@@ -803,7 +803,7 @@ export class GitIntegrationService {
   ): TaskRuntimeIsolationPreparation {
     return this.runtimeIsolation.preflight({
       workspace,
-      launchId: integrationRuntimeLaunchId(this.home, attempt.id),
+      runtimeGenerationId: integrationRuntimeRuntimeGenerationId(this.home, attempt.id),
       generationId: "integration-checks",
       allowExactActive: true
     });
@@ -1473,7 +1473,7 @@ function integrationRuntimeRoot(): string {
   return join("/tmp", `yi-${uid.toString(36)}`);
 }
 
-function integrationRuntimeLaunchId(home: string, integrationId: string): string {
+function integrationRuntimeRuntimeGenerationId(home: string, integrationId: string): string {
   const homeDigest = createHash("sha256")
     .update(resolve(home))
     .digest("hex");

@@ -40,12 +40,12 @@ export type RoleSessionOwner = GlobalRoleSessionOwner | TaskRoleSessionOwner;
 
 /** One independently resumable native session for one Agent binding on a Role. */
 export type RoleAgentSession = {
-  schemaVersion: 4;
+  schemaVersion: 5;
   agentId: string;
   adapterId: string;
   nativeSessionId: string;
   /** Durable exact generation identity for native lifecycle events. */
-  launchId?: string;
+  runtimeGenerationId?: string;
   title?: string;
   preview?: string;
   policy: "fixed" | "leader-controlled";
@@ -66,13 +66,13 @@ type RoleSessionSetBase<TOwner extends RoleSessionOwner> = {
 };
 
 export type GlobalRoleSessionSet = RoleSessionSetBase<GlobalRoleSessionOwner> & {
-  schemaVersion: 4;
+  schemaVersion: 5;
   /** Immutable terminal native Sessions keyed by an opaque Yui reference. */
   history?: Record<string, RoleAgentSession>;
 };
 
 export type TaskRoleSessionSet = RoleSessionSetBase<TaskRoleSessionOwner> & {
-  schemaVersion: 11;
+  schemaVersion: 12;
   /** Immutable terminal native Sessions superseded by a fresh effective launch. */
   history?: readonly RoleAgentSession[];
   /** Provider-native conversation and Turn observations only. */
@@ -90,7 +90,7 @@ export type RecordRoleAgentSessionInput = {
   agentId: string;
   adapterId: string;
   nativeSessionId: string;
-  launchId?: string;
+  runtimeGenerationId?: string;
   title?: string;
   preview?: string;
   policy: RoleAgentSession["policy"];
@@ -121,10 +121,10 @@ export function createRoleSessionSet(
     updatedAt: now.toISOString()
   };
   return owner.scope === "global"
-    ? { ...base, schemaVersion: 4 } as GlobalRoleSessionSet
+    ? { ...base, schemaVersion: 5 } as GlobalRoleSessionSet
     : {
         ...base,
-        schemaVersion: 11,
+        schemaVersion: 12,
         providerBinding: null
       } as TaskRoleSessionSet;
 }
@@ -168,7 +168,7 @@ export function recordRoleAgentSession<TSet extends RoleSessionSet>(
   if (set.owner.scope === "task") {
     const historical = ((set as TaskRoleSessionSet).history ?? []).find((entry) => (
       entry.nativeSessionId === nativeSessionId
-      || (input.launchId !== undefined && entry.launchId === input.launchId)
+      || (input.runtimeGenerationId !== undefined && entry.runtimeGenerationId === input.runtimeGenerationId)
     ));
     if (historical !== undefined) {
       throw new Error("A new Task Role Session cannot reuse a historical native identity.");
@@ -201,13 +201,13 @@ export function recordRoleAgentSession<TSet extends RoleSessionSet>(
   const timestamp = now.toISOString();
   const continuing = existing?.nativeSessionId === nativeSessionId ? existing : undefined;
   const session: RoleAgentSession = {
-    schemaVersion: 4,
+    schemaVersion: 5,
     agentId,
     adapterId,
     nativeSessionId,
-    ...(input.launchId === undefined
-      ? continuing?.launchId === undefined ? {} : { launchId: continuing.launchId }
-      : { launchId: requireText(input.launchId, "Launch id") }),
+    ...(input.runtimeGenerationId === undefined
+      ? continuing?.runtimeGenerationId === undefined ? {} : { runtimeGenerationId: continuing.runtimeGenerationId }
+      : { runtimeGenerationId: requireText(input.runtimeGenerationId, "Runtime generation id") }),
     ...optionalSessionText("title", input.title ?? continuing?.title),
     ...optionalSessionText("preview", input.preview ?? continuing?.preview),
     policy: input.policy,
@@ -369,7 +369,7 @@ export function retireConfirmedAbsentInactiveTaskRolePlaceholders(
     const isNeverStartedInactiveClaude = agentId !== set.activeAgentId
       && session.adapterId === "claude"
       && session.status === "active"
-      && session.launchId === undefined
+      && session.runtimeGenerationId === undefined
       && session.recentCompletedTurnIds.length === 0;
     if (!isNeverStartedInactiveClaude) return [agentId, session];
     changed = true;
@@ -515,7 +515,7 @@ export function detachRoleAgentSessionHost<TSet extends RoleSessionSet>(
   const active = set.sessions[set.activeAgentId];
   if (active === undefined || active.status === "ended") return set;
   const timestamp = requireDate(now, "Role Host detach timestamp");
-  const { launchId: _launchId, endReason: _endReason, ...session } = active;
+  const { runtimeGenerationId: _runtimeGenerationId, endReason: _endReason, ...session } = active;
   let updated = validateRoleSessionSet({
     ...set,
     sessions: {
@@ -633,7 +633,7 @@ export function validateRoleSessionSet<TSet extends RoleSessionSet>(set: TSet): 
     validateRoleAgentSession(session, agentId);
   }
   if (set.owner.scope === "global") {
-    if (set.schemaVersion !== 4) {
+    if (set.schemaVersion !== 5) {
       throw new Error("Global Role session set schema version is invalid.");
     }
     if (
@@ -654,7 +654,7 @@ export function validateRoleSessionSet<TSet extends RoleSessionSet>(set: TSet): 
       }
     }
   } else {
-    if (set.schemaVersion !== 11) {
+    if (set.schemaVersion !== 12) {
       throw new Error("Task Role session set schema version is invalid.");
     }
     if (!Object.hasOwn(set, "providerBinding")) {
@@ -704,7 +704,7 @@ export function validateRoleAgentSession(
   session: RoleAgentSession,
   expectedAgentId = session.agentId
 ): RoleAgentSession {
-  if (session.schemaVersion !== 4) {
+  if (session.schemaVersion !== 5) {
     throw new Error(`Role Agent session schema version is invalid: ${expectedAgentId}.`);
   }
   const agentId = requireSafeIdentity(session.agentId, "Agent id");
@@ -719,13 +719,13 @@ export function validateRoleAgentSession(
   // A restored opaque host may have no provider-native identity; retain its
   // launch fence so it can be inspected or stopped without inventing identity.
   if (session.nativeSessionId === undefined) {
-    if (session.launchId === undefined) {
-      throw new Error("Role Agent session requires a native Session or launch id.");
+    if (session.runtimeGenerationId === undefined) {
+      throw new Error("Role Agent session requires a native Session or runtime generation id.");
     }
   } else {
     requireText(session.nativeSessionId, "Native session id");
   }
-  if (session.launchId !== undefined) requireSafeIdentity(session.launchId, "Launch id");
+  if (session.runtimeGenerationId !== undefined) requireSafeIdentity(session.runtimeGenerationId, "Runtime generation id");
   if (
     session.title !== undefined
     && optionalSessionText("title", session.title).title !== session.title
@@ -762,10 +762,10 @@ function taskRoleSessionIdentity(session: RoleAgentSession): string {
   if (session.nativeSessionId !== undefined) {
     return `${session.agentId}\0native\0${session.nativeSessionId}`;
   }
-  if (session.launchId === undefined) {
-    throw new Error("Opaque Task Role session requires a launch identity.");
+  if (session.runtimeGenerationId === undefined) {
+    throw new Error("Opaque Task Role session requires a runtime generation identity.");
   }
-  return `${session.agentId}\0launch\0${session.launchId}`;
+  return `${session.agentId}\0runtime-generation\0${session.runtimeGenerationId}`;
 }
 
 function optionalSessionText(

@@ -762,22 +762,24 @@ retain the complete history. This records facts already known to the caller;
 it does not query a provider or replace Review, Integration, or Task completion
 gates.
 
-Verify one current GitHub Publication against the real PR state:
+Verify one current GitHub or GitLab Publication against the real PR/MR state:
 
 ```sh
 yui task publication verify <task-id>/<publication-id>
 ```
 
-Verification is an explicit external read. The first implementation invokes a
-trusted, PATH-pinned local `gh` executable and reuses its authentication; Yui
-does not store a GitHub token. The command requires the current unsuperseded
-Publication to record the exact Task delivery head, then requires GitHub to
-report the same PR head as merged and to return a remote merge commit. It
-rechecks the Task head and Publication after the remote call before appending a
-new immutable `verified` record. Missing `gh`, unavailable authentication,
-ambiguous provider output, open/closed PRs, moved heads, and concurrent local
-changes fail without recording verification. GitLab verification is not
-implemented in this first version.
+Verification is an explicit external read. GitHub uses a trusted, PATH-pinned
+local `gh` executable; GitLab uses a trusted, PATH-pinned local `glab`
+executable. Both reuse the CLI's existing authentication, and Yui stores no
+provider token. The command requires the current unsuperseded Publication to
+record the exact Task delivery head, then requires the provider to report the
+same PR/MR head as merged and expose the integrated remote commit. It rechecks
+the Task head and Publication after the remote call before appending a new
+immutable `verified` record. Missing provider CLIs, unavailable
+authentication, ambiguous provider output, open/closed PRs or MRs, moved
+heads, and concurrent local changes fail without recording verification.
+GitLab repositories may use nested namespaces; a recorded self-hosted MR URL
+selects that GitLab host.
 
 Query whether every delivered Project head is represented by a current merged
 Publication:

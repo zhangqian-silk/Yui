@@ -12,24 +12,24 @@ import { join, resolve } from "node:path";
 export type RuntimeStopReceipt = Readonly<{
   schemaVersion: 1;
   receiptId: string;
-  launchId: string;
+  runtimeGenerationId: string;
   requestedAt: string;
 }>;
 
 export function writeRuntimeStopReceipt(
   home: string,
-  launchId: string,
+  runtimeGenerationId: string,
   requestedAt: Date
 ): RuntimeStopReceipt {
   const receipt = Object.freeze({
     schemaVersion: 1 as const,
     receiptId: `runtime-stop-${createHash("sha256")
-      .update(`${launchId}\0${requestedAt.toISOString()}`)
+      .update(`${runtimeGenerationId}\0${requestedAt.toISOString()}`)
       .digest("hex")}`,
-    launchId,
+    runtimeGenerationId,
     requestedAt: requestedAt.toISOString()
   });
-  const path = stopReceiptPath(home, launchId);
+  const path = stopReceiptPath(home, runtimeGenerationId);
   mkdirSync(resolve(join(home, "runtime", "stop-receipts")), { recursive: true, mode: 0o700 });
   const temporary = `${path}.tmp-${process.pid}`;
   writeFileSync(temporary, `${JSON.stringify(receipt)}\n`, { mode: 0o600 });
@@ -40,11 +40,11 @@ export function writeRuntimeStopReceipt(
 
 export function readRuntimeStopReceipt(
   home: string,
-  launchId: string
+  runtimeGenerationId: string
 ): RuntimeStopReceipt | null {
   try {
-    const value = JSON.parse(readFileSync(stopReceiptPath(home, launchId), "utf8")) as RuntimeStopReceipt;
-    if (value.schemaVersion !== 1 || value.launchId !== launchId
+    const value = JSON.parse(readFileSync(stopReceiptPath(home, runtimeGenerationId), "utf8")) as RuntimeStopReceipt;
+    if (value.schemaVersion !== 1 || value.runtimeGenerationId !== runtimeGenerationId
       || typeof value.receiptId !== "string" || !Number.isFinite(Date.parse(value.requestedAt))) {
       throw new Error("Runtime stop receipt is invalid.");
     }
@@ -55,11 +55,11 @@ export function readRuntimeStopReceipt(
   }
 }
 
-export function removeRuntimeStopReceipt(home: string, launchId: string): void {
-  rmSync(stopReceiptPath(home, launchId), { force: true });
+export function removeRuntimeStopReceipt(home: string, runtimeGenerationId: string): void {
+  rmSync(stopReceiptPath(home, runtimeGenerationId), { force: true });
 }
 
-function stopReceiptPath(home: string, launchId: string): string {
-  const name = createHash("sha256").update(launchId).digest("hex");
+function stopReceiptPath(home: string, runtimeGenerationId: string): string {
+  const name = createHash("sha256").update(runtimeGenerationId).digest("hex");
   return resolve(join(home, "runtime", "stop-receipts", `${name}.json`));
 }

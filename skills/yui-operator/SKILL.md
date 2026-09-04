@@ -188,9 +188,13 @@ Never use an InputRequest to solicit permission for unrequested real-resource
 validation. Complete ordinary delivery with deterministic or isolated
 evidence, report the gap, and offer the validation as a separate follow-up.
 
-Record only confirmed PR/MR creation, state, commit, and merge evidence with
-`yui task publication upsert`. Use `yui task publication verify` only when
-current authorization covers the external provider read. Publication never
+Immediately after creating, updating, closing, reopening, or merging a PR/MR,
+record the confirmed fact with `yui task publication upsert`; do not defer it
+to another Role or require provider-specific discovery logic. Supply only
+information already known from the operation itself. Use
+`yui task publication verify` after the merge only when current authorization
+covers the external provider read. Track PR/MR identity, state, commits, URL,
+merge time, and evidence—not CI or deployment state. Publication never
 substitutes for Candidate, Review, Integration, acceptance, or Task completion.
 
 Completion does not authorize archive. Report whether the exact Task is

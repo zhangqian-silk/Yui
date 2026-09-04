@@ -976,7 +976,7 @@ function assertActivatedControllerIdentity(
     || identity.args.length !== 1
     || identity.args[0] !== expectedEntrypoint) {
     throw new Error(
-      "Replacement Controller launch identity does not match the activated global binary "
+      "Replacement Controller runtime generation identity does not match the activated global binary "
         + "runtime/entrypoint; refusing readiness."
     );
   }
@@ -1137,7 +1137,7 @@ function parseUpdateBlockers(value: unknown): readonly UpdateBlockerIdentity[] |
     if (!isRecord(item) || typeof item.reason !== "string" || item.reason.length === 0) {
       return undefined;
     }
-    const optional = ["taskId", "roleName", "turnId", "nativeSessionId", "launchId"] as const;
+    const optional = ["taskId", "roleName", "turnId", "nativeSessionId", "runtimeGenerationId"] as const;
     if (optional.some((key) => item[key] !== undefined && typeof item[key] !== "string")) {
       return undefined;
     }
@@ -1148,7 +1148,7 @@ function parseUpdateBlockers(value: unknown): readonly UpdateBlockerIdentity[] |
       ...(typeof item.nativeSessionId === "string"
         ? { nativeSessionId: item.nativeSessionId }
         : {}),
-      ...(typeof item.launchId === "string" ? { launchId: item.launchId } : {}),
+      ...(typeof item.runtimeGenerationId === "string" ? { runtimeGenerationId: item.runtimeGenerationId } : {}),
       reason: item.reason
     });
   }

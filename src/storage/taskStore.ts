@@ -90,7 +90,7 @@ export const CURRENT_CONFIGURED_AGENT_SCHEMA_VERSION = 2 as const;
 export const CURRENT_PROJECT_SCHEMA_VERSION = 5 as const;
 export const CURRENT_AGENT_PROFILE_SCHEMA_VERSION = 3 as const;
 export const CURRENT_GLOBAL_ROLE_SCHEMA_VERSION = 3 as const;
-export const CURRENT_GLOBAL_ROLE_SESSION_SET_SCHEMA_VERSION = 4 as const;
+export const CURRENT_GLOBAL_ROLE_SESSION_SET_SCHEMA_VERSION = 5 as const;
 export const CURRENT_TASK_SCHEMA_VERSION = 7 as const;
 export const CURRENT_TASK_BRIEF_SCHEMA_VERSION = 2 as const;
 export const CURRENT_CONTEXT_SNAPSHOT_SCHEMA_VERSION = 1 as const;
@@ -204,7 +204,7 @@ export function executionLaneActiveTurnKeyParts(key: string):
 /**
  * Nested-record versions consumed by the current SQLite payload validators.
  */
-export const CURRENT_TASK_ROLE_SESSION_SET_SCHEMA_VERSION = 11 as const;
+export const CURRENT_TASK_ROLE_SESSION_SET_SCHEMA_VERSION = 12 as const;
 export const CURRENT_TURN_SCHEMA_VERSION = 4 as const;
 export const CURRENT_INTEGRATION_QUEUE_SCHEMA_VERSION = 1 as const;
 export type TaskStore = {
@@ -334,14 +334,14 @@ export type TaskStore = {
   setJobCallerKeyHash(taskId: string, roleName: string, agentId: string, hash: string): void;
   /** Issue 03: Persist one runtime generation's exact physical owner identity. */
   saveSessionOwner(identity: SessionOwnerIdentity): void;
-  /** Issue 03: Look up one owner record by launch id. */
-  getSessionOwner(launchId: string): SessionOwnerIdentity | null;
+  /** Issue 03: Look up one owner record by runtime generation id. */
+  getSessionOwner(runtimeGenerationId: string): SessionOwnerIdentity | null;
   /** Issue 03: Enumerate every persisted owner record. */
   listSessionOwners(): SessionOwnerIdentity[];
   /** Issue 03: Enumerate owner records for one Task/global Role. */
   listSessionOwnersForOwner(owner: RuntimeOwner): SessionOwnerIdentity[];
   /** Issue 03: Remove a record whose physical resources were proven absent. */
-  removeSessionOwner(launchId: string): void;
+  removeSessionOwner(runtimeGenerationId: string): void;
   nextWorkItemId(taskId: string): string;
   getWorkItem(taskId: string, workItemId: string): WorkItem | null;
   listWorkItems(taskId: string): WorkItem[];

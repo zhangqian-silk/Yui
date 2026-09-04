@@ -7,7 +7,7 @@ import { requireSafeIdentity, requireText, requireTimestamp } from "./validation
  *
  * The record describes only resources Yui itself created: a tmux pane and the
  * Provider process tree launched into it. Ownership is never inferred from a
- * process name. The Provider root is attributed by the exact `YUI_LAUNCH_ID`
+ * process name. The Provider root is attributed by the exact `YUI_RUNTIME_GENERATION_ID`
  * fence the launch exported into its environment, and PID liveness is always
  * paired with the Linux process start identity so a reused PID can never
  * rebind a dead generation.
@@ -18,7 +18,7 @@ import { requireSafeIdentity, requireText, requireTimestamp } from "./validation
  * whose durable pointer was already cleared.
  */
 export type SessionOwnerIdentity = Readonly<{
-  schemaVersion: 1;
+  schemaVersion: 2;
   kind: "yui-session-owner";
   owner: Readonly<{
     scope: "task" | "global";
@@ -27,7 +27,7 @@ export type SessionOwnerIdentity = Readonly<{
   }>;
   agentId: string;
   adapterId: string;
-  launchId: string;
+  runtimeGenerationId: string;
   nativeSessionId?: string;
   tmux: Readonly<{
     serverName: string;
@@ -43,7 +43,7 @@ export type SessionOwnerIdentity = Readonly<{
     processGroupId?: number;
     processSessionId?: number;
     /**
-     * How the root was proven: `launch-env` matched the exact YUI_LAUNCH_ID
+     * How the root was proven: `launch-env` matched the exact YUI_RUNTIME_GENERATION_ID
      * environment fence; `pane-pid` fell back to the tmux pane process and is
      * a weaker attribution that reconciliation must flag, never auto-kill.
      */
@@ -71,7 +71,7 @@ export type SessionOwnerIdentityInput = Readonly<{
   }>;
   agentId: string;
   adapterId: string;
-  launchId: string;
+  runtimeGenerationId: string;
   nativeSessionId?: string;
   tmux: Readonly<{
     serverName: string;
@@ -126,7 +126,7 @@ export function createSessionOwnerIdentity(
   }
   const tmux = input.tmux;
   return Object.freeze({
-    schemaVersion: 1 as const,
+    schemaVersion: 2 as const,
     kind: "yui-session-owner" as const,
     owner: Object.freeze({
       scope: owner.scope,
@@ -135,7 +135,7 @@ export function createSessionOwnerIdentity(
     }),
     agentId: requireSafeIdentity(input.agentId, "Agent id"),
     adapterId: requireText(input.adapterId, "Adapter id"),
-    launchId: requireSafeIdentity(input.launchId, "Launch id"),
+    runtimeGenerationId: requireSafeIdentity(input.runtimeGenerationId, "Runtime generation id"),
     ...(input.nativeSessionId === undefined
       ? {}
       : { nativeSessionId: requireText(input.nativeSessionId, "Native session id") }),
@@ -231,14 +231,14 @@ export function isLinuxProcessLive(
 }
 
 /**
- * Discovers the Provider root for one launch by the exact YUI_LAUNCH_ID
+ * Discovers the Provider root for one launch by the exact YUI_RUNTIME_GENERATION_ID
  * environment fence. Returns undefined when no same-user process carries the
  * fence — the caller must not guess from a process name or cwd.
  */
 export function discoverProviderRootByLaunchEnv(
-  launchId: string
+  runtimeGenerationId: string
 ): { pid: number; identity: LinuxProcessIdentity } | undefined {
-  const matches = listLaunchFencedProcesses(launchId);
+  const matches = listLaunchFencedProcesses(runtimeGenerationId);
   for (const pid of matches) {
     const identity = readLinuxProcessIdentity(pid);
     if (identity !== undefined) return { pid, identity };
@@ -248,13 +248,13 @@ export function discoverProviderRootByLaunchEnv(
 
 /**
  * Lists every live process whose initial environment carries the exact
- * `YUI_LAUNCH_ID=<launchId>` fence. The fence is inherited by Provider
+ * `YUI_RUNTIME_GENERATION_ID=<runtimeGenerationId>` fence. The fence is inherited by Provider
  * children, so this is the exact, PID-reuse-safe attribution for a surviving
  * child after its root has exited: a recycled PID never carries the fence.
  * Processes without the fence are unattributed and must never be signaled.
  */
-export function listLaunchFencedProcesses(launchId: string): number[] {
-  if (!Number.isSafeInteger(launchId as unknown as number) && !/^[A-Za-z0-9_.:-]+$/u.test(launchId)) {
+export function listLaunchFencedProcesses(runtimeGenerationId: string): number[] {
+  if (!Number.isSafeInteger(runtimeGenerationId as unknown as number) && !/^[A-Za-z0-9_.:-]+$/u.test(runtimeGenerationId)) {
     return [];
   }
   let entries: string[];
@@ -263,7 +263,7 @@ export function listLaunchFencedProcesses(launchId: string): number[] {
   } catch {
     return [];
   }
-  const needle = `YUI_LAUNCH_ID=${launchId}`;
+  const needle = `YUI_RUNTIME_GENERATION_ID=${runtimeGenerationId}`;
   const matches: number[] = [];
   for (const entry of entries) {
     if (!/^[0-9]+$/u.test(entry)) continue;

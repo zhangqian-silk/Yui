@@ -2882,7 +2882,7 @@ function canCorrectActiveWorkItemRoleWorkspaceHint(
     || session === undefined
     || session.agentId !== role.activeAgentId
     || session.adapterId !== run.effective.adapterId
-    || session.launchId === undefined
+    || session.runtimeGenerationId === undefined
     || session.nativeSessionId === undefined
     || !["ready", "running"].includes(session.status)
     || !isDeepStrictEqual(session.effective, run.effective)
@@ -2901,7 +2901,7 @@ function canCorrectActiveWorkItemRoleWorkspaceHint(
     && isRuntimeLaunchReservation(lifecycle)) {
     const executionRef = lifecycle.executionRef;
     if (
-      !isRuntimeLaunchReservation(lifecycle, session.launchId)
+      !isRuntimeLaunchReservation(lifecycle, session.runtimeGenerationId)
       || executionRef?.type !== "turn"
       || executionRef.taskId !== taskId
       || executionRef.id !== run.id

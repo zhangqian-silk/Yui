@@ -15,7 +15,7 @@ export type CodexSessionNotification = Readonly<{
   agentId: string;
   adapterId: "codex";
   /** Launch generation carried by the notify envelope, if the process has one. */
-  launchId?: string;
+  runtimeGenerationId?: string;
   nativeSessionId: string;
   nativeTurnId: string;
   title?: string;
@@ -44,8 +44,8 @@ export async function runSessionNotifyCommand(
   const params = parseCodexSessionNotification(payloadArgument, environment);
   const home = requireText(environment.YUI_HOME, "YUI_HOME");
   // A Codex process outlives its Turn, so the notify envelope cannot say which
-  // Turn or launch generation is current. Durable Session state answers both;
-  // the envelope's launch id is used only before a Session has been projected.
+  // Turn or runtime generation is current. Durable Session state answers both;
+  // the envelope's runtime generation id is used only before a Session has been projected.
   const current = currentNotifyGeneration(home, params);
   const enqueued = new FileRuntimeEventInbox(home).enqueueTurnCompleted({
     scope: params.scope,
@@ -53,7 +53,7 @@ export async function runSessionNotifyCommand(
     roleName: params.roleName,
     agentId: params.agentId,
     adapterId: params.adapterId,
-    ...(current.launchId === undefined ? {} : { launchId: current.launchId }),
+    ...(current.runtimeGenerationId === undefined ? {} : { runtimeGenerationId: current.runtimeGenerationId }),
     nativeSessionId: params.nativeSessionId,
     nativeTurnId: params.nativeTurnId,
     ...(current.turnId === undefined ? {} : { turnId: current.turnId }),
@@ -88,29 +88,29 @@ export async function runSessionNotifyCommand(
 }
 
 /**
- * Reads the durable launch generation and active Turn for the notifying
- * Session. The envelope's launch id only applies before Yui has projected a
+ * Reads the durable runtime generation and active Turn for the notifying
+ * Session. The envelope's runtime generation id only applies before Yui has projected a
  * Session for this Role, which is the one moment durable state cannot answer.
  */
 function currentNotifyGeneration(
   home: string,
   params: CodexSessionNotification
-): Readonly<{ launchId?: string; turnId?: string }> {
+): Readonly<{ runtimeGenerationId?: string; turnId?: string }> {
   if (params.scope !== "task" || params.taskId === undefined) {
-    return params.launchId === undefined ? {} : { launchId: params.launchId };
+    return params.runtimeGenerationId === undefined ? {} : { runtimeGenerationId: params.runtimeGenerationId };
   }
   try {
     const store = openCurrentTaskStore(home);
     const session = store.getTaskRoleSessionSet(params.taskId, params.roleName)
       ?.sessions[params.agentId];
     const activeTurn = store.getActiveTurn(params.taskId, params.roleName);
-    const launchId = session?.launchId ?? params.launchId;
+    const runtimeGenerationId = session?.runtimeGenerationId ?? params.runtimeGenerationId;
     return {
-      ...(launchId === undefined ? {} : { launchId }),
+      ...(runtimeGenerationId === undefined ? {} : { runtimeGenerationId }),
       ...(activeTurn === null ? {} : { turnId: activeTurn.id })
     };
   } catch {
-    return params.launchId === undefined ? {} : { launchId: params.launchId };
+    return params.runtimeGenerationId === undefined ? {} : { runtimeGenerationId: params.runtimeGenerationId };
   }
 }
 
@@ -137,9 +137,9 @@ export function parseCodexSessionNotification(
     roleName: requireText(environment.YUI_ROLE, "YUI_ROLE"),
     agentId: requireText(environment.YUI_AGENT_ID, "YUI_AGENT_ID"),
     adapterId: requireCodexAdapter(environment.YUI_ADAPTER_ID),
-    ...(environment.YUI_LAUNCH_ID === undefined
+    ...(environment.YUI_RUNTIME_GENERATION_ID === undefined
       ? {}
-      : { launchId: requireText(environment.YUI_LAUNCH_ID, "YUI_LAUNCH_ID") }),
+      : { runtimeGenerationId: requireText(environment.YUI_RUNTIME_GENERATION_ID, "YUI_RUNTIME_GENERATION_ID") }),
     nativeSessionId,
     nativeTurnId,
     ...(title === undefined ? {} : { title }),

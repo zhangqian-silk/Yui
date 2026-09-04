@@ -16,6 +16,7 @@ import type {
   SessionLaunchRequest
 } from "./sessionLaunchRequest.js";
 import {
+  RuntimeGenerationMismatchError,
   RuntimeHostContentionError,
   RuntimeLaunchError,
   type ActivePromptPushPort,
@@ -79,7 +80,7 @@ export interface RuntimeRoleLaunchPlannerPort {
     mode: "new" | "resume";
     turnId?: string;
     nativeSessionId?: string;
-    launchId?: string;
+    runtimeGenerationId?: string;
     runtimeIsolation?: TaskRuntimeIsolationDescriptor;
     environment?: Readonly<Record<string, string>>;
   }>): RuntimePlannedSession;
@@ -90,7 +91,7 @@ export interface RuntimeRoleLaunchPlannerPort {
     effective: EffectiveLaunchSnapshot;
     mode: "new" | "resume";
     nativeSessionId?: string;
-    launchId?: string;
+    runtimeGenerationId?: string;
     environment?: Readonly<Record<string, string>>;
   }>): RuntimePlannedSession;
   /**
@@ -425,7 +426,7 @@ export class TmuxSessionHost implements SessionHostPort {
       agentId: request.agentId,
       adapterId: request.adapterId,
       effective: request.effective,
-      launchId: request.launchId,
+      runtimeGenerationId: request.runtimeGenerationId,
       mode: request.mode,
       ...(request.turnId === undefined ? {} : { turnId: request.turnId }),
       ...(request.runtimeIsolation === undefined
@@ -473,7 +474,7 @@ export class TmuxSessionHost implements SessionHostPort {
       ?? (request.mode === "resume" ? request.nativeSessionId : undefined);
     beforeHostStart?.({
       owner: request.owner,
-      launchId: request.launchId,
+      runtimeGenerationId: request.runtimeGenerationId,
       ...(request.turnId === undefined ? {} : { turnId: request.turnId }),
       agentId: request.agentId,
       adapterId: request.adapterId,
@@ -505,7 +506,7 @@ export class TmuxSessionHost implements SessionHostPort {
       }
       let binding = createRuntimeBinding({
         id: bindingId,
-        launchId: request.launchId,
+        runtimeGenerationId: request.runtimeGenerationId,
         owner: request.owner,
         agentId: request.agentId,
         adapterId: request.adapterId,
@@ -556,8 +557,8 @@ export class TmuxSessionHost implements SessionHostPort {
       );
     }
     const reservation = broker.reserve(Object.freeze({
-      schemaVersion: 1,
-      launchId: request.launchId,
+      schemaVersion: 2,
+      runtimeGenerationId: request.runtimeGenerationId,
       command: planned.launch.command,
       args: [...planned.launch.args],
       environment: { ...planned.launch.env },
@@ -574,7 +575,7 @@ export class TmuxSessionHost implements SessionHostPort {
         fileURLToPath(new URL("../cli.js", import.meta.url)),
         "internal",
         "agent-host",
-        reservation.launchId,
+        reservation.runtimeGenerationId,
         reservation.ticket
       ],
       env: {
@@ -582,7 +583,7 @@ export class TmuxSessionHost implements SessionHostPort {
         YUI_SESSION_SCOPE: request.owner.scope,
         ...(request.owner.scope === "task" ? { YUI_TASK_ID: request.owner.taskId } : {}),
         YUI_ROLE: request.owner.roleName,
-        YUI_LAUNCH_ID: request.launchId,
+        YUI_RUNTIME_GENERATION_ID: request.runtimeGenerationId,
         ...(planned.launch.env.YUI_AGENT_ID === undefined
           ? {}
           : { YUI_AGENT_ID: planned.launch.env.YUI_AGENT_ID }),
@@ -611,7 +612,7 @@ export class TmuxSessionHost implements SessionHostPort {
           scope: request.owner.scope,
           ...(request.owner.scope === "task" ? { taskId: request.owner.taskId } : {}),
           roleName: request.owner.roleName,
-          launchId: reservation.launchId,
+          runtimeGenerationId: reservation.runtimeGenerationId,
           requireTurnAck: false
         });
         providerDispatchObserved = true;
@@ -625,35 +626,46 @@ export class TmuxSessionHost implements SessionHostPort {
           control: {
             protocol: AGENT_HOST_CONTROL_PROTOCOL,
             type: "launch",
-            launchId: reservation.launchId,
+            runtimeGenerationId: reservation.runtimeGenerationId,
             ticket: reservation.ticket
           }
         });
-        if (controlResult.outcome === "active-other-launch") {
-          broker.revoke(request.launchId);
+        if (controlResult.outcome === "active-other-generation") {
+          broker.revoke(request.runtimeGenerationId);
           throw new RuntimeHostContentionError(
             "provider-child-active",
             `The persistent Agent Host for ${request.owner.roleName} still owns another Provider Turn.`
           );
         }
-        if (controlResult.outcome === "active-same-launch") {
-          broker.revoke(request.launchId);
+        if (controlResult.outcome === "active-same-generation") {
+          broker.revoke(request.runtimeGenerationId);
         }
         const acceptableState = ["idle", "ready", "busy"].includes(
           controlResult.snapshot.state
         );
         if (!acceptableState
-          || controlResult.snapshot.launchId !== reservation.launchId) {
-          broker.revoke(request.launchId);
-          throw new Error(
-            `Agent Host did not return an exact Provider acknowledgement for ${reservation.launchId}.`
+          || controlResult.snapshot.runtimeGenerationId !== reservation.runtimeGenerationId) {
+          broker.revoke(request.runtimeGenerationId);
+          try {
+            await stopExactRole(this.tmux, hostId, request.owner.roleName);
+          } catch {
+            // The coordinator will enqueue durable owner cleanup.
+          }
+          throw new RuntimeGenerationMismatchError(
+            reservation.runtimeGenerationId,
+            controlResult.snapshot.runtimeGenerationId,
+            controlResult.snapshot.state,
+            `Agent Host acknowledgement generation mismatch for ${
+              reservation.runtimeGenerationId
+            }; observed=${controlResult.snapshot.runtimeGenerationId ?? "none"}; `
+              + `state=${controlResult.snapshot.state}.`
           );
         }
         providerSnapshot = controlResult.snapshot;
         providerDispatchObserved = true;
       }
     } catch (error) {
-      broker.revoke(request.launchId);
+      broker.revoke(request.runtimeGenerationId);
       if (hostCreated && !providerDispatchObserved) {
         try {
           await stopExactRole(this.tmux, hostId, request.owner.roleName);
@@ -687,7 +699,7 @@ export class TmuxSessionHost implements SessionHostPort {
     }
     const binding = createRuntimeBinding({
       id: bindingId,
-      launchId: request.launchId,
+      runtimeGenerationId: request.runtimeGenerationId,
       owner: request.owner,
       agentId: request.agentId,
       adapterId: request.adapterId,
@@ -824,7 +836,7 @@ export class AgentHostPromptPushAdapter implements ActivePromptPushPort {
         control: {
           protocol: AGENT_HOST_CONTROL_PROTOCOL,
           type: "submit-turn",
-          launchId: request.binding.launchId,
+          runtimeGenerationId: request.binding.runtimeGenerationId,
           nativeSessionId: request.binding.nativeSessionId,
           turnId: request.envelope.source.localId,
           authority: request.binding.providerAuthority,
@@ -864,7 +876,7 @@ export class AgentHostPromptPushAdapter implements ActivePromptPushPort {
         control: {
           protocol: AGENT_HOST_CONTROL_PROTOCOL,
           type: "steer-turn",
-          launchId: request.launchId,
+          runtimeGenerationId: request.runtimeGenerationId,
           nativeSessionId: request.nativeSessionId,
           nativeTurnId: request.nativeTurnId,
           authority: request.providerAuthority,

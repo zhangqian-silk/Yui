@@ -15,7 +15,8 @@ export type SessionRuntimeState = "starting" | "running" | "stopped" | "unavaila
 export type RuntimeLaunchRetryReason =
   | "previous-process"
   | "writable-client"
-  | "provider-child-active";
+  | "provider-child-active"
+  | "generation-mismatch";
 
 /** A persisted launch is either temporarily unavailable or permanently lost. */
 export class RuntimeLaunchError extends Error {
@@ -23,7 +24,7 @@ export class RuntimeLaunchError extends Error {
 
   constructor(
     readonly retryable: boolean,
-    readonly launchId: string,
+    readonly runtimeGenerationId: string,
     message: string,
     readonly reason?: RuntimeLaunchRetryReason
   ) {
@@ -40,6 +41,20 @@ export class RuntimeHostContentionError extends Error {
       RuntimeLaunchRetryReason,
       "writable-client" | "provider-child-active"
     >,
+    message: string
+  ) {
+    super(message);
+  }
+}
+
+/** A reused Agent Host acknowledged a different runtime generation. */
+export class RuntimeGenerationMismatchError extends Error {
+  readonly name = "RuntimeGenerationMismatchError";
+
+  constructor(
+    readonly expectedRuntimeGenerationId: string,
+    readonly observedRuntimeGenerationId: string | undefined,
+    readonly hostState: SessionRuntimeState | string,
     message: string
   ) {
     super(message);
@@ -76,7 +91,7 @@ export type RuntimeLaunchPersistence = "deferred" | "immediate";
  */
 export type RuntimeLaunchPreflight = Readonly<{
   owner: RuntimeOwner;
-  launchId: string;
+  runtimeGenerationId: string;
   turnId?: string;
   agentId: string;
   adapterId: string;
@@ -159,7 +174,7 @@ export type ActivePromptPushRequest = Readonly<{
 
 export type ActivePromptSteerRequest = Readonly<{
   owner: Extract<RuntimeOwner, { scope: "task" }>;
-  launchId: string;
+  runtimeGenerationId: string;
   agentId: string;
   adapterId: string;
   nativeSessionId: string;

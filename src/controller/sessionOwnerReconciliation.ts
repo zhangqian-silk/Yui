@@ -72,19 +72,19 @@ export class SessionOwnerReconciliation {
   /**
    * Persists the exact physical owner identity after a host created a new
    * Provider process. The Provider root is attributed by the exact
-   * YUI_LAUNCH_ID environment fence; the tmux pane PID is only a weaker
+   * YUI_RUNTIME_GENERATION_ID environment fence; the tmux pane PID is only a weaker
    * fallback when the fence cannot be read.
    */
   recordHostOwner(input: Readonly<{
     owner: RuntimeOwner;
     agentId: string;
     adapterId: string;
-    launchId: string;
+    runtimeGenerationId: string;
     nativeSessionId?: string;
     panePid?: number;
     runtimeRoot?: string;
   }>): void {
-    const discovered = discoverProviderRootByLaunchEnv(input.launchId);
+    const discovered = discoverProviderRootByLaunchEnv(input.runtimeGenerationId);
     const fallback = discovered === undefined && input.panePid !== undefined
       ? readLinuxProcessIdentity(input.panePid)
       : undefined;
@@ -93,7 +93,7 @@ export class SessionOwnerReconciliation {
       : { pid: fallback.pid, identity: fallback });
     if (root === undefined) {
       this.#onWarning(
-        `Session owner identity could not attribute a Provider root for launch ${input.launchId}; `
+        `Session owner identity could not attribute a Provider root for launch ${input.runtimeGenerationId}; `
           + "no owner record was written."
       );
       return;
@@ -108,7 +108,7 @@ export class SessionOwnerReconciliation {
       },
       agentId: input.agentId,
       adapterId: input.adapterId,
-      launchId: input.launchId,
+      runtimeGenerationId: input.runtimeGenerationId,
       ...(input.nativeSessionId === undefined
         ? {}
         : { nativeSessionId: input.nativeSessionId }),
@@ -156,8 +156,8 @@ export class SessionOwnerReconciliation {
           return undefined;
         }
       },
-      lastStopOutcome: (taskId, roleName, launchId) => (
-        lastSessionTerminationOutcome(this.#store, taskId, roleName, launchId)
+      lastStopOutcome: (taskId, roleName, runtimeGenerationId) => (
+        lastSessionTerminationOutcome(this.#store, taskId, roleName, runtimeGenerationId)
       ),
       now: new Date()
     });
@@ -191,7 +191,7 @@ export class SessionOwnerReconciliation {
           return false;
         }
       },
-      listLaunchFencedProcesses: (launchId) => listLaunchFencedProcesses(launchId),
+      listLaunchFencedProcesses: (runtimeGenerationId) => listLaunchFencedProcesses(runtimeGenerationId),
       signalProcess: (pid, signal) => process.kill(pid, signal),
       signalProcessGroup: (processGroupId, signal) => {
         try {
@@ -207,8 +207,8 @@ export class SessionOwnerReconciliation {
     const result = await terminateSessionOwners(owner, records, ports, options);
     if (result.outcome === "stop-confirmed") {
       for (const record of result.confirmed) {
-        this.#store.removeSessionOwner(record.launchId);
-        removeRuntimeStopReceipt(this.#home, record.launchId);
+        this.#store.removeSessionOwner(record.runtimeGenerationId);
+        removeRuntimeStopReceipt(this.#home, record.runtimeGenerationId);
       }
     }
     return result;
@@ -216,8 +216,8 @@ export class SessionOwnerReconciliation {
 
   #recordTerminationEvent(event: SessionTerminationEvent): void {
     const owner = event.owner;
-    if (event.stage === "stop-requested" && event.launchId !== undefined) {
-      writeRuntimeStopReceipt(this.#home, event.launchId, event.at);
+    if (event.stage === "stop-requested" && event.runtimeGenerationId !== undefined) {
+      writeRuntimeStopReceipt(this.#home, event.runtimeGenerationId, event.at);
     }
     if (owner.scope !== "task") return;
     try {
@@ -227,7 +227,7 @@ export class SessionOwnerReconciliation {
         "runtime.session-termination",
         {
           roleName: owner.roleName,
-          launchId: event.launchId ?? "",
+          runtimeGenerationId: event.runtimeGenerationId ?? "",
           nativeSessionId: event.nativeSessionId ?? "",
           outcome: event.stage,
           ...(event.detail === undefined ? {} : { detail: event.detail })
@@ -244,7 +244,7 @@ export class SessionOwnerReconciliation {
   }
 }
 
-/** Projects every durable Role session generation for reconciliation. */
+/** Projects every durable Role runtime generation for reconciliation. */
 export function durableSessionFacts(store: TaskStore): DurableSessionFact[] {
   const facts: DurableSessionFact[] = [];
   for (const task of store.listTasks()) {
@@ -256,7 +256,7 @@ export function durableSessionFacts(store: TaskStore): DurableSessionFact[] {
           roleName: set.owner.roleName,
           agentId,
           adapterId: session.adapterId,
-          ...(session.launchId === undefined ? {} : { launchId: session.launchId }),
+          ...(session.runtimeGenerationId === undefined ? {} : { runtimeGenerationId: session.runtimeGenerationId }),
           ...(session.nativeSessionId === undefined
             ? {}
             : { nativeSessionId: session.nativeSessionId }),
@@ -271,7 +271,7 @@ export function durableSessionFacts(store: TaskStore): DurableSessionFact[] {
           roleName: set.owner.roleName,
           agentId: history.agentId,
           adapterId: history.adapterId,
-          ...(history.launchId === undefined ? {} : { launchId: history.launchId }),
+          ...(history.runtimeGenerationId === undefined ? {} : { runtimeGenerationId: history.runtimeGenerationId }),
           ...(history.nativeSessionId === undefined
             ? {}
             : { nativeSessionId: history.nativeSessionId }),
@@ -288,7 +288,7 @@ export function durableSessionFacts(store: TaskStore): DurableSessionFact[] {
         roleName: set.owner.roleName,
         agentId,
         adapterId: session.adapterId,
-        ...(session.launchId === undefined ? {} : { launchId: session.launchId }),
+        ...(session.runtimeGenerationId === undefined ? {} : { runtimeGenerationId: session.runtimeGenerationId }),
         ...(session.nativeSessionId === undefined
           ? {}
           : { nativeSessionId: session.nativeSessionId }),
@@ -303,7 +303,7 @@ export function durableSessionFacts(store: TaskStore): DurableSessionFact[] {
         roleName: set.owner.roleName,
         agentId: session.agentId,
         adapterId: session.adapterId,
-        ...(session.launchId === undefined ? {} : { launchId: session.launchId }),
+        ...(session.runtimeGenerationId === undefined ? {} : { runtimeGenerationId: session.runtimeGenerationId }),
         ...(session.nativeSessionId === undefined
           ? {}
           : { nativeSessionId: session.nativeSessionId }),
@@ -374,7 +374,7 @@ export function lastSessionTerminationOutcome(
   store: Pick<TaskStore, "listEvents">,
   taskId: string | undefined,
   roleName: string,
-  launchId: string
+  runtimeGenerationId: string
 ): string | undefined {
   if (taskId === undefined) return undefined;
   let latest: string | undefined;
@@ -382,10 +382,10 @@ export function lastSessionTerminationOutcome(
     if (event.type !== "runtime.session-termination") continue;
     if (event.payload.roleName !== roleName) continue;
     if (
-      launchId !== ""
-      && event.payload.launchId !== undefined
-      && event.payload.launchId !== ""
-      && event.payload.launchId !== launchId
+      runtimeGenerationId !== ""
+      && event.payload.runtimeGenerationId !== undefined
+      && event.payload.runtimeGenerationId !== ""
+      && event.payload.runtimeGenerationId !== runtimeGenerationId
     ) {
       continue;
     }

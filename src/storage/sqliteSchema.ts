@@ -490,7 +490,7 @@ CREATE INDEX IF NOT EXISTS idx_review_findings_stable_key ON review_findings(tas
 /**
  * Session owner physical identity records.
  *
- * One row per runtime generation, keyed by launch id. The payload column
+ * One row per runtime generation, keyed by runtime generation id. The payload column
  * stores the full versioned JSON record; typed columns support the
  * reconciliation queries (task/role lookup, PID liveness).
  */

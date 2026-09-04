@@ -92,6 +92,9 @@ export async function runTaskPublicationVerifyCommand(
       repository: request.publication.repository,
       externalKind: request.publication.externalKind,
       externalId: request.publication.externalId,
+      ...(request.publication.externalUrl === undefined
+        ? {}
+        : { externalUrl: request.publication.externalUrl }),
       expectedLocalCommit: request.expectedLocalCommit
     });
   } catch (error) {

@@ -201,7 +201,7 @@ async function forceLeaderSteer(
   const binding = sessions?.providerBinding;
   const providerTurn = binding?.turn;
   const authority = binding?.authority;
-  if (session?.launchId === undefined || session.nativeSessionId === undefined
+  if (session?.runtimeGenerationId === undefined || session.nativeSessionId === undefined
     || providerTurn === null || providerTurn === undefined
     || providerTurn.turnId !== active.id || providerTurn.nativeTurnId === undefined
     || providerTurn.status !== "accepted"
@@ -227,7 +227,7 @@ async function forceLeaderSteer(
     roleName,
     agentId: active.effective.agentId,
     adapterId: active.effective.adapterId,
-    launchId: session.launchId,
+    runtimeGenerationId: session.runtimeGenerationId,
     nativeSessionId: session.nativeSessionId,
     nativeTurnId: providerTurn.nativeTurnId,
     authority: {

@@ -29,7 +29,7 @@ export function projectFirstProgressAdvisory(input: Readonly<{
     : [...(input.sessions.history ?? []), ...Object.values(input.sessions.sessions)]
       .sort((left, right) => left.createdAt.localeCompare(right.createdAt));
   const unique = [...new Map(sessions.map((session) => [
-    `${session.nativeSessionId}\0${session.launchId ?? ""}`,
+    `${session.nativeSessionId}\0${session.runtimeGenerationId ?? ""}`,
     session
   ])).values()];
   const firstGenerationAt = unique[0]?.createdAt;

@@ -1,13 +1,13 @@
 import type { SessionOwnerIdentity } from "./sessionOwnerIdentity.js";
 
-/** Durable projection of one Role session generation, read by reconciliation. */
+/** Durable projection of one Role runtime generation, read by reconciliation. */
 export type DurableSessionFact = Readonly<{
   scope: "task" | "global";
   taskId?: string;
   roleName: string;
   agentId: string;
   adapterId: string;
-  launchId?: string;
+  runtimeGenerationId?: string;
   nativeSessionId?: string;
   status: "active" | "ended";
   inHistory: boolean;
@@ -33,7 +33,7 @@ export type SessionReconciliationEntry = Readonly<{
   owner: Readonly<{ scope: "task" | "global"; taskId?: string; roleName: string }>;
   agentId: string;
   adapterId: string;
-  launchId: string;
+  runtimeGenerationId: string;
   nativeSessionId?: string;
   taskStatus?: "draft" | "active" | "completed" | "retired" | "archived";
   durableStatus: "active" | "ended" | "absent";
@@ -69,13 +69,13 @@ export type SessionReconciliationInput = Readonly<{
   lastStopOutcome: (
     taskId: string | undefined,
     roleName: string,
-    launchId: string
+    runtimeGenerationId: string
   ) => string | undefined;
   now: Date;
 }>;
 
 /**
- * Bidirectional durable <-> physical reconciliation for Session generations.
+ * Bidirectional durable <-> physical reconciliation for Runtime generations.
  *
  * Durable -> physical: every owner record's Provider root must be absent once
  * its durable Session is terminal; a live root with a terminal durable state
@@ -123,7 +123,7 @@ function reconcileOne(
   const lastStopOutcome = input.lastStopOutcome(
     owner.taskId,
     owner.roleName,
-    record.launchId
+    record.runtimeGenerationId
   );
 
   let mismatch: SessionReconciliationMismatch | undefined;
@@ -154,7 +154,7 @@ function reconcileOne(
     },
     agentId: record.agentId,
     adapterId: record.adapterId,
-    launchId: record.launchId,
+    runtimeGenerationId: record.runtimeGenerationId,
     ...(record.nativeSessionId === undefined
       ? {}
       : { nativeSessionId: record.nativeSessionId }),
@@ -180,7 +180,7 @@ function matchDurable(
     && fact.agentId === record.agentId
   ));
   const byLaunch = candidates.find(
-    (fact) => fact.launchId !== undefined && fact.launchId === record.launchId
+    (fact) => fact.runtimeGenerationId !== undefined && fact.runtimeGenerationId === record.runtimeGenerationId
   );
   if (byLaunch !== undefined) return byLaunch;
   const byNative = candidates.find(

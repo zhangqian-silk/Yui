@@ -2,7 +2,7 @@ import type { TelemetryMode } from "./telemetryConfig.js";
 
 /**
  * One high-volume Agent Driver observation routed to the telemetry sidecar.
- * `generation` is the launch/session generation the progress belongs to;
+ * `generation` is the launch/runtime generation the progress belongs to;
  * `sequence` is the provider's monotonic per-turn counter when known.
  */
 export type TelemetryProgressEntry = Readonly<{

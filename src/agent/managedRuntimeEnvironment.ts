@@ -1,7 +1,7 @@
 /**
  * Environment values owned by Yui's managed runtime.
  *
- * These values carry control-plane, Task, workspace, or launch identity. They
+ * These values carry control-plane, Task, workspace, or runtime generation identity. They
  * are never user Agent environment bindings, and an ordinary repository test
  * must not inherit them from the managed Session that launched the test
  * command.
@@ -17,7 +17,7 @@ export const YUI_MANAGED_RUNTIME_ENVIRONMENT_NAMES = Object.freeze([
   "YUI_DRIVER_ID",
   "YUI_WORKSPACE",
   "YUI_TURN_ID",
-  "YUI_LAUNCH_ID",
+  "YUI_RUNTIME_GENERATION_ID",
   "YUI_NATIVE_SESSION_ROOT",
   "YUI_NATIVE_SESSION_ID",
   "YUI_CONTROL_PLANE_DESCRIPTOR",

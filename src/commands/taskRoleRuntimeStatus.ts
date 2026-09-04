@@ -531,7 +531,7 @@ function projectTaskRoleRuntime(
   roleName: string,
   now: Date
 ): TaskRoleRuntimeStatus["runtime"] {
-  if (run === null || session?.launchId === undefined) return null;
+  if (run === null || session?.runtimeGenerationId === undefined) return null;
   let driverId: string;
   try {
     driverId = builtinDriverIdForAdapter(run.effective.adapterId);
@@ -544,8 +544,7 @@ function projectTaskRoleRuntime(
     turnId: run.id,
     agentId: run.effective.agentId,
     driverId,
-    launchId: session.launchId,
-    sessionGenerationId: session.launchId,
+    runtimeGenerationId: session.runtimeGenerationId,
     nativeSessionId: session.nativeSessionId,
     nativeTurnId: runtimeNativeTurnId(
       events,
@@ -555,7 +554,7 @@ function projectTaskRoleRuntime(
         turnId: run.id,
         agentId: run.effective.agentId,
         driverId,
-        launchId: session.launchId,
+        runtimeGenerationId: session.runtimeGenerationId,
         nativeSessionId: session.nativeSessionId,
         receiptId: store.getTaskRoleSessionSet(taskId, roleName)?.providerBinding?.turn?.attemptId
           ?? formatTurnReceiptId(run.taskId, run.id)
@@ -566,7 +565,7 @@ function projectTaskRoleRuntime(
   };
   let projection = projectRuntimeTaskEvents(fence, run.createdAt, events);
   projection = projectRuntimeObservation(projection, createRuntimeObservation({
-    schemaVersion: 2,
+    schemaVersion: 3,
     eventId: `runtime-host-${run.id}`,
     semanticKey: `runtime-host-${run.id}`,
     kind: "host.observed",
@@ -618,7 +617,7 @@ function runtimeNativeTurnId(
     turnId: string;
     agentId: string;
     driverId: string;
-    launchId: string;
+    runtimeGenerationId: string;
     nativeSessionId: string;
     receiptId: string;
   }>
@@ -631,7 +630,7 @@ function runtimeNativeTurnId(
       && observation.fence.turnId === expected.turnId
       && observation.fence.agentId === expected.agentId
       && observation.fence.driverId === expected.driverId
-      && observation.fence.launchId === expected.launchId
+      && observation.fence.runtimeGenerationId === expected.runtimeGenerationId
       && observation.fence.nativeSessionId === expected.nativeSessionId
       && observation.fence.receiptId === expected.receiptId
       && observation.fence.nativeTurnId !== undefined)

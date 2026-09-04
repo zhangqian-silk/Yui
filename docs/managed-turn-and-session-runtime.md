@@ -18,7 +18,7 @@ Each question has one authority:
   durable lifecycle is `active` or `ended`; `endReason` distinguishes an
   explicit stop from failure.
 - Host owns one disposable Yui attachment/process activation for a Role and
-workspace. It is identified by `launchId`, not by Turn.
+  workspace. It is identified by `runtimeGenerationId`, not by Turn.
 - Provider Runtime Binding owns one immutable provider input attempt and its accepted, running,
   waiting, completed, failed, cancelled, or uncertain result.
 
@@ -76,6 +76,15 @@ event, Yui steers one forced input into that exact active Leader Turn. The input
 lists the aggregate, states that it waited ten minutes, and instructs the
 Leader to handle the events before resuming its interrupted work.
 
+Native child continuation reports follow the same ownership boundary. While
+their parent Yui Turn is active, `continuation.reported` and
+`continuation.settled` are persisted without waking a supervisor because the
+parent still owns the result. If the parent Turn is already terminal or absent,
+the result is routed once from the original Role to its supervisor and then
+uses the ordinary Leader/Operator mailbox aggregation window. A Reviewer
+result still completes through the normal Review terminal path rather than a
+parallel continuation-specific review path.
+
 ## Session Goal
 
 Goal is explicit Session-scoped Provider state and may span multiple Turns. It
@@ -95,6 +104,21 @@ settles as soon as the Host and Session are known. It never belongs to a Turn an
 never remains held while a Turn executes. Therefore a later Turn may reuse the
 same live Host and Session. If that Host has stopped, restoring the same Session
 creates a new Host activation while retaining the native Session id.
+
+`runtimeGenerationId` identifies that exact Host activation/rebind generation.
+It is neither a native Session/conversation id nor a Yui or provider Turn id.
+Several Turns—including Turns entered directly by the user in the provider
+UI—may run in the same runtime generation. A direct user message changes Turn
+history, not the runtime generation. Yui changes the generation only when it
+establishes a new Host activation boundary; restoring a still-running exact
+Host retains its current generation.
+
+Before sending any input through a reused Agent Host, Yui requires the Host to
+acknowledge the requested `runtimeGenerationId` and an admissible Host state.
+An acknowledgement for another generation, or an otherwise invalid
+acknowledgement, is a poisoned activation boundary: Yui sends no input, stops
+the exact Role Host when possible, and otherwise leaves a durable owner-cleanup
+obligation. It never treats that Host as ready or reusable.
 
 The stable attempt id and Provider Turn fence prevent duplicate input. A
 `delivery-unknown` input is not replayed automatically because it may already

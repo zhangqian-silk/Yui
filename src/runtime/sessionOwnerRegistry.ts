@@ -18,7 +18,7 @@ import type { RuntimeOwner } from "./runtimeOwner.js";
 /**
  * Durable, enumerable physical owner records for runtime generations.
  *
- * One JSON file per launch id under `<home>/runtime/session-owners/`. The
+ * One JSON file per runtime generation id under `<home>/runtime/session-owners/`. The
  * directory is runtime state (like the tmux socket), not aggregate domain
  * state, so it needs no schema migration; it survives a Controller restart and
  * stays enumerable after the durable Session map or history is cleared, which
@@ -39,7 +39,7 @@ export class FileSessionOwnerRegistry {
   /** Atomically records (or replaces) one generation's owner identity. */
   record(identity: SessionOwnerIdentity): void {
     mkdirSync(this.#directory, { recursive: true, mode: 0o700 });
-    const target = this.#path(identity.launchId);
+    const target = this.#path(identity.runtimeGenerationId);
     const temporary = `${target}.tmp-${process.pid}`;
     writeFileSync(
       temporary,
@@ -49,10 +49,10 @@ export class FileSessionOwnerRegistry {
     renameSync(temporary, target);
   }
 
-  get(launchId: string): SessionOwnerIdentity | null {
-    if (!isSafeLaunchId(launchId)) return null;
+  get(runtimeGenerationId: string): SessionOwnerIdentity | null {
+    if (!isSafeRuntimeGenerationId(runtimeGenerationId)) return null;
     try {
-      return parseOwnerRecord(readFileSync(this.#path(launchId), "utf8"));
+      return parseOwnerRecord(readFileSync(this.#path(runtimeGenerationId), "utf8"));
     } catch {
       return null;
     }
@@ -90,10 +90,10 @@ export class FileSessionOwnerRegistry {
   }
 
   /** Removes a record whose physical resources were proven absent. */
-  remove(launchId: string): void {
-    if (!isSafeLaunchId(launchId)) return;
+  remove(runtimeGenerationId: string): void {
+    if (!isSafeRuntimeGenerationId(runtimeGenerationId)) return;
     try {
-      rmSync(this.#path(launchId), { force: true });
+      rmSync(this.#path(runtimeGenerationId), { force: true });
     } catch {
       // A stale record is harmless: reconciliation re-verifies physical
       // identity before acting on it.
@@ -104,13 +104,13 @@ export class FileSessionOwnerRegistry {
     return existsSync(this.#directory);
   }
 
-  #path(launchId: string): string {
-    return join(this.#directory, `${launchId}.json`);
+  #path(runtimeGenerationId: string): string {
+    return join(this.#directory, `${runtimeGenerationId}.json`);
   }
 }
 
-function isSafeLaunchId(launchId: string): boolean {
-  return /^[A-Za-z0-9_.:-]+$/u.test(launchId);
+function isSafeRuntimeGenerationId(runtimeGenerationId: string): boolean {
+  return /^[A-Za-z0-9_.:-]+$/u.test(runtimeGenerationId);
 }
 
 function parseOwnerRecord(raw: string): SessionOwnerIdentity {
@@ -130,7 +130,7 @@ function parseOwnerRecord(raw: string): SessionOwnerIdentity {
     },
     agentId: String(record.agentId),
     adapterId: String(record.adapterId),
-    launchId: String(record.launchId),
+    runtimeGenerationId: String(record.runtimeGenerationId),
     ...(record.nativeSessionId === undefined
       ? {}
       : { nativeSessionId: String(record.nativeSessionId) }),

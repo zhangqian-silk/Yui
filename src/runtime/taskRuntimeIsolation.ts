@@ -39,7 +39,7 @@ export type TaskRuntimeLaunchPolicy = Readonly<{
 }>;
 
 export type TaskRuntimeIsolationDescriptor = Readonly<{
-  schemaVersion: 1;
+  schemaVersion: 2;
   kind: "yui-task-runtime-isolation";
   taskId: string;
   workspace: Readonly<{
@@ -60,7 +60,7 @@ export type TaskRuntimeIsolationDescriptor = Readonly<{
     requested: readonly string[];
   }>;
   generation: Readonly<{
-    launchId: string;
+    runtimeGenerationId: string;
     generationId: string;
   }>;
 }>;
@@ -95,7 +95,7 @@ export type TaskRuntimeIsolationPreparation = Readonly<{
 
 export type TaskRuntimeIsolationPreflightInput = Readonly<{
   workspace: ManagedWorkspace;
-  launchId: string;
+  runtimeGenerationId: string;
   generationId: string;
   policy?: TaskRuntimeLaunchPolicy;
   allowExactActive?: boolean;
@@ -113,7 +113,7 @@ export interface TaskRuntimeIsolationPort {
 export interface TaskRuntimeLifecycleCleanupPort {
   cleanupTaskLaunch(input: Readonly<{
     taskId: string;
-    launchId: string;
+    runtimeGenerationId: string;
     reason: TaskRuntimeCleanupReason;
   }>): "absent" | "cleaned";
 }
@@ -290,11 +290,11 @@ export class FileTaskRuntimeIsolation implements
 
   cleanupTaskLaunch(input: Readonly<{
     taskId: string;
-    launchId: string;
+    runtimeGenerationId: string;
     reason: TaskRuntimeCleanupReason;
   }>): "absent" | "cleaned" {
     const taskId = requireIdentity(input.taskId, "Task id");
-    const launchId = requireIdentity(input.launchId, "Launch id");
+    const runtimeGenerationId = requireIdentity(input.runtimeGenerationId, "Runtime generation id");
     requireCleanupReason(input.reason);
     const taskRoot = taskRuntimeInventoryRoot(
       this.#runtimeRoot,
@@ -312,7 +312,7 @@ export class FileTaskRuntimeIsolation implements
       if (isNodeCode(error, "ENOENT")) return "absent";
       throw error;
     }
-    const launchDigest = taskRuntimeLaunchDigest(taskId, launchId, this.#pathLayout);
+    const launchDigest = taskRuntimeLaunchDigest(taskId, runtimeGenerationId, this.#pathLayout);
     const matches: TaskRuntimeIsolationPreparation[] = [];
     for (const entry of entries) {
       if (!entry.isDirectory() || entry.isSymbolicLink()) {
@@ -333,7 +333,7 @@ export class FileTaskRuntimeIsolation implements
       try {
         marker = parseMarker(readFileSync(join(generationRoot, MARKER_FILE), "utf8"));
       } catch (error) {
-        throw new Error("Task runtime launch generation is unmarked or invalid.", {
+        throw new Error("Task runtime generation is unmarked or invalid.", {
           cause: error
         });
       }
@@ -342,10 +342,10 @@ export class FileTaskRuntimeIsolation implements
       if (
         marker.fingerprint !== fingerprint
         || descriptor.taskId !== taskId
-        || descriptor.generation.launchId !== launchId
+        || descriptor.generation.runtimeGenerationId !== runtimeGenerationId
         || descriptor.roots.generation !== generationRoot
       ) {
-        throw new Error("Task runtime launch generation ownership is mismatched.");
+        throw new Error("Task runtime generation ownership is mismatched.");
       }
       matches.push({
         descriptor,
@@ -355,7 +355,7 @@ export class FileTaskRuntimeIsolation implements
     }
     if (matches.length === 0) return "absent";
     if (matches.length !== 1) {
-      throw new Error("Task runtime launch generation ownership is ambiguous.");
+      throw new Error("Task runtime generation ownership is ambiguous.");
     }
     this.cleanup(matches[0]!, input.reason);
     return "cleaned";
@@ -364,7 +364,7 @@ export class FileTaskRuntimeIsolation implements
 
 export function createTaskRuntimeIsolationDescriptor(input: Readonly<{
   workspace: ManagedWorkspace;
-  launchId: string;
+  runtimeGenerationId: string;
   generationId: string;
   runtimeRoot: string;
   pathLayout?: TaskRuntimePathLayout;
@@ -373,7 +373,7 @@ export function createTaskRuntimeIsolationDescriptor(input: Readonly<{
   const workspace = validateManagedWorkspace(input.workspace);
   const owner = taskRuntimeWorkspaceOwner(workspace.owner);
   const taskId = requireIdentity(owner.taskId, "Task id");
-  const launchId = requireIdentity(input.launchId, "Launch id");
+  const runtimeGenerationId = requireIdentity(input.runtimeGenerationId, "Runtime generation id");
   const generationId = requireIdentity(input.generationId, "Generation id");
   const runtimeRoot = canonicalPath(input.runtimeRoot, "Task runtime root");
   const pathLayout = taskRuntimePathLayout(input.pathLayout);
@@ -381,7 +381,7 @@ export function createTaskRuntimeIsolationDescriptor(input: Readonly<{
     runtimeRoot,
     taskId,
     owner,
-    launchId,
+    runtimeGenerationId,
     pathLayout
   );
   const declared = capabilities(
@@ -395,7 +395,7 @@ export function createTaskRuntimeIsolationDescriptor(input: Readonly<{
   const portPreference = ports(input.policy?.portPreference ?? [], "Port preference");
   const portAllocations = allocations(input.policy?.portAllocations ?? []);
   return Object.freeze({
-    schemaVersion: 1,
+    schemaVersion: 2,
     kind: "yui-task-runtime-isolation",
     taskId,
     workspace: Object.freeze({ owner, root: canonicalPath(workspace.root, "Workspace root") }),
@@ -408,14 +408,14 @@ export function createTaskRuntimeIsolationDescriptor(input: Readonly<{
     serviceNamespace: taskRuntimeServiceNamespace(
       taskId,
       owner,
-      launchId,
+      runtimeGenerationId,
       generationId
     ),
     portPreference,
     portAllocations,
     externalCapabilities: Object.freeze({ declared, requested }),
     generation: Object.freeze({
-      launchId,
+      runtimeGenerationId,
       generationId
     })
   });
@@ -437,7 +437,7 @@ export function parseTaskRuntimeIsolationDescriptor(
       }.`
     );
   }
-  if (value.schemaVersion !== 1) {
+  if (value.schemaVersion !== 2) {
     throw new Error("Task runtime isolation descriptor schema version is invalid.");
   }
   const workspace = requireRecord(value.workspace, "Task runtime workspace");
@@ -451,7 +451,7 @@ export function parseTaskRuntimeIsolationDescriptor(
     requireRecord(workspace.owner, "Task runtime workspace owner") as ManagedWorkspaceOwner
   );
   const descriptor: TaskRuntimeIsolationDescriptor = {
-    schemaVersion: 1,
+    schemaVersion: 2,
     kind: "yui-task-runtime-isolation",
     taskId: requireIdentity(value.taskId, "Task id"),
     workspace: {
@@ -472,7 +472,7 @@ export function parseTaskRuntimeIsolationDescriptor(
       requested: capabilities(external.requested, "Requested external capability")
     },
     generation: {
-      launchId: requireIdentity(generation.launchId, "Launch id"),
+      runtimeGenerationId: requireIdentity(generation.runtimeGenerationId, "Runtime generation id"),
       generationId: requireIdentity(generation.generationId, "Generation id")
     }
   };
@@ -527,7 +527,7 @@ export function assertTaskRuntimeIsolationPreflight(input: Readonly<{
     runtimeRoot,
     descriptor.taskId,
     expectedOwner,
-    descriptor.generation.launchId,
+    descriptor.generation.runtimeGenerationId,
     pathLayout
   );
   if (
@@ -537,17 +537,17 @@ export function assertTaskRuntimeIsolationPreflight(input: Readonly<{
     || descriptor.roots.temporary !== join(expectedGeneration, "tmp")
   ) {
     throw new Error(
-      "Task runtime roots do not match the exact Task, owner, and launch identity."
+      "Task runtime roots do not match the exact Task, owner, and runtime generation identity."
     );
   }
   if (descriptor.serviceNamespace !== taskRuntimeServiceNamespace(
     descriptor.taskId,
     expectedOwner,
-    descriptor.generation.launchId,
+    descriptor.generation.runtimeGenerationId,
     descriptor.generation.generationId
   )) {
     throw new Error(
-      "Task runtime service namespace does not match its exact Task launch generation."
+      "Task runtime service namespace does not match its exact Task runtime generation."
     );
   }
   if (!isWithin(runtimeRoot, descriptor.roots.generation)) {
@@ -746,13 +746,13 @@ function taskRuntimeGenerationRoot(
   runtimeRoot: string,
   taskId: string,
   owner: TaskRuntimeWorkspaceOwner,
-  launchId: string,
+  runtimeGenerationId: string,
   pathLayout: TaskRuntimePathLayout = "hierarchical"
 ): string {
   return join(
     taskRuntimeInventoryRoot(runtimeRoot, taskId, pathLayout),
     taskRuntimeOwnerDigest(taskId, owner, pathLayout),
-    taskRuntimeLaunchDigest(taskId, launchId, pathLayout)
+    taskRuntimeLaunchDigest(taskId, runtimeGenerationId, pathLayout)
   );
 }
 
@@ -776,10 +776,10 @@ function taskRuntimeOwnerDigest(
 
 function taskRuntimeLaunchDigest(
   taskId: string,
-  launchId: string,
+  runtimeGenerationId: string,
   pathLayout: TaskRuntimePathLayout
 ): string {
-  return digest(JSON.stringify([taskId, launchId])).slice(
+  return digest(JSON.stringify([taskId, runtimeGenerationId])).slice(
     0,
     pathLayout === "compact" ? 20 : 24
   );
@@ -796,13 +796,13 @@ function taskRuntimePathLayout(value: TaskRuntimePathLayout | undefined): TaskRu
 function taskRuntimeServiceNamespace(
   taskId: string,
   owner: TaskRuntimeWorkspaceOwner,
-  launchId: string,
+  runtimeGenerationId: string,
   generationId: string
 ): string {
   return `yui-task-${digest(JSON.stringify([
     taskId,
     owner,
-    launchId,
+    runtimeGenerationId,
     generationId
   ])).slice(0, 24)}`;
 }
