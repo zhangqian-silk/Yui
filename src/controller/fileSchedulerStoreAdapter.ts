@@ -427,7 +427,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
       ? transportAgentResult(input.payload.output)
       : {
           status: "failed" as const,
-          output: providerStatus === "cancelled"
+          diagnostic: providerStatus === "cancelled"
             ? "Provider cancelled the Agent Turn."
             : `Provider Agent Turn failed: ${input.payload.failure?.error.message ?? "unknown provider failure"}`,
           failureReason: providerStatus === "cancelled"
@@ -1996,7 +1996,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
           ? {}
           : { nativeSessionId: session.nativeSessionId }),
         ...(input.runtimeGenerationId === undefined ? {} : { runtimeGenerationId: input.runtimeGenerationId }),
-        outcome: { status: "failed", output: summary, failureReason: input.failureReason }
+        outcome: { status: "failed", diagnostic: summary, failureReason: input.failureReason }
       }, input.now);
       if (result.disposition !== "applied" || result.turn === null) {
         return "state-changed";
@@ -2457,14 +2457,24 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
         }
         const providerStatus = input.providerStatus;
         let systemEvidence: Parameters<typeof terminalizeExactTaskTurn>[1]["systemEvidence"];
+        let workspaceFailure: Parameters<typeof terminalizeExactTaskTurn>[1]["workspaceFailure"];
         if ((observedTurn.purpose === "execution" || observedTurn.purpose === "review")
           && observedTurn.executionGroupId !== undefined
           && observedTurn.executionLaneId !== undefined
           && observedTurn.workspace !== undefined
           && input.outcome.status === "completed") {
           const gitSnapshot = this.snapshotExecutionLaneWorkspace(store, observedTurn.workspace);
-          if (gitSnapshot !== undefined) {
-            systemEvidence = { workspaceSnapshot: gitSnapshot };
+          if (gitSnapshot.status === "captured") {
+            systemEvidence = { workspaceSnapshot: gitSnapshot.snapshot };
+          } else {
+            workspaceFailure = {
+              failureReason: gitSnapshot.cause === "workspace-dirty"
+                ? "workspace-dirty"
+                : gitSnapshot.cause === "branch-mismatch"
+                  ? "workspace-branch-mismatch"
+                  : "workspace-unavailable",
+              diagnostic: gitSnapshot.diagnostic
+            };
           }
         }
         const terminalized = terminalizeExactTaskTurn(store, {
@@ -2485,7 +2495,8 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
               status: providerStatus
             }
           },
-          ...(systemEvidence === undefined ? {} : { systemEvidence })
+          ...(systemEvidence === undefined ? {} : { systemEvidence }),
+          ...(workspaceFailure === undefined ? {} : { workspaceFailure })
         }, now);
         if (terminalized.disposition !== "applied" || terminalized.turn === null) {
           throw new Error(
@@ -3188,7 +3199,11 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
         nativeSessionId,
         ...(input.runtimeGenerationId === undefined ? {} : { runtimeGenerationId: input.runtimeGenerationId }),
         title: effectiveExisting?.title ?? input.title,
-        preview: effectiveExisting?.preview ?? sessionPreview(input.outcome.output),
+        preview: effectiveExisting?.preview ?? sessionPreview(
+          input.outcome.status === "completed"
+            ? input.outcome.output
+            : input.outcome.diagnostic
+        ),
         policy: "fixed",
         status: completedStatus,
         ...(effectiveExisting?.endReason === undefined

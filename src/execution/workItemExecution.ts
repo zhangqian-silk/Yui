@@ -573,13 +573,6 @@ export function executionGroupSettled(group: ExecutionGroup): boolean {
   return group.lanes.every(({ disposition }) => disposition !== "open");
 }
 
-export function summarizeWorkItemExecutionGroup(
-  group: WorkItemExecutionGroup
-): WorkItemExecutionGroupSummary {
-  validateWorkItemExecutionGroup(group);
-  return summarizeExecutionGroup(group);
-}
-
 export function summarizeExecutionGroup(
   group: ExecutionGroup
 ): ExecutionGroupSummary {

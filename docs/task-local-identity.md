@@ -51,7 +51,7 @@ There is no compatibility lookup, cross-Task guess, or bare-ID fallback.
 
 ## Current-schema boundary
 
-Runtime opens only aggregate v13 / StoredTask v12. It does not convert,
+Runtime opens only aggregate v31 / Task v7. It does not convert,
 dual-read, or infer records from an older schema. If an existing `YUI_HOME`
 does not match the current schema, keep it untouched for external archival
 and initialize a fresh home for this runtime.

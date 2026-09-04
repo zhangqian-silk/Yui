@@ -155,7 +155,7 @@ function globalHookOutcome(
   return {
     status: "failed",
     failureReason: "runtime-failed",
-    output: boundedTurnFailureDiagnostic(diagnostic)
+    diagnostic: boundedTurnFailureDiagnostic(diagnostic)
   };
 }
 

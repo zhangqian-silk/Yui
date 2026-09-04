@@ -206,10 +206,6 @@ export function ensureStorageSchema(rootDir: string, now = new Date()): void {
   requireInspectedSchema(state);
 }
 
-export function requireStorageSchema(rootDir: string): void {
-  requireInspectedSchema(inspectStorageSchema(rootDir));
-}
-
 /** Persist the current three-axis manifest through the existing atomic-file seam. */
 export function writeCurrentStorageManifest(rootDir: string, now = new Date()): void {
   const recordVersions: Record<string, number> = {};
@@ -341,11 +337,6 @@ export function parseStorageSchemaManifest(value: unknown): ParsedStorageManifes
     ...(recordVersions === undefined ? {} : { recordVersions }),
     updatedAt: value.updatedAt
   };
-}
-
-/** Read and strictly parse the durable manifest through the same contract. */
-export function readStorageSchemaManifest(rootDir: string): ParsedStorageManifest {
-  return parseStorageManifest(readFileSync(join(rootDir, STORAGE_SCHEMA_FILE), "utf8"));
 }
 
 function parseJsonObject(raw: string, label: string): Record<string, unknown> {

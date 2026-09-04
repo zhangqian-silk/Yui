@@ -396,9 +396,12 @@ export function runTaskContextCommand(
               : [
                   `    Turns: ${itemRuns.length}; latest ${latestTurn.id} [${latestTurn.status}] ${latestTurn.effective.agentId}/${latestTurn.effective.adapterId} · effective r${latestTurn.effective.sourceDesiredRevision}/${latestTurn.effective.profileAccess}/${latestTurn.effective.permission.strategy}`,
                   `      Assignment: ${latestTurn.inputs[0]!.input.source.channel}${latestTurn.inputs[0]!.input.directive === undefined ? "" : ` · ${compactText(latestTurn.inputs[0]!.input.directive)}`}`,
-                  ...(latestTurn.result === undefined
+                  ...(latestTurn.result?.output === undefined
                     ? []
-                    : [`      Result: ${compactText(latestTurn.result.output)}`])
+                    : [`      Result: ${compactText(latestTurn.result.output)}`]),
+                  ...(latestTurn.result?.diagnostic === undefined
+                    ? []
+                    : [`      Failure: ${compactText(latestTurn.result.diagnostic)}`])
                 ]),
             ...renderReviewRounds(reviewRounds.filter(
               (round) => round.workItemId === item.id
@@ -417,7 +420,10 @@ export function runTaskContextCommand(
       (run) => [
         `  ${run.id} [${run.status}/${run.purpose}] ${run.roleName} via ${run.effective.agentId}/${run.effective.adapterId}`,
         `    Effective: r${run.effective.sourceDesiredRevision}; Profile intent: ${run.effective.profileAccess}; permission: ${run.effective.permission.strategy}; model: ${run.effective.model ?? "default"}; effort: ${run.effective.effort ?? "default"}`,
-        ...(run.result === undefined ? [] : [`    Result: ${compactText(run.result.output)}`])
+        ...(run.result?.output === undefined ? [] : [`    Result: ${compactText(run.result.output)}`]),
+        ...(run.result?.diagnostic === undefined
+          ? []
+          : [`    Failure: ${compactText(run.result.diagnostic)}`])
       ]
     ),
     "",

@@ -17,10 +17,14 @@ import {
 import type { ContextSnapshotRef } from "../context/contextSnapshot.js";
 import type { ExecutionLaneGitSnapshot } from "../repository/executionLaneGitSnapshot.js";
 import {
+  boundedTurnFailureDiagnostic,
+  MAX_TURN_FAILURE_DIAGNOSTIC_BYTES,
   MAX_TURN_RESULT_OUTPUT_BYTES,
   transportAgentResult
 } from "../domain/agentResultTransport.js";
 export {
+  boundedTurnFailureDiagnostic,
+  MAX_TURN_FAILURE_DIAGNOSTIC_BYTES,
   MAX_TURN_RESULT_OUTPUT_BYTES,
   transportAgentResult,
   type TransportedAgentResult
@@ -34,6 +38,9 @@ export type TurnFailureReason =
   | "runtime-failed"
   | "delivery-unknown"
   | "missing-result"
+  | "workspace-unavailable"
+  | "workspace-dirty"
+  | "workspace-branch-mismatch"
   | "cancelled";
 
 export type TurnProviderResult = Readonly<{
@@ -56,7 +63,10 @@ export type TurnSystemEvidence = Readonly<{
  */
 export type TurnResult = Readonly<{
   schemaVersion: 2;
-  output: string;
+  /** Exact Agent-authored terminal result, when one was transportable. */
+  output?: string;
+  /** Bounded Core-owned explanation for a failed Turn. */
+  diagnostic?: string;
   completedAt: string;
   provider?: TurnProviderResult;
   /** Objective evidence produced and validated by Core, never parsed from Agent output. */
@@ -370,11 +380,19 @@ export function validateTurn(run: Turn): Turn {
       if (!isTurnFailureReason(result.failureReason)) {
         throw new Error(`Failed Turn reason is invalid: ${String(result.failureReason)}.`);
       }
+      if (result.diagnostic === undefined) {
+        throw new Error("A failed Turn requires a Core diagnostic.");
+      }
       if (result.systemEvidence !== undefined) {
         throw new Error("A failed Turn cannot carry successful system evidence.");
       }
-    } else if (result.failureReason !== undefined) {
-      throw new Error("A completed Turn cannot carry a failure reason.");
+    } else {
+      if (result.output === undefined) {
+        throw new Error("A completed Turn requires an Agent result.");
+      }
+      if (result.failureReason !== undefined || result.diagnostic !== undefined) {
+        throw new Error("A completed Turn cannot carry failure metadata.");
+      }
     }
   }
   return run;
@@ -393,9 +411,10 @@ export function completeTurn(
 export function failTurn(
   run: Turn,
   reason: TurnFailureReason,
-  output: string,
+  diagnostic: string,
   now: Date,
-  provider?: TurnProviderResult
+  provider?: TurnProviderResult,
+  output?: string
 ): Turn {
   return finishTurn(
     run,
@@ -403,18 +422,21 @@ export function failTurn(
     output,
     now,
     reason,
-    provider
+    provider,
+    undefined,
+    boundedTurnFailureDiagnostic(diagnostic)
   );
 }
 
 function finishTurn(
   run: Turn,
   status: Exclude<TurnStatus, "active">,
-  output: string,
+  output: string | undefined,
   now: Date,
   failureReason?: TurnFailureReason,
   provider?: TurnProviderResult,
-  systemEvidence?: TurnSystemEvidence
+  systemEvidence?: TurnSystemEvidence,
+  diagnostic?: string
 ): Turn {
   if (run.status !== "active") {
     throw new Error(`Turn is already terminal: ${run.id}.`);
@@ -425,7 +447,10 @@ function finishTurn(
     status,
     result: {
       schemaVersion: 2,
-      output: requireResultText(output, "Turn result output"),
+      ...(output === undefined ? {} : { output: requireResultText(output, "Turn result output") }),
+      ...(diagnostic === undefined
+        ? {}
+        : { diagnostic: requireDiagnosticText(diagnostic, "Turn result diagnostic") }),
       completedAt: timestamp,
       ...(provider === undefined ? {} : { provider: validateTurnProviderResult(provider) }),
       ...(systemEvidence === undefined
@@ -445,12 +470,16 @@ function validateTurnResult(result: TurnResult | undefined): TurnResult {
   rejectUnknownFields(result as unknown as Record<string, unknown>, [
     "schemaVersion",
     "output",
+    "diagnostic",
     "completedAt",
     "provider",
     "systemEvidence",
     "failureReason"
   ], "Turn result");
-  requireResultText(result.output, "Turn result output");
+  if (result.output !== undefined) requireResultText(result.output, "Turn result output");
+  if (result.diagnostic !== undefined) {
+    requireDiagnosticText(result.diagnostic, "Turn result diagnostic");
+  }
   requireTimestamp(result.completedAt, "Turn result completedAt");
   if (result.provider !== undefined) validateTurnProviderResult(result.provider);
   if (result.systemEvidence !== undefined) validateTurnSystemEvidence(result.systemEvidence);
@@ -551,6 +580,15 @@ function requireResultText(value: string, label: string): string {
   return value;
 }
 
+function requireDiagnosticText(value: string, label: string): string {
+  if (typeof value !== "string" || value.includes("\0")) throw new Error(`${label} is invalid.`);
+  if (value.trim().length === 0) throw new Error(`${label} is required.`);
+  if (Buffer.byteLength(value, "utf8") > MAX_TURN_FAILURE_DIAGNOSTIC_BYTES) {
+    throw new Error(`${label} exceeds ${MAX_TURN_FAILURE_DIAGNOSTIC_BYTES} bytes.`);
+  }
+  return value;
+}
+
 
 function requireTimestamp(value: string, label: string): void {
   if (typeof value !== "string" || !Number.isFinite(Date.parse(value))) {
@@ -564,6 +602,9 @@ function isTurnFailureReason(value: unknown): value is TurnFailureReason {
     "runtime-failed",
     "delivery-unknown",
     "missing-result",
+    "workspace-unavailable",
+    "workspace-dirty",
+    "workspace-branch-mismatch",
     "cancelled"
   ].includes(String(value));
 }

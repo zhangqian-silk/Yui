@@ -6,10 +6,6 @@ import {
   integrationAttemptRequiresSettlement,
   workItemDeliverySettled
 } from "../integration/deliveryObligation.js";
-import { isCompletedTaskReviewEvidenceFromTurns } from "../review/reviewAcceptance.js";
-import { resolveRecordedTaskFinalReviewContract } from "../review/taskFinalReviewContractResolution.js";
-import { sameTaskFinalReviewContract } from "../review/taskFinalReviewContract.js";
-import type { Turn } from "../turn/turn.js";
 import type { ManagedWorkspace } from "../worktree/managedWorkspace.js";
 import type { WorkItem } from "../workItem/workItem.js";
 import type { NextActionFacts, NextActionRef } from "./nextAction.js";
@@ -80,8 +76,6 @@ export type CompletionReadiness = Readonly<{
  * extra reads on every command.
  */
 export type CompletionReadinessFacts = NextActionFacts & Readonly<{
-  /** Exact Turns used to validate structural Review completion. */
-  turns: readonly Turn[];
   managedWorkspaces: readonly ManagedWorkspace[];
   durableJobs: readonly DurableJob[];
   integrationQueueEntries: readonly IntegrationQueueEntry[];
@@ -108,12 +102,6 @@ export function projectCompletionReadiness(
   const blockers: CompletionBlocker[] = [];
   const advisories: CompletionAdvisory[] = [];
   const { task } = facts;
-  const taskFinalReviewContract = resolveRecordedTaskFinalReviewContract(
-    task.id,
-    facts.workItems,
-    facts.reviewRounds
-  )?.effective;
-  const taskFinalReviewRequired = taskFinalReviewContract !== undefined;
 
   // A pending/running Task-final Review must be resumed or blocked first.
   for (const round of facts.reviewRounds) {
@@ -128,25 +116,6 @@ export function projectCompletionReadiness(
         : `wait for Reviewer Turn on ${round.id} to finish`
     });
   }
-
-  // Only a ReviewRound with one exact completed main Reviewer Turn can satisfy
-  // the structural final-review contract. Leader completion is the semantic
-  // acceptance decision.
-  const latestCompletedTaskReview = facts.reviewRounds
-    .filter((round) => (
-      (round.scope ?? "work-item") === "task"
-      && (taskFinalReviewContract === undefined || sameTaskFinalReviewContract(
-        round.taskFinalReviewContract,
-        taskFinalReviewContract
-      ))
-      && isCompletedTaskReviewEvidenceFromTurns(round, facts.turns)
-    ))
-    .slice()
-    .sort((left, right) => (
-      left.createdAt.localeCompare(right.createdAt)
-      || left.id.localeCompare(right.id, undefined, { numeric: true })
-    ))
-    .at(-1);
 
   // Open Input requests block protocol convergence.
   for (const request of facts.openInputRequests) {

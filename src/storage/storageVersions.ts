@@ -11,8 +11,7 @@
  *
  * Layout 8 is the current SQLite WAL control-plane layout: the authoritative
  * store is `yui.db`. Layout 8 is the only physical layout this release reads
- * and writes; logical aggregate upgrades within layout 8 use the centralized
- * adjacent migration graph.
+ * and writes. Historical aggregate contracts are rejected without mutation.
  */
 export const CURRENT_STORAGE_LAYOUT_VERSION = 8;
 

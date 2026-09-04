@@ -111,7 +111,7 @@ Task 的命令（例如 `task work create`、`task integration start`）仍使�
 Task 内的本地子记录 ID。Candidate 只在所属 WorkItem 内递增，并同时保存
 Task 与 WorkItem provenance。
 
-Yui 只支持当前 aggregate-v14 / StoredTask-v13 schema。旧 home 不提供转换、
+Yui 只支持当前 aggregate-v31 / Task-v7 schema。旧 home 不提供转换、
 双读或历史记录推断；需要使用新版本时初始化全新的 `YUI_HOME`。当前引用契约见
 [Task 本地 ID](../docs/task-local-identity.md)。
 

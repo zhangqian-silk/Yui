@@ -108,6 +108,9 @@ Stable taxonomy for execution failures (`src/observability/faultClassification.t
 | --- | --- | --- |
 | `session-dead` | core-fact | startup failure |
 | `delivery-uncertain` | core-fact | exact delivery-unknown reason |
+| `result-missing` | core-fact | missing or untransportable Agent result |
+| `runtime-failure` | core-fact | Provider/runtime failed |
+| `workspace-state` | core-fact | unavailable, dirty, or wrong-branch workspace |
 | `review-infra` | core-fact | ReviewRound failed to execute |
 | `integration-environment` | core-diagnostic | `tsc: not found`, `ENOENT`, dirty target |
 | `integration-candidate-failure` | core-fact | Core-run Integration check failed |
@@ -116,8 +119,7 @@ Stable taxonomy for execution failures (`src/observability/faultClassification.t
 
 `core-diagnostic` is intentionally honest about bounded regex attribution over
 Core-run command diagnostics. Agent-authored Worker or Reviewer results are
-never classified. A caller with narrower Core evidence may supply a
-`CoreFaultHint`.
+never classified. A cancelled Turn is not counted as a fault class.
 
 ## `yui execution audit`
 
@@ -165,7 +167,7 @@ binding, so Review activity is never presented as delegated implementation.
 Advisories are derived from existing records and never write state or block a
 legal action. Current
 advisories cover direct-path protocol overhead, initial integrated WorkItem
-fan-out, unexplained review-repair fan-out, repeated exact Integration checks,
+fan-out, repeated exact Integration checks,
 same-Reviewer/same-candidate full Review repetition, and
 the two-generation first-progress advisory threshold. No Review advisory is a
 budget or blocks a legal action; the first-progress threshold never chooses
@@ -178,7 +180,7 @@ Agent recovery.
    `yui execution audit` against the current Home, confirm consistency with
    manual `ps`/filesystem checks.
 3. Classify existing Core-owned outcomes and diagnostics using the taxonomy;
-   narrower facts plug in through `CoreFaultHint`.
+   retain the exact Core failure reason as the classification evidence.
 4. If collection overhead exceeds budget, disable high-cost inventory
    gates; the basic identity and audit remain. No business-state rollback is
    needed.

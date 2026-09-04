@@ -49,7 +49,7 @@ export type RuntimeTurnTerminalOutcome =
   | Readonly<{ status: "completed"; output: string }>
   | Readonly<{
       status: "failed";
-      output: string;
+      diagnostic: string;
       failureReason: TurnFailureReason;
     }>;
 
@@ -458,13 +458,22 @@ function normalizeRuntimeTurnTerminalOutcome(
   }
   if (input.status === "completed") return transportAgentResult(input.output);
   if (input.status !== "failed"
-    || !["startup-failed", "runtime-failed", "delivery-unknown", "missing-result", "cancelled"]
+    || ![
+      "startup-failed",
+      "runtime-failed",
+      "delivery-unknown",
+      "missing-result",
+      "workspace-unavailable",
+      "workspace-dirty",
+      "workspace-branch-mismatch",
+      "cancelled"
+    ]
       .includes(input.failureReason)) {
     throw invalidEvent("Runtime Turn failure outcome is invalid.");
   }
   return {
     status: "failed",
-    output: boundedTurnFailureDiagnostic(input.output),
+    diagnostic: boundedTurnFailureDiagnostic(input.diagnostic),
     failureReason: input.failureReason
   };
 }

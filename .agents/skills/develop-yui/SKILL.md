@@ -47,7 +47,7 @@ than an Agent using current context, must make the decision.
 Use [`docs/testing/verification-levels.md`](../../../docs/testing/verification-levels.md)
 as the executable policy. Yui keeps one permanent, seconds-scale smoke suite:
 `npm test` / `npm run test:core`. It covers only the essential happy paths for
-CLI startup, SQLite Task persistence, supported storage migration, and built-in
+CLI startup, SQLite Task persistence, current-storage rejection, and built-in
 Agent Driver registration.
 
 - Treat TDD and change-specific tests as temporary development scaffolding.
@@ -118,10 +118,11 @@ when the repair is itself a substantial independently owned requirement.
 
 ## Implement the current Yui contract
 
-Provide compatibility only through explicit migrations between valid versions
-of persistent Yui data. A persistent layout, aggregate, record, or
-configuration schema change must include its version transition and centralized
-migration function.
+Yui implements one current persistent contract. A layout, aggregate, record, or
+configuration schema change replaces that current contract and updates its
+centralized version declarations and validators. Historical Homes remain
+unsupported and untouched; do not add migration, dual-read, or compatibility
+paths unless the user explicitly changes that product policy.
 
 For all other behavior, implement and validate only the current contract. Do
 not preserve transitional paths or add recovery logic for malformed, partial,

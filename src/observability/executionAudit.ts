@@ -509,7 +509,7 @@ export function runExecutionAudit(
             failedCount += 1;
             failedDurationMs += duration;
             cumulativeDurationMs += duration;
-            addLaunchFailureCounts(launchFailures, turn.result?.output);
+            addLaunchFailureCounts(launchFailures, turn.result?.diagnostic);
             failures.push(classifyTurnFailure(turn));
           }
         }

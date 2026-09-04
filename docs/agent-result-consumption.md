@@ -2,7 +2,8 @@
 
 Status: implemented contract
 Date: 2026-09-04
-Baseline: `8a29c294d66107c697a74f803b3190ab9c00e333`
+Branch base: `8a29c294d66107c697a74f803b3190ab9c00e333`; the
+contract is defined by the current branch head.
 
 ## Decision
 
@@ -46,7 +47,8 @@ The current contract is:
 ```ts
 type TurnResult = Readonly<{
   schemaVersion: 2;
-  output: string;
+  output?: string;
+  diagnostic?: string;
   completedAt: string;
   provider?: TurnProviderResult;
   systemEvidence?: TurnSystemEvidence;
@@ -58,12 +60,15 @@ type TurnSystemEvidence = Readonly<{
 }>;
 ```
 
-`output` preserves the Provider's complete non-empty text, including its outer
-whitespace, up to the 512 KiB durable result limit. Provider status and Yui
-outcome are separate: a Provider may report `completed`, while missing, empty,
-NUL-containing, or oversized result text terminalizes the Yui Turn as
-`missing-result`. Core stores a bounded diagnostic instead of truncating or
-inventing Agent prose. `systemEvidence` is authored and validated by Core.
+`output`, when present, preserves the Provider's complete non-empty Agent text,
+including its outer whitespace, up to the 512 KiB durable result limit.
+`diagnostic`, when present, is bounded Core-authored failure context. A
+completed Turn requires `output` and has no failure metadata. A failed Turn
+requires `diagnostic`; it may also retain `output` when the Agent result arrived
+before a later Core-owned workspace boundary failed. Provider status and Yui
+outcome remain separate: missing, empty, NUL-containing, or oversized result
+text terminalizes the Yui Turn as `missing-result` without inventing Agent
+prose. `systemEvidence` is authored and validated by Core.
 
 A useful, optional Agent layout is:
 
@@ -92,8 +97,10 @@ Markdown, JSON, or ordinary prose are all legal.
 
 For a writable replicated Lane, Core still requires a clean exact workspace
 snapshot. A dirty workspace, wrong branch, missing durable owner, mismatched
-Project set, or wrong commit fails the Lane. The Agent does not need to repeat
-those facts in its output.
+Project set, or wrong commit fails the Lane. If the Agent result already
+arrived, that exact text remains in `output` while Core records the distinct
+workspace failure reason and `diagnostic`. The Agent does not need to repeat
+those facts.
 
 ## Direct execution
 
@@ -167,15 +174,15 @@ workspace, execution Group, exact main Reviewer Turn, lifecycle status, and
 optional Core failure. It does not copy Agent summary, report, checks, findings,
 or evidence commits.
 
-Task-final Review completion requires:
+When a Task-final ReviewRound exists, its structural completion requires:
 
-- the required Review contract;
 - a completed ReviewRound over the current exact Task heads; and
 - one exact completed main Reviewer Turn bound to that Round.
 
 Core does not inspect the Reviewer output to decide whether it passed. The
-Leader reads the original result and explicitly completes the Task when the
-outcome is acceptable.
+Leader decides whether Review is useful, reads the original result when Review
+was requested, and explicitly completes the Task when the outcome is
+acceptable. Core does not force a ReviewRound as a Task completion gate.
 
 A delta recheck stores only objective lineage and diff facts. The Reviewer may
 state that the change is equivalent, defective, or requires a full review, but
@@ -220,7 +227,8 @@ The required deterministic evidence is:
 - missing headings, invalid JSON, or omitted reported checks do not fail a
   Turn;
 - missing and oversized Provider results still terminalize as `missing-result`;
-- dirty or mismatched writable Lane state still fails;
+- dirty or mismatched writable Lane state fails without replacing an arrived
+  Agent result;
 - main synthesis receives every successful source Turn in stable Lane order;
 - Review completion depends on the exact completed main Turn, not its wording;
 - wake inspection includes a long-running Turn referenced by a terminal Event;

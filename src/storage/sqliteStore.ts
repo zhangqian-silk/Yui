@@ -1094,11 +1094,6 @@ export class SqliteTaskStore implements TaskStore {
     if (base === null) return null;
     return {
       ...base,
-      turns: operationalTaskRecords(
-        this.listTurns(taskId),
-        this.listEvents(taskId),
-        "turn"
-      ),
       managedWorkspaces: this.#sortById(
         this.#listPayload<ManagedWorkspace>("managed_workspaces", "task_id = ?", [taskId]),
         (workspace) => managedWorkspaceKey(workspace.owner)

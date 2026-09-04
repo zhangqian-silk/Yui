@@ -69,7 +69,10 @@ import { createExactControlPlaneDescriptor } from "../../dist/runtime/exactContr
 import { resolveManagedTaskCaller } from "../../dist/runtime/managedCaller.js";
 import { taskLeaderActionTurnId } from "../../dist/commands/taskActor.js";
 import { buildTurnContextPack } from "../../dist/context/turnContextPack.js";
-import { buildTaskWakeEnvelope } from "../../dist/context/wakeNotification.js";
+import {
+  buildTaskWakeEnvelope,
+  WAKE_ENVELOPE_HARD_BYTES
+} from "../../dist/context/wakeNotification.js";
 import { startStructuredProviderSession } from "../../dist/runtime/structuredProviderHost.js";
 import {
   acceptProviderTurn,
@@ -103,7 +106,6 @@ import {
   processLeaderWakeups
 } from "../../dist/scheduler/leaderWakeupProcessor.js";
 import { buildTaskExecutionProjection } from "../../dist/scheduler/taskExecutionProjection.js";
-import { buildTaskObservabilityProjection } from "../../dist/scheduler/taskObservabilityProjection.js";
 import { projectWorkItemExecution } from "../../dist/execution/workItemExecutionProjection.js";
 import {
   createWorkItemExecutionAssignment,
@@ -201,6 +203,8 @@ test("the packaged CLI starts and exposes the core workflow", () => {
   assert.equal(commands.includes("task rebuild"), false);
   assert.equal(commands.some((command) => command.startsWith("task history")), false);
   assert.equal(commands.includes("task review rebind"), false);
+  assert.equal(commands.includes("task review force-fresh"), false);
+  assert.equal(commands.includes("task review finding"), false);
   assert.equal(commands.includes("task role session switch"), false);
 });
 
@@ -1398,6 +1402,37 @@ test("a wake names a completed Turn even when that Turn predates the delta curso
   assert.deepEqual(envelope.referencedTurnIds, [turn.id]);
   assert.match(envelope.text, /Changed: 1 events, 0 messages, 1 Turns/u);
   assert.match(envelope.text, /yui task turn show task-1\/turn-1/u);
+
+  const wideTurns = Array.from({ length: 6 }, (_, index) => ({
+    ...turn,
+    id: `turn-${index + 2}`
+  }));
+  const wideEvents = wideTurns.map((candidate, index) => createTaskEvent(
+    `event-${index + 10}`,
+    task.id,
+    "turn.completed",
+    { turnId: candidate.id, role: worker.name },
+    new Date(eventAt.getTime() + index + 1)
+  ));
+  const wideEnvelope = buildTaskWakeEnvelope({
+    getTask: () => task,
+    listEvents: () => wideEvents,
+    listMessages: () => [],
+    listTurns: () => wideTurns,
+    listReviewRounds: () => []
+  }, {
+    taskId: task.id,
+    wakeId: "wake-wide",
+    reasons: Array.from(
+      { length: 6 },
+      (_, index) => `reason-${index + 1}-${"r".repeat(400)}`
+    ),
+    fromCursor: cursor,
+    now: eventAt
+  });
+  assert.equal(wideEnvelope.referencedTurnIds.length, 6);
+  assert.ok(wideEnvelope.totalBytes <= WAKE_ENVELOPE_HARD_BYTES);
+  assert.equal(Buffer.byteLength(wideEnvelope.text, "utf8"), wideEnvelope.totalBytes);
 });
 
 test("Leader wakeups aggregate for one minute and force-steer after ten", async (t) => {
@@ -1544,6 +1579,19 @@ test("Leader wakeups aggregate for one minute and force-steer after ten", async 
   assert.equal(results[0].reason, "state-changed");
   assert.equal(store.getWorkMailbox(leaderTarget).processing, null);
   assert.deepEqual(store.getPendingWakeup(task.id).reasons, ["event-arrived-during-steer"]);
+
+  const throwingAdapter = new FileSchedulerStoreAdapter(store);
+  throwingAdapter.getTaskWakeEnvelope = () => {
+    throw new Error("wake envelope read failed");
+  };
+  results = await processLeaderWakeups(
+    throwingAdapter,
+    delivery,
+    new Date(firstEventAt.getTime() + 22 * 60_000)
+  );
+  assert.equal(results[0].status, "failed");
+  assert.match(results[0].error, /wake envelope read failed/u);
+  assert.equal(store.getWorkMailbox(leaderTarget).processing, null);
 });
 
 test("an active Task without a durable event remains quiet", async (t) => {
@@ -1774,7 +1822,7 @@ test("active Role Turns deliver from durable state and Worker hints settle at ac
     outcome: {
       status: "failed",
       failureReason: "runtime-failed",
-      output: "Worker delivery path verified."
+      diagnostic: "Worker delivery path verified."
     }
   }, new Date(nextAt.getTime() + 1_000)));
   assert.equal(workerTerminal.disposition, "applied");
@@ -2193,11 +2241,13 @@ test("direct and replicated WorkItem execution converge through exact Lane retry
       roleName: turn.roleName,
       agentId: turn.effective.agentId,
       turnId: turn.id,
-      outcome: {
-        status,
-        output: status === "completed" ? `${turn.roleName} completed.` : `${turn.roleName} failed.`,
-        ...(status === "failed" ? { failureReason: "runtime-failed" } : {})
-      }
+      outcome: status === "completed"
+        ? { status, output: `${turn.roleName} completed.` }
+        : {
+            status,
+            diagnostic: `${turn.roleName} failed.`,
+            failureReason: "runtime-failed"
+          }
     }, now));
     assert.equal(result.disposition, "applied");
   };
@@ -2472,11 +2522,9 @@ test("direct and replicated Review keep Producer results non-authoritative", (t)
       roleName: turn.roleName,
       agentId: turn.effective.agentId,
       turnId: turn.id,
-      outcome: {
-        status,
-        output,
-        ...(status === "failed" ? { failureReason: "runtime-failed" } : {})
-      },
+      outcome: status === "failed"
+        ? { status, diagnostic: output, failureReason: "runtime-failed" }
+        : { status, output },
       ...(status === "completed"
         && turn.executionLaneId !== undefined
         && includeGitSnapshot
@@ -3063,7 +3111,9 @@ test("Core freezes writable Lane state without parsing the Producer output", (t)
     }
   }, new Date("2026-09-02T00:21:00.000Z")));
   assert.equal(rejected.turn.status, "failed");
-  assert.equal(rejected.turn.result.failureReason, "missing-result");
+  assert.equal(rejected.turn.result.failureReason, "workspace-unavailable");
+  assert.equal(rejected.turn.result.output, "# Result\n\nThe Agent claims everything passed.");
+  assert.match(rejected.turn.result.diagnostic, /could not freeze/u);
 
   const gitless = prepare("work-item-3", "execution-group-3", "turn-3", []);
   const rejectedGitless = store.transaction((tx) => terminalizeExactTaskTurn(tx, {
@@ -3146,15 +3196,269 @@ test("Core freezes writable Lane state without parsing the Producer output", (t)
     }]
   }, now);
   store.saveManagedWorkspace(actualWorkspace);
-  assert.equal(
-    snapshotExecutionLaneWorkspaceSync(store, actualWorkspace).projects[0].headCommit,
-    headCommit
-  );
+  assert.deepEqual(snapshotExecutionLaneWorkspaceSync(store, actualWorkspace), {
+    status: "captured",
+    snapshot: {
+      schemaVersion: 1,
+      projects: [{
+        projectId: projectIds[0],
+        headCommit,
+        branch: "lane-main"
+      }]
+    }
+  });
   writeFileSync(join(snapshotPath, "dirty.txt"), "not committed\n");
-  assert.equal(snapshotExecutionLaneWorkspaceSync(store, actualWorkspace), undefined);
+  const dirtySnapshot = snapshotExecutionLaneWorkspaceSync(store, actualWorkspace);
+  assert.equal(dirtySnapshot.status, "failed");
+  assert.equal(dirtySnapshot.cause, "workspace-dirty");
   rmSync(join(snapshotPath, "dirty.txt"));
   execFileSync("git", ["checkout", "-b", "wrong-lane"], { cwd: snapshotPath });
-  assert.equal(snapshotExecutionLaneWorkspaceSync(store, actualWorkspace), undefined);
+  const wrongBranchSnapshot = snapshotExecutionLaneWorkspaceSync(store, actualWorkspace);
+  assert.equal(wrongBranchSnapshot.status, "failed");
+  assert.equal(wrongBranchSnapshot.cause, "branch-mismatch");
+});
+
+test("runtime terminalization preserves Agent output across dirty and wrong-branch Lane failures", (t) => {
+  const home = mkdtempSync(join(tmpdir(), "yui-lane-result-preservation-"));
+  t.after(() => rmSync(home, { recursive: true, force: true }));
+  ensureStorageSchema(home);
+  const store = new SqliteTaskStore(home);
+  t.after(() => store.close());
+
+  const runCase = (ordinal, workspaceMutation, expectedReason) => {
+    const startedAt = new Date(`2026-09-04T02:0${ordinal}:00.000Z`);
+    const task = activateTask(createTask(
+      `task-${ordinal}`,
+      `Lane failure ${ordinal}`,
+      startedAt,
+      { cwd: home }
+    ), startedAt);
+    store.saveTask(task);
+    const agent = createRoleAgentBinding({ id: "codex", adapterId: "codex" });
+    const role = createRole(
+      task.id,
+      "producer",
+      [agent],
+      agent.agentId,
+      home,
+      startedAt
+    );
+    store.saveRole(task.id, role);
+    const secondaryRole = createRole(
+      task.id,
+      "producer-secondary",
+      [agent],
+      agent.agentId,
+      home,
+      startedAt
+    );
+    store.saveRole(task.id, secondaryRole);
+
+    const projectId = "project-1";
+    const workItemId = "work-item-1";
+    const groupId = "execution-group-1";
+    const laneId = `${groupId}-lane-1`;
+    const turnId = "turn-1";
+    const repositoryPath = join(home, `lane-repository-${ordinal}`);
+    mkdirSync(repositoryPath, { recursive: true });
+    execFileSync("git", ["init", "--initial-branch", laneId], { cwd: repositoryPath });
+    writeFileSync(join(repositoryPath, "result.txt"), "committed result\n");
+    execFileSync("git", ["add", "result.txt"], { cwd: repositoryPath });
+    execFileSync(
+      "git",
+      ["-c", "user.name=Yui Test", "-c", "user.email=yui@example.invalid", "commit", "-m", "result"],
+      { cwd: repositoryPath }
+    );
+    const headCommit = execFileSync("git", ["rev-parse", "HEAD"], {
+      cwd: repositoryPath,
+      encoding: "utf8"
+    }).trim();
+    workspaceMutation(repositoryPath);
+
+    const workspace = createManagedWorkspace({
+      owner: {
+        type: "execution-lane",
+        taskId: task.id,
+        executionGroupId: groupId,
+        executionLaneId: laneId,
+        purpose: "execution",
+        workItemId
+      },
+      root: join(home, `${task.id}-${laneId}`),
+      entries: [{
+        projectId,
+        directory: projectId,
+        access: "write",
+        path: repositoryPath,
+        branch: laneId,
+        baseRef: headCommit,
+        baseCommit: headCommit
+      }]
+    }, startedAt);
+    const effective = resolveEffectiveLaunch({
+      role,
+      purpose: "execution",
+      workspace,
+      workItemWriteProjectIds: [projectId]
+    });
+    const secondaryWorkspace = createManagedWorkspace({
+      owner: {
+        type: "execution-lane",
+        taskId: task.id,
+        executionGroupId: groupId,
+        executionLaneId: `${groupId}-lane-2`,
+        purpose: "execution",
+        workItemId
+      },
+      root: join(home, `${task.id}-${groupId}-lane-2`),
+      entries: [{
+        projectId,
+        directory: projectId,
+        access: "write",
+        path: repositoryPath,
+        branch: laneId,
+        baseRef: headCommit,
+        baseCommit: headCommit
+      }]
+    }, startedAt);
+    const secondaryEffective = resolveEffectiveLaunch({
+      role: secondaryRole,
+      purpose: "execution",
+      workspace: secondaryWorkspace,
+      workItemWriteProjectIds: [projectId]
+    });
+    let item = updateWorkItemStatus(createWorkItem(workItemId, task.id, {
+      title: "Preserve the exact result",
+      assignee: role.name,
+      writeProjectIds: [projectId]
+    }, startedAt), "running", startedAt);
+    const assignment = createWorkItemExecutionAssignment({
+      input: "Produce a result.",
+      objective: item.objective,
+      acceptance: item.acceptance,
+      contextSnapshotRef: {
+        schemaVersion: 1,
+        id: "context-snapshot-1",
+        taskId: task.id,
+        scope: "task",
+        sequence: 1,
+        digest: "a".repeat(64)
+      },
+      taskId: task.id,
+      workItemId,
+      workItemRevision: item.revision,
+      projects: [{ projectId, baseCommit: headCommit }],
+      dependencyFacts: []
+    });
+    item = attachWorkItemExecutionGroup(item, createWorkItemExecutionGroup(
+      groupId,
+      task.id,
+      assignment,
+      [{
+        roleName: role.name,
+        effective,
+        workspace: { root: workspace.root, writableProjectIds: [projectId] },
+        currentTurnId: turnId
+      }, {
+        roleName: secondaryRole.name,
+        effective: secondaryEffective,
+        workspace: {
+          root: secondaryWorkspace.root,
+          writableProjectIds: [projectId]
+        }
+      }],
+      startedAt
+    ), startedAt);
+    store.saveWorkItem(task.id, item);
+    store.saveManagedWorkspace(workspace);
+    const turn = createTurn(
+      turnId,
+      task.id,
+      role.name,
+      "new",
+      turnInput(turnId, task.id, role.name, "Produce a result."),
+      startedAt,
+      {
+        workItemId,
+        purpose: "execution",
+        executionGroupId: groupId,
+        executionLaneId: laneId,
+        workspace,
+        effective
+      }
+    );
+    store.saveActiveExecutionLaneTurn(turn);
+
+    const runtimeGenerationId = `activation-${ordinal}`;
+    const nativeSessionId = `session-${ordinal}`;
+    const nativeTurnId = `native-turn-${ordinal}`;
+    const attemptId = `run:${task.id}/${turn.id}`;
+    let sessions = recordRoleAgentSession(createRoleSessionSet(
+      { scope: "task", taskId: task.id, roleName: role.name },
+      agent.agentId,
+      startedAt
+    ), {
+      agentId: agent.agentId,
+      adapterId: agent.adapterId,
+      nativeSessionId,
+      runtimeGenerationId,
+      policy: "fixed",
+      status: "active",
+      effective
+    }, startedAt);
+    let provider = createProviderRuntimeBinding({
+      providerNamespace: "openai/codex",
+      accountScope: agent.agentId,
+      conversationId: nativeSessionId,
+      activationId: runtimeGenerationId,
+      startedAt: startedAt.toISOString()
+    });
+    provider = beginProviderTurn(provider, {
+      turnId,
+      attemptId,
+      authorityEpoch: provider.authority.epoch,
+      submittedAt: startedAt.toISOString()
+    });
+    provider = acceptProviderTurn(provider, {
+      attemptId,
+      nativeTurnId,
+      acceptedAt: new Date(startedAt.getTime() + 1_000).toISOString()
+    });
+    sessions = bindTaskRoleProviderRuntime(sessions, provider, startedAt);
+    store.saveTaskRoleSessionSet(sessions);
+
+    const originalOutput = `\n# Agent result ${ordinal}\n\nThis text must survive.\n`;
+    const observed = new FileSchedulerStoreAdapter(store).observeRuntimeTurnTerminal({
+      taskId: task.id,
+      roleName: role.name,
+      agentId: agent.agentId,
+      adapterId: agent.adapterId,
+      runtimeGenerationId,
+      nativeSessionId,
+      nativeTurnId,
+      attemptId,
+      turnId,
+      providerStatus: "completed",
+      outcome: { status: "completed", output: originalOutput }
+    }, new Date(startedAt.getTime() + 2_000));
+    assert.equal(observed.turn.status, "failed");
+    assert.equal(observed.turn.result.output, originalOutput);
+    assert.equal(observed.turn.result.failureReason, expectedReason);
+    assert.ok(observed.turn.result.diagnostic.length > 0);
+  };
+
+  runCase(
+    1,
+    (repositoryPath) => writeFileSync(join(repositoryPath, "dirty.txt"), "dirty\n"),
+    "workspace-dirty"
+  );
+  runCase(
+    2,
+    (repositoryPath) => execFileSync("git", ["checkout", "-b", "wrong-lane"], {
+      cwd: repositoryPath
+    }),
+    "workspace-branch-mismatch"
+  );
 });
 
 test("a packaged Controller restart inherits its direct parent's handover", (t) => {
@@ -3819,13 +4123,13 @@ test("native terminal ingress preserves valid output and durably fails missing o
     providerStatus: "failed",
     outcome: {
       status: "failed",
-      output: longDiagnostic,
+      diagnostic: longDiagnostic,
       failureReason: "runtime-failed"
     }
   }).event;
   assert.equal(failed.outcome.status, "failed");
-  assert.ok(Buffer.byteLength(failed.outcome.output, "utf8") <= 16 * 1024);
-  assert.ok(longDiagnostic.startsWith(failed.outcome.output));
+  assert.ok(Buffer.byteLength(failed.outcome.diagnostic, "utf8") <= 16 * 1024);
+  assert.ok(longDiagnostic.startsWith(failed.outcome.diagnostic));
 
   assert.throws(() => inbox.enqueueTurnTerminal({
     ...base,

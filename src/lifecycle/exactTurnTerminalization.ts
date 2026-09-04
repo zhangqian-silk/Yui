@@ -19,6 +19,7 @@ import {
   type TurnSystemEvidence,
   type TurnProviderResult
 } from "../turn/turn.js";
+import { boundedTurnFailureDiagnostic } from "../domain/agentResultTransport.js";
 import {
   updateExecutionLane,
   updateWorkItemExecutionLane
@@ -187,9 +188,13 @@ export function terminalizeExactTurnReviewRound(
     taskId: string;
     turn: Turn;
     outcome: Readonly<{
-      status: "completed" | "failed";
+      status: "completed";
       output: string;
-      failureReason?: import("../turn/turn.js").TurnFailureReason;
+    }> | Readonly<{
+      status: "failed";
+      diagnostic: string;
+      failureReason: import("../turn/turn.js").TurnFailureReason;
+      output?: string;
     }>;
     systemEvidence?: TurnSystemEvidence;
   }>,
@@ -211,7 +216,7 @@ export function terminalizeExactTurnReviewRound(
     input.outcome.status,
     now,
     input.outcome.status === "failed"
-      ? { kind: "execution", message: input.outcome.output }
+      ? { kind: "execution", message: input.outcome.diagnostic }
       : undefined
   );
   store.saveReviewRound(input.taskId, terminal);
@@ -228,12 +233,24 @@ export type ExactTurnTerminalizationInput = Readonly<{
   /** Aggregate retirement owns every queued Role signal, not only this Turn. */
   mailboxDisposition?: "exact" | "discard";
   outcome: Readonly<{
-    status: "completed" | "failed";
+    status: "completed";
     output: string;
-    failureReason?: import("../turn/turn.js").TurnFailureReason;
     provider?: TurnProviderResult;
+  }> | Readonly<{
+    status: "failed";
+    diagnostic: string;
+    failureReason: import("../turn/turn.js").TurnFailureReason;
+    provider?: TurnProviderResult;
+    output?: string;
   }>;
   systemEvidence?: TurnSystemEvidence;
+  workspaceFailure?: Readonly<{
+    failureReason:
+      | "workspace-unavailable"
+      | "workspace-dirty"
+      | "workspace-branch-mismatch";
+    diagnostic: string;
+  }>;
 }>;
 
 export type ExactTurnTerminalizationResult = Readonly<{
@@ -323,7 +340,7 @@ export function retireExactActiveTurn(
     turnId: input.turnId,
     ...(input.nativeSessionId === undefined ? {} : { nativeSessionId: input.nativeSessionId }),
     ...(input.runtimeGenerationId === undefined ? {} : { runtimeGenerationId: input.runtimeGenerationId }),
-    outcome: { status: "failed", output: input.reason, failureReason: "missing-result" }
+    outcome: { status: "failed", diagnostic: input.reason, failureReason: "missing-result" }
   };
   const session = sessions?.sessions[input.agentId];
   const providerBinding = sessions?.providerBinding;
@@ -393,22 +410,38 @@ export function terminalizeExactTaskTurn(
   const observedSnapshotProjects = input.systemEvidence?.workspaceSnapshot?.projects
     .map(({ projectId }) => projectId)
     .sort();
-  const missingLaneSnapshot = input.outcome.status === "completed"
+  const laneSnapshotRequired = input.outcome.status === "completed"
     && turn.executionGroupId !== undefined
     && turn.executionLaneId !== undefined
-    && requiredSnapshotProjects.length > 0
+    && requiredSnapshotProjects.length > 0;
+  const missingLaneSnapshot = laneSnapshotRequired
     && (
       observedSnapshotProjects === undefined
       || !isDeepStrictEqual(observedSnapshotProjects, requiredSnapshotProjects)
     );
-  const effectiveOutcome = missingLaneSnapshot
+  const workspaceFailure = laneSnapshotRequired
+    ? input.workspaceFailure ?? (missingLaneSnapshot
+      ? {
+          failureReason: "workspace-unavailable" as const,
+          diagnostic: "Core could not freeze the exact clean writable Lane workspace."
+        }
+      : undefined)
+    : undefined;
+  const effectiveOutcome = input.outcome.status === "completed" && workspaceFailure !== undefined
     ? {
         status: "failed" as const,
-        output: "Core could not freeze the exact clean writable Lane workspace.",
-        failureReason: "missing-result" as const,
+        output: input.outcome.output,
+        diagnostic: workspaceFailure.diagnostic,
+        failureReason: workspaceFailure.failureReason,
         ...(input.outcome.provider === undefined ? {} : { provider: input.outcome.provider })
       }
     : input.outcome;
+  const terminalOutcome = effectiveOutcome.status === "failed"
+    ? {
+        ...effectiveOutcome,
+        diagnostic: boundedTurnFailureDiagnostic(effectiveOutcome.diagnostic)
+      }
+    : effectiveOutcome;
 
   // All Turn, active-pointer, Session, launch, and mailbox fences have passed.
   // Only now may the exact ReviewRound be terminalized alongside the Turn so a
@@ -416,26 +449,27 @@ export function terminalizeExactTaskTurn(
   const reviewRoundTerminalization = terminalizeExactTurnReviewRound(store, {
     taskId: input.taskId,
     turn,
-    outcome: effectiveOutcome
+    outcome: terminalOutcome
   }, now);
   if (reviewRoundTerminalization.disposition !== "applied") {
     return obsolete(turn, reviewRoundTerminalization.reason ?? "review-round-mismatch");
   }
 
-  const terminal = effectiveOutcome.status === "completed"
+  const terminal = terminalOutcome.status === "completed"
     ? completeTurn(
         turn,
-        effectiveOutcome.output,
+        terminalOutcome.output,
         now,
-        effectiveOutcome.provider,
+        terminalOutcome.provider,
         input.systemEvidence
       )
     : failTurn(
         turn,
-        effectiveOutcome.failureReason ?? "runtime-failed",
-        effectiveOutcome.output,
+        terminalOutcome.failureReason,
+        terminalOutcome.diagnostic,
         now,
-        effectiveOutcome.provider
+        terminalOutcome.provider,
+        terminalOutcome.output
       );
   if (turn.executionGroupId !== undefined
     && turn.executionLaneId !== undefined

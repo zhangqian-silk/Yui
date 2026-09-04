@@ -6,6 +6,9 @@ import type { IntegrationAttempt } from "../integration/integrationAttempt.js";
 export const FAULT_CLASSES = [
   "session-dead",
   "delivery-uncertain",
+  "result-missing",
+  "runtime-failure",
+  "workspace-state",
   "review-infra",
   "integration-environment",
   "integration-candidate-failure",
@@ -28,12 +31,6 @@ export const NO_FAULT: FaultClassification = Object.freeze({
   evidence: ""
 });
 
-/** Optional Core-owned fault fact supplied by a caller with narrower evidence. */
-export type CoreFaultHint = Readonly<{
-  faultClass: FaultClass;
-  evidence: string;
-}>;
-
 const INTEGRATION_ENVIRONMENT_PATTERN =
   /tsc: not found|command not found|ENOENT|runner disappeared|runner vanished|dirty target|wrong argument|not a git repository|npm error|node: not found/iu;
 
@@ -44,18 +41,11 @@ function excerpt(text: string, max = 160): string {
 
 /** Classify a failed Turn without inspecting Agent-authored output. */
 export function classifyTurnFailure(
-  run: Pick<Turn, "status" | "result">,
-  hint?: CoreFaultHint
+  run: Pick<Turn, "status" | "result">
 ): FaultClassification {
   if (run.status !== "failed") return NO_FAULT;
-  if (hint !== undefined) {
-    return {
-      faultClass: hint.faultClass,
-      basis: "core-fact",
-      evidence: hint.evidence
-    };
-  }
   const failureReason = run.result?.failureReason;
+  if (failureReason === "cancelled") return NO_FAULT;
   if (failureReason === "delivery-unknown") {
     return {
       faultClass: "delivery-uncertain",
@@ -66,6 +56,29 @@ export function classifyTurnFailure(
   if (failureReason === "startup-failed") {
     return {
       faultClass: "session-dead",
+      basis: "core-fact",
+      evidence: failureReason
+    };
+  }
+  if (failureReason === "missing-result") {
+    return {
+      faultClass: "result-missing",
+      basis: "core-fact",
+      evidence: failureReason
+    };
+  }
+  if (failureReason === "runtime-failed") {
+    return {
+      faultClass: "runtime-failure",
+      basis: "core-fact",
+      evidence: failureReason
+    };
+  }
+  if (failureReason === "workspace-unavailable"
+    || failureReason === "workspace-dirty"
+    || failureReason === "workspace-branch-mismatch") {
+    return {
+      faultClass: "workspace-state",
       basis: "core-fact",
       evidence: failureReason
     };
@@ -143,8 +156,12 @@ export function countFaultClasses(
   const counts = new Map<FaultClass, number>(
     FAULT_CLASSES.map((name) => [name, 0])
   );
-  for (const { faultClass } of classifications) {
-    counts.set(faultClass, (counts.get(faultClass) ?? 0) + 1);
+  for (const classification of classifications) {
+    if (classification.basis === "none") continue;
+    counts.set(
+      classification.faultClass,
+      (counts.get(classification.faultClass) ?? 0) + 1
+    );
   }
   return Object.freeze(Object.fromEntries(counts)) as FaultClassCounts;
 }

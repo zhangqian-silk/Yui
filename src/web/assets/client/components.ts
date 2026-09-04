@@ -579,6 +579,9 @@ export function turnCard(turn, t, locale) {
   if (turn.result?.output) {
     card.append(richText(t("detail.outcome"), turn.result.output, t, { className: "execute-io outcome", threshold: 320 }));
   }
+  if (turn.result?.diagnostic) {
+    card.append(richText(t("detail.failure"), turn.result.diagnostic, t, { className: "execute-io outcome", threshold: 320 }));
+  }
 
   const foot = node("div", "execute-foot");
   const tags = node("div", "execute-tags");

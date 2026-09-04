@@ -198,74 +198,85 @@ async function forceLeaderSteer(
   if (processing.batchId !== batchId || processing.owner !== owner) {
     return { taskId, turnId: active.id, status: "skipped", reason: "busy" };
   }
-  const sessions = store.getTaskRoleSessionSet?.(taskId, roleName) ?? null;
-  const session = sessions?.sessions[active.effective.agentId];
-  const binding = sessions?.providerBinding;
-  const providerTurn = binding?.turn;
-  const authority = binding?.authority;
-  if (session?.runtimeGenerationId === undefined || session.nativeSessionId === undefined
-    || providerTurn === null || providerTurn === undefined
-    || providerTurn.turnId !== active.id || providerTurn.nativeTurnId === undefined
-    || providerTurn.status !== "accepted"
-    || authority?.owner !== "controller" || authority.holderId === undefined) {
+  try {
+    const sessions = store.getTaskRoleSessionSet?.(taskId, roleName) ?? null;
+    const session = sessions?.sessions[active.effective.agentId];
+    const binding = sessions?.providerBinding;
+    const providerTurn = binding?.turn;
+    const authority = binding?.authority;
+    if (session?.runtimeGenerationId === undefined || session.nativeSessionId === undefined
+      || providerTurn === null || providerTurn === undefined
+      || providerTurn.turnId !== active.id || providerTurn.nativeTurnId === undefined
+      || providerTurn.status !== "accepted"
+      || authority?.owner !== "controller" || authority.holderId === undefined) {
+      store.releaseWorkMailbox(target, batchId);
+      return { taskId, status: "failed", reason: "not-ready", error: "Active Leader Turn has no steerable Provider fence." };
+    }
+    const batch = processing.batch;
+    const envelope = store.getTaskWakeEnvelope?.(taskId) ?? null;
+    const referencedTurnIds = envelope?.referencedTurnIds ?? [];
+    const displayedTurnIds = referencedTurnIds.slice(0, 4);
+    const directive = [
+      `Aggregated Leader events: ${batch.reasons.join(", ")}.`,
+      `The first event arrived at ${batch.firstQueuedAt} and has waited at least 10 minutes while this Leader Turn remained active.`,
+      ...displayedTurnIds.map(
+        (turnId) => `Read the complete result: yui task turn show ${taskId}/${turnId}.`
+      ),
+      ...(referencedTurnIds.length > displayedTurnIds.length
+        ? [
+            `${referencedTurnIds.length - displayedTurnIds.length} additional result Turns are listed in yui task wake show ${taskId} ${envelope!.wakeId}.`
+          ]
+        : []),
+      "Process these events now and update durable Task or WorkItem facts when needed.",
+      "After the events are handled, continue the work you were doing before this interruption.",
+      `Load the current exact context for ${taskId}/${active.id}; the event batch may have grown while this input was delivered.`
+    ].join("\n");
+    const input = createTurnInput({
+      source: { type: "yui", channel: "leader-forced-wakeup" },
+      directive,
+      deltaRefIds: []
+    });
+    const outcome = await delivery.steerOnce({
+      taskId,
+      roleName,
+      agentId: active.effective.agentId,
+      adapterId: active.effective.adapterId,
+      runtimeGenerationId: session.runtimeGenerationId,
+      nativeSessionId: session.nativeSessionId,
+      nativeTurnId: providerTurn.nativeTurnId,
+      authority: {
+        epoch: authority.epoch,
+        owner: "controller",
+        holderId: authority.holderId
+      },
+      receiptId: `turn-input:${taskId}/${active.id}/${batchId}`,
+      text: directive
+    });
+    if (outcome !== "sent" && outcome !== "already-sent") {
+      if (outcome !== "delivery-unknown") store.releaseWorkMailbox(target, batchId);
+      return {
+        taskId,
+        turnId: active.id,
+        status: outcome === "busy" ? "skipped" : "failed",
+        reason: outcome === "busy" ? "busy" : "not-ready",
+        error: outcome
+      };
+    }
+    const saved = store.saveLeaderSteer({ taskId, turnId: active.id, batchId, input, now });
+    if (saved !== "claimed") store.releaseWorkMailbox(target, batchId);
+    return saved === "claimed"
+      ? { taskId, turnId: active.id, status: "steered" }
+      : { taskId, turnId: active.id, status: "skipped", reason: saved };
+  } catch (error) {
     store.releaseWorkMailbox(target, batchId);
-    return { taskId, status: "failed", reason: "not-ready", error: "Active Leader Turn has no steerable Provider fence." };
-  }
-  const batch = processing.batch;
-  const envelope = store.getTaskWakeEnvelope?.(taskId) ?? null;
-  const referencedTurnIds = envelope?.referencedTurnIds ?? [];
-  const displayedTurnIds = referencedTurnIds.slice(0, 4);
-  const directive = [
-    `Aggregated Leader events: ${batch.reasons.join(", ")}.`,
-    `The first event arrived at ${batch.firstQueuedAt} and has waited at least 10 minutes while this Leader Turn remained active.`,
-    ...displayedTurnIds.map(
-      (turnId) => `Read the complete result: yui task turn show ${taskId}/${turnId}.`
-    ),
-    ...(referencedTurnIds.length > displayedTurnIds.length
-      ? [
-          `${referencedTurnIds.length - displayedTurnIds.length} additional result Turns are listed in yui task wake show ${taskId} ${envelope!.wakeId}.`
-        ]
-      : []),
-    "Process these events now and update durable Task or WorkItem facts when needed.",
-    "After the events are handled, continue the work you were doing before this interruption.",
-    `Load the current exact context for ${taskId}/${active.id}; the event batch may have grown while this input was delivered.`
-  ].join("\n");
-  const input = createTurnInput({
-    source: { type: "yui", channel: "leader-forced-wakeup" },
-    directive,
-    deltaRefIds: []
-  });
-  const outcome = await delivery.steerOnce({
-    taskId,
-    roleName,
-    agentId: active.effective.agentId,
-    adapterId: active.effective.adapterId,
-    runtimeGenerationId: session.runtimeGenerationId,
-    nativeSessionId: session.nativeSessionId,
-    nativeTurnId: providerTurn.nativeTurnId,
-    authority: {
-      epoch: authority.epoch,
-      owner: "controller",
-      holderId: authority.holderId
-    },
-    receiptId: `turn-input:${taskId}/${active.id}/${batchId}`,
-    text: directive
-  });
-  if (outcome !== "sent" && outcome !== "already-sent") {
-    if (outcome !== "delivery-unknown") store.releaseWorkMailbox(target, batchId);
     return {
       taskId,
       turnId: active.id,
-      status: outcome === "busy" ? "skipped" : "failed",
-      reason: outcome === "busy" ? "busy" : "not-ready",
-      error: outcome
+      status: "failed",
+      reason: "not-ready",
+      error: error instanceof Error ? error.message : String(error)
     };
   }
-  const saved = store.saveLeaderSteer({ taskId, turnId: active.id, batchId, input, now });
-  if (saved !== "claimed") store.releaseWorkMailbox(target, batchId);
-  return saved === "claimed"
-    ? { taskId, turnId: active.id, status: "steered" }
-    : { taskId, turnId: active.id, status: "skipped", reason: saved };
 }
 
 

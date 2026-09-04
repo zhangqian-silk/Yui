@@ -27,6 +27,7 @@ import {
   operationalTaskRecords,
   taskRecordRetirement
 } from "../task/taskRecordRetirement.js";
+import { referencedWakeTurnIds } from "../context/wakeNotification.js";
 import {
   isRoleTurnStalled,
   TURN_PROGRESS_EVENT,
@@ -1662,7 +1663,8 @@ function retireTaskCommand(
         mailboxDisposition: "discard",
         outcome: {
           status: "failed",
-          output: `Task retired: ${summary}`
+          diagnostic: `Task retired: ${summary}`,
+          failureReason: "cancelled"
         }
       }, now);
       if (terminal.disposition !== "applied") {
@@ -3734,7 +3736,8 @@ function retireWork(
           turnId: run.id,
           outcome: {
             status: "failed",
-            output: `Work Item retired: ${summary}`
+            diagnostic: `Work Item retired: ${summary}`,
+            failureReason: "cancelled"
           }
         }, now);
         if (terminal.disposition !== "applied") {
@@ -4905,7 +4908,7 @@ function listTurns(
       run.effective.permission.strategy,
       run.status,
       isTaskRecordRetired(events, "turn", run.id) ? "retired" : "active",
-      run.result?.output ?? "-"
+      run.result?.output ?? run.result?.diagnostic ?? "-"
     ]),
     defaultTableWidth()
   )}\n`;
@@ -6063,9 +6066,12 @@ function renderTurnShow(
     `Effective: ${run.effective.agentId}/${run.effective.adapterId} r${run.effective.sourceDesiredRevision}`,
     `Created: ${run.createdAt}`,
     ...(run.result === undefined ? [] : [`Ended: ${run.result.completedAt}`]),
-    ...(run.result === undefined || run.result.output.trim().length === 0
+    ...(run.result?.output === undefined
       ? []
-      : [`Result: ${run.result.output}`])
+      : [`Result: ${run.result.output}`]),
+    ...(run.result?.diagnostic === undefined
+      ? []
+      : [`Failure: ${run.result.diagnostic}`])
   ];
   return `${lines.join("\n")}\n`;
 }
@@ -7980,14 +7986,12 @@ function taskWakeInspectionCommand(
       const ms = Date.parse(createdAt);
       return ms > fromMs && ms <= toMs;
     };
-    const events = store.listEvents(task.id).filter((e) => inWindow(e.createdAt));
+    const allEvents = store.listEvents(task.id);
+    const events = allEvents.filter((e) => inWindow(e.createdAt));
     const messages = store.listMessages(task.id).filter((m) => inWindow(m.createdAt));
     const allTurns = store.listTurns(task.id);
-    const referencedTurnIds = new Set(events.flatMap((event) => {
-      if (!["turn.completed", "turn.failed", "turn.cancelled"].includes(event.type)) return [];
-      return event.payload.turnId === undefined ? [] : [event.payload.turnId];
-    }));
-    const turns = allTurns.filter((turn) => (
+    const referencedTurnIds = new Set(referencedWakeTurnIds(allTurns, allEvents, events));
+    const turns = operationalTaskRecords(allTurns, allEvents, "turn").filter((turn) => (
       inWindow(turn.createdAt) || referencedTurnIds.has(turn.id)
     ));
     const lines: string[] = [
