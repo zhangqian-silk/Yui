@@ -10,20 +10,16 @@ import { createTaskEvent } from "../event/taskEvent.js";
 import {
   finishReviewRound,
   updateReviewExecutionGroup,
-  type DeltaRecheckDisposition,
-  type ReviewCheck,
-  type ReviewFinding,
   type ReviewRound
 } from "../review/reviewRound.js";
-import { reconcileReviewFindingsAfterReview } from "../review/reviewFindingLedger.js";
 import {
   completeTurn,
-  createProducerTurnResult,
   failTurn,
-  type ProducerTurnResult,
   type Turn,
+  type TurnSystemEvidence,
   type TurnProviderResult
 } from "../turn/turn.js";
+import { boundedTurnFailureDiagnostic } from "../domain/agentResultTransport.js";
 import {
   updateExecutionLane,
   updateWorkItemExecutionLane
@@ -44,7 +40,6 @@ import {
   workItemExecutionGroupById,
   updateWorkItemExecutionGroup
 } from "../workItem/workItem.js";
-import type { ExecutionLaneGitSnapshot } from "../repository/executionLaneGitSnapshot.js";
 
 export type ExactReviewRoundTerminalizationResult = Readonly<{
   disposition: "applied" | "obsolete";
@@ -192,18 +187,16 @@ export function terminalizeExactTurnReviewRound(
   input: Readonly<{
     taskId: string;
     turn: Turn;
-    outcome: Readonly<{ status: "completed" | "failed"; summary: string }>;
-    reviewResult?: Readonly<{
-      summary?: string;
-      report?: string;
-      checks?: readonly ReviewCheck[];
-      findings?: readonly ReviewFinding[];
-      evidence?: readonly string[];
-      evidenceCommit?: string;
-      gitSnapshot?: ExecutionLaneGitSnapshot;
-      deltaDisposition?: DeltaRecheckDisposition;
-      deltaReasoning?: string;
+    outcome: Readonly<{
+      status: "completed";
+      output: string;
+    }> | Readonly<{
+      status: "failed";
+      diagnostic: string;
+      failureReason: import("../turn/turn.js").TurnFailureReason;
+      output?: string;
     }>;
+    systemEvidence?: TurnSystemEvidence;
   }>,
   now: Date
 ): ExactReviewRoundTerminalizationResult {
@@ -221,9 +214,10 @@ export function terminalizeExactTurnReviewRound(
   const terminal = finishReviewRound(
     reviewRound,
     input.outcome.status,
-    input.outcome.summary,
     now,
-    input.reviewResult
+    input.outcome.status === "failed"
+      ? { kind: "execution", message: input.outcome.diagnostic }
+      : undefined
   );
   store.saveReviewRound(input.taskId, terminal);
   return { disposition: "applied", round: terminal };
@@ -239,21 +233,23 @@ export type ExactTurnTerminalizationInput = Readonly<{
   /** Aggregate retirement owns every queued Role signal, not only this Turn. */
   mailboxDisposition?: "exact" | "discard";
   outcome: Readonly<{
-    status: "completed" | "failed";
-    summary: string;
-    failureReason?: import("../turn/turn.js").TurnFailureReason;
+    status: "completed";
+    output: string;
     provider?: TurnProviderResult;
+  }> | Readonly<{
+    status: "failed";
+    diagnostic: string;
+    failureReason: import("../turn/turn.js").TurnFailureReason;
+    provider?: TurnProviderResult;
+    output?: string;
   }>;
-  reviewResult?: Readonly<{
-    summary?: string;
-    report?: string;
-    checks?: readonly ReviewCheck[];
-    findings?: readonly ReviewFinding[];
-    evidence?: readonly string[];
-    evidenceCommit?: string;
-    gitSnapshot?: ExecutionLaneGitSnapshot;
-    deltaDisposition?: DeltaRecheckDisposition;
-    deltaReasoning?: string;
+  systemEvidence?: TurnSystemEvidence;
+  workspaceFailure?: Readonly<{
+    failureReason:
+      | "workspace-unavailable"
+      | "workspace-dirty"
+      | "workspace-branch-mismatch";
+    diagnostic: string;
   }>;
 }>;
 
@@ -344,7 +340,7 @@ export function retireExactActiveTurn(
     turnId: input.turnId,
     ...(input.nativeSessionId === undefined ? {} : { nativeSessionId: input.nativeSessionId }),
     ...(input.runtimeGenerationId === undefined ? {} : { runtimeGenerationId: input.runtimeGenerationId }),
-    outcome: { status: "failed", summary: input.reason, failureReason: "missing-result" }
+    outcome: { status: "failed", diagnostic: input.reason, failureReason: "missing-result" }
   };
   const session = sessions?.sessions[input.agentId];
   const providerBinding = sessions?.providerBinding;
@@ -410,6 +406,42 @@ export function terminalizeExactTaskTurn(
   if (reviewValidation.disposition !== "applied") {
     return obsolete(turn, reviewValidation.reason ?? "review-round-mismatch");
   }
+  const requiredSnapshotProjects = [...new Set(turn.effective.writeProjectIds)].sort();
+  const observedSnapshotProjects = input.systemEvidence?.workspaceSnapshot?.projects
+    .map(({ projectId }) => projectId)
+    .sort();
+  const laneSnapshotRequired = input.outcome.status === "completed"
+    && turn.executionGroupId !== undefined
+    && turn.executionLaneId !== undefined
+    && requiredSnapshotProjects.length > 0;
+  const missingLaneSnapshot = laneSnapshotRequired
+    && (
+      observedSnapshotProjects === undefined
+      || !isDeepStrictEqual(observedSnapshotProjects, requiredSnapshotProjects)
+    );
+  const workspaceFailure = laneSnapshotRequired
+    ? input.workspaceFailure ?? (missingLaneSnapshot
+      ? {
+          failureReason: "workspace-unavailable" as const,
+          diagnostic: "Core could not freeze the exact clean writable Lane workspace."
+        }
+      : undefined)
+    : undefined;
+  const effectiveOutcome = input.outcome.status === "completed" && workspaceFailure !== undefined
+    ? {
+        status: "failed" as const,
+        output: input.outcome.output,
+        diagnostic: workspaceFailure.diagnostic,
+        failureReason: workspaceFailure.failureReason,
+        ...(input.outcome.provider === undefined ? {} : { provider: input.outcome.provider })
+      }
+    : input.outcome;
+  const terminalOutcome = effectiveOutcome.status === "failed"
+    ? {
+        ...effectiveOutcome,
+        diagnostic: boundedTurnFailureDiagnostic(effectiveOutcome.diagnostic)
+      }
+    : effectiveOutcome;
 
   // All Turn, active-pointer, Session, launch, and mailbox fences have passed.
   // Only now may the exact ReviewRound be terminalized alongside the Turn so a
@@ -417,58 +449,27 @@ export function terminalizeExactTaskTurn(
   const reviewRoundTerminalization = terminalizeExactTurnReviewRound(store, {
     taskId: input.taskId,
     turn,
-    outcome: input.outcome,
-    reviewResult: input.reviewResult
+    outcome: terminalOutcome
   }, now);
   if (reviewRoundTerminalization.disposition !== "applied") {
     return obsolete(turn, reviewRoundTerminalization.reason ?? "review-round-mismatch");
   }
 
-  const producer = input.outcome.status === "completed"
-    && turn.executionGroupId !== undefined
-    && turn.executionLaneId !== undefined
-    ? createProducerTurnResult({
-        summary: input.reviewResult?.summary ?? input.outcome.summary,
-        ...(input.reviewResult?.report === undefined
-          ? {}
-          : { report: input.reviewResult.report }),
-        ...(input.reviewResult?.checks === undefined
-          ? {}
-          : { checks: input.reviewResult.checks }),
-        ...(input.reviewResult?.findings === undefined
-          ? {}
-          : { findings: input.reviewResult.findings }),
-        ...(input.reviewResult?.evidence === undefined
-          ? {}
-          : { evidence: input.reviewResult.evidence }),
-        ...(input.reviewResult?.evidenceCommit === undefined
-          ? {}
-          : { evidenceCommit: input.reviewResult.evidenceCommit }),
-        ...(input.reviewResult?.gitSnapshot === undefined
-          ? {}
-          : {
-              projectCodeRefs: input.reviewResult.gitSnapshot.projects.map((project) => ({
-                projectId: project.projectId,
-                commit: project.headCommit
-              }))
-            })
-      })
-    : undefined;
-  const incompleteProducer = producer !== undefined
-    && (producer.checks.length === 0
-      || (turn.purpose === "execution"
-        && turn.effective.writeProjectIds.length > 0
-        && !producerCoversWriteProjects(producer, turn.effective.writeProjectIds)));
-  const terminal = input.outcome.status === "completed" && !incompleteProducer
-    ? completeTurn(turn, input.outcome.summary, now, input.outcome.provider, producer)
+  const terminal = terminalOutcome.status === "completed"
+    ? completeTurn(
+        turn,
+        terminalOutcome.output,
+        now,
+        terminalOutcome.provider,
+        input.systemEvidence
+      )
     : failTurn(
         turn,
-        incompleteProducer ? "missing-result" : input.outcome.failureReason ?? "runtime-failed",
-        incompleteProducer
-          ? "Producer result is missing an immutable code reference or validation check."
-          : input.outcome.summary,
+        terminalOutcome.failureReason,
+        terminalOutcome.diagnostic,
         now,
-        input.outcome.provider
+        terminalOutcome.provider,
+        terminalOutcome.output
       );
   if (turn.executionGroupId !== undefined
     && turn.executionLaneId !== undefined
@@ -527,14 +528,6 @@ export function terminalizeExactTaskTurn(
     dispatchIdentity
   );
   settleRoleTurnDispatch(store, dispatchIdentity, dispatchToken);
-  if (terminal.status === "completed"
-    && terminal.purpose === "review"
-    && terminal.executionGroupId === undefined
-    && terminal.reviewRoundId !== undefined) {
-    // The authoritative main Turn is durable before the semantic classifier
-    // and finding ledger observe its completed ReviewRound.
-    reconcileReviewFindingsAfterReview(store, input.taskId, terminal.reviewRoundId, now);
-  }
   if (terminal.roleName === "leader") {
     const wake = store.listTaskWakes(input.taskId)
       .find((candidate) => candidate.turnId === terminal.id && candidate.status === "dispatched");
@@ -555,19 +548,6 @@ export function terminalizeExactTaskTurn(
   reconcileWorkItemMainTurns(store, input.taskId, now);
   reconcileReviewMainTurns(store, input.taskId, now);
   return { disposition: "applied", turn: terminal };
-}
-
-function producerCoversWriteProjects(
-  producer: ProducerTurnResult,
-  writeProjectIds: readonly string[]
-): boolean {
-  const expected = [...new Set(writeProjectIds)].sort();
-  const observed = producer.codeRefs.flatMap(({ projectId }) => (
-    projectId === undefined ? [] : [projectId]
-  ));
-  return observed.length === expected.length
-    && new Set(observed).size === observed.length
-    && [...observed].sort().every((projectId, index) => projectId === expected[index]);
 }
 
 function settleLaunchReservation(

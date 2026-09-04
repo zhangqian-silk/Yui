@@ -11,10 +11,12 @@
  *
  * Layout 8 is the current SQLite WAL control-plane layout: the authoritative
  * store is `yui.db`. Layout 8 is the only physical layout this release reads
- * and writes; logical aggregate upgrades within layout 8 use the centralized
- * adjacent migration graph.
+ * and writes. Historical aggregate contracts are rejected without mutation.
  */
 export const CURRENT_STORAGE_LAYOUT_VERSION = 8;
 
-/** Aggregate 30 canonicalizes reusable runtime-generation identity across persisted records. */
-export const CURRENT_AGGREGATE_SCHEMA_VERSION = 30;
+/**
+ * Aggregate 31 makes Agent results opaque, removes parsed Review/finding
+ * authority, and intentionally has no upgrade path from earlier contracts.
+ */
+export const CURRENT_AGGREGATE_SCHEMA_VERSION = 31;

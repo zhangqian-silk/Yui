@@ -19,6 +19,7 @@ import {
   mapCodexAgentError
 } from "./builtinAgentErrorMappers.js";
 import { serializeAgentErrorRaw, standardAgentError } from "./agentError.js";
+import { transportAgentResult } from "../domain/agentResultTransport.js";
 
 export const CODEX_DRIVER_ID = "openai/codex";
 export const CLAUDE_CODE_DRIVER_ID = "anthropic/claude-code";
@@ -293,7 +294,7 @@ function mapClaudeLifecycleHook(
       ];
     case "Stop":
       return [
-        mapped("turn.completed", optionalSummary(payload)),
+        mapped("turn.completed", optionalResultOutput(payload)),
         mapped("native-work.snapshot", {
           snapshotComplete: payload.background_tasks_complete === true,
           observationQuality: payload.background_tasks_complete === true ? "exact" : "partial"
@@ -435,7 +436,7 @@ function mapCodexHook(
         })
       ];
     case "Stop":
-      return mapped("turn.completed", optionalSummary(payload));
+      return mapped("turn.completed", optionalResultOutput(payload));
     case "SessionEnd":
       return mapped("activation.ended");
     default:
@@ -553,6 +554,15 @@ function optionalSummary(
     }
   }
   return {};
+}
+
+function optionalResultOutput(
+  payload: Readonly<Record<string, unknown>>
+): RuntimeObservationPayload {
+  const result = transportAgentResult(payload.last_assistant_message);
+  return result.status === "completed"
+    ? { output: result.output }
+    : { resultTransportDiagnostic: result.diagnostic };
 }
 
 function claudeFailure(

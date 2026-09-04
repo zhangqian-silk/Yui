@@ -5,7 +5,6 @@ export const TASK_RECORD_ID_PREFIXES = {
   contextSnapshot: "context-snapshot",
   turn: "turn",
   reviewRound: "review-round",
-  reviewFinding: "review-finding",
   changeSet: "change-set",
   integrationAttempt: "integration",
   integrationQueue: "integration-queue",

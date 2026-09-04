@@ -41,9 +41,7 @@ import { resolveTimeZone } from "../output/timePresentation.js";
 import { defaultTableWidth, renderTable } from "../output/table.js";
 import type { YuiConfig } from "../storage/taskStore.js";
 import {
-  REVIEW_FINDING_LEDGER_MODES,
   REVIEW_TRIGGERS,
-  type ReviewFindingLedgerMode,
   type ReviewTrigger
 } from "../review/reviewConfig.js";
 
@@ -84,8 +82,7 @@ const RECONCILIATION_SET_USAGE = "Runtime config set usage: yui config runtime s
 const RESOURCES_GC_MODE_SET_USAGE = "Resources config set usage: yui config resources set resources-gc-mode <report|quarantine>.";
 const RESOURCES_GC_AUTO_QUARANTINE_SET_USAGE = "Resources config set usage: yui config resources set resources-gc-auto-quarantine <true|false>.";
 const LEADER_NEXT_ACTION_SET_USAGE = `Workflow config set usage: yui config workflow set leader-next-action <${LEADER_NEXT_ACTION_MODES.join("|")}>.`;
-const REVIEW_SET_USAGE = "Workflow config set usage: yui config workflow set review --role <global-role> --trigger <always|leader|final> "
-  + "[--finding-ledger <shadow|enforce>].";
+const REVIEW_SET_USAGE = "Workflow config set usage: yui config workflow set review --role <global-role> --trigger <always|leader|final>.";
 
 type ConfigKeyHandler = Readonly<{
   key: ConfigKey;
@@ -176,8 +173,7 @@ export function effectiveConfigData(
       ? null
       : {
           roleName: config.review.roleName,
-          trigger: config.review.trigger,
-          findingLedger: config.review.findingLedger ?? "shadow"
+          trigger: config.review.trigger
         },
     completionInstallations: config.completionInstallations ?? {}
   };
@@ -678,15 +674,14 @@ const CONFIG_KEY_HANDLERS: readonly ConfigKeyHandler[] = [
     showLabel: "Review",
     showValue: (config) => (config.review === undefined
       ? "disabled"
-      : `${config.review.roleName} (${config.review.trigger}; finding ledger: ${config.review.findingLedger ?? "shadow"}`
-        + ")"),
+      : `${config.review.roleName} (${config.review.trigger})`),
     set(args, store) {
       if (args.length < 4 || args.length % 2 !== 0) throw usageError(REVIEW_SET_USAGE);
       const options = new Map<string, string>();
       for (let index = 0; index < args.length; index += 2) {
         const name = args[index];
         const value = args[index + 1];
-        if (!["--role", "--trigger", "--finding-ledger"].includes(name)
+        if (!["--role", "--trigger"].includes(name)
           || value === undefined
           || options.has(name)) {
           throw usageError(REVIEW_SET_USAGE);
@@ -704,23 +699,14 @@ const CONFIG_KEY_HANDLERS: readonly ConfigKeyHandler[] = [
         throw usageError(`Global Role not found: ${roleName}.`);
       }
       const trigger = rawTrigger as ReviewTrigger;
-      const rawLedgerMode = options.get("--finding-ledger")?.trim();
-      let findingLedger: ReviewFindingLedgerMode | undefined;
-      if (rawLedgerMode !== undefined) {
-        if (!REVIEW_FINDING_LEDGER_MODES.includes(rawLedgerMode as ReviewFindingLedgerMode)) {
-          throw usageError(REVIEW_SET_USAGE);
-        }
-        findingLedger = rawLedgerMode as ReviewFindingLedgerMode;
-      }
       saveConfigKey(store, (config) => ({
         ...config,
         review: {
           roleName,
-          trigger,
-          ...(findingLedger === undefined ? {} : { findingLedger })
+          trigger
         }
       }));
-      return `Review set to ${roleName} (${trigger}; finding ledger: ${findingLedger ?? "shadow"})\n`;
+      return `Review set to ${roleName} (${trigger})\n`;
     },
     clear(store) {
       saveConfigKey(store, (config) => {

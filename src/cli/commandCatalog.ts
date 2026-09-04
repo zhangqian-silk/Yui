@@ -139,7 +139,7 @@ function durableConfigDomainNode(domain: ConfigDomain): NodeInput {
   const values = CONFIG_KEY_VALUES.filter(({ name }) => keys.includes(name));
   const options = domain === "workflow"
     ? [
-        "--soft-tokens", "--hard-tokens", "--role", "--trigger", "--finding-ledger"
+        "--soft-tokens", "--hard-tokens", "--role", "--trigger"
       ]
     : domain === "runtime"
       ? ["--quiet-after-seconds", "--diagnostic-after-seconds", "--stall-after-seconds"]
@@ -165,7 +165,6 @@ function durableConfigDomainNode(domain: ConfigDomain): NodeInput {
         optionValues: domain === "workflow"
           ? {
               "--trigger": ["always", "leader", "final"],
-              "--finding-ledger": ["shadow", "enforce"]
             }
           : {}
       },
@@ -885,7 +884,7 @@ const taskChildren: readonly NodeInput[] = [
   {
     name: "review",
     summary: "Control Task-final ReviewRounds.",
-    sections: [{ id: "manage", title: "Commands", entries: ["request", "force-fresh", "retry", "finding"] }],
+    sections: [{ id: "manage", title: "Commands", entries: ["request", "retry"] }],
     children: [
       {
         name: "request",
@@ -894,48 +893,9 @@ const taskChildren: readonly NodeInput[] = [
         options: ["--role", "--lane-role", "--delta-recheck"]
       },
       {
-        name: "force-fresh",
-        summary: "Replace one exact terminal non-semantic Task-final Review with a distinct full Round.",
-        usage: "yui task review force-fresh <task>/<review-round>"
-      },
-      {
         name: "retry",
         summary: "Retry a failed Task-final ReviewRound without a Reviewer Turn.",
         usage: "yui task review retry <task>/<review-round>"
-      },
-      {
-        name: "finding",
-        summary: "Inspect and disposition the cross-Round Review finding ledger.",
-        executable: true,
-        sections: [{ id: "manage", title: "Commands", entries: ["list", "dispose", "repair-wave", "extract"] }],
-        children: [
-          {
-            name: "list",
-            summary: "List the Task's review findings with disposition and repair lineage.",
-            usage: "yui task review finding list <task>"
-          },
-          {
-            name: "dispose",
-            summary: "Record one Leader disposition for a review finding.",
-            usage: "yui task review finding dispose <task>/<finding> --disposition <fixed-pending-review|verified-fixed|accepted-risk|not-actionable|superseded> [--work-item <id>] [--commit <sha>] [--verification <text>] [--note <text>] [--superseded-by <stable-key>]",
-            options: ["--disposition", "--work-item", "--commit", "--verification", "--note", "--superseded-by"],
-            optionValues: {
-              "--disposition": ["fixed-pending-review", "verified-fixed", "accepted-risk", "not-actionable", "superseded"]
-            }
-          },
-          {
-            name: "repair-wave",
-            summary: "Consolidate open P1/P2 findings, or explicitly plan parallel repair groups.",
-            usage: "yui task review finding repair-wave <task> [--strategy <consolidated|parallel>] [--create]",
-            options: ["--strategy", "--create"],
-            optionValues: { "--strategy": ["consolidated", "parallel"] }
-          },
-          {
-            name: "extract",
-            summary: "Reconcile findings from one completed ReviewRound into the ledger.",
-            usage: "yui task review finding extract <task>/<review-round>"
-          }
-        ]
       }
     ]
   },
@@ -1123,7 +1083,7 @@ export const ROOT_COMMAND = buildNode({
     { name: "update", summary: "Install the latest published Yui package globally." },
     {
       name: "upgrade",
-      summary: "Inspect this Home and apply any supported storage upgrade.",
+      summary: "Validate this Home against the exact current storage contract.",
       usage: "yui upgrade [--dry-run]",
       options: ["--dry-run"]
     },

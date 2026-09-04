@@ -26,16 +26,15 @@ Ordinary commands open a Home only when all of these are true:
 
 An older, newer, incomplete, or malformed Home fails ordinary admission.
 `yui doctor` and `yui upgrade --dry-run` report the reason without changing the
-Home; explicit `yui upgrade` writes only when the centralized graph has every
-adjacent step and the Controller lifecycle is quiesced. There is no in-process
-normalization, repair worker, file-Store fallback, dual read/write, backup
-switch, or migration receipt protocol.
+Home; explicit `yui upgrade` performs the same read-only exact-current
+validation. There is no in-process normalization, repair worker, file-Store
+fallback, dual read/write, backup switch, or migration receipt protocol.
 
-If an old Home has no complete migration path, preserve it byte-for-byte. Use
-its original Yui release for read-only inspection, then initialize a new Home
-and let the Operator create a new Task from the objective, relevant WorkItems,
-repository state, and available Turn summaries. New records receive new
-identities; Provider/session state is not imported.
+Preserve an old Home byte-for-byte. Use its original Yui release for read-only
+inspection, then initialize a new Home and let the Operator create a new Task
+from the objective, relevant WorkItems, repository state, and available exact
+Turn results. New records receive new identities; Provider/session state is not
+imported.
 
 ## Write and concurrency contract
 
@@ -63,10 +62,9 @@ Leader remains the authority for WorkItem and Task completion.
 
 `yui update` stages an exact package, asks that staged binary to verify the
 existing Home against its current contract, stops the exact Controller,
-activates the same package, applies any preflighted adjacent aggregate migration,
-verifies the installed binary and Home, and starts the replacement Controller.
-The Controller is stopped before any record mutation.
+activates the same package, verifies the installed binary and unchanged Home,
+and starts the replacement Controller.
 
-Every persistent schema change must add an explicit adjacent step to the
-centralized migration graph. This release supports aggregate 21→22→23→24
-(WorkItem 13→14 and Turn 1→2→3); Homes outside a complete path are rejected.
+Every persistent schema change advances the exact current contract. This release
+does not ship historical migration steps; Homes on any other contract are
+rejected without mutation.

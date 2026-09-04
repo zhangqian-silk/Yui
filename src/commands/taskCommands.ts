@@ -27,6 +27,7 @@ import {
   operationalTaskRecords,
   taskRecordRetirement
 } from "../task/taskRecordRetirement.js";
+import { referencedWakeTurnIds } from "../context/wakeNotification.js";
 import {
   isRoleTurnStalled,
   TURN_PROGRESS_EVENT,
@@ -102,7 +103,6 @@ import {
   createTaskReviewRound,
   createTaskDeltaReviewRound,
   attachReviewExecutionGroup,
-  deltaRecheckBlocksAcceptance,
   finishReviewRound,
   recordReviewWorkspaceDisposition,
   retryReviewRound,
@@ -121,24 +121,11 @@ import {
   verifyDeltaRecheckDiff,
   type DeltaRecheckPreflight
 } from "../review/deltaRecheck.js";
-import { isAcceptedTaskReviewBaseline } from "../review/reviewAcceptance.js";
+import { isCompletedTaskReviewEvidence } from "../review/reviewAcceptance.js";
 import {
   projectReviewerAvailability,
   type ReviewerBusy
 } from "../review/reviewerAvailability.js";
-import {
-  buildTaskFinalReviewFindingContext,
-  dispositionReviewFinding,
-  planRepairGroups,
-  reconcileReviewFindings,
-  reconcileReviewFindingsAfterReview,
-  type RepairGroup,
-  type ReviewFindingDispositionCommand
-} from "../review/reviewFindingLedger.js";
-import {
-  TASK_CONTROL_FINDING_DISPOSITIONS,
-  type ReviewFindingDisposition
-} from "../review/reviewFinding.js";
 import { createTaskBrief, updateTaskBrief } from "../brief/taskBrief.js";
 import { createDecision, supersedeDecision } from "../decision/decision.js";
 import { createMilestone } from "../milestone/milestone.js";
@@ -256,10 +243,6 @@ import {
   validateTaskFinalReviewContract,
   type TaskFinalReviewContract
 } from "../review/taskFinalReviewContract.js";
-import {
-  classifyReviewRoundOutcome,
-  isSemanticReviewRound
-} from "../review/reviewOutcomeClassifier.js";
 import {
   resolveRecordedTaskFinalReviewContract,
   type TaskFinalReviewContractResolution
@@ -683,10 +666,7 @@ export function preflightTaskCompletion(
   // Issue 06: one shared readiness projection enumerates every blocker.
   const readinessFacts = store.readCompletionReadinessFacts(task.id);
   if (readinessFacts === null) throw taskNotFound(task.id);
-  // The finding ledger gate is intentionally deferred: the transactional
-  // completion path runs it after `prepareFinalTaskReview`, which may create
-  // the Task-final Review that resolves `fixed-pending-review` findings.
-  const readiness = projectCompletionReadiness(readinessFacts, { findingsGate: false });
+  const readiness = projectCompletionReadiness(readinessFacts);
   // An active Task-final Review is not a preflight failure: the transactional
   // path resumes a pending Round (or reports the running one) via
   // `prepareFinalTaskReview`, and the CLI skips remote reconciliation while
@@ -1367,10 +1347,8 @@ function completeTaskCommand(
     // its independent lifecycle.
     // Issue 06: re-validate the full completion readiness inside the
     // transaction (the CAS fence) after final-review preparation.  This is the
-    // same pure projection `task next-action` displays, now with the finding
-    // ledger gate enabled: `fixed-pending-review` findings that the prepared
-    // Review would resolve are no longer blocked, but once no Review is needed
-    // every remaining blocker fails closed with the fresh list.
+    // same pure projection `task next-action` displays. Once no Review is
+    // needed, every remaining structural blocker fails closed.
     const readinessFacts = tx.readCompletionReadinessFacts(task.id);
     if (readinessFacts === null) throw taskNotFound(task.id);
     const readiness = projectCompletionReadiness(readinessFacts);
@@ -1445,7 +1423,9 @@ function completeTaskCommand(
   if (result.finalReview !== undefined) {
     const status = result.finalReview.status === "pending"
       ? `Final Task Review requested as ${result.finalReview.id}.`
-      : `Final Task Review is blocked: ${result.finalReview.summary ?? result.finalReview.id}.`;
+      : `Final Task Review is blocked: ${
+          result.finalReview.failure?.message ?? result.finalReview.id
+        }.`;
     return output(`${status}\n`, {
       task: result.task,
       reviewRound: result.finalReview
@@ -1683,7 +1663,8 @@ function retireTaskCommand(
         mailboxDisposition: "discard",
         outcome: {
           status: "failed",
-          summary: `Task retired: ${summary}`
+          diagnostic: `Task retired: ${summary}`,
+          failureReason: "cancelled"
         }
       }, now);
       if (terminal.disposition !== "applied") {
@@ -3174,7 +3155,7 @@ function updateWork(
       );
     }
     const updated = submitWorkItemCandidate(current, {
-      summary: mainTurn.result.output,
+      summary: `Result from Turn ${mainTurn.id}.`,
       source: { type: "turn", turnId: mainTurn.id },
       ...(candidatePolicy === null ? {} : { reviewPolicy: candidatePolicy }),
       ...(taskFinalContract === undefined
@@ -3212,7 +3193,9 @@ function updateWork(
   notifyMailbox(options.runtime, taskMailbox(result.item.taskId), result.item.taskId);
   if (result.item.status === "awaiting_acceptance" && status === "completed") {
     const failure = result.reviewDispatch?.round.status === "failed"
-      ? `Review could not start: ${result.reviewDispatch.round.summary}\n`
+      ? `Review could not start: ${
+          result.reviewDispatch.round.failure?.message ?? result.reviewDispatch.round.id
+        }\n`
       : "";
     const destination = result.reviewTrigger === "always"
       ? "review"
@@ -3510,11 +3493,12 @@ function replicatedProducerAssignmentInput(input: string, requiresCodeRef: boole
   return [
     input,
     "",
-    "Return the final result as one JSON object with: summary, checks, findings, evidence, and evidenceCommit.",
-    "checks must list the validation commands and passed/failed/skipped outcomes.",
+    "Return one complete original result in clear Markdown or JSON.",
+    "Recommended sections are Outcome, Changes, Verification, Risks or blockers, and Recommended next action.",
+    "Yui preserves the result verbatim and does not parse or validate those sections.",
     requiresCodeRef
-      ? "evidenceCommit must be the 40-character commit containing this Lane's clean final code."
-      : "For a Gitless or read-only Lane, evidenceCommit may be omitted."
+      ? "Commit the Lane's final code and leave its managed workspace clean; Yui observes the exact Git snapshot independently."
+      : "For a Gitless or read-only Lane, report the result without inventing Git evidence."
   ].join("\n");
 }
 
@@ -3544,20 +3528,6 @@ function acceptWork(
       throw usageError(
         "A ReviewRound-owned workspace cannot be used for WorkItem acceptance."
       );
-    }
-    // Only diagnostic evidence commits (a reviewer's own commit on top of the
-    // frozen base) are barred from WorkItem acceptance.  A clean review
-    // attests the frozen base itself (evidenceCommit === reviewBaseCommit),
-    // which is the candidate's own head.
-    const diagnosticEvidence = new Set(tx.listReviewRounds(item.taskId)
-      .flatMap(({ evidenceCommit, reviewBaseCommit }) =>
-        evidenceCommit !== undefined && evidenceCommit !== reviewBaseCommit
-          ? [evidenceCommit]
-          : []));
-    if (options.workItemIntegrationProof?.projects.some(
-      ({ headCommit }) => diagnosticEvidence.has(headCommit)
-    )) {
-      throw usageError("A ReviewRound diagnostic evidence commit cannot be used for WorkItem acceptance.");
     }
     const candidate = requireWorkItemCandidate(item);
     const taskFinalContract = taskFinalReviewContractForMutation(tx, task.id, options);
@@ -3766,7 +3736,8 @@ function retireWork(
           turnId: run.id,
           outcome: {
             status: "failed",
-            summary: `Work Item retired: ${summary}`
+            diagnostic: `Work Item retired: ${summary}`,
+            failureReason: "cancelled"
           }
         }, now);
         if (terminal.disposition !== "applied") {
@@ -4030,7 +4001,9 @@ function reviewWork(
   }
   return result.round.status === "failed"
     ? output(
-        `Review could not start for ${result.round.workItemId}: ${result.round.summary}\n`,
+        `Review could not start for ${result.round.workItemId}: ${
+          result.round.failure?.message ?? result.round.id
+        }\n`,
         { reviewRound: result.round }
       )
     : output(`Review requested as ${result.round.id}\n`, { reviewRound: result.round });
@@ -4052,234 +4025,10 @@ function taskReviewCommand(
 ): TaskCommandExecution {
   const [command, ...rest] = args;
   if (command === "request") return requestTaskReviewRound(rest, store, options);
-  if (command === "force-fresh") return forceFreshTaskReviewRound(rest, store, options);
   if (command === "retry") return retryFailedTaskReviewRound(rest, store, options);
-  if (command === "finding") return reviewFindingCommand(rest, store, options);
   throw usageError(command === undefined
     ? "Task review command is required."
     : `Unknown command: task review ${command}`);
-}
-
-/**
- * Issue 06: `yui task review finding` — the cross-Round finding ledger CLI.
- * Findings are extracted automatically from completed Rounds; these commands
- * let the Leader inspect the ledger, disposition each finding, and plan one
- * convergent repair unit by default. Parallel fan-out is explicit.
- */
-function reviewFindingCommand(
-  args: string[],
-  store: TaskWorkflowStore,
-  options: TaskCommandOptions
-): TaskCommandExecution {
-  const [command, ...rest] = args;
-  if (command === "list") return listReviewFindings(rest, store, options);
-  if (command === "dispose") return disposeReviewFindingCommand(rest, store, options);
-  if (command === "repair-wave") return planReviewRepairWave(rest, store, options);
-  if (command === "extract") return extractReviewFindingsCommand(rest, store, options);
-  throw usageError(command === undefined
-    ? "Task review finding command is required."
-    : `Unknown command: task review finding ${command}`);
-}
-
-function listReviewFindings(
-  args: string[],
-  store: TaskWorkflowStore,
-  options: TaskCommandOptions
-): TaskCommandExecution {
-  const usage = "Task review finding list usage: yui task review finding list <task>.";
-  exactPositionals(args, 1, usage);
-  const task = requireTask(store, args[0]!);
-  const findings = store.listReviewFindings(task.id);
-  if (findings.length === 0) {
-    return output(`No review findings recorded for ${task.id}.\n`);
-  }
-  const lines = findings.map((finding) => {
-    const repair = finding.repair === undefined
-      ? ""
-      : `; repair: ${finding.repair.workItemId ?? "?"}${finding.repair.commit === undefined ? "" : `@${finding.repair.commit.slice(0, 12)}`}`;
-    const merge = finding.mergeRequired === true ? " [merge-required]" : "";
-    return `${finding.id} [${finding.severity}/${finding.disposition}] ${finding.title}`
-      + ` (invariant: ${finding.invariant}; first: ${finding.firstReviewRoundId}; last: ${finding.lastReviewRoundId})${repair}${merge}`;
-  });
-  return output(`Review findings for ${task.id}:\n${lines.join("\n")}\n`);
-}
-
-function disposeReviewFindingCommand(
-  args: string[],
-  store: TaskWorkflowStore,
-  options: TaskCommandOptions
-): TaskCommandExecution {
-  const usage = "Task review finding dispose usage: yui task review finding dispose <task>/<finding> "
-    + "--disposition <fixed-pending-review|verified-fixed|accepted-risk|not-actionable|superseded> "
-    + "[--work-item <id>] [--commit <sha>] [--verification <text>] [--note <text>] [--superseded-by <stable-key>].";
-  const parsed = parseTail(
-    args,
-    new Set(["--disposition", "--work-item", "--commit", "--verification", "--note", "--superseded-by"]),
-    usage
-  );
-  exactPositionals(parsed.positionals, 1, usage);
-  const disposition = requiredOption(parsed.options, "--disposition") as ReviewFindingDisposition;
-  if (!TASK_CONTROL_FINDING_DISPOSITIONS.includes(disposition)) {
-    throw usageError(`Review finding disposition is invalid: ${disposition}.`);
-  }
-  const now = clock(options);
-  const reference = resolveTaskRecordReference(parsed.positionals[0]!, {
-    kind: "reviewFinding",
-    label: "Review finding"
-  });
-  const result = store.transaction((tx) => {
-    const task = requireTask(tx, reference.taskId);
-    if (task.status !== "active") throw usageError(inactiveTaskMessage(task, "dispositioning a review finding"));
-    const actor = taskActor(tx, options, task.id);
-    const command: ReviewFindingDispositionCommand = {
-      disposition,
-      by: actor === "leader"
-        ? taskLeaderActionTurnId(tx, task.id, options.environment) ?? actor
-        : actor,
-      ...(parsed.options.get("--note") === undefined ? {} : { note: parsed.options.get("--note")! }),
-      ...(parsed.options.get("--work-item") === undefined ? {} : { workItemId: parsed.options.get("--work-item")! }),
-      ...(parsed.options.get("--commit") === undefined ? {} : { commit: parsed.options.get("--commit")! }),
-      ...(parsed.options.get("--verification") === undefined ? {} : { verification: parsed.options.get("--verification")! }),
-      ...(parsed.options.get("--superseded-by") === undefined ? {} : { supersededBy: parsed.options.get("--superseded-by")! }),
-      now
-    };
-    return dispositionReviewFinding(tx, task.id, reference.localId, command);
-  });
-  return output(`Dispositioned ${result.id} as ${result.disposition}.\n`);
-}
-
-function planReviewRepairWave(
-  args: string[],
-  store: TaskWorkflowStore,
-  options: TaskCommandOptions
-): TaskCommandExecution {
-  const usage = "Task review finding repair-wave usage: yui task review finding repair-wave <task> [--strategy <consolidated|parallel>] [--create].";
-  const parsed = parseTail(args, new Set(["--strategy"]), usage, new Set(["--create"]));
-  exactPositionals(parsed.positionals, 1, usage);
-  const task = requireTask(store, parsed.positionals[0]!);
-  const strategy = parsed.options.get("--strategy") ?? "consolidated";
-  if (strategy !== "consolidated" && strategy !== "parallel") {
-    throw usageError(`Review repair strategy is invalid: ${strategy}.`, usage);
-  }
-  const groups = repairGroupsForStrategy(planRepairGroups(store, task.id), strategy);
-  if (groups.length === 0) {
-    return output(`No open P1/P2 findings need repair for ${task.id}.\n`);
-  }
-  if (parsed.options.has("--create")) {
-    const now = clock(options);
-    const created = store.transaction((tx) => {
-      const currentTask = requireTask(tx, task.id);
-      if (currentTask.status !== "active") {
-        throw usageError(inactiveTaskMessage(currentTask, "creating a review repair wave"));
-      }
-      taskActor(tx, options, currentTask.id);
-      const openItems = tx.listWorkItems(currentTask.id)
-        .filter((item) => item.status === "pending" || item.status === "running");
-      return groups.map((group) => {
-        const findingMarkers = group.findingIds.map((id) => `review-finding:${id}`);
-        const existing = openItems.find((item) => isDeepStrictEqual(
-          [...item.acceptance].sort(),
-          [...findingMarkers].sort()
-        ));
-        if (existing !== undefined) return { group, item: existing, changed: false } as const;
-        const item = createWorkItem(tx.nextWorkItemId(currentTask.id), currentTask.id, {
-          title: `Repair review findings ${group.findingIds.join(", ")}`,
-          objective: [
-            "Repair the following Task-final Review findings as one overlapping group:",
-            ...group.findings.map((finding) => (
-              `- ${finding.id} [${finding.severity}] ${finding.title} `
-              + `(invariant: ${finding.invariant}; evidence: ${finding.evidence.join(" | ") || "see ReviewRound"})`
-            )),
-            "Integrate this repair with the rest of the Task before requesting another Task-final Review."
-          ].join("\n"),
-          acceptance: findingMarkers,
-          writeProjectIds: reviewRepairProjectIds(currentTask, group.affectedPaths)
-        }, now);
-        tx.saveWorkItem(currentTask.id, item);
-        enqueueWork(tx, taskMailbox(currentTask.id), "work-created", now, [
-          workItemRef(currentTask.id, item.id)
-        ]);
-        return { group, item, changed: true } as const;
-      });
-    });
-    const lines = created.map(({ group, item, changed }) => (
-      `wave ${group.groupKey}: ${item.id} ${changed ? "created" : "already open"} `
-      + `(${group.findingIds.join(", ")})`
-    ));
-    return output(
-      `Review repair wave for ${task.id} (${strategy}, ${groups.length} group(s)):\n${lines.join("\n")}\n`,
-      { strategy, groups: created }
-    );
-  }
-  const lines = groups.map((group, index) => {
-    const findings = group.findings
-      .map((finding) => `${finding.id} [${finding.severity}] ${finding.title}`)
-      .join("; ");
-    return `wave ${index + 1}: ${findings}`
-      + ` (paths: ${group.affectedPaths.join(", ") || "none"}; invariants: ${group.invariants.join(", ")})`;
-  });
-  return output(
-    `Repair wave for ${task.id} (${strategy}, ${groups.length} group(s)):\n${lines.join("\n")}\n`
-      + (strategy === "consolidated"
-        ? "Default: keep all findings in one WorkItem; use --strategy parallel only for proven independent ownership.\n"
-        : "Parallel strategy explicitly selected; each disjoint group may become one WorkItem.\n")
-  );
-}
-
-function repairGroupsForStrategy(
-  groups: readonly RepairGroup[],
-  strategy: "consolidated" | "parallel"
-): readonly RepairGroup[] {
-  if (strategy === "parallel" || groups.length <= 1) return groups;
-  const findings = groups.flatMap(({ findings }) => findings)
-    .sort((left, right) => left.id.localeCompare(right.id, undefined, { numeric: true }));
-  return [{
-    groupKey: findings.map(({ id }) => id).join("+"),
-    findings,
-    findingIds: findings.map(({ id }) => id),
-    affectedPaths: [...new Set(groups.flatMap(({ affectedPaths }) => affectedPaths))].sort(),
-    affectedSymbols: [...new Set(groups.flatMap(({ affectedSymbols }) => affectedSymbols))].sort(),
-    invariants: [...new Set(groups.flatMap(({ invariants }) => invariants))].sort()
-  }];
-}
-
-function reviewRepairProjectIds(
-  task: Task,
-  affectedPaths: readonly string[]
-): readonly string[] {
-  const bindings = task.projectBindings;
-  const matched = bindings.filter((binding) => affectedPaths.some((path) => pathWithinProject(path, binding.directory)));
-  const projectIds = (matched.length > 0 ? matched : bindings).map(({ projectId }) => projectId);
-  return [...new Set(projectIds)];
-}
-
-function pathWithinProject(path: string, directory: string): boolean {
-  const normalizedPath = path.replace(/^\.\//u, "").replace(/^\/+/u, "");
-  const normalizedDirectory = directory.replace(/^\.\//u, "").replace(/^\/+|\/+$/gu, "");
-  if (normalizedDirectory.length === 0 || normalizedDirectory === ".") return true;
-  return normalizedPath === normalizedDirectory
-    || normalizedPath.startsWith(`${normalizedDirectory}/`);
-}
-
-function extractReviewFindingsCommand(
-  args: string[],
-  store: TaskWorkflowStore,
-  options: TaskCommandOptions
-): TaskCommandExecution {
-  const usage = "Task review finding extract usage: yui task review finding extract <task>/<review-round>.";
-  exactPositionals(args, 1, usage);
-  const reference = resolveTaskRecordReference(args[0]!, {
-    kind: "reviewRound",
-    label: "ReviewRound"
-  });
-  const now = clock(options);
-  const result = store.transaction((tx) =>
-    reconcileReviewFindings(tx, reference.taskId, reference.localId, now));
-  if (result.skipped) {
-    return output(`ReviewRound ${result.roundId} produced no findings: ${result.reason ?? "skipped"}\n`);
-  }
-  return output(`Reconciled ${result.created.length + result.updated.length + result.conflicts.length} finding(s) from ${result.roundId}: `
-    + `${result.created.length} created, ${result.updated.length} updated, ${result.conflicts.length} conflict(s).\n`);
 }
 
 function requestTaskReviewRound(
@@ -4331,14 +4080,6 @@ function requestTaskReviewRound(
     }
     const taskRounds = reviewRoundsByIdentity(tx.listReviewRounds(task.id))
       .filter((entry) => (entry.scope ?? "work-item") === "task");
-    const latestNonAcceptingDelta = deltaRecheckRequested
-      ? undefined
-      : taskRounds.filter((entry) => (
-          entry.reviewerRoleName === reviewerRoleName
-          && entry.deltaRecheck !== undefined
-          && deltaRecheckBlocksAcceptance(entry)
-          && isSameTaskReviewCandidate(entry.taskCandidate, provenance.candidate)
-        )).at(-1);
     const exact = taskRounds.filter((entry) => (
       entry.reviewerRoleName === reviewerRoleName
       && (deltaRecheckRequested
@@ -4432,7 +4173,7 @@ function requestTaskReviewRound(
         acceptance: [
           "Inspect every bound Project at the frozen Task heads.",
           "Report only reachable, material, actionable findings or bounded verification gaps.",
-          "Return durable checks, findings, evidence, and exact code references."
+          "Return one complete original result for the main Reviewer to read."
         ],
         contextSnapshotRef: contextSnapshotRef(baseline),
         taskId: task.id,
@@ -4453,20 +4194,6 @@ function requestTaskReviewRound(
       );
       created = attachReviewExecutionGroup(created, group);
       tx.saveReviewRound(task.id, created);
-    }
-    // Issue 07: when a full Review is created after a non-accepting delta
-    // disposition, record the escalation lineage on the delta Round.
-    if (latestNonAcceptingDelta !== undefined
-      && created.deltaRecheck === undefined
-      && latestNonAcceptingDelta.deltaRecheck !== undefined
-      && latestNonAcceptingDelta.deltaRecheck.escalatedToReviewRoundId === undefined) {
-      tx.saveReviewRound(task.id, {
-        ...latestNonAcceptingDelta,
-        deltaRecheck: {
-          ...latestNonAcceptingDelta.deltaRecheck,
-          escalatedToReviewRoundId: created.id
-        }
-      });
     }
     recordTaskEvent(tx, task.id, "review.task-final-requested", {
       reviewRoundId: created.id,
@@ -4505,189 +4232,11 @@ function requestTaskReviewRound(
   );
 }
 
-const TASK_FINAL_FORCE_FRESH_EVENT = "review.task-final-force-fresh-requested";
-
-/**
- * Creates a distinct full Task-final ReviewRound only when the exact previous
- * terminal Round durably proves that no semantic review was produced. The
- * source Round, Turn, findings, workspace, and terminal report remain immutable
- * history; the linking Event is both the audit record and the idempotence key.
- */
-function forceFreshTaskReviewRound(
-  args: string[],
-  store: TaskWorkflowStore,
-  options: TaskCommandOptions
-): TaskCommandExecution {
-  const usage = "Task review force-fresh usage: yui task review force-fresh <task>/<review-round>.";
-  exactPositionals(args, 1, usage);
-  const reference = taskRecordReference(
-    args[0],
-    "reviewRound",
-    "ReviewRound reference",
-    options
-  );
-  const now = clock(options);
-  const result = store.transaction((tx) => {
-    const source = tx.getReviewRound(reference.taskId, reference.localId);
-    if (source === null) {
-      throw dataError(`ReviewRound not found: ${reference.taskId}/${reference.localId}.`);
-    }
-    const task = requireTask(tx, reference.taskId);
-    if (task.status !== "active") throw usageError(`Task is not active: ${task.id}.`);
-    const requestedBy = taskActor(tx, options, task.id);
-    if ((source.scope ?? "work-item") !== "task") {
-      throw usageError(`ReviewRound ${source.id} is not a Task-final ReviewRound.`);
-    }
-
-    const replacementEvents = tx.listEvents(task.id).filter((event) => (
-      event.type === TASK_FINAL_FORCE_FRESH_EVENT
-      && event.payload.sourceReviewRoundId === source.id
-    ));
-    if (replacementEvents.length > 1) {
-      throw dataError(`ReviewRound ${source.id} has duplicate force-fresh audit events.`);
-    }
-    const replacementEvent = replacementEvents[0];
-    if (replacementEvent !== undefined) {
-      const replacementId = replacementEvent.payload.reviewRoundId;
-      const replacement = replacementId === undefined
-        ? null
-        : tx.getReviewRound(task.id, replacementId);
-      if (replacement === null
-        || replacement.id === source.id
-        || (replacement.scope ?? "work-item") !== "task"
-        || replacement.reviewerRoleName !== source.reviewerRoleName
-        || replacement.deltaRecheck !== undefined
-        || !sameTaskFinalReviewContract(
-          replacement.taskFinalReviewContract,
-          source.taskFinalReviewContract
-        )
-        || !isSameTaskReviewCandidate(replacement.taskCandidate, source.taskCandidate!)
-        || replacementEvent.payload.reviewerRoleName !== replacement.reviewerRoleName
-        || replacementEvent.payload.taskCandidate !== JSON.stringify(replacement.taskCandidate)) {
-        throw dataError(`Force-fresh audit for ${source.id} does not match its replacement Round.`);
-      }
-      return { round: replacement, source, created: false } as const;
-    }
-
-    const recovery = classifyForceFreshReviewRecovery(tx, source);
-    if (recovery.kind === "semantic-or-ambiguous") {
-      throw usageError(
-        `ReviewRound ${source.id} is not eligible for force-fresh: ${recovery.reason}`
-      );
-    }
-    if (source.taskCandidate === undefined) {
-      throw dataError(`ReviewRound ${source.id} has no frozen Task candidate.`);
-    }
-    const taskFinalContract = taskFinalReviewContractForMutation(tx, task.id, options);
-    if (!sameTaskFinalReviewContract(source.taskFinalReviewContract, taskFinalContract)) {
-      throw usageError(`Task final-review contract does not match ReviewRound ${source.id}.`);
-    }
-    if (source.executionGroup !== undefined) {
-      throw usageError(
-        `ReviewRound ${source.id} used replicated producers; force-fresh is refused.`
-      );
-    }
-
-    const taskRounds = reviewRoundsByIdentity(tx.listReviewRounds(task.id)
-      .filter((entry) => (entry.scope ?? "work-item") === "task"));
-    const sourceIndex = taskRounds.findIndex(({ id }) => id === source.id);
-    if (sourceIndex < 0) {
-      throw dataError(`Final ReviewRound is not in Task history: ${source.id}.`);
-    }
-    const laterRound = taskRounds.slice(sourceIndex + 1).find((entry) => (
-      entry.reviewerRoleName === source.reviewerRoleName
-    ));
-    if (laterRound !== undefined) {
-      throw usageError(
-        `A newer Task-final ReviewRound already exists after ${source.id}: `
-        + `${laterRound.id}/${laterRound.status}.`
-      );
-    }
-    assertNoConflictingTaskReviewRound(taskRounds, source.id, source.reviewerRoleName);
-    assertTaskReviewRequestLane(tx, task.id, source.reviewerRoleName);
-
-    let reviewer = tx.getRole(task.id, source.reviewerRoleName);
-    if (reviewer === null) {
-      if (tx.getGlobalRole(source.reviewerRoleName) === null) {
-        throw usageError(`Global Role not found: ${source.reviewerRoleName}.`);
-      }
-      reviewer = createTaskRole(
-        tx,
-        task,
-        source.reviewerRoleName,
-        undefined,
-        now,
-        source.reviewerRoleName
-      );
-      tx.saveRole(task.id, reviewer);
-    }
-
-    const created = createTaskReviewRound(
-      tx.nextReviewRoundId(task.id),
-      task.id,
-      source.reviewerRoleName,
-      requestedBy,
-      source.taskCandidate,
-      now,
-      taskFinalContract
-    );
-    tx.saveReviewRound(task.id, created);
-    recordTaskEvent(tx, task.id, TASK_FINAL_FORCE_FRESH_EVENT, {
-      sourceReviewRoundId: source.id,
-      ...(source.reviewerTurnId === undefined ? {} : { sourceReviewerTurnId: source.reviewerTurnId }),
-      reviewRoundId: created.id,
-      reviewerRoleName: created.reviewerRoleName,
-      taskCandidate: JSON.stringify(created.taskCandidate),
-      reason: "source-round-terminal-without-semantic-review",
-      requestedBy,
-      ...(requestedBy === "leader" ? leaderActionEventPayload(tx, task.id, options) : {})
-    }, now);
-    return { round: created, source, created: true } as const;
-  });
-  return output(
-    result.created
-      ? `Fresh Task-final Review requested as ${result.round.id} after ${result.source.id}\n`
-      : `Fresh Task-final Review already requested as ${result.round.id} after ${result.source.id}\n`,
-    { reviewRound: result.round, sourceReviewRound: result.source }
-  );
-}
-
-export type ForceFreshReviewRecoveryClassification =
-  | Readonly<{ kind: "non-semantic-terminal"; reason: string }>
-  | Readonly<{ kind: "semantic-or-ambiguous"; reason: string }>;
-
-type ForceFreshReviewEvidenceStore = Pick<
-  TaskWorkflowStore,
-  "listTurns" | "listReviewFindings" | "listEvents"
->;
-
-/**
- * Conservatively classifies an immutable Task-final Review as replaceable.
- * A failed Round keeps the existing no-semantic-evidence behavior. A completed
- * Round needs stronger, mutually corroborating evidence: an explicit internal
- * context/workspace failure, its exact completed Turn, matching Lane
- * output, and the mechanically emitted empty completion Event.
- * This is command eligibility only; it never rewrites the source outcome or
- * changes the global semantic classifier used by the finding ledger.
- */
-export function classifyForceFreshReviewRecovery(
-  store: ForceFreshReviewEvidenceStore,
-  round: ReviewRound
-): ForceFreshReviewRecoveryClassification {
-  const classification = classifyReviewRoundOutcome(round, store);
-  return classification?.kind === "non-semantic"
-    ? { kind: "non-semantic-terminal", reason: classification.reason }
-    : {
-        kind: "semantic-or-ambiguous",
-        reason: classification?.reason ?? `source status is ${round.status}, not terminal.`
-      };
-}
-
 /**
  * Issue 07: re-validates the CLI-computed delta preflight inside the store
  * transaction.  The previous Round must be a completed acceptance (a full
- * Review or an equivalent-and-accepted delta) so a delta never extends a
- * non-accepting disposition.
+ * Review or a completed delta) so a delta never extends missing execution
+ * evidence.
  */
 function validateDeltaRecheckRequest(
   store: TaskWorkflowStore,
@@ -4703,7 +4252,7 @@ function validateDeltaRecheckRequest(
   }
   const previous = store.getReviewRound(taskId, preflight.record.previousReviewRoundId);
   if (previous === null
-    || !isAcceptedTaskReviewBaseline(store, previous)) {
+    || !isCompletedTaskReviewEvidence(store, previous)) {
     throw usageError(
       `Delta-recheck previous ReviewRound is not an accepted Task-final baseline: `
       + `${preflight.record.previousReviewRoundId}.`
@@ -4712,14 +4261,6 @@ function validateDeltaRecheckRequest(
   if (previous.reviewBaseCommit !== preflight.record.previousBaseCommit) {
     throw usageError(
       "Delta-recheck previous base commit does not match the recorded acceptance."
-    );
-  }
-  // A delta may only extend an acceptance, never a finding or an escalation.
-  if (previous.deltaRecheck !== undefined
-    && previous.deltaRecheck.disposition !== "equivalent-and-accepted") {
-    throw usageError(
-      `Delta-recheck cannot extend ${previous.id}: its disposition is `
-      + `${previous.deltaRecheck.disposition}. The Leader must choose the next Review action.`
     );
   }
   if (candidate.projects[0]!.commit === preflight.record.previousBaseCommit) {
@@ -5367,7 +4908,7 @@ function listTurns(
       run.effective.permission.strategy,
       run.status,
       isTaskRecordRetired(events, "turn", run.id) ? "retired" : "active",
-      run.result?.output ?? "-"
+      run.result?.output ?? run.result?.diagnostic ?? "-"
     ]),
     defaultTableWidth()
   )}\n`;
@@ -5452,12 +4993,7 @@ function settleStaleFinalReviewTurn(
     }
 
     if (round.status === "failed") {
-      const summary = run.result?.output.trim();
-      if (summary !== undefined
-        && round.summary === summary
-        && round.report === summary
-        && (round.checks?.length ?? 0) === 0
-        && round.evidenceCommit === undefined) {
+      if (round.failure?.kind === "execution") {
         return { turn: run, round, changed: false } as const;
       }
       throw usageError(`Final ReviewRound is already terminal: ${round.id}/${round.status}.`);
@@ -5468,21 +5004,12 @@ function settleStaleFinalReviewTurn(
 
     assertReviewerAvailable(tx, task.id, round.reviewerRoleName, round);
 
-    // Preserve any report/check/evidence already attached to the old Round;
-    // terminalization only adds the missing failure boundary and end time.
-    const summary = round.summary
-      ?? run.result?.output
-      ?? `Review Turn ${run.id} failed before delivery; committed Task heads changed.`;
+    const summary = `Review Turn ${run.id} failed before delivery; committed Task heads changed.`;
     const terminal = finishReviewRound(
       round,
       "failed",
-      summary,
       now,
-      {
-        report: round.report ?? summary,
-        checks: round.checks ?? [],
-        ...(round.evidenceCommit === undefined ? {} : { evidenceCommit: round.evidenceCommit })
-      }
+      { kind: "execution", message: summary }
     );
     tx.saveReviewRound(task.id, terminal);
     recordTaskEvent(tx, task.id, "turn.review-stale-settled", {
@@ -6036,7 +5563,7 @@ function assertNoConflictingTaskReviewRound(
 /**
  * Queues a Task-scoped final ReviewRound only after the Reviewer lane passes
  * its mechanical preflight. Busy or unavailable preparation never becomes a
- * failed semantic ReviewRound.
+ * failed ReviewRound.
  */
 function queueTaskReviewRound(
   store: TaskWorkflowStore,
@@ -6131,7 +5658,7 @@ function prepareFinalTaskReview(
       options
     );
   }
-  if (taskRounds.some((round) => isAcceptedTaskReviewBaseline(store, round))) {
+  if (taskRounds.some((round) => isCompletedTaskReviewEvidence(store, round))) {
     return null;
   }
   const taskCandidate = taskReviewProvenance(store, task, options).candidate;
@@ -6143,7 +5670,7 @@ function prepareFinalTaskReview(
     // A non-accepting delta is durable evidence for the Leader, not an
     // instruction for Core to manufacture a full Review. Completion remains
     // blocked until the Leader explicitly chooses and obtains valid evidence.
-    return isAcceptedTaskReviewBaseline(store, latest) ? null : latest;
+    return isCompletedTaskReviewEvidence(store, latest) ? null : latest;
   }
 
   return queueTaskReviewRound(
@@ -6238,8 +5765,8 @@ function assertPendingFinalReviewWorkspaceEvidence(
 
 /**
  * Task-control retry of an exact failed review Turn. The old failed Turn
- * remains the attempt trail, while the semantic ReviewRound is reset to
- * pending under its existing identity. Every identity and frozen-head fence is
+ * remains the attempt trail, while the ReviewRound is reset to pending under
+ * its existing identity. Every identity and frozen-head fence is
  * checked inside one transaction so a partial fail-old-without-reset state can
  * never be committed.
  */
@@ -6463,19 +5990,12 @@ function retryFailedReviewRun(
     // fence has passed. The outer transaction rolls back if Round creation fails.
     let roundToReset = round;
     if (round.status !== "failed") {
-      const summary = round.summary
-        ?? run.result?.output
-        ?? `Review Turn ${run.id} failed before delivery.`;
+      const summary = `Review Turn ${run.id} failed before delivery.`;
       roundToReset = finishReviewRound(
         round,
         "failed",
-        summary,
         now,
-        {
-          report: round.report ?? summary,
-          checks: round.checks ?? [],
-          ...(round.evidenceCommit === undefined ? {} : { evidenceCommit: round.evidenceCommit })
-        }
+        { kind: "execution", message: summary }
       );
       tx.saveReviewRound(task.id, roundToReset);
     }
@@ -6546,9 +6066,12 @@ function renderTurnShow(
     `Effective: ${run.effective.agentId}/${run.effective.adapterId} r${run.effective.sourceDesiredRevision}`,
     `Created: ${run.createdAt}`,
     ...(run.result === undefined ? [] : [`Ended: ${run.result.completedAt}`]),
-    ...(run.result === undefined || run.result.output.trim().length === 0
+    ...(run.result?.output === undefined
       ? []
-      : [`Summary: ${run.result.output}`])
+      : [`Result: ${run.result.output}`]),
+    ...(run.result?.diagnostic === undefined
+      ? []
+      : [`Failure: ${run.result.diagnostic}`])
   ];
   return `${lines.join("\n")}\n`;
 }
@@ -6645,8 +6168,8 @@ export function queueReviewRound(
     const failed = finishReviewRound(
       pending,
       "failed",
-      collision,
-      now
+      now,
+      { kind: "dispatch", message: collision }
     );
     store.saveReviewRound(item.taskId, failed);
     return { round: failed };
@@ -6661,8 +6184,8 @@ export function queueReviewRound(
         const failed = finishReviewRound(
           pending,
           "failed",
-          `Global Role not found: ${roleName}.`,
-          now
+          now,
+          { kind: "dispatch", message: `Global Role not found: ${roleName}.` }
         );
         store.saveReviewRound(item.taskId, failed);
         return { round: failed };
@@ -6677,8 +6200,11 @@ export function queueReviewRound(
       const failed = finishReviewRound(
         pending,
         "failed",
-        `Reviewer Role already has an active Turn: ${reviewer.name}.`,
-        now
+        now,
+        {
+          kind: "dispatch",
+          message: `Reviewer Role already has an active Turn: ${reviewer.name}.`
+        }
       );
       store.saveReviewRound(item.taskId, failed);
       return { round: failed };
@@ -6979,13 +6505,10 @@ export function dispatchPreparedReviewRound(
         .map(({ projectId, commit }) => `${projectId}@${commit}`)
         .join(", ")
       : `candidate@${round.reviewBaseCommit}`;
-    const findingContext = taskScope
-      ? buildTaskFinalReviewFindingContext(tx, taskId, round.taskCandidate!).context
-      : "";
     let deltaContext = "";
     if (taskScope && round.deltaRecheck !== undefined) {
       const previousRound = tx.getReviewRound(taskId, round.deltaRecheck.previousReviewRoundId);
-      if (previousRound === null || !isAcceptedTaskReviewBaseline(tx, previousRound)) {
+      if (previousRound === null || !isCompletedTaskReviewEvidence(tx, previousRound)) {
         throw new TaskFinalReviewDispatchDriftError(
           `Delta-recheck accepted baseline is unavailable: ${round.deltaRecheck.previousReviewRoundId}.`
         );
@@ -7007,8 +6530,7 @@ export function dispatchPreparedReviewRound(
       deltaContext = buildDeltaRecheckDispatchContext({
         round,
         previousRound,
-        diffByProject,
-        ledgerContext: findingContext
+        diffByProject
       });
     }
     const scopeLabel = taskScope ? "Task-final" : "WorkItem";
@@ -7033,7 +6555,7 @@ export function dispatchPreparedReviewRound(
       `Acceptance criteria: ${taskScope
         ? "Task objective, maintained decisions, and Project Policy"
         : item!.acceptance.length === 0 ? "none" : item!.acceptance.join("; ")}`,
-      ...(taskScope ? [deltaContext !== "" ? deltaContext : findingContext] : []),
+      ...(taskScope && deltaContext !== "" ? [deltaContext] : []),
       "Start from the user's core outcome and the WorkItem intent. The candidate summary is a pointer, not proof: inspect the complete relevant change, callers, and proportionate checks.",
       "Keep Yui Core lifecycle safety, generic Reviewer behavior, Project Policy/Knowledge, and the Task Contract separate. Follow Project Policy pointers from the dispatch context for project-specific checks.",
       ...(round.scope === "task" && round.deltaRecheck === undefined
@@ -7041,7 +6563,7 @@ export function dispatchPreparedReviewRound(
         : []),
       "You may freely edit source/tests, run local build or test commands, and optionally commit diagnostic evidence only inside this stable Reviewer workspace at the exact ReviewRound snapshot.",
       "Do not push, integrate, mutate Task state, touch the Candidate or Worker workspace, another Task/workspace, a stable checkout, or the real Yui control-plane home.",
-      "End the Provider turn with complete findings, evidence, checks actually run, uncertainty, and recommended next actions in clear Markdown or JSON. Yui preserves the full report automatically; no fixed wording or field list is required. If you include evidenceCommit, it must match the managed Review workspace.",
+      "End the Provider turn with one complete original result in clear Markdown or JSON. Recommended sections are conclusion, material findings, checks actually run, uncertainty, and next actions. Yui preserves the text verbatim and does not parse or validate those sections.",
       "Report reviewBaseCommit, exact checks/results, material findings, and uncertainty. This Turn result completes only the Round and creates no Candidate or ChangeSet.",
       "The Leader alone interprets and routes evidence: original Worker when open, a small Repair WorkItem when needed, or Leader/Integration for merge and local fixes; never merge review evidence yourself."
     ].join("\n");
@@ -7146,8 +6668,9 @@ export function dispatchPreparedReviewRound(
           rawInput,
           "",
           "You are a non-authoritative Review Producer.",
-          "Return one durable JSON result with summary, checks, findings, evidence, and evidenceCommit.",
-          "Do not create a Candidate, ChangeSet, integration, ReviewResult, or authoritative Review finding.",
+          "Return one complete original result in clear Markdown or JSON for the main Reviewer to read.",
+          "Recommended sections are conclusion, findings, verification, uncertainty, and next action; Yui does not parse or validate them.",
+          "Do not create a Candidate, ChangeSet, integration, or any acceptance decision.",
           JSON.stringify({
             schemaVersion: 1,
             executionGroupId: runningGroup.id,
@@ -7251,7 +6774,12 @@ export function failPendingReviewRound(
     const round = tx.getReviewRound(taskId, reviewRoundId);
     if (round === null) throw usageError(`ReviewRound not found: ${taskId}/${reviewRoundId}.`);
     if (round.status !== "pending") return round;
-    const terminal = finishReviewRound(round, "failed", summary, now);
+    const terminal = finishReviewRound(
+      round,
+      "failed",
+      now,
+      { kind: "dispatch", message: summary }
+    );
     tx.saveReviewRound(taskId, terminal);
     const event = recordTaskEventRecord(tx, taskId, "review.failed-to-start", {
       reviewRoundId: terminal.id,
@@ -8458,9 +7986,14 @@ function taskWakeInspectionCommand(
       const ms = Date.parse(createdAt);
       return ms > fromMs && ms <= toMs;
     };
-    const events = store.listEvents(task.id).filter((e) => inWindow(e.createdAt));
+    const allEvents = store.listEvents(task.id);
+    const events = allEvents.filter((e) => inWindow(e.createdAt));
     const messages = store.listMessages(task.id).filter((m) => inWindow(m.createdAt));
-    const turns = store.listTurns(task.id).filter((turn) => inWindow(turn.createdAt));
+    const allTurns = store.listTurns(task.id);
+    const referencedTurnIds = new Set(referencedWakeTurnIds(allTurns, allEvents, events));
+    const turns = operationalTaskRecords(allTurns, allEvents, "turn").filter((turn) => (
+      inWindow(turn.createdAt) || referencedTurnIds.has(turn.id)
+    ));
     const lines: string[] = [
       `Wake: ${wake.id}`,
       `Task: ${task.id}`,
@@ -8477,7 +8010,13 @@ function taskWakeInspectionCommand(
       `Messages (${messages.length}):`,
       ...messages.map((m) => `  ${m.id} [${taskMessageAuthorLabel(m.author)}] ${presentTime(m.createdAt, timeZone)}`),
       `Turns (${turns.length}):`,
-      ...turns.map((turn) => `  ${turn.id} [${turn.status}/${turn.purpose}] ${turn.roleName} ${presentTime(turn.createdAt, timeZone)}`)
+      ...turns.map((turn) => (
+        `  ${turn.id} [${turn.status}/${turn.purpose}] ${turn.roleName} `
+        + `${presentTime(turn.createdAt, timeZone)}`
+        + `${referencedTurnIds.has(turn.id)
+          ? ` → yui task turn show ${task.id}/${turn.id}`
+          : ""}`
+      ))
     ];
     return output(lines.join("\n").concat("\n"), {
       taskId: task.id,

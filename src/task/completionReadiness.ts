@@ -6,18 +6,6 @@ import {
   integrationAttemptRequiresSettlement,
   workItemDeliverySettled
 } from "../integration/deliveryObligation.js";
-import { isReviewFindingBlocking, type ReviewFinding } from "../review/reviewFinding.js";
-import { deltaRecheckBlocksAcceptance } from "../review/reviewRound.js";
-import { isSemanticReviewRound } from "../review/reviewOutcomeClassifier.js";
-import type { ReviewFindingLedgerMode } from "../review/reviewFindingLedger.js";
-import {
-  REVIEW_FINDINGS_RECONCILE_FAILED_EVENT,
-  reviewFindingLedgerWriteFailedFromEvents
-} from "../review/reviewFindingLedger.js";
-import { resolveRecordedTaskFinalReviewContract } from "../review/taskFinalReviewContractResolution.js";
-import { sameTaskFinalReviewContract } from "../review/taskFinalReviewContract.js";
-import type { Turn } from "../turn/turn.js";
-import type { TaskEvent } from "../event/taskEvent.js";
 import type { ManagedWorkspace } from "../worktree/managedWorkspace.js";
 import type { WorkItem } from "../workItem/workItem.js";
 import type { NextActionFacts, NextActionRef } from "./nextAction.js";
@@ -48,10 +36,7 @@ export type CompletionBlockerCode =
   | "work-item-workspace-undisposed"
   | "review-workspace-undisposed"
   | "integration-workspace-undisposed"
-  | "execution-lane-workspace-undisposed"
-  | "open-review-finding"
-  | "finding-ledger-unavailable"
-  | "delta-recheck-not-accepted";
+  | "execution-lane-workspace-undisposed";
 
 export type CompletionBlocker = Readonly<{
   /** Stable machine-readable code; callers may key on it. */
@@ -91,14 +76,9 @@ export type CompletionReadiness = Readonly<{
  * extra reads on every command.
  */
 export type CompletionReadinessFacts = NextActionFacts & Readonly<{
-  /** Turn evidence used to validate semantic Review results. */
-  turns: readonly Turn[];
   managedWorkspaces: readonly ManagedWorkspace[];
   durableJobs: readonly DurableJob[];
   integrationQueueEntries: readonly IntegrationQueueEntry[];
-  reviewFindings: readonly ReviewFinding[];
-  reviewFindingLedgerMode: ReviewFindingLedgerMode;
-  events: readonly TaskEvent[];
 }>;
 
 const ACTIVE_JOB_STATUSES = new Set([
@@ -116,32 +96,12 @@ const UNRESOLVED_INTEGRATION_STATUSES = new Set([
 const TERMINAL_REVIEW_STATUSES = new Set(["completed", "failed"]);
 const TERMINAL_LANE_STATUSES = new Set(["completed", "failed", "skipped"]);
 
-export type CompletionReadinessOptions = Readonly<{
-  /**
-   * Whether to enforce the Review finding ledger gate.  The completion
-   * preflight runs before `prepareFinalTaskReview`, which may create the
-   * Task-final Review that resolves `fixed-pending-review` findings; it passes
-   * `false` and lets the transactional path enforce the gate after Review
-   * preparation.  Read-only projections (next-action) pass `true` (the
-   * default) so the Leader sees every blocker.
-   */
-  findingsGate?: boolean;
-}>;
-
 export function projectCompletionReadiness(
-  facts: CompletionReadinessFacts,
-  options: CompletionReadinessOptions = {}
+  facts: CompletionReadinessFacts
 ): CompletionReadiness {
   const blockers: CompletionBlocker[] = [];
   const advisories: CompletionAdvisory[] = [];
   const { task } = facts;
-  const findingsGate = options.findingsGate ?? true;
-  const taskFinalReviewContract = resolveRecordedTaskFinalReviewContract(
-    task.id,
-    facts.workItems,
-    facts.reviewRounds
-  )?.effective;
-  const taskFinalReviewRequired = taskFinalReviewContract !== undefined;
 
   // A pending/running Task-final Review must be resumed or blocked first.
   for (const round of facts.reviewRounds) {
@@ -154,44 +114,6 @@ export function projectCompletionReadiness(
       fix: round.status === "pending"
         ? `yui task review retry ${task.id}/${round.id}`
         : `wait for Reviewer Turn on ${round.id} to finish`
-    });
-  }
-
-  // Issue 07: only the latest completed Task-final Review can define whether
-  // the current review lineage is accepted. Historical delta findings and
-  // escalations remain audit evidence, but a later completed full Review (or
-  // accepted delta) supersedes them instead of blocking completion forever.
-  const latestCompletedTaskReview = facts.reviewRounds
-    .filter((round) => (
-      (round.scope ?? "work-item") === "task"
-      && (taskFinalReviewContract === undefined || sameTaskFinalReviewContract(
-        round.taskFinalReviewContract,
-        taskFinalReviewContract
-      ))
-      && isSemanticReviewRound(round, {
-          listTurns: () => facts.turns,
-          listReviewFindings: () => facts.reviewFindings,
-          listEvents: () => facts.events
-        })
-    ))
-    .slice()
-    .sort((left, right) => (
-      left.createdAt.localeCompare(right.createdAt)
-      || left.id.localeCompare(right.id, undefined, { numeric: true })
-    ))
-    .at(-1);
-  if (taskFinalReviewRequired
-    && latestCompletedTaskReview !== undefined
-    && deltaRecheckBlocksAcceptance(latestCompletedTaskReview)) {
-    const round = latestCompletedTaskReview;
-    const disposition = round.deltaRecheck!.disposition!;
-    blockers.push({
-      code: "delta-recheck-not-accepted",
-      ref: ref("review-round", round.id),
-      reason: `Delta-recheck ${round.id} disposition is ${disposition}; the head is not accepted.`,
-      fix: disposition === "requires-full-review"
-        ? `yui task review request ${task.id} --role <global-role>`
-        : `repair the finding and request a new Task-final Review`
     });
   }
 
@@ -278,36 +200,6 @@ export function projectCompletionReadiness(
     const disposition = workspaceCompletionDisposition(facts, task.id, workspace);
     if (disposition?.kind === "blocker") blockers.push(disposition.value);
     if (disposition?.kind === "advisory") advisories.push(disposition.value);
-  }
-
-  // Review finding ledger gate (enforce mode only).
-  // The transactional completion path runs this gate after final-review
-  // preparation: a pending/running Task-final Review is expected to resolve
-  // `fixed-pending-review` findings, so the gate only blocks when no Review
-  // is active.  Mirror that timing here so the projection never blocks a
-  // completion attempt that is about to request the resolving Review.
-  const activeTaskReview = facts.reviewRounds.some((round) => (
-    (round.scope ?? "work-item") === "task"
-    && (round.status === "pending" || round.status === "running")
-  ));
-  if (findingsGate && facts.reviewFindingLedgerMode === "enforce" && !activeTaskReview) {
-    if (reviewFindingLedgerWriteFailedFromEvents(facts.events)) {
-      blockers.push({
-        code: "finding-ledger-unavailable",
-        ref: ref("task", task.id),
-        reason: "The Review finding ledger was unavailable while reconciling a semantic Review.",
-        fix: "recover the ledger and reconcile the Round before completing the Task"
-      });
-    }
-    for (const finding of facts.reviewFindings) {
-      if (!isReviewFindingBlocking(finding)) continue;
-      blockers.push({
-        code: "open-review-finding",
-        ref: ref("review-finding", finding.id),
-        reason: `Open ${finding.severity.toUpperCase()} finding ${finding.id} is undispositioned.`,
-        fix: `yui task review finding dispose ${task.id}/${finding.id}`
-      });
-    }
   }
 
   const sorted = [...blockers].sort((left, right) => {

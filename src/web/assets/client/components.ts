@@ -288,23 +288,6 @@ export function candidateList(candidates, t, locale) {
   return block;
 }
 
-// --- Execution findings (checks / review findings) ---------------------------
-export function findingsBlock(label, findings, t) {
-  if (!findings || !findings.length) return null;
-  const block = node("div", "record-block");
-  block.append(node("small", "", label));
-  const list = node("div", "finding-list");
-  findings.forEach(function (finding) {
-    const row = node("div", "finding-row is-" + finding.severity);
-    row.append(chip(t("finding.severity." + finding.severity), "is-" + finding.severity));
-    row.append(node("span", "finding-summary", finding.summary));
-    row.append(chip(t("finding.status." + finding.status)));
-    list.append(row);
-  });
-  block.append(list);
-  return block;
-}
-
 // --- Progressive disclosure --------------------------------------------------
 // Re-render is cheap and happens whenever the underlying data changes, so all
 // disclosure state (collapsed blocks, visible pages) is deliberately
@@ -548,16 +531,10 @@ export function workItemCard(item, titles, t, locale, actions, taskId) {
     metrics.append(node("span", "", observability.cost.wallClockSeconds + "s"));
     metrics.append(node("span", "", t("detail.contextSnapshots") + " · "
       + observability.context.snapshotCount));
-    metrics.append(node("span", "", t("detail.evidence") + " · "
-      + (observability.evidenceCount == null
+    metrics.append(node("span", "", t("detail.results") + " · "
+      + (observability.resultCount == null
         ? t("detail.unobserved")
-        : observability.evidenceCount)));
-    if (observability.openFindingCount == null) {
-      metrics.append(node("span", "", t("detail.openFindings") + " · "
-        + t("detail.unobserved")));
-    } else if (observability.openFindingCount > 0) {
-      metrics.append(chip(t("detail.openFindings") + " · " + observability.openFindingCount, "is-danger"));
-    }
+        : observability.resultCount)));
     body.append(metrics);
   }
 
@@ -601,6 +578,9 @@ export function turnCard(turn, t, locale) {
   card.append(richText(t("detail.instruction"), visibleInput?.directive || visibleInput?.action || "-", t, { className: "execute-io", threshold: 320 }));
   if (turn.result?.output) {
     card.append(richText(t("detail.outcome"), turn.result.output, t, { className: "execute-io outcome", threshold: 320 }));
+  }
+  if (turn.result?.diagnostic) {
+    card.append(richText(t("detail.failure"), turn.result.diagnostic, t, { className: "execute-io outcome", threshold: 320 }));
   }
 
   const foot = node("div", "execute-foot");
@@ -651,8 +631,8 @@ export function reviewCard(round, t, locale) {
   if (round.workspace && round.workspace.root) {
     meta.append(pathMetaItem(t("detail.workspace"), round.workspace.root));
   }
-  if (round.evidenceCommit) {
-    meta.append(node("span", "", t("detail.evidence") + " · " + round.evidenceCommit));
+  if (round.reviewerTurnId) {
+    meta.append(node("span", "mono", t("detail.reviewerTurn") + " · " + round.reviewerTurnId));
   }
   if (round.workspaceDisposition) {
     meta.append(node("span", "", t("detail.workspaceDisposition") + " · "
@@ -682,15 +662,13 @@ export function reviewCard(round, t, locale) {
     execution.append(lanes);
     card.append(execution);
   }
-  if (round.checks && round.checks.length) {
-    card.append(richText(t("detail.checks"), round.checks.map(function (check) {
-      return check.name + "=" + check.outcome;
-    }).join(", "), t));
+  if (round.failure) {
+    card.append(richText(
+      t("detail.failure"),
+      round.failure.kind + ": " + round.failure.message,
+      t
+    ));
   }
-  const findings = findingsBlock(t("detail.findings"), round.findings, t);
-  if (findings) card.append(findings);
-  if (round.summary) card.append(richText(null, round.summary, t));
-  if (round.report) card.append(richText(t("detail.report"), round.report, t, { muted: true }));
   return card;
 }
 

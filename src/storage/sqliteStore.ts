@@ -66,11 +66,6 @@ import {
 import type { SessionOwnerIdentity } from "../runtime/sessionOwnerIdentity.js";
 import type { ReviewConfig } from "../review/reviewConfig.js";
 import { validateReviewRound, type ReviewRound } from "../review/reviewRound.js";
-import {
-  validateReviewFinding,
-  type ReviewFinding
-} from "../review/reviewFinding.js";
-import { reviewFindingLedgerMode } from "../review/reviewFindingLedger.js";
 import type { Project, ProjectReferenceSummary } from "../repository/project.js";
 import {
   generateHomeIdentity,
@@ -1089,9 +1084,7 @@ export class SqliteTaskStore implements TaskStore {
             [taskId]
           ).filter((run) => run.purpose === "review"),
           (run) => run.id
-        ),
-        reviewFindings: this.listReviewFindings(taskId),
-        events: events.filter((event) => event.type === "review.completed")
+        )
       }
     };
   }
@@ -1101,11 +1094,6 @@ export class SqliteTaskStore implements TaskStore {
     if (base === null) return null;
     return {
       ...base,
-      turns: operationalTaskRecords(
-        this.listTurns(taskId),
-        this.listEvents(taskId),
-        "turn"
-      ),
       managedWorkspaces: this.#sortById(
         this.#listPayload<ManagedWorkspace>("managed_workspaces", "task_id = ?", [taskId]),
         (workspace) => managedWorkspaceKey(workspace.owner)
@@ -1122,15 +1110,6 @@ export class SqliteTaskStore implements TaskStore {
         ),
         (entry) => entry.id
       ),
-      reviewFindings: this.#sortById(
-        this.#listPayload<ReviewFinding>("review_findings", "task_id = ?", [taskId]),
-        (finding) => finding.id
-      ),
-      reviewFindingLedgerMode: reviewFindingLedgerMode(this.getConfig()),
-      events: this.#sortById(
-        this.#listPayload<TaskEvent>("events", "task_id = ?", [taskId]),
-        (event) => event.id
-      )
     };
   }
 
@@ -2300,37 +2279,6 @@ export class SqliteTaskStore implements TaskStore {
     });
   }
 
-  // -- review findings --------------------------------------------------------
-
-  nextReviewFindingId(taskId: string): string { return this.#nextTaskRecordId(taskId, "reviewFinding"); }
-
-  getReviewFinding(taskId: string, findingId: string): ReviewFinding | null {
-    return this.#getPayload<ReviewFinding>("review_findings", "task_id = ? AND finding_id = ?", [taskId, findingId]);
-  }
-
-  listReviewFindings(taskId: string): ReviewFinding[] {
-    return this.#sortById(
-      this.#listPayload<ReviewFinding>("review_findings", "task_id = ?", [taskId]),
-      (finding) => finding.id
-    );
-  }
-
-  saveReviewFinding(taskId: string, finding: ReviewFinding): void {
-    validateReviewFinding(finding);
-    if (finding.taskId !== taskId) {
-      throw new StorageRecordError(`Review finding belongs to another Task: ${finding.taskId}`);
-    }
-    this.#requireTask(taskId);
-    this.#mutate(() => {
-      this.#db.prepare(
-        `INSERT INTO review_findings (task_id, finding_id, stable_key, severity, payload, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?)
-         ON CONFLICT(task_id, finding_id) DO UPDATE SET stable_key = excluded.stable_key,
-           severity = excluded.severity, payload = excluded.payload, updated_at = excluded.updated_at`
-      ).run(taskId, finding.id, finding.stableKey, finding.severity, this.#json(finding), this.#now());
-    });
-  }
-
   // -- active turns ----------------------------------------------------------
 
   #saveActiveTurn(taskId: string, pointer: string, turnId: string): void {
@@ -3092,10 +3040,9 @@ function validIntegrationQueueTransition(
     || before.createdAt !== after.createdAt
   ) return false;
   const allowed: Readonly<Record<IntegrationQueueStatus, readonly IntegrationQueueStatus[]>> = {
-    queued: ["queued", "running", "validated", "superseded"],
+    queued: ["queued", "running", "superseded"],
     running: ["running", "conflicted", "committed"],
     conflicted: ["conflicted", "running", "committed", "queued", "superseded"],
-    validated: ["validated", "running", "queued", "superseded"],
     committed: ["committed"],
     superseded: ["superseded"]
   };

@@ -10,11 +10,6 @@ import {
   type CompletionReadiness
 } from "../task/completionReadiness.js";
 import {
-  extractReviewFindings,
-  planRepairWave,
-  type RepairWave
-} from "../task/repairWave.js";
-import {
   projectTaskOrchestration,
   type OrchestrationAdvisory
 } from "../observability/orchestrationMetrics.js";
@@ -44,8 +39,7 @@ type NextActionExecutionView = Readonly<Pick<
  * Folds the existing durable records into exactly one protocol-level next
  * action with exact refs, preconditions, recommended command, alternatives, and
  * the judgment that remains owned by the Leader.
- * The command never mutates state; when the action is `route-review-findings`
- * it also prints the minimal repair wave for the failing Review.
+ * The command never mutates state and never interprets Agent result text.
  *
  * Issue 06: when the recommended action is `complete-task`, the output also
  * carries the full `completionReadiness` blocker list so the Leader sees every
@@ -79,7 +73,6 @@ export function runTaskNextActionCommand(
       executionGroups: execution.executionGroups
     };
     const action = projectNextAction(actionFacts);
-    const repairWave = repairWaveFor(action, actionFacts);
     // Issue 12: surface pending Knowledge promotion proposals for the Task's
     // bound Projects as a non-blocking advisory. The proposals are workflow
     // state, not completion blockers: an Operator reviews them separately.
@@ -130,18 +123,15 @@ export function runTaskNextActionCommand(
       workItems: reader.listWorkItems(taskId),
       changeSets: reader.listChangeSets(taskId),
       reviewRounds,
-      reviewFindings: reader.listReviewFindings(taskId),
       integrations: reader.listIntegrationAttempts(taskId),
       durableJobs: reader.listDurableJobs(taskId),
       publications: reader.listPublicationReferences(taskId),
-      decisions: reader.listDecisions(taskId),
       events,
       managedWorkspaces: reader.listManagedWorkspaces(taskId)
     });
     return {
       taskType: facts.task.type ?? null,
       action,
-      repairWave,
       completionReadiness,
       knowledgeProposals,
       reviewDecision,
@@ -162,7 +152,6 @@ export function runTaskNextActionCommand(
     output: renderNextAction(
       data.action,
       data.taskType,
-      data.repairWave,
       data.completionReadiness,
       data.knowledgeProposals,
       data.reviewDecision,
@@ -174,24 +163,9 @@ export function runTaskNextActionCommand(
   };
 }
 
-function repairWaveFor(
-  action: NextAction,
-  facts: NextActionFacts
-): RepairWave | null {
-  if (action.kind !== "route-review-findings") return null;
-  const reviewRef = action.refs.find((ref) => ref.kind === "review-round");
-  if (reviewRef === undefined) return null;
-  const round = facts.reviewRounds.find((candidate) => candidate.id === reviewRef.id);
-  if (round === undefined) return null;
-  const findings = extractReviewFindings(round);
-  if (findings.length === 0) return null;
-  return planRepairWave(round.id, findings);
-}
-
 function renderNextAction(
   action: NextAction,
   taskType: string | null,
-  repairWave: RepairWave | null,
   completionReadiness: CompletionReadiness | null,
   knowledgeProposals: readonly {
     projectId: string;
@@ -282,15 +256,6 @@ function renderNextAction(
           + ` — fix before archive: ${advisory.fix}`)
       );
     }
-  }
-  if (repairWave !== null) {
-    lines.push(
-      `Repair wave (${repairWave.openFindingCount} open finding(s), ${repairWave.groups.length} group(s)):`,
-      ...repairWave.groups.map((group) =>
-        `  ${group.id}: findings ${group.findingIds.join(", ")}`
-        + ` — paths ${group.paths.length === 0 ? "none" : group.paths.join(", ")}`
-        + ` — ${group.reason}`)
-    );
   }
   if (knowledgeProposals.length > 0) {
     lines.push(

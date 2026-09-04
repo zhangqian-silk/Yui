@@ -69,6 +69,10 @@ import { createExactControlPlaneDescriptor } from "../../dist/runtime/exactContr
 import { resolveManagedTaskCaller } from "../../dist/runtime/managedCaller.js";
 import { taskLeaderActionTurnId } from "../../dist/commands/taskActor.js";
 import { buildTurnContextPack } from "../../dist/context/turnContextPack.js";
+import {
+  buildTaskWakeEnvelope,
+  WAKE_ENVELOPE_HARD_BYTES
+} from "../../dist/context/wakeNotification.js";
 import { startStructuredProviderSession } from "../../dist/runtime/structuredProviderHost.js";
 import {
   acceptProviderTurn,
@@ -86,7 +90,12 @@ import { runRuntimeObservationHookCommand } from "../../dist/controller/runtimeO
 import { callFileTaskController } from "../../dist/controller/clientRuntime.js";
 import { startControllerServer } from "../../dist/core/controllerServer.js";
 import { terminalizeExactTaskTurn } from "../../dist/lifecycle/exactTurnTerminalization.js";
-import { completeTurn, createTurn, validateTurn } from "../../dist/turn/turn.js";
+import {
+  MAX_TURN_RESULT_OUTPUT_BYTES,
+  completeTurn,
+  createTurn,
+  validateTurn
+} from "../../dist/turn/turn.js";
 import { createTurnInput } from "../../dist/context/turnInputContract.js";
 import { processActiveRoleTurnDeliveries } from "../../dist/scheduler/activeRoleTurnDelivery.js";
 import { processOperatorInputNotifications } from "../../dist/scheduler/operatorInputNotificationProcessor.js";
@@ -96,7 +105,6 @@ import {
   processLeaderWakeups
 } from "../../dist/scheduler/leaderWakeupProcessor.js";
 import { buildTaskExecutionProjection } from "../../dist/scheduler/taskExecutionProjection.js";
-import { buildTaskObservabilityProjection } from "../../dist/scheduler/taskObservabilityProjection.js";
 import { projectWorkItemExecution } from "../../dist/execution/workItemExecutionProjection.js";
 import {
   createWorkItemExecutionAssignment,
@@ -107,11 +115,9 @@ import {
   attachReviewRoundWorkspace,
   createTaskReviewRound,
   finishReviewRound,
-  startReviewRound
+  startReviewRound,
+  validateReviewRound
 } from "../../dist/review/reviewRound.js";
-import {
-  createExecutionGroup as createLegacyExecutionGroup
-} from "../../dist/execution/legacyExecutionGroup.js";
 import { projectReviewerAvailability } from "../../dist/review/reviewerAvailability.js";
 import { projectNextAction } from "../../dist/task/nextAction.js";
 import { projectTaskRemoteDelivery } from "../../dist/task/remoteDelivery.js";
@@ -146,7 +152,8 @@ import {
   createCandidateGitSnapshot,
   createWorkItem,
   submitWorkItemCandidate,
-  updateWorkItemStatus
+  updateWorkItemStatus,
+  validateWorkItem
 } from "../../dist/workItem/workItem.js";
 import { createManagedWorkspace } from "../../dist/worktree/managedWorkspace.js";
 import { sanitizedTestEnv } from "../helpers/sanitizedEnv.mjs";
@@ -195,6 +202,8 @@ test("the packaged CLI starts and exposes the core workflow", () => {
   assert.equal(commands.includes("task rebuild"), false);
   assert.equal(commands.some((command) => command.startsWith("task history")), false);
   assert.equal(commands.includes("task review rebind"), false);
+  assert.equal(commands.includes("task review force-fresh"), false);
+  assert.equal(commands.includes("task review finding"), false);
   assert.equal(commands.includes("task role session switch"), false);
 });
 
@@ -326,7 +335,7 @@ test("publication evidence changes stay exact across upsert and remote delivery"
   assert.equal(unavailable.allMerged, false);
 });
 
-test("update quiesces the exact Controller before an adjacent storage migration", () => {
+test("update quiesces the exact Controller before replacing a current-contract binary", () => {
   const calls = [];
   const result = runUpdate({
     stage: () => {
@@ -335,7 +344,7 @@ test("update quiesces the exact Controller before an adjacent storage migration"
     },
     preflight: () => {
       calls.push("preflight");
-      return { status: "migration-ready", stepCount: 3 };
+      return { status: "already-current", stepCount: 0 };
     },
     beginControllerHandover: () => {
       calls.push("handover");
@@ -358,7 +367,6 @@ test("update quiesces the exact Controller before an adjacent storage migration"
       return { stopped: true, pid };
     },
     activateBinary: () => calls.push("activate"),
-    migrate: () => calls.push("migrate"),
     verify: () => calls.push("verify"),
     startController: () => calls.push("start"),
     restoreController: () => calls.push("restore"),
@@ -366,8 +374,7 @@ test("update quiesces the exact Controller before an adjacent storage migration"
   }, { home: "/tmp/yui-update-home" });
   assert.deepEqual(result, {
     outcome: "updated",
-    version: "0.15.0",
-    path: "migrated"
+    version: "0.15.0"
   });
   assert.deepEqual(calls, [
     "stage",
@@ -376,7 +383,6 @@ test("update quiesces the exact Controller before an adjacent storage migration"
     "status",
     "stop:42",
     "activate",
-    "migrate",
     "verify",
     "start",
     "release",
@@ -576,7 +582,7 @@ test("Managed Codex performs the App Server WebSocket handshake through its prox
   assert.equal(terminal.clientOwned, true);
   assert.equal(starts.length, 1);
   assert.equal(starts[0].clientOwned, true);
-  assert.equal(terminal.summary, "Native Codex result.");
+  assert.equal(terminal.output, "Native Codex result.");
 });
 
 test("Task execution can be fenced without changing semantic progress", () => {
@@ -766,7 +772,7 @@ test("native continuation results wake the supervisor only after the parent Turn
     continuationGeneration: 1
   };
   const observation = (kind, payload, minute) => createRuntimeObservation({
-    schemaVersion: 3,
+    schemaVersion: 4,
     eventId: `continuation-${kind}-${minute}`,
     semanticKey: `continuation-${kind}-${minute}`,
     kind,
@@ -898,7 +904,7 @@ test("Turns record provider-visible input without delivery handshake state", () 
   );
   const mailbox = createWorkMailbox({ kind: "role", taskId: "task-1", roleName: role.name });
 
-  assert.equal(run.schemaVersion, 4);
+  assert.equal(run.schemaVersion, 5);
   assert.deepEqual(run.inputs[0].input.source, { type: "yui", channel: "task-dispatch" });
   assert.equal(run.inputs[0].input.directive, "Read the durable Task context and continue.");
   for (const legacyField of ["pushedAt", "deliveredAt", "deliveryReceiptId", "controlRequest"]) {
@@ -918,6 +924,41 @@ test("Turns record provider-visible input without delivery handshake state", () 
   assert.throws(
     () => validateRoleSessionSet({ ...sessions, inFlight: null }),
     /unknown field: inFlight/u
+  );
+  const originalOutput = "not JSON: { pass? }\nNo required headings.";
+  const completed = completeTurn(run, originalOutput, new Date(now.getTime() + 1_000));
+  assert.equal(completed.result.output, originalOutput);
+  assert.throws(
+    () => validateTurn({
+      ...completed,
+      result: { ...completed.result, producer: { checks: [] } }
+    }),
+    /unknown field: producer/u
+  );
+  const item = createWorkItem("work-item-1", "task-1", { title: "Current contract" }, now);
+  assert.throws(
+    () => validateWorkItem({ ...item, legacyExecutionGroups: [] }),
+    /unknown field: legacyExecutionGroups/u
+  );
+  const round = createTaskReviewRound(
+    "review-round-1",
+    "task-1",
+    "reviewer",
+    "leader",
+    { schemaVersion: 1, projects: [{ projectId: "project-1", commit: "a".repeat(40) }] },
+    now
+  );
+  assert.throws(
+    () => validateReviewRound({ ...round, report: "parsed report" }),
+    /unknown field: report/u
+  );
+  assert.throws(
+    () => validateReviewRound({
+      ...round,
+      status: "completed",
+      endedAt: new Date(now.getTime() + 1_000).toISOString()
+    }),
+    /requires its exact main Reviewer Turn/u
   );
 });
 
@@ -1210,7 +1251,7 @@ test("a direct Provider Turn records visible input and output without workflow s
     nativeSessionId: "thread-1"
   };
   const observation = (kind, ordinal, extra = {}) => ({
-    schemaVersion: 3,
+    schemaVersion: 4,
     eventId: `direct-turn-${ordinal}`,
     semanticKey: `direct-turn-${kind}-${ordinal}`,
     kind,
@@ -1251,17 +1292,20 @@ test("a direct Provider Turn records visible input and output without workflow s
     attemptId: "direct:turn-ordinary-1",
     turnId: directTurn.id,
     input: "Please inspect the current code.",
-    summary: "Ordinary conversation reply.",
-    providerStatus: "completed"
+    providerStatus: "completed",
+    outcome: {
+      status: "completed",
+      output: "\nOrdinary conversation reply.\n"
+    }
   };
 
-  assert.equal(adapter.classifyRuntimeTurnCompleted(terminal), "apply");
-  const observed = adapter.observeRuntimeTurnCompleted(terminal, completedAt);
+  assert.equal(adapter.classifyRuntimeTurnTerminal(terminal), "apply");
+  const observed = adapter.observeRuntimeTurnTerminal(terminal, completedAt);
   assert.equal(observed.duplicate, false);
   assert.equal(observed.turn.inputs[0].input.source.type, "user");
   assert.equal(observed.turn.inputs[0].input.source.channel, "direct");
   assert.equal(observed.turn.inputs[0].input.directive, "Please inspect the current code.");
-  assert.equal(observed.turn.result.output, "Ordinary conversation reply.");
+  assert.equal(observed.turn.result.output, "\nOrdinary conversation reply.\n");
   assert.equal(store.listTurns(task.id).length, 1);
   assert.equal(store.getTask(task.id).status, "active");
   assert.equal(store.getTaskRoleSessionSet(task.id, role.name).providerBinding.turn.status, "completed");
@@ -1273,7 +1317,7 @@ test("a direct Provider Turn records visible input and output without workflow s
   }), continuationAt), "applied");
   const goalTurn = store.getActiveTurn(task.id, role.name);
   assert.notEqual(goalTurn, null);
-  const continued = adapter.observeRuntimeTurnCompleted({
+  const continued = adapter.observeRuntimeTurnTerminal({
     taskId: task.id,
     roleName: role.name,
     agentId: agent.agentId,
@@ -1283,8 +1327,11 @@ test("a direct Provider Turn records visible input and output without workflow s
     nativeTurnId: "turn-goal-2",
     attemptId: "direct:turn-goal-2",
     turnId: goalTurn.id,
-    summary: "Goal-directed continuation reply.",
-    providerStatus: "completed"
+    providerStatus: "completed",
+    outcome: {
+      status: "completed",
+      output: "Goal-directed continuation reply."
+    }
   }, continuationAt);
   assert.deepEqual(continued.turn.inputs[0].input.source, {
     type: "provider",
@@ -1294,15 +1341,120 @@ test("a direct Provider Turn records visible input and output without workflow s
   assert.equal(store.listTurns(task.id).length, 2);
   assert.equal(store.getPendingWakeup(task.id), null);
 
-  assert.equal(adapter.observeRuntimeObservation(observation("goal.updated", 7, {
+  assert.equal(adapter.observeRuntimeObservation(observation("turn.accepted", 7, {
+    fence: { nativeTurnId: "turn-missing-result-3", receiptId: "direct:turn-missing-result-3" }
+  }), new Date("2026-08-31T00:31:01.000Z")), "applied");
+  const missingResultTurn = store.getActiveTurn(task.id, role.name);
+  assert.notEqual(missingResultTurn, null);
+  const preciseDiagnostic = "Provider Agent result is 900000 bytes and exceeds the durable result limit.";
+  assert.equal(adapter.observeRuntimeObservation(observation("turn.completed", 8, {
+    fence: {
+      turnId: missingResultTurn.id,
+      nativeTurnId: "turn-missing-result-3",
+      receiptId: "direct:turn-missing-result-3"
+    },
+    payload: { resultTransportDiagnostic: preciseDiagnostic }
+  }), new Date("2026-08-31T00:31:02.000Z")), "applied");
+  const failedResultTurn = store.getTurn(task.id, missingResultTurn.id);
+  assert.equal(failedResultTurn.status, "failed");
+  assert.equal(failedResultTurn.result.output, undefined);
+  assert.equal(failedResultTurn.result.diagnostic, preciseDiagnostic);
+  assert.equal(failedResultTurn.result.failureReason, "missing-result");
+
+  assert.equal(adapter.observeRuntimeObservation(observation("goal.updated", 9, {
     payload: {
       goalStatus: "complete",
       goalObjective: "Continue until the delegated work is actually complete.",
-      goalUpdatedAt: "2026-08-31T00:31:01.000Z",
+      goalUpdatedAt: "2026-08-31T00:31:03.000Z",
       goalNativeTurnId: "turn-ordinary-1"
     }
-  }), new Date("2026-08-31T00:31:01.000Z")), "applied");
-  assert.deepEqual(store.getPendingWakeup(task.id).reasons, ["provider-goal-complete"]);
+  }), new Date("2026-08-31T00:31:03.000Z")), "applied");
+  assert.deepEqual(store.getPendingWakeup(task.id).reasons, [
+    "role-turn-result",
+    "provider-goal-complete"
+  ]);
+});
+
+test("a wake names a completed Turn even when that Turn predates the delta cursor", (t) => {
+  const home = mkdtempSync(join(tmpdir(), "yui-wake-result-turn-smoke-"));
+  t.after(() => rmSync(home, { recursive: true, force: true }));
+  ensureStorageSchema(home);
+  const store = new SqliteTaskStore(home);
+  t.after(() => store.close());
+  const createdAt = new Date("2026-09-04T01:00:00.000Z");
+  const cursor = "2026-09-04T01:05:00.000Z";
+  const eventAt = new Date("2026-09-04T01:06:00.000Z");
+  const task = activateTask(createTask("task-1", "Wake exact result Turn", createdAt), createdAt);
+  store.saveTask(task);
+  const binding = createRoleAgentBinding({ id: "codex", adapterId: "codex" });
+  const worker = createRole(
+    task.id,
+    "worker",
+    [binding],
+    binding.agentId,
+    home,
+    createdAt
+  );
+  store.saveRole(task.id, worker);
+  const turn = completeTurn(createTurn(
+    "turn-1",
+    task.id,
+    worker.name,
+    "new",
+    turnInput("turn-1", task.id, worker.name, "Produce the result."),
+    createdAt,
+    { effective: resolveEffectiveLaunch({ role: worker, purpose: "execution" }) }
+  ), "# Original result\n\nPreserve this text.", new Date("2026-09-04T01:01:00.000Z"));
+  store.saveTurn(turn);
+  store.saveEvent(task.id, createTaskEvent(
+    store.nextEventId(task.id),
+    task.id,
+    "turn.completed",
+    { turnId: turn.id, role: worker.name },
+    eventAt
+  ));
+
+  const envelope = buildTaskWakeEnvelope(store, {
+    taskId: task.id,
+    wakeId: "wake-1",
+    reasons: ["worker-completed"],
+    fromCursor: cursor,
+    now: eventAt
+  });
+  assert.deepEqual(envelope.referencedTurnIds, [turn.id]);
+  assert.match(envelope.text, /Changed: 1 events, 0 messages, 1 Turns/u);
+  assert.match(envelope.text, /yui task turn show task-1\/turn-1/u);
+
+  const wideTurns = Array.from({ length: 6 }, (_, index) => ({
+    ...turn,
+    id: `turn-${index + 2}`
+  }));
+  const wideEvents = wideTurns.map((candidate, index) => createTaskEvent(
+    `event-${index + 10}`,
+    task.id,
+    "turn.completed",
+    { turnId: candidate.id, role: worker.name },
+    new Date(eventAt.getTime() + index + 1)
+  ));
+  const wideEnvelope = buildTaskWakeEnvelope({
+    getTask: () => task,
+    listEvents: () => wideEvents,
+    listMessages: () => [],
+    listTurns: () => wideTurns,
+    listReviewRounds: () => []
+  }, {
+    taskId: task.id,
+    wakeId: "wake-wide",
+    reasons: Array.from(
+      { length: 6 },
+      (_, index) => `reason-${index + 1}-${"r".repeat(400)}`
+    ),
+    fromCursor: cursor,
+    now: eventAt
+  });
+  assert.equal(wideEnvelope.referencedTurnIds.length, 6);
+  assert.ok(wideEnvelope.totalBytes <= WAKE_ENVELOPE_HARD_BYTES);
+  assert.equal(Buffer.byteLength(wideEnvelope.text, "utf8"), wideEnvelope.totalBytes);
 });
 
 test("Leader wakeups aggregate for one minute and force-steer after ten", async (t) => {
@@ -1449,6 +1601,19 @@ test("Leader wakeups aggregate for one minute and force-steer after ten", async 
   assert.equal(results[0].reason, "state-changed");
   assert.equal(store.getWorkMailbox(leaderTarget).processing, null);
   assert.deepEqual(store.getPendingWakeup(task.id).reasons, ["event-arrived-during-steer"]);
+
+  const throwingAdapter = new FileSchedulerStoreAdapter(store);
+  throwingAdapter.getTaskWakeEnvelope = () => {
+    throw new Error("wake envelope read failed");
+  };
+  results = await processLeaderWakeups(
+    throwingAdapter,
+    delivery,
+    new Date(firstEventAt.getTime() + 22 * 60_000)
+  );
+  assert.equal(results[0].status, "failed");
+  assert.match(results[0].error, /wake envelope read failed/u);
+  assert.equal(store.getWorkMailbox(leaderTarget).processing, null);
 });
 
 test("an active Task without a durable event remains quiet", async (t) => {
@@ -1628,7 +1793,7 @@ test("active Role Turns deliver from durable state and Worker hints settle at ac
     },
     waitUntilReady: async () => {
       assert.equal(adapter.observeRuntimeObservation({
-        schemaVersion: 3,
+        schemaVersion: 4,
         eventId: "new-session-ready",
         semanticKey: "new-session-ready",
         kind: "session.ready",
@@ -1679,7 +1844,7 @@ test("active Role Turns deliver from durable state and Worker hints settle at ac
     outcome: {
       status: "failed",
       failureReason: "runtime-failed",
-      summary: "Worker delivery path verified."
+      diagnostic: "Worker delivery path verified."
     }
   }, new Date(nextAt.getTime() + 1_000)));
   assert.equal(workerTerminal.disposition, "applied");
@@ -1917,8 +2082,11 @@ test("the exact Provider Turn terminal atomically completes its Turn once", asyn
     nativeTurnId: "turn-1",
     attemptId: "run:task-1/turn-1",
     turnId: run.id,
-    summary: "Managed execution finished.",
-    providerStatus: "completed"
+    providerStatus: "completed",
+    outcome: {
+      status: "completed",
+      output: "Managed execution finished."
+    }
   };
   runTaskCommand(
     ["message", "send", task.id, "A newer fact arrived during the current Turn."],
@@ -1926,7 +2094,7 @@ test("the exact Provider Turn terminal atomically completes its Turn once", asyn
     { now: () => new Date("2026-08-31T01:00:30.000Z"), environment: bareEnv }
   );
 
-  assert.deepEqual(adapter.observeRuntimeTurnCompleted(terminal, completedAt), {
+  assert.deepEqual(adapter.observeRuntimeTurnTerminal(terminal, completedAt), {
     session: store.getTaskRoleSessionSet(task.id, role.name).sessions[agent.agentId],
     duplicate: false,
     turn: store.getTurn(task.id, run.id)
@@ -1945,7 +2113,7 @@ test("the exact Provider Turn terminal atomically completes its Turn once", asyn
   assert.equal(store.getActiveTurn(task.id, role.name), null);
   assert.equal(store.getTaskRoleSessionSet(task.id, role.name).sessions[agent.agentId].status, "active");
 
-  const replay = adapter.observeRuntimeTurnCompleted(terminal, completedAt);
+  const replay = adapter.observeRuntimeTurnTerminal(terminal, completedAt);
   assert.equal(replay.duplicate, true);
   assert.equal(replay.turn.id, run.id);
   assert.equal(store.listTurns(task.id).length, 1);
@@ -2095,19 +2263,13 @@ test("direct and replicated WorkItem execution converge through exact Lane retry
       roleName: turn.roleName,
       agentId: turn.effective.agentId,
       turnId: turn.id,
-      outcome: {
-        status,
-        summary: status === "completed" ? `${turn.roleName} completed.` : `${turn.roleName} failed.`,
-        ...(status === "failed" ? { failureReason: "runtime-failed" } : {})
-      },
-      ...(turn.executionLaneId === undefined || status === "failed"
-        ? {}
+      outcome: status === "completed"
+        ? { status, output: `${turn.roleName} completed.` }
         : {
-            reviewResult: {
-              summary: `${turn.roleName} result.`,
-              checks: [{ name: "core", outcome: "passed" }]
-            }
-          })
+            status,
+            diagnostic: `${turn.roleName} failed.`,
+            failureReason: "runtime-failed"
+          }
     }, now));
     assert.equal(result.disposition, "applied");
   };
@@ -2373,7 +2535,7 @@ test("direct and replicated Review keep Producer results non-authoritative", (t)
     turn,
     status,
     completedAt,
-    report,
+    output,
     producerLabel,
     includeGitSnapshot = true
   ) => {
@@ -2382,34 +2544,25 @@ test("direct and replicated Review keep Producer results non-authoritative", (t)
       roleName: turn.roleName,
       agentId: turn.effective.agentId,
       turnId: turn.id,
-      outcome: {
-        status,
-        summary: status === "completed"
-          ? `${turn.roleName} completed.`
-          : `${turn.roleName} failed.`,
-        ...(status === "failed" ? { failureReason: "runtime-failed" } : {})
-      },
-      ...(status === "failed"
-        ? {}
-        : {
-            reviewResult: {
-              summary: `${turn.roleName} completed.`,
-              report,
-              checks: [{ name: "core", outcome: "passed" }],
-              ...(turn.executionLaneId === undefined || !includeGitSnapshot
-                ? {}
-                : {
-                    gitSnapshot: {
-                      schemaVersion: 1,
-                      projects: [{
-                        projectId: project.id,
-                        headCommit: commit,
-                        branch: producerLabel
-                      }]
-                    }
-                  })
+      outcome: status === "failed"
+        ? { status, diagnostic: output, failureReason: "runtime-failed" }
+        : { status, output },
+      ...(status === "completed"
+        && turn.executionLaneId !== undefined
+        && includeGitSnapshot
+        ? {
+            systemEvidence: {
+              workspaceSnapshot: {
+                schemaVersion: 1,
+                projects: [{
+                  projectId: project.id,
+                  headCommit: commit,
+                  branch: producerLabel
+                }]
+              }
             }
-          })
+          }
+        : {})
     }, completedAt));
     assert.equal(result.disposition, "applied");
     return result.turn;
@@ -2447,15 +2600,47 @@ test("direct and replicated Review keep Producer results non-authoritative", (t)
   assert.equal(directTurn.executionGroupId, undefined);
   assert.equal(directTurn.executionLaneId, undefined);
   assert.equal(directTurn.sourceExecutionGroupId, undefined);
-  finish(
+  const directOutput = "# Direct review\n\nFree-form result; no JSON contract.";
+  const completedDirect = finish(
     directTurn,
     "completed",
     new Date("2026-09-02T00:12:00.000Z"),
-    JSON.stringify({ summary: "Direct Review complete.", findings: [] }),
+    directOutput,
     "direct"
   );
   assert.equal(store.getReviewRound(task.id, directRound.id).status, "completed");
-  assert.deepEqual(store.listReviewFindings(task.id), []);
+  assert.equal(completedDirect.result.output, directOutput);
+
+  runTaskCommand([
+    "review", "request", task.id,
+    "--role", "reviewer-direct"
+  ], store, {
+    now: () => new Date("2026-09-02T00:12:10.000Z"),
+    environment: bareEnv,
+    actualTaskReviewCandidate: candidate
+  });
+  const failedRound = attachWorkspace(
+    store.listReviewRounds(task.id).at(-1),
+    "review-direct-failed"
+  );
+  const failedTurn = dispatchPreparedReviewRound(task.id, failedRound.id, store, {
+    now: () => new Date("2026-09-02T00:12:20.000Z"),
+    environment: bareEnv,
+    actualTaskReviewCandidate: candidate
+  });
+  const failureOutput = "Provider Agent Turn failed: reviewer process exited with status 17";
+  const terminalFailure = finish(
+    failedTurn,
+    "failed",
+    new Date("2026-09-02T00:12:30.000Z"),
+    failureOutput,
+    "direct-failed"
+  );
+  assert.equal(terminalFailure.result.failureReason, "runtime-failed");
+  assert.equal(
+    store.getReviewRound(task.id, failedRound.id).failure.message,
+    failureOutput
+  );
 
   runTaskCommand([
     "review", "request", task.id,
@@ -2502,44 +2687,56 @@ test("direct and replicated Review keep Producer results non-authoritative", (t)
     assert.match(producer.inputs[0].input.directive, new RegExp(commit, "u"));
   }
 
-  const producerReport = (label) => JSON.stringify({
-    summary: `${label} producer report.`,
-    checks: [{ name: "core", outcome: "passed" }],
-    findings: [{
-      id: `${label}-only`,
-      severity: "critical",
-      status: "open",
-      invariant: "producer-must-not-authorize",
-      title: `${label} producer-only finding`,
-      paths: [`src/${label}.ts`],
-      evidence: [`${label} evidence`]
-    }]
-  });
+  const producerOutputs = [
+    "# Producer A\n\nA plain Markdown result without required headings.",
+    "{\"shape\":\"optional\"}\nThis trailing prose intentionally makes it invalid JSON."
+  ];
   const firstProducer = finish(
     producerTurns[0],
     "completed",
     new Date("2026-09-02T00:15:00.000Z"),
-    producerReport("producer-a"),
-    "producer-a",
-    false
+    producerOutputs[0],
+    "producer-a"
   );
   assert.equal(firstProducer.status, "completed");
-  assert.deepEqual(firstProducer.result.producer.codeRefs, []);
+  assert.equal(firstProducer.result.output, producerOutputs[0]);
+  assert.deepEqual(firstProducer.result.systemEvidence.workspaceSnapshot.projects, [{
+    projectId: project.id,
+    headCommit: commit,
+    branch: "producer-a"
+  }]);
   assert.equal(store.getReviewRound(task.id, replicatedRound.id).reviewerTurnId, undefined);
-  assert.deepEqual(store.listReviewFindings(task.id), []);
-  finish(
+  const secondProducer = finish(
     producerTurns[1],
     "completed",
     new Date("2026-09-02T00:16:00.000Z"),
-    producerReport("producer-b"),
+    producerOutputs[1],
     "producer-b"
   );
+  assert.equal(secondProducer.result.output, producerOutputs[1]);
   const initialMain = store.getActiveTurn(task.id, "reviewer-main");
   assert.ok(initialMain);
   assert.equal(initialMain.sourceExecutionGroupId, groupId);
   assert.equal(initialMain.executionGroupId, undefined);
   assert.equal(initialMain.executionLaneId, undefined);
-  assert.deepEqual(store.listReviewFindings(task.id), []);
+  const mainSnapshotRef = initialMain.inputs[0].input.contextSnapshotRef;
+  const mainSnapshot = store.getContextSnapshot(task.id, mainSnapshotRef.id);
+  const sourceTurns = mainSnapshot.resources
+    .filter(({ ref }) => ref.store === "source-turn")
+    .map(({ value }) => value);
+  assert.deepEqual(
+    sourceTurns.map(({ id }) => id),
+    producerTurns.map(({ id }) => id)
+  );
+  assert.deepEqual(
+    sourceTurns.map(({ result }) => result.output),
+    producerOutputs
+  );
+  for (const sourceTurn of sourceTurns) {
+    assert.equal(Object.hasOwn(sourceTurn, "inputs"), false);
+    assert.equal(Object.hasOwn(sourceTurn, "workspace"), false);
+    assert.equal(Object.hasOwn(sourceTurn, "effective"), false);
+  }
   assert.deepEqual(
     store.transaction((tx) => reconcileReviewMainTurns(
       tx,
@@ -2549,35 +2746,25 @@ test("direct and replicated Review keep Producer results non-authoritative", (t)
     []
   );
 
-  const authoritativeReport = JSON.stringify({
-    summary: "Main synthesis found one issue.",
-    checks: [{ name: "core", outcome: "passed" }],
-    findings: [{
-      id: "main-1",
-      severity: "high",
-      status: "open",
-      invariant: "main-review-authority",
-      title: "Only the main synthesis may create this finding",
-      paths: ["src/main.ts"],
-      evidence: ["Both Producer results were synthesized."]
-    }]
-  });
-  finish(
+  const authoritativeOutput = [
+    "# Main review",
+    "",
+    "I read both exact source results. This conclusion remains ordinary prose.",
+    "Severity words and JSON-like text have no Core meaning."
+  ].join("\n");
+  const completedMain = finish(
     initialMain,
     "completed",
     new Date("2026-09-02T00:17:00.000Z"),
-    authoritativeReport,
+    authoritativeOutput,
     "main"
   );
   const terminalRound = store.getReviewRound(task.id, replicatedRound.id);
   assert.equal(terminalRound.status, "completed");
   assert.equal(terminalRound.reviewerTurnId, initialMain.id);
-  assert.equal(terminalRound.report, authoritativeReport);
-  assert.equal(store.listReviewFindings(task.id).length, 1);
-  assert.equal(
-    store.listReviewFindings(task.id)[0].title,
-    "Only the main synthesis may create this finding"
-  );
+  assert.equal(completedMain.result.output, authoritativeOutput);
+  assert.equal(Object.hasOwn(terminalRound, "report"), false);
+  assert.equal(Object.hasOwn(terminalRound, "checks"), false);
   assert.deepEqual(store.listWorkItems(task.id), []);
   assert.deepEqual(store.listChangeSets(task.id), []);
   assert.deepEqual(store.listIntegrationAttempts(task.id), []);
@@ -2810,7 +2997,7 @@ test("Leader replicated Lanes derive from Task main without a WorkItem workspace
   );
 });
 
-test("producer evidence covers every writable Project and drives WorkItem observability", (t) => {
+test("Core freezes writable Lane state without parsing the Producer output", (t) => {
   const home = mkdtempSync(join(tmpdir(), "yui-producer-evidence-smoke-"));
   t.after(() => rmSync(home, { recursive: true, force: true }));
   ensureStorageSchema(home);
@@ -2889,6 +3076,22 @@ test("producer evidence covers every writable Project and drives WorkItem observ
       })),
       dependencyFacts: []
     });
+    if (groupId === "execution-group-1") {
+      assert.throws(() => createWorkItemExecutionGroup(
+        "execution-group-too-wide",
+        task.id,
+        assignment,
+        Array.from({ length: 9 }, (_, index) => ({
+          roleName: `producer-${index + 1}`,
+          effective: effective[0],
+          workspace: {
+            root: laneWorkspaces[0].root,
+            writableProjectIds: writeProjectIds
+          }
+        })),
+        now
+      ), /at most 8 Lanes/u);
+    }
     const group = createWorkItemExecutionGroup(groupId, task.id, assignment, roles.map((role, index) => ({
       roleName: role.name,
       effective: effective[index],
@@ -2924,14 +3127,15 @@ test("producer evidence covers every writable Project and drives WorkItem observ
     roleName: incomplete.turn.roleName,
     agentId: incomplete.turn.effective.agentId,
     turnId: incomplete.turn.id,
-    outcome: { status: "completed", summary: "Unscoped evidence only." },
-    reviewResult: {
-      checks: [{ name: "core", outcome: "passed" }],
-      evidenceCommit: commits[0]
+    outcome: {
+      status: "completed",
+      output: "# Result\n\nThe Agent claims everything passed."
     }
   }, new Date("2026-09-02T00:21:00.000Z")));
   assert.equal(rejected.turn.status, "failed");
-  assert.equal(rejected.turn.result.failureReason, "missing-result");
+  assert.equal(rejected.turn.result.failureReason, "workspace-unavailable");
+  assert.equal(rejected.turn.result.output, "# Result\n\nThe Agent claims everything passed.");
+  assert.match(rejected.turn.result.diagnostic, /could not freeze/u);
 
   const gitless = prepare("work-item-3", "execution-group-3", "turn-3", []);
   const rejectedGitless = store.transaction((tx) => terminalizeExactTaskTurn(tx, {
@@ -2939,10 +3143,17 @@ test("producer evidence covers every writable Project and drives WorkItem observ
     roleName: gitless.turn.roleName,
     agentId: gitless.turn.effective.agentId,
     turnId: gitless.turn.id,
-    outcome: { status: "completed", summary: "No validation evidence." }
+    outcome: {
+      status: "completed",
+      output: "Unstructured result for a Lane with no writable Projects."
+    }
   }, new Date("2026-09-02T00:21:30.000Z")));
-  assert.equal(rejectedGitless.turn.status, "failed");
-  assert.equal(rejectedGitless.turn.result.failureReason, "missing-result");
+  assert.equal(rejectedGitless.turn.status, "completed");
+  assert.equal(
+    rejectedGitless.turn.result.output,
+    "Unstructured result for a Lane with no writable Projects."
+  );
+  assert.equal(rejectedGitless.turn.result.systemEvidence, undefined);
 
   const complete = prepare("work-item-2", "execution-group-2", "turn-2");
   const accepted = store.transaction((tx) => terminalizeExactTaskTurn(tx, {
@@ -2950,17 +3161,12 @@ test("producer evidence covers every writable Project and drives WorkItem observ
     roleName: complete.turn.roleName,
     agentId: complete.turn.effective.agentId,
     turnId: complete.turn.id,
-    outcome: { status: "completed", summary: "All Projects frozen." },
-    reviewResult: {
-      checks: [{ name: "core", outcome: "passed" }],
-      evidence: ["artifact-1", "artifact-2"],
-      findings: [{
-        id: "finding-1",
-        severity: "high",
-        summary: "Needs follow-up.",
-        status: "open"
-      }],
-      gitSnapshot: {
+    outcome: {
+      status: "completed",
+      output: "{\"status\":\"pass\"}\nnot valid JSON after all"
+    },
+    systemEvidence: {
+      workspaceSnapshot: {
         schemaVersion: 1,
         projects: projectIds.map((projectId, index) => ({
           projectId,
@@ -2971,27 +3177,11 @@ test("producer evidence covers every writable Project and drives WorkItem observ
     }
   }, new Date("2026-09-02T00:22:00.000Z")));
   assert.equal(accepted.turn.status, "completed");
+  assert.equal(accepted.turn.result.output, "{\"status\":\"pass\"}\nnot valid JSON after all");
   assert.deepEqual(
-    accepted.turn.result.producer.codeRefs.map(({ projectId }) => projectId),
+    accepted.turn.result.systemEvidence.workspaceSnapshot.projects.map(({ projectId }) => projectId),
     projectIds
   );
-  const storedItem = store.getWorkItem(task.id, complete.item.id);
-  const projection = buildTaskObservabilityProjection({
-    workItems: [storedItem],
-    executionGroups: [],
-    turns: store.listTurns(task.id),
-    events: []
-  }).workItems[0];
-  assert.equal(projection.evidenceCount, 2);
-  assert.equal(projection.openFindingCount, 1);
-  const unobserved = buildTaskObservabilityProjection({
-    workItems: [storedItem],
-    executionGroups: [],
-    turns: [],
-    events: []
-  }).workItems[0];
-  assert.equal(unobserved.evidenceCount, null);
-  assert.equal(unobserved.openFindingCount, null);
 
   const snapshotPath = join(home, "actual-lane-project");
   mkdirSync(snapshotPath, { recursive: true });
@@ -3028,12 +3218,269 @@ test("producer evidence covers every writable Project and drives WorkItem observ
     }]
   }, now);
   store.saveManagedWorkspace(actualWorkspace);
-  assert.equal(
-    snapshotExecutionLaneWorkspaceSync(store, actualWorkspace).projects[0].headCommit,
-    headCommit
-  );
+  assert.deepEqual(snapshotExecutionLaneWorkspaceSync(store, actualWorkspace), {
+    status: "captured",
+    snapshot: {
+      schemaVersion: 1,
+      projects: [{
+        projectId: projectIds[0],
+        headCommit,
+        branch: "lane-main"
+      }]
+    }
+  });
   writeFileSync(join(snapshotPath, "dirty.txt"), "not committed\n");
-  assert.equal(snapshotExecutionLaneWorkspaceSync(store, actualWorkspace), undefined);
+  const dirtySnapshot = snapshotExecutionLaneWorkspaceSync(store, actualWorkspace);
+  assert.equal(dirtySnapshot.status, "failed");
+  assert.equal(dirtySnapshot.cause, "workspace-dirty");
+  rmSync(join(snapshotPath, "dirty.txt"));
+  execFileSync("git", ["checkout", "-b", "wrong-lane"], { cwd: snapshotPath });
+  const wrongBranchSnapshot = snapshotExecutionLaneWorkspaceSync(store, actualWorkspace);
+  assert.equal(wrongBranchSnapshot.status, "failed");
+  assert.equal(wrongBranchSnapshot.cause, "branch-mismatch");
+});
+
+test("runtime terminalization preserves Agent output across dirty and wrong-branch Lane failures", (t) => {
+  const home = mkdtempSync(join(tmpdir(), "yui-lane-result-preservation-"));
+  t.after(() => rmSync(home, { recursive: true, force: true }));
+  ensureStorageSchema(home);
+  const store = new SqliteTaskStore(home);
+  t.after(() => store.close());
+
+  const runCase = (ordinal, workspaceMutation, expectedReason) => {
+    const startedAt = new Date(`2026-09-04T02:0${ordinal}:00.000Z`);
+    const task = activateTask(createTask(
+      `task-${ordinal}`,
+      `Lane failure ${ordinal}`,
+      startedAt,
+      { cwd: home }
+    ), startedAt);
+    store.saveTask(task);
+    const agent = createRoleAgentBinding({ id: "codex", adapterId: "codex" });
+    const role = createRole(
+      task.id,
+      "producer",
+      [agent],
+      agent.agentId,
+      home,
+      startedAt
+    );
+    store.saveRole(task.id, role);
+    const secondaryRole = createRole(
+      task.id,
+      "producer-secondary",
+      [agent],
+      agent.agentId,
+      home,
+      startedAt
+    );
+    store.saveRole(task.id, secondaryRole);
+
+    const projectId = "project-1";
+    const workItemId = "work-item-1";
+    const groupId = "execution-group-1";
+    const laneId = `${groupId}-lane-1`;
+    const turnId = "turn-1";
+    const repositoryPath = join(home, `lane-repository-${ordinal}`);
+    mkdirSync(repositoryPath, { recursive: true });
+    execFileSync("git", ["init", "--initial-branch", laneId], { cwd: repositoryPath });
+    writeFileSync(join(repositoryPath, "result.txt"), "committed result\n");
+    execFileSync("git", ["add", "result.txt"], { cwd: repositoryPath });
+    execFileSync(
+      "git",
+      ["-c", "user.name=Yui Test", "-c", "user.email=yui@example.invalid", "commit", "-m", "result"],
+      { cwd: repositoryPath }
+    );
+    const headCommit = execFileSync("git", ["rev-parse", "HEAD"], {
+      cwd: repositoryPath,
+      encoding: "utf8"
+    }).trim();
+    workspaceMutation(repositoryPath);
+
+    const workspace = createManagedWorkspace({
+      owner: {
+        type: "execution-lane",
+        taskId: task.id,
+        executionGroupId: groupId,
+        executionLaneId: laneId,
+        purpose: "execution",
+        workItemId
+      },
+      root: join(home, `${task.id}-${laneId}`),
+      entries: [{
+        projectId,
+        directory: projectId,
+        access: "write",
+        path: repositoryPath,
+        branch: laneId,
+        baseRef: headCommit,
+        baseCommit: headCommit
+      }]
+    }, startedAt);
+    const effective = resolveEffectiveLaunch({
+      role,
+      purpose: "execution",
+      workspace,
+      workItemWriteProjectIds: [projectId]
+    });
+    const secondaryWorkspace = createManagedWorkspace({
+      owner: {
+        type: "execution-lane",
+        taskId: task.id,
+        executionGroupId: groupId,
+        executionLaneId: `${groupId}-lane-2`,
+        purpose: "execution",
+        workItemId
+      },
+      root: join(home, `${task.id}-${groupId}-lane-2`),
+      entries: [{
+        projectId,
+        directory: projectId,
+        access: "write",
+        path: repositoryPath,
+        branch: laneId,
+        baseRef: headCommit,
+        baseCommit: headCommit
+      }]
+    }, startedAt);
+    const secondaryEffective = resolveEffectiveLaunch({
+      role: secondaryRole,
+      purpose: "execution",
+      workspace: secondaryWorkspace,
+      workItemWriteProjectIds: [projectId]
+    });
+    let item = updateWorkItemStatus(createWorkItem(workItemId, task.id, {
+      title: "Preserve the exact result",
+      assignee: role.name,
+      writeProjectIds: [projectId]
+    }, startedAt), "running", startedAt);
+    const assignment = createWorkItemExecutionAssignment({
+      input: "Produce a result.",
+      objective: item.objective,
+      acceptance: item.acceptance,
+      contextSnapshotRef: {
+        schemaVersion: 1,
+        id: "context-snapshot-1",
+        taskId: task.id,
+        scope: "task",
+        sequence: 1,
+        digest: "a".repeat(64)
+      },
+      taskId: task.id,
+      workItemId,
+      workItemRevision: item.revision,
+      projects: [{ projectId, baseCommit: headCommit }],
+      dependencyFacts: []
+    });
+    item = attachWorkItemExecutionGroup(item, createWorkItemExecutionGroup(
+      groupId,
+      task.id,
+      assignment,
+      [{
+        roleName: role.name,
+        effective,
+        workspace: { root: workspace.root, writableProjectIds: [projectId] },
+        currentTurnId: turnId
+      }, {
+        roleName: secondaryRole.name,
+        effective: secondaryEffective,
+        workspace: {
+          root: secondaryWorkspace.root,
+          writableProjectIds: [projectId]
+        }
+      }],
+      startedAt
+    ), startedAt);
+    store.saveWorkItem(task.id, item);
+    store.saveManagedWorkspace(workspace);
+    const turn = createTurn(
+      turnId,
+      task.id,
+      role.name,
+      "new",
+      turnInput(turnId, task.id, role.name, "Produce a result."),
+      startedAt,
+      {
+        workItemId,
+        purpose: "execution",
+        executionGroupId: groupId,
+        executionLaneId: laneId,
+        workspace,
+        effective
+      }
+    );
+    store.saveActiveExecutionLaneTurn(turn);
+
+    const runtimeGenerationId = `activation-${ordinal}`;
+    const nativeSessionId = `session-${ordinal}`;
+    const nativeTurnId = `native-turn-${ordinal}`;
+    const attemptId = `run:${task.id}/${turn.id}`;
+    let sessions = recordRoleAgentSession(createRoleSessionSet(
+      { scope: "task", taskId: task.id, roleName: role.name },
+      agent.agentId,
+      startedAt
+    ), {
+      agentId: agent.agentId,
+      adapterId: agent.adapterId,
+      nativeSessionId,
+      runtimeGenerationId,
+      policy: "fixed",
+      status: "active",
+      effective
+    }, startedAt);
+    let provider = createProviderRuntimeBinding({
+      providerNamespace: "openai/codex",
+      accountScope: agent.agentId,
+      conversationId: nativeSessionId,
+      activationId: runtimeGenerationId,
+      startedAt: startedAt.toISOString()
+    });
+    provider = beginProviderTurn(provider, {
+      turnId,
+      attemptId,
+      authorityEpoch: provider.authority.epoch,
+      submittedAt: startedAt.toISOString()
+    });
+    provider = acceptProviderTurn(provider, {
+      attemptId,
+      nativeTurnId,
+      acceptedAt: new Date(startedAt.getTime() + 1_000).toISOString()
+    });
+    sessions = bindTaskRoleProviderRuntime(sessions, provider, startedAt);
+    store.saveTaskRoleSessionSet(sessions);
+
+    const originalOutput = `\n# Agent result ${ordinal}\n\nThis text must survive.\n`;
+    const observed = new FileSchedulerStoreAdapter(store).observeRuntimeTurnTerminal({
+      taskId: task.id,
+      roleName: role.name,
+      agentId: agent.agentId,
+      adapterId: agent.adapterId,
+      runtimeGenerationId,
+      nativeSessionId,
+      nativeTurnId,
+      attemptId,
+      turnId,
+      providerStatus: "completed",
+      outcome: { status: "completed", output: originalOutput }
+    }, new Date(startedAt.getTime() + 2_000));
+    assert.equal(observed.turn.status, "failed");
+    assert.equal(observed.turn.result.output, originalOutput);
+    assert.equal(observed.turn.result.failureReason, expectedReason);
+    assert.ok(observed.turn.result.diagnostic.length > 0);
+  };
+
+  runCase(
+    1,
+    (repositoryPath) => writeFileSync(join(repositoryPath, "dirty.txt"), "dirty\n"),
+    "workspace-dirty"
+  );
+  runCase(
+    2,
+    (repositoryPath) => execFileSync("git", ["checkout", "-b", "wrong-lane"], {
+      cwd: repositoryPath
+    }),
+    "workspace-branch-mismatch"
+  );
 });
 
 test("a packaged Controller restart inherits its direct parent's handover", (t) => {
@@ -3373,671 +3820,32 @@ test("Task Role Profiles preserve runtime and portable behavior across add and u
   );
 });
 
-test("a valid aggregate-21 Home upgrades through every adjacent record step", async (t) => {
-  const home = mkdtempSync(join(tmpdir(), "yui-aggregate-21-upgrade-smoke-"));
-  const upgradeEnvironment = { ...bareEnv, YUI_HOME: home };
-  t.after(() => {
-    try {
-      execFileSync(
-        process.execPath,
-        [join(root, "dist", "cli.js"), "controller", "stop"],
-        { cwd: root, encoding: "utf8", env: upgradeEnvironment }
-      );
-    } catch {
-      // The cleanup remains valid when the migration never started a Controller.
-    }
-    rmSync(home, { recursive: true, force: true });
-  });
-  ensureStorageSchema(home);
-  const now = new Date("2026-09-02T01:00:00.000Z");
-  const store = new SqliteTaskStore(home);
-  const baseCommit = "1".repeat(40);
-  store.saveProject(createProject(
-    "project-1",
-    "app",
-    home,
-    { stable: "master", development: "master" },
-    now
-  ));
-  const task = activateTask(bindTaskProjectCommits(
-    createTask("task-1", "Upgrade existing Home", now, {
-      cwd: home,
-      projectBindings: [{
-        projectId: "project-1",
-        directory: "app",
-        baseRef: "master"
-      }]
-    }),
-    [{ projectId: "project-1", commit: baseCommit }],
-    now
-  ), now);
-  store.saveTask(task);
-  const configuredAgent = createConfiguredAgent("codex", "codex", "codex", [], [], now);
-  store.saveConfiguredAgent(configuredAgent);
-  const sharedDirectory = join(home, "shared");
-  mkdirSync(sharedDirectory, { recursive: true });
-  const workerBinding = createRoleAgentBinding(configuredAgent, {
-    adapterId: "codex",
-    permission: {
-      strategy: "configured",
-      sandbox: "workspace-write",
-      approval: "on-request"
-    },
-    model: "legacy-model",
-    effort: "high",
-    search: true,
-    additionalDirectories: [sharedDirectory]
-  });
-  store.saveGlobalRole(createGlobalRole(
-    "worker",
-    [workerBinding],
-    workerBinding.agentId,
-    home,
-    now
-  ));
-  const legacyProfile = createAgentProfile({
-    id: "legacy-explicit-profile",
-    runtime: {
-      source: "explicit",
-      agentId: configuredAgent.id,
-      model: "legacy-model",
-      effort: "high"
-    }
-  }, now);
-  store.saveAgentProfile(legacyProfile);
-  store.saveManagedWorkspace(createManagedWorkspace({
-    owner: { type: "task", taskId: task.id },
-    root: home,
-    entries: [{
-      projectId: "project-1",
-      directory: "app",
-      access: "write",
-      path: join(home, "app"),
-      branch: "yui/task-1/main",
-      baseRef: "master",
-      baseCommit
-    }]
-  }, now));
-  let latestIntegrationCommit = baseCommit;
-  for (let index = 1; index <= 10; index += 1) {
-    const candidateCommit = index.toString(16).padStart(40, "0");
-    latestIntegrationCommit = candidateCommit;
-    const attempt = createIntegrationAttempt({
-      id: `integration-${index}`,
-      taskId: task.id,
-      projectId: "project-1",
-      targetRef: "yui/task-1/main",
-      source: {
-        kind: "upstream",
-        branch: "master",
-        remoteCommit: candidateCommit,
-        taskBaseCommit: baseCommit,
-        strategy: "rebase"
-      },
-      beforeCommit: index === 1
-        ? baseCommit
-        : (index - 1).toString(16).padStart(40, "0")
-    }, now);
-    store.saveIntegrationAttempt(task.id, updateIntegrationAttempt(attempt, {
-      candidateCommit,
-      afterCommit: candidateCommit,
-      summary: `Committed Integration ${index}.`,
-      status: "committed"
-    }, new Date(now.getTime() + index)));
-  }
-  const binding = createRoleAgentBinding({ id: "codex", adapterId: "codex" });
-  for (const roleName of ["leader", "producer", "reviewer", "legacy-runtime"]) {
-    store.saveRole(task.id, createRole(task.id, roleName, [binding], binding.agentId, home, now));
-  }
-  const legacyRuntimeGenerationId = "legacy-generation-1";
-  const taskSessionSet = recordRoleAgentSession(createRoleSessionSet(
-    { scope: "task", taskId: task.id, roleName: "legacy-runtime" },
-    binding.agentId,
-    now
-  ), {
-    agentId: binding.agentId,
-    adapterId: binding.adapterId,
-    nativeSessionId: "legacy-task-session",
-    runtimeGenerationId: legacyRuntimeGenerationId,
-    policy: "fixed",
-    status: "active",
-    effective: resolveEffectiveLaunch({
-      role: store.getRole(task.id, "legacy-runtime"),
-      purpose: "execution"
-    })
-  }, now);
-  store.saveTaskRoleSessionSet(taskSessionSet);
-  const globalWorker = store.getGlobalRole("worker");
-  const globalSessionSet = recordRoleAgentSession(createRoleSessionSet(
-    { scope: "global", roleName: globalWorker.name },
-    globalWorker.activeAgentId,
-    now
-  ), {
-    agentId: globalWorker.activeAgentId,
-    adapterId: globalWorker.agentBindings[globalWorker.activeAgentId].adapterId,
-    nativeSessionId: "legacy-global-session",
-    runtimeGenerationId: "legacy-global-generation",
-    policy: "fixed",
-    status: "active",
-    effective: resolveEffectiveLaunch({
-      role: globalWorker,
-      purpose: "execution"
-    })
-  }, now);
-  store.saveGlobalRoleSessionSet(globalSessionSet);
-  store.saveSessionOwner(createSessionOwnerIdentity({
-    owner: { scope: "task", taskId: task.id, roleName: "legacy-runtime" },
-    agentId: binding.agentId,
-    adapterId: binding.adapterId,
-    runtimeGenerationId: legacyRuntimeGenerationId,
-    nativeSessionId: "legacy-task-session",
-    tmux: {
-      serverName: "yui-test",
-      socketPath: join(home, "tmux.sock"),
-      sessionName: task.id,
-      windowName: "producer",
-      panePid: 4242
-    },
-    providerRoot: {
-      pid: 4243,
-      startIdentity: "12345",
-      attribution: "launch-env"
-    },
-    recordedAt: now
-  }));
-  const legacyObservation = createRuntimeObservation({
-    schemaVersion: 3,
-    eventId: "legacy-observation-1",
-    semanticKey: "legacy-observation-1",
-    kind: "host.observed",
-    authority: "host",
-    receivedAt: now.toISOString(),
-    fence: {
-      taskId: task.id,
-      roleName: "legacy-runtime",
-      agentId: binding.agentId,
-      driverId: "openai/codex",
-      runtimeGenerationId: legacyRuntimeGenerationId,
-      nativeSessionId: "legacy-task-session"
-    },
-    payload: { alive: true }
-  });
-  store.saveEvent(task.id, createTaskEvent(
-    store.nextEventId(task.id),
-    task.id,
-    "runtime.observation",
-    runtimeObservationTaskEventPayload(legacyObservation),
-    now
-  ));
-  const legacyProcessExitObservationId = "legacy-process-exit-1";
-  const legacyProcessExitObservation = {
-    schemaVersion: 2,
-    observationId: legacyProcessExitObservationId,
-    hostSequence: 1,
-    hostInstanceId: "legacy-host-1",
-    taskId: task.id,
-    roleName: "legacy-runtime",
-    runtimeGenerationId: legacyRuntimeGenerationId,
-    nativeSessionId: "legacy-task-session",
-    processKind: "provider-child",
-    exitCode: 0,
-    observedAt: now.toISOString()
-  };
-  store.saveEvent(task.id, createTaskEvent(
-    store.nextEventId(task.id),
-    task.id,
-    "runtime.process-exit-observed",
-    {
-      observationId: legacyProcessExitObservationId,
-      processKind: "provider-child",
-      roleName: "legacy-runtime",
-      runtimeGenerationId: legacyRuntimeGenerationId,
-      observedAt: now.toISOString(),
-      classification: "expected-per-turn-exit",
-      observation: JSON.stringify(legacyProcessExitObservation)
-    },
-    now
-  ));
-  const oldItem = createWorkItem("work-item-1", task.id, {
-    title: "Existing valid WorkItem",
-    assignee: "producer"
-  }, now);
-  store.saveWorkItem(task.id, oldItem);
-  const oldTurn = completeTurn(createTurn(
-    "turn-1",
-    task.id,
-    "leader",
-    "new",
-    turnInput("turn-1", task.id, "leader", "Existing valid Turn."),
-    now,
-    { effective: resolveEffectiveLaunch({ role: store.getRole(task.id, "leader"), purpose: "execution" }) }
-  ), "Existing result.", now);
-  store.saveTurn(oldTurn);
-  const legacyReviewCommit = "d".repeat(40);
-  const legacyCandidate = {
-    schemaVersion: 1,
-    projects: [{ projectId: "project-legacy", commit: legacyReviewCommit }]
-  };
-  const pendingLegacyRound = createTaskReviewRound(
-    "review-round-1",
-    task.id,
-    "reviewer",
-    "user",
-    legacyCandidate,
-    now
-  );
-  const legacyReviewRoot = join(home, "legacy-review");
-  const legacyReviewProject = join(legacyReviewRoot, "project-legacy");
-  mkdirSync(legacyReviewProject, { recursive: true });
-  const legacyReviewWorkspace = createManagedWorkspace({
-    owner: {
-      type: "review-round",
-      taskId: task.id,
-      reviewRoundId: pendingLegacyRound.id
-    },
-    root: legacyReviewRoot,
-    entries: [{
-      projectId: "project-legacy",
-      directory: "project-legacy",
-      access: "write",
-      path: legacyReviewProject,
-      branch: "legacy-review",
-      baseRef: legacyReviewCommit,
-      baseCommit: legacyReviewCommit
-    }]
-  }, now);
-  store.saveManagedWorkspace(legacyReviewWorkspace);
-  const readyLegacyRound = attachReviewRoundWorkspace(
-    pendingLegacyRound,
-    legacyReviewWorkspace
-  );
-  const legacyReviewTurn = createTurn(
-    "turn-2",
-    task.id,
-    "reviewer",
-    "new",
-    turnInput("turn-2", task.id, "reviewer", "Existing active legacy Review."),
-    now,
-    {
-      purpose: "review",
-      reviewRoundId: readyLegacyRound.id,
-      workspace: legacyReviewWorkspace,
-      effective: resolveEffectiveLaunch({
-        role: store.getRole(task.id, "reviewer"),
-        purpose: "review",
-        workspace: legacyReviewWorkspace,
-        reviewRoundId: readyLegacyRound.id,
-        reviewBaseCommit: legacyReviewCommit
-      })
-    }
-  );
-  store.saveReviewRound(
-    task.id,
-    startReviewRound(readyLegacyRound, legacyReviewTurn.id)
-  );
-  store.saveActiveTurn(legacyReviewTurn);
-  const historicalLegacyReport = JSON.stringify({
-    summary: "Historical Review result.",
-    findings: []
-  });
-  const historicalLegacyRound = finishReviewRound(createTaskReviewRound(
-    "review-round-2",
-    task.id,
-    "reviewer",
-    "user",
-    legacyCandidate,
-    now
-  ), "completed", "Historical Review result.", now, {
-    report: historicalLegacyReport,
-    checks: [{ name: "core", outcome: "passed" }]
-  });
-  store.saveReviewRound(task.id, historicalLegacyRound);
-  store.close();
-
-  const legacyTarget = {
-    schemaVersion: 1,
-    kind: "task-final-review",
-    taskId: task.id,
-    revision: 1,
-    projects: legacyCandidate.projects,
-    fingerprint: "legacy-task-review"
-  };
-  const activeLegacyGroup = createLegacyExecutionGroup(
-    "execution-group-review-round-1",
-    task.id,
-    {
-      purpose: "review",
-      target: legacyTarget,
-      strategy: { mode: "fixed", count: 2 },
-      lanes: [
-        { roleName: "reviewer", reviewRoundId: pendingLegacyRound.id },
-        { roleName: "producer", reviewRoundId: pendingLegacyRound.id }
-      ]
-    },
-    now
-  );
-  const historicalLegacyGroup = createLegacyExecutionGroup(
-    "execution-group-review-round-2",
-    task.id,
-    {
-      purpose: "review",
-      target: legacyTarget,
-      strategy: { mode: "fixed", count: 1 },
-      lanes: [{ roleName: "reviewer", reviewRoundId: historicalLegacyRound.id }]
-    },
-    now
-  );
-  const database = new Database(join(home, "yui.db"));
-  try {
-    for (const table of ["work_items", "turns", "task_records"]) {
-      const rows = database.prepare(`SELECT rowid, payload FROM ${table}`).all();
-      for (const row of rows) {
-        const payload = JSON.parse(row.payload);
-        payload.schemaVersion = table === "work_items"
-          ? 13
-          : table === "turns" ? 1 : 6;
-        database.prepare(`UPDATE ${table} SET payload = ? WHERE rowid = ?`)
-          .run(JSON.stringify(payload), row.rowid);
-      }
-    }
-    const reviewRows = database.prepare(
-      "SELECT rowid, review_round_id, payload FROM review_rounds"
-    ).all();
-    for (const row of reviewRows) {
-      const payload = JSON.parse(row.payload);
-      payload.schemaVersion = 6;
-      payload.executionGroup = row.review_round_id === pendingLegacyRound.id
-        ? activeLegacyGroup
-        : historicalLegacyGroup;
-      database.prepare("UPDATE review_rounds SET payload = ? WHERE rowid = ?")
-        .run(JSON.stringify(payload), row.rowid);
-    }
-    const profileRows = database.prepare("SELECT rowid, payload FROM agent_profiles").all();
-    for (const row of profileRows) {
-      const payload = JSON.parse(row.payload);
-      payload.schemaVersion = 2;
-      payload.model = payload.runtime.model;
-      payload.effort = payload.runtime.effort;
-      delete payload.runtime;
-      database.prepare("UPDATE agent_profiles SET payload = ? WHERE rowid = ?")
-        .run(JSON.stringify(payload), row.rowid);
-    }
-    const integrationRows = database.prepare(
-      "SELECT rowid, payload FROM integration_attempts"
-    ).all();
-    for (const row of integrationRows) {
-      const payload = JSON.parse(row.payload);
-      payload.schemaVersion = 5;
-      payload.expectedHead = payload.beforeCommit;
-      payload.changeSetIds = [payload.id.replace("integration-", "change-set-")];
-      delete payload.source;
-      delete payload.beforeCommit;
-      delete payload.afterCommit;
-      delete payload.summary;
-      database.prepare("UPDATE integration_attempts SET payload = ? WHERE rowid = ?")
-        .run(JSON.stringify(payload), row.rowid);
-    }
-    for (const table of ["global_role_session_sets", "role_session_sets"]) {
-      const rows = database.prepare(`SELECT rowid, payload FROM ${table}`).all();
-      for (const row of rows) {
-        const payload = JSON.parse(row.payload);
-        payload.schemaVersion = table === "global_role_session_sets" ? 4 : 11;
-        const sessions = [
-          ...Object.values(payload.sessions),
-          ...(Array.isArray(payload.history)
-            ? payload.history
-            : Object.values(payload.history ?? {}))
-        ];
-        for (const session of sessions) {
-          session.schemaVersion = 4;
-          if (session.runtimeGenerationId !== undefined) {
-            session.launchId = session.runtimeGenerationId;
-            delete session.runtimeGenerationId;
-          }
-        }
-        database.prepare(`UPDATE ${table} SET payload = ? WHERE rowid = ?`)
-          .run(JSON.stringify(payload), row.rowid);
-      }
-    }
-    const ownerRows = database.prepare(
-      "SELECT launch_id, payload FROM session_owners"
-    ).all();
-    for (const row of ownerRows) {
-      const payload = JSON.parse(row.payload);
-      payload.schemaVersion = 1;
-      payload.launchId = payload.runtimeGenerationId;
-      delete payload.runtimeGenerationId;
-      database.prepare("UPDATE session_owners SET payload = ? WHERE launch_id = ?")
-        .run(JSON.stringify(payload), row.launch_id);
-    }
-    const eventRows = database.prepare(
-      `SELECT rowid, type, payload FROM events
-       WHERE type IN ('runtime.observation', 'runtime.process-exit-observed')`
-    ).all();
-    for (const row of eventRows) {
-      const event = JSON.parse(row.payload);
-      const observation = JSON.parse(event.payload.observation);
-      if (row.type === "runtime.observation") {
-        observation.schemaVersion = 2;
-        observation.fence.launchId = observation.fence.runtimeGenerationId;
-        observation.fence.sessionGenerationId = observation.fence.runtimeGenerationId;
-        delete observation.fence.runtimeGenerationId;
-      } else {
-        observation.schemaVersion = 1;
-        observation.launchId = observation.runtimeGenerationId;
-        delete observation.runtimeGenerationId;
-      }
-      event.payload.launchId = event.payload.runtimeGenerationId;
-      delete event.payload.runtimeGenerationId;
-      event.payload.observation = JSON.stringify(observation);
-      database.prepare("UPDATE events SET payload = ? WHERE rowid = ?")
-        .run(JSON.stringify(event), row.rowid);
-    }
-  } finally {
-    database.close();
-  }
-  const manifestPath = join(home, "schema.json");
-  const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
-  manifest.aggregateSchemaVersion = 21;
-  manifest.recordVersions.workItem = 13;
-  manifest.recordVersions.turn = 1;
-  manifest.recordVersions.reviewRound = 6;
-  manifest.recordVersions.task = 6;
-  manifest.recordVersions.integrationAttempt = 5;
-  manifest.recordVersions.agentProfile = 2;
-  manifest.recordVersions.globalRoleSessionSet = 4;
-  manifest.recordVersions.taskRoleSessionSet = 11;
-  writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
-
-  const preflight = JSON.parse(execFileSync(
-    process.execPath,
-    [join(root, "dist", "cli.js"), "--json", "upgrade", "--dry-run"],
-    { cwd: root, encoding: "utf8", env: upgradeEnvironment }
-  ));
-  assert.equal(preflight.ok, true);
-  assert.equal(preflight.data.outcome, "upgrade-plan");
-  assert.equal(preflight.data.report.steps.length, 10);
-  const upgraded = await runStorageUpgrade({
-    home,
-    latest: latestStorageVersionState(),
-    mode: "execute"
-  });
-  assert.equal(upgraded.outcome, "upgraded");
-
-  const reopened = new SqliteTaskStore(home);
-  t.after(() => reopened.close());
-  assert.equal(reopened.getWorkItem(task.id, oldItem.id).schemaVersion, 14);
-  assert.equal(reopened.getTurn(task.id, oldTurn.id).schemaVersion, 4);
-  const migratedActiveRound = reopened.getReviewRound(task.id, pendingLegacyRound.id);
-  assert.equal(migratedActiveRound.schemaVersion, 7);
-  assert.equal(migratedActiveRound.status, "failed");
-  assert.equal(migratedActiveRound.executionGroup, undefined);
-  assert.deepEqual(migratedActiveRound.legacyExecutionGroup, activeLegacyGroup);
-  assert.match(migratedActiveRound.summary, /pre-v7 Review ExecutionGroup protocol was retired/u);
-  assert.equal(reopened.getTurn(task.id, legacyReviewTurn.id).status, "failed");
-  assert.equal(reopened.getActiveTurn(task.id, "reviewer"), null);
-  const migratedHistoricalRound = reopened.getReviewRound(task.id, historicalLegacyRound.id);
-  assert.equal(migratedHistoricalRound.status, "completed");
-  assert.equal(migratedHistoricalRound.report, historicalLegacyReport);
-  assert.deepEqual(migratedHistoricalRound.legacyExecutionGroup, historicalLegacyGroup);
-  const migrationAudit = reopened.listEvents(task.id)
-    .find(({ type }) => type === "review.legacy-execution-terminalized");
-  assert.ok(migrationAudit);
-  assert.equal(migrationAudit.payload.reviewRoundId, pendingLegacyRound.id);
-  assert.equal(migrationAudit.payload.executionGroupId, activeLegacyGroup.id);
-  assert.equal(migrationAudit.payload.terminalizedTurnIds, legacyReviewTurn.id);
-  assert.equal(reopened.getTask(task.id).schemaVersion, 7);
-  assert.equal(reopened.getTask(task.id).projectBindings[0].baseCommit, baseCommit);
-  assert.equal(
-    reopened.getTask(task.id).projectBindings[0].currentCommit,
-    latestIntegrationCommit
-  );
-  assert.deepEqual(reopened.getAgentProfile(legacyProfile.id).runtime, {
-    source: "explicit",
-    agentId: configuredAgent.id,
-    model: "legacy-model",
-    effort: "high"
-  });
-  const migratedTaskSessions = reopened.getTaskRoleSessionSet(task.id, "legacy-runtime");
-  assert.equal(migratedTaskSessions.schemaVersion, 12);
-  assert.equal(migratedTaskSessions.sessions[binding.agentId].schemaVersion, 5);
-  assert.equal(
-    migratedTaskSessions.sessions[binding.agentId].runtimeGenerationId,
-    legacyRuntimeGenerationId
-  );
-  assert.equal(
-    Object.hasOwn(migratedTaskSessions.sessions[binding.agentId], "launchId"),
-    false
-  );
-  const migratedGlobalSessions = reopened.getGlobalRoleSessionSet("worker");
-  assert.equal(migratedGlobalSessions.schemaVersion, 5);
-  assert.equal(
-    migratedGlobalSessions.sessions[globalWorker.activeAgentId].runtimeGenerationId,
-    "legacy-global-generation"
-  );
-  const migratedOwner = reopened.getSessionOwner(legacyRuntimeGenerationId);
-  assert.equal(migratedOwner.schemaVersion, 2);
-  assert.equal(migratedOwner.runtimeGenerationId, legacyRuntimeGenerationId);
-  assert.equal(Object.hasOwn(migratedOwner, "launchId"), false);
-  const migratedObservationEvent = reopened.listEvents(task.id)
-    .find(({ payload }) => payload.semanticKey === legacyObservation.semanticKey);
-  const migratedObservation = JSON.parse(migratedObservationEvent.payload.observation);
-  assert.equal(migratedObservation.schemaVersion, 3);
-  assert.equal(
-    migratedObservation.fence.runtimeGenerationId,
-    legacyRuntimeGenerationId
-  );
-  assert.equal(Object.hasOwn(migratedObservation.fence, "launchId"), false);
-  assert.equal(Object.hasOwn(migratedObservation.fence, "sessionGenerationId"), false);
-  const migratedProcessExitEvent = reopened.listEvents(task.id)
-    .find(({ payload }) => payload.observationId === legacyProcessExitObservationId);
-  const migratedProcessExit = JSON.parse(migratedProcessExitEvent.payload.observation);
-  assert.equal(migratedProcessExit.schemaVersion, 2);
-  assert.equal(
-    migratedProcessExit.runtimeGenerationId,
-    legacyRuntimeGenerationId
-  );
-  assert.equal(Object.hasOwn(migratedProcessExit, "launchId"), false);
-  runTaskCommand(
-    ["role", "add", task.id, "migrated-profile-role", "--profile", legacyProfile.id],
-    reopened,
-    { now: () => new Date("2026-09-02T01:00:30.000Z"), environment: bareEnv }
-  );
-  assert.deepEqual(
-    reopened.getRole(task.id, "migrated-profile-role").agentBindings[configuredAgent.id].config,
-    workerBinding.config
-  );
-  const newItem = createWorkItem("work-item-2", task.id, {
-    title: "New work after upgrade",
-    assignee: "producer",
-    writeProjectIds: ["project-1"]
-  }, new Date("2026-09-02T01:01:00.000Z"));
-  reopened.saveWorkItem(task.id, newItem);
-  reopened.saveManagedWorkspace(createManagedWorkspace({
-    owner: { type: "work-item", taskId: task.id, workItemId: newItem.id },
-    root: join(home, newItem.id),
-    entries: [{
-      projectId: "project-1",
-      directory: "app",
-      access: "write",
-      path: join(home, newItem.id, "app"),
-      branch: "yui/task-1/work-item-2",
-      baseRef: "master",
-      baseCommit: latestIntegrationCommit
-    }]
-  }, new Date("2026-09-02T01:01:30.000Z")));
-  runTaskCommand(
-    ["work", "dispatch", `${task.id}/${newItem.id}`],
-    reopened,
-    { now: () => new Date("2026-09-02T01:02:00.000Z"), environment: bareEnv }
-  );
-  assert.equal(reopened.getActiveTurn(task.id, "producer").workItemId, newItem.id);
-});
-
-test("aggregate-24 Profile hints migrate through the sole configured Agent without Worker", (t) => {
-  const home = mkdtempSync(join(tmpdir(), "yui-aggregate-24-profile-upgrade-smoke-"));
-  const upgradeEnvironment = { ...bareEnv, YUI_HOME: home };
+test("historical aggregate Homes are blocked without mutation", async (t) => {
+  const home = mkdtempSync(join(tmpdir(), "yui-unsupported-aggregate-smoke-"));
   t.after(() => rmSync(home, { recursive: true, force: true }));
   ensureStorageSchema(home);
-  const now = new Date("2026-09-03T08:15:00.000Z");
-  const store = new SqliteTaskStore(home);
-  const configuredAgent = createConfiguredAgent("codex", "codex", "codex", [], [], now);
-  store.saveConfiguredAgent(configuredAgent);
-  const legacyProfile = createAgentProfile({
-    id: "workerless-legacy-profile",
-    runtime: {
-      source: "explicit",
-      agentId: configuredAgent.id,
-      model: "legacy-model",
-      effort: "high"
-    }
-  }, now);
-  store.saveAgentProfile(legacyProfile);
-  store.close();
-
-  const database = new Database(join(home, "yui.db"));
-  try {
-    const row = database.prepare(
-      "SELECT payload FROM agent_profiles WHERE id = ?"
-    ).get(legacyProfile.id);
-    const payload = JSON.parse(row.payload);
-    payload.schemaVersion = 2;
-    payload.model = payload.runtime.model;
-    payload.effort = payload.runtime.effort;
-    delete payload.runtime;
-    database.prepare("UPDATE agent_profiles SET payload = ? WHERE id = ?")
-      .run(JSON.stringify(payload), legacyProfile.id);
-  } finally {
-    database.close();
-  }
+  new SqliteTaskStore(home).close();
   const manifestPath = join(home, "schema.json");
   const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
-  manifest.aggregateSchemaVersion = 24;
-  manifest.recordVersions.turn = 3;
-  manifest.recordVersions.reviewRound = 6;
-  manifest.recordVersions.task = 6;
-  manifest.recordVersions.integrationAttempt = 5;
-  manifest.recordVersions.agentProfile = 2;
-  manifest.recordVersions.globalRoleSessionSet = 4;
-  manifest.recordVersions.taskRoleSessionSet = 11;
+  manifest.aggregateSchemaVersion = 30;
   writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
+  const beforeManifest = readFileSync(manifestPath, "utf8");
+  const beforeDatabase = readFileSync(join(home, "yui.db"));
 
-  const upgraded = JSON.parse(execFileSync(
-    process.execPath,
-    [join(root, "dist", "cli.js"), "--json", "upgrade"],
-    { cwd: root, encoding: "utf8", env: upgradeEnvironment }
-  ));
-  assert.equal(upgraded.ok, true);
-  assert.equal(upgraded.data.outcome, "upgraded");
-  const reopened = new SqliteTaskStore(home);
-  t.after(() => reopened.close());
-  assert.equal(reopened.getGlobalRole("worker"), null);
-  assert.deepEqual(reopened.getAgentProfile(legacyProfile.id).runtime, {
-    source: "explicit",
-    agentId: configuredAgent.id,
-    model: "legacy-model",
-    effort: "high"
-  });
+  for (const mode of ["dry-run", "execute", "update-preflight"]) {
+    const result = await runStorageUpgrade({
+      home,
+      latest: latestStorageVersionState(),
+      mode
+    });
+    assert.equal(result.outcome, "blocked");
+    assert.equal(result.stage, "unsupported");
+    assert.equal(result.sceneUnchanged, true);
+    assert.equal(result.classification.classification.verdict, "NEEDS_NEW_VERSION");
+    assert.equal(result.classification.aggregateVersion, 30);
+    assert.equal(readFileSync(manifestPath, "utf8"), beforeManifest);
+    assert.deepEqual(readFileSync(join(home, "yui.db")), beforeDatabase);
+  }
 });
 
 test("an existing SQLite Home with missing singleton rows fails closed", (t) => {
@@ -4111,6 +3919,34 @@ test("the built-in Agent Drivers are available through the shared registry", () 
     });
     const observations = Array.isArray(mapped) ? mapped : [mapped];
     assert.deepEqual(observations.map(({ kind }) => kind), ["activation.ended"]);
+
+    const completed = drivers.requireByAdapterId(adapterId).runtime.mapHook({
+      hookEventName: "Stop",
+      payload: { summary: "Not the final Agent result." },
+      occurrenceId: "hook-2"
+    });
+    const terminal = (Array.isArray(completed) ? completed : [completed])
+      .find(({ kind }) => kind === "turn.completed");
+    assert.equal(terminal.payload.output, undefined);
+    assert.equal(
+      terminal.payload.resultTransportDiagnostic,
+      "Provider terminal event did not include an Agent result."
+    );
+
+    const boundary = "x".repeat(MAX_TURN_RESULT_OUTPUT_BYTES);
+    const oversized = drivers.requireByAdapterId(adapterId).runtime.mapHook({
+      hookEventName: "Stop",
+      payload: { last_assistant_message: `${boundary}x` },
+      occurrenceId: "hook-3"
+    });
+    const oversizedTerminal = (Array.isArray(oversized) ? oversized : [oversized])
+      .find(({ kind }) => kind === "turn.completed");
+    assert.equal(oversizedTerminal.payload.output, undefined);
+    assert.match(oversizedTerminal.payload.resultTransportDiagnostic, /524289 bytes/u);
+    assert.match(
+      oversizedTerminal.payload.resultTransportDiagnostic,
+      /524288-byte durable result limit/u
+    );
   }
 });
 
@@ -4230,18 +4066,18 @@ test("Operator batches durable refs and defers the whole batch while busy", asyn
   assert.notEqual(mailbox.pending, null);
 });
 
-test("the async runtime observer preserves completion classification", async () => {
+test("the async runtime observer preserves terminal classification", async () => {
   const calls = [];
   const observer = createAsyncRuntimeObserver(async (method) => {
     calls.push(method);
-    return method === "classifyGlobalRuntimeTurnCompleted" ? "apply" : "deferred";
+    return method === "classifyGlobalRuntimeTurnTerminal" ? "apply" : "deferred";
   });
 
-  assert.equal(await observer.classifyRuntimeTurnCompleted({}), "deferred");
-  assert.equal(await observer.classifyGlobalRuntimeTurnCompleted({}), "apply");
+  assert.equal(await observer.classifyRuntimeTurnTerminal({}), "deferred");
+  assert.equal(await observer.classifyGlobalRuntimeTurnTerminal({}), "apply");
   assert.deepEqual(calls, [
-    "classifyRuntimeTurnCompleted",
-    "classifyGlobalRuntimeTurnCompleted"
+    "classifyRuntimeTurnTerminal",
+    "classifyGlobalRuntimeTurnTerminal"
   ]);
 });
 
@@ -4252,7 +4088,7 @@ test("Claude global Stop hooks publish the native completion boundary", async (t
   await runRuntimeObservationHookCommand(JSON.stringify({
     hook_event_name: "Stop",
     session_id: "claude-session-1",
-    last_assistant_message: "Done."
+    last_assistant_message: "\nDone.\n"
   }), {
     YUI_SESSION_SCOPE: "global",
     YUI_HOME: home,
@@ -4268,11 +4104,88 @@ test("Claude global Stop hooks publish the native completion boundary", async (t
   }, new Date("2026-08-28T00:00:00.000Z"), { sequence: () => 1 });
 
   const [event] = new FileRuntimeEventInbox(home).list();
-  assert.equal(event.type, "native-turn-completed");
+  assert.equal(event.type, "native-turn-terminal");
   assert.equal(event.scope, "global");
   assert.equal(event.adapterId, "claude");
-  assert.equal(event.summary, "Done.");
+  assert.deepEqual(event.outcome, { status: "completed", output: "\nDone.\n" });
   assert.deepEqual(signal, { key: "global-role:operator" });
+});
+
+test("native terminal ingress preserves valid output and durably fails missing or oversized output", (t) => {
+  const home = mkdtempSync(join(tmpdir(), "yui-native-terminal-output-"));
+  t.after(() => rmSync(home, { recursive: true, force: true }));
+  const inbox = new FileRuntimeEventInbox(home);
+  const base = {
+    scope: "task",
+    taskId: "task-1",
+    roleName: "worker",
+    agentId: "codex",
+    adapterId: "codex",
+    runtimeGenerationId: "generation-1",
+    nativeSessionId: "session-1",
+    providerStatus: "completed"
+  };
+  const boundary = "x".repeat(MAX_TURN_RESULT_OUTPUT_BYTES);
+  const accepted = inbox.enqueueTurnTerminal({
+    ...base,
+    nativeTurnId: "native-turn-1",
+    turnId: "turn-1",
+    outcome: { status: "completed", output: boundary }
+  }).event;
+  assert.equal(accepted.outcome.status, "completed");
+  assert.equal(accepted.outcome.output, boundary);
+
+  const oversized = inbox.enqueueTurnTerminal({
+    ...base,
+    nativeTurnId: "native-turn-2",
+    turnId: "turn-2",
+    outcome: {
+      status: "completed",
+      output: `${boundary}x`
+    }
+  }).event;
+  assert.equal(oversized.outcome.status, "failed");
+  assert.equal(oversized.outcome.failureReason, "missing-result");
+  assert.equal(oversized.outcome.output, undefined);
+  assert.match(oversized.outcome.diagnostic, /524289 bytes/u);
+  assert.match(oversized.outcome.diagnostic, /524288-byte durable result limit/u);
+
+  const missing = inbox.enqueueTurnTerminal({
+    ...base,
+    nativeTurnId: "native-turn-3",
+    turnId: "turn-3",
+    outcome: { status: "completed", output: null }
+  }).event;
+  assert.deepEqual(missing.outcome, {
+    status: "failed",
+    diagnostic: "Provider terminal event did not include an Agent result.",
+    failureReason: "missing-result"
+  });
+
+  const longDiagnostic = `failed:${"🔥".repeat(20_000)}`;
+  const failed = inbox.enqueueTurnTerminal({
+    ...base,
+    nativeTurnId: "native-turn-4",
+    turnId: "turn-4",
+    providerStatus: "failed",
+    outcome: {
+      status: "failed",
+      diagnostic: longDiagnostic,
+      failureReason: "runtime-failed"
+    }
+  }).event;
+  assert.equal(failed.outcome.status, "failed");
+  assert.ok(Buffer.byteLength(failed.outcome.diagnostic, "utf8") <= 16 * 1024);
+  assert.ok(longDiagnostic.startsWith(failed.outcome.diagnostic));
+
+  assert.throws(() => inbox.enqueueTurnTerminal({
+    ...base,
+    nativeTurnId: "native-turn-5",
+    turnId: "turn-5",
+    providerStatus: "failed",
+    outcome: { status: "completed", output: "Contradictory success." }
+  }), /Only a completed Provider Turn/u);
+  assert.equal(inbox.list().length, 4);
 });
 
 test("managed Session authority follows durable state, not a frozen environment", (t) => {

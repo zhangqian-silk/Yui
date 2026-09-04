@@ -17,11 +17,6 @@ import {
 import { createProject } from "../../dist/repository/project.js";
 import { TaskWorkspaceCoordinator } from "../../dist/repository/taskWorkspaceCoordinator.js";
 import { FileTaskWorkspacePreparer } from "../../dist/repository/taskWorkspacePreparer.js";
-import {
-  createTaskReviewRound,
-  finishReviewRound
-} from "../../dist/review/reviewRound.js";
-import { createTaskFinalReviewContract } from "../../dist/review/taskFinalReviewContract.js";
 import { latestStorageVersionState } from "../../dist/storage/upgrade/recordVersions.js";
 import { inspectStorageSchema } from "../../dist/storage/storageSchema.js";
 import { SqliteTaskStore } from "../../dist/storage/sqliteStore.js";
@@ -349,54 +344,6 @@ test("upstream rebase uses the unified Integration lifecycle without ChangeSets"
     "removed"
   );
   assert.equal(existsSync(integrationEntry.path), false);
-});
-
-test("a completed Review remains usable information after the Task head changes", () => {
-  const oldCommit = "a".repeat(40);
-  const currentCommit = "b".repeat(40);
-  const task = activateTask(createTask("task-1", "Review information", now, {
-    projectBindings: [{ projectId: "project-1", directory: "app", baseRef: "master" }]
-  }), now);
-  const contract = createTaskFinalReviewContract({
-    taskId: task.id,
-    reviewerRoleName: "reviewer",
-    controlPlaneDigest: "c".repeat(64)
-  });
-  const round = finishReviewRound(createTaskReviewRound(
-    "review-round-1",
-    task.id,
-    "reviewer",
-    "leader",
-    {
-      schemaVersion: 1,
-      projects: [{ projectId: "project-1", commit: oldCommit }]
-    },
-    now,
-    contract
-  ), "completed", "Reviewed the earlier head.", now, {
-    checks: [{ name: "review", outcome: "passed" }],
-    evidenceCommit: oldCommit
-  });
-
-  const action = projectNextAction({
-    task,
-    workItems: [],
-    changeSets: [],
-    integrations: [],
-    integrationQueueEntries: [],
-    reviewRounds: [round],
-    reviewConfig: { roleName: "reviewer", trigger: "final" },
-    openInputRequests: [],
-    activeTurns: [],
-    leaderTurns: [],
-    currentTaskReviewCandidate: {
-      schemaVersion: 1,
-      projects: [{ projectId: "project-1", commit: currentCommit }]
-    }
-  });
-
-  assert.equal(action.kind, "complete-task");
-  assert.doesNotMatch(action.reason, /no valid Task-final Review/iu);
 });
 
 test("project reset refuses divergence without --discard-local and lists the local commits", async (t) => {

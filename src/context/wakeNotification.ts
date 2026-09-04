@@ -43,6 +43,8 @@ export type WakeEnvelope = Readonly<{
   taskId: string;
   wakeId: string;
   fromCursor: string;
+  /** Existing Turns named by terminal events in the wake delta, in event order. */
+  referencedTurnIds: readonly string[];
   totalBytes: number;
   text: string;
 }>;
@@ -68,19 +70,26 @@ export function buildTaskWakeEnvelope(
 
   const fromTime = Date.parse(request.fromCursor);
   const events = reader.listEvents(request.taskId);
+  const deltaEvents = events.filter((record) => Date.parse(record.createdAt) > fromTime);
+  const turns = operationalTaskRecords(reader.listTurns(request.taskId), events, "turn");
+  const referencedTurnIds = referencedWakeTurnIds(turns, events, deltaEvents);
+  const changedTurnIds = new Set([
+    ...turns
+      .filter((record) => Date.parse(record.createdAt) > fromTime)
+      .map(({ id }) => id),
+    ...referencedTurnIds
+  ]);
   const counts = {
-    events: events
-      .filter((record) => Date.parse(record.createdAt) > fromTime).length,
+    events: deltaEvents.length,
     messages: operationalTaskRecords(reader.listMessages(request.taskId), events, "message")
       .filter((record) => Date.parse(record.createdAt) > fromTime).length,
-    turns: operationalTaskRecords(reader.listTurns(request.taskId), events, "turn")
-      .filter((record) => Date.parse(record.createdAt) > fromTime).length
+    turns: changedTurnIds.size
   };
   const activeReviews = reader.listReviewRounds(request.taskId).filter((round) => (
     (round.scope ?? "work-item") === "task"
     && (round.status === "pending" || round.status === "running")
   ));
-  const reviewOrientation = activeReviews.slice(0, 3).map((round) => {
+  const renderReviewOrientation = (limit: number) => activeReviews.slice(0, limit).map((round) => {
     const projects = round.taskCandidate?.projects ?? [];
     const heads = projects.slice(0, 2).map(({ projectId, commit }) => (
       `${projectId}@${commit.slice(0, 12)}`
@@ -92,40 +101,105 @@ export function buildTaskWakeEnvelope(
       + `${projects.length > 2 ? `+${projects.length - 2}` : ""}`;
   }).join(", ");
 
-  const lines: string[] = [
-    `Wake: ${request.wakeId} — delta since ${request.fromCursor}`,
-    `  Reasons: ${renderReasons(request.reasons)}`,
-    `  Changed: ${counts.events} events, ${counts.messages} messages, ${counts.turns} Turns`
-      + ` → yui task wake show ${request.taskId} ${request.wakeId}`,
-    `  Active Task Reviews: ${activeReviews.length === 0
-      ? "none"
-      : `${reviewOrientation}${activeReviews.length > 3 ? `, … (+${activeReviews.length - 3})` : ""}`}`,
-    `Full context: yui task context ${request.taskId}`
-  ];
+  const render = (
+    reasonLimit: number,
+    resultTurnLimit: number,
+    reviewLimit: number
+  ): string => {
+    const reviewOrientation = renderReviewOrientation(reviewLimit);
+    return [
+      `Wake: ${request.wakeId} — delta since ${request.fromCursor}`,
+      `  Reasons: ${renderReasons(request.reasons, reasonLimit)}`,
+      `  Changed: ${counts.events} events, ${counts.messages} messages, ${counts.turns} Turns`
+        + ` → yui task wake show ${request.taskId} ${request.wakeId}`,
+      `  Result Turns: ${renderResultTurns(
+        request.taskId,
+        referencedTurnIds,
+        resultTurnLimit
+      )}`,
+      `  Active Task Reviews: ${activeReviews.length === 0
+        ? "none"
+        : reviewLimit === 0
+          ? `${activeReviews.length} → yui task context ${request.taskId}`
+          : `${reviewOrientation}${activeReviews.length > reviewLimit
+            ? `, … (+${activeReviews.length - reviewLimit})`
+            : ""}`}`,
+      `Full context: yui task context ${request.taskId}`
+    ].join("\n");
+  };
 
-  const body = lines.join("\n");
-  const totalBytes = byteLength(body) + 1;
-  if (totalBytes > WAKE_ENVELOPE_HARD_BYTES) {
-    throw new Error(
-      `Wake envelope ${request.wakeId} exceeds the structural hard budget of`
-      + ` ${WAKE_ENVELOPE_HARD_BYTES} bytes (${totalBytes}).`
-    );
+  let reasonLimit = Math.min(REASON_DISPLAY_LIMIT, request.reasons.length);
+  let resultTurnLimit = Math.min(4, referencedTurnIds.length);
+  let reviewLimit = Math.min(3, activeReviews.length);
+  let body = render(reasonLimit, resultTurnLimit, reviewLimit);
+  while (byteLength(body) + 1 > WAKE_ENVELOPE_HARD_BYTES) {
+    if (resultTurnLimit > 0) resultTurnLimit -= 1;
+    else if (reasonLimit > 0) reasonLimit -= 1;
+    else if (reviewLimit > 0) reviewLimit -= 1;
+    else break;
+    body = render(reasonLimit, resultTurnLimit, reviewLimit);
   }
+  if (byteLength(body) + 1 > WAKE_ENVELOPE_HARD_BYTES) {
+    body = fitUtf8([
+      `Wake: ${request.wakeId}`,
+      `Inspect: yui task wake show ${request.taskId} ${request.wakeId}`,
+      `Full context: yui task context ${request.taskId}`
+    ].join("\n"), WAKE_ENVELOPE_HARD_BYTES - 1);
+  }
+  const totalBytes = byteLength(body) + 1;
 
   return Object.freeze({
     taskId: request.taskId,
     wakeId: request.wakeId,
     fromCursor: request.fromCursor,
+    referencedTurnIds: Object.freeze(referencedTurnIds),
     totalBytes,
     text: `${body}\n`
   });
 }
 
-function renderReasons(reasons: readonly string[]): string {
-  const selected = reasons.slice(0, REASON_DISPLAY_LIMIT);
+export function referencedWakeTurnIds(
+  turns: readonly Turn[],
+  allEvents: readonly TaskEvent[],
+  terminalEvents: readonly TaskEvent[]
+): readonly string[] {
+  const turnsById = new Map(
+    operationalTaskRecords(turns, allEvents, "turn").map((turn) => [turn.id, turn])
+  );
+  return [...new Set(terminalEvents.flatMap((event) => {
+    if (!["turn.completed", "turn.failed", "turn.cancelled"].includes(event.type)) return [];
+    const turnId = event.payload.turnId;
+    return turnId !== undefined && turnsById.has(turnId) ? [turnId] : [];
+  }))];
+}
+
+function renderReasons(reasons: readonly string[], limit: number): string {
+  if (limit === 0) return `${reasons.length} reason tags`;
+  const selected = reasons.slice(0, limit);
   const elided = reasons.length - selected.length;
   const rendered = selected.map(renderWakeReason).join(", ");
   return elided === 0 ? rendered : `${rendered}, … (+${elided} more)`;
+}
+
+function renderResultTurns(
+  taskId: string,
+  turnIds: readonly string[],
+  limit: number
+): string {
+  if (turnIds.length === 0) return "none";
+  if (limit === 0) return `${turnIds.length} → inspect the wake delta`;
+  return `${turnIds.slice(0, limit)
+    .map((turnId) => `${turnId} → yui task turn show ${taskId}/${turnId}`)
+    .join(", ")}${turnIds.length > limit ? `, … (+${turnIds.length - limit})` : ""}`;
+}
+
+function fitUtf8(value: string, maxBytes: number): string {
+  let fitted = "";
+  for (const character of value) {
+    if (byteLength(fitted) + byteLength(character) > maxBytes) break;
+    fitted += character;
+  }
+  return fitted;
 }
 
 function byteLength(value: string): number {

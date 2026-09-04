@@ -1,9 +1,8 @@
 /**
  * Side-by-side `yui update` orchestration for the current storage contract.
  *
- * The staged binary proves either an exact-current Home or a complete adjacent
- * migration path. Any migration runs only after the exact Controller is
- * stopped and before the replacement is verified and restarted.
+ * The staged binary proves an exact-current Home before the exact Controller
+ * is stopped and the replacement is activated, verified, and restarted.
  */
 
 /** A side-by-side staged package, isolated from the live global install. */
@@ -16,7 +15,6 @@ export type StagedPackage = Readonly<{
 /** Read-only verdict produced by the staged binary. */
 export type UpdatePreflight = Readonly<
   | { status: "already-current"; stepCount?: 0 }
-  | { status: "migration-ready"; stepCount: number }
   | {
       status: "blocked";
       stage: string;
@@ -56,12 +54,11 @@ export type UpdateControllerStopResult = Readonly<{
   pid?: number;
 }>;
 
-/** Injected update effects. Migration runs only after exact Controller stop. */
+/** Injected update effects for a current-contract binary replacement. */
 export type UpdatePorts = Readonly<{
   stage: (version?: string) => StagedPackage;
   preflight: (staged: StagedPackage, home: string) => UpdatePreflight;
   activateBinary: (staged: StagedPackage) => void;
-  migrate: (staged: StagedPackage, home: string) => void;
   verify: (staged: StagedPackage, home: string) => void;
   cleanup: (staged: StagedPackage) => void;
   beginControllerHandover?: (home: string) => () => void;
@@ -74,7 +71,7 @@ export type UpdatePorts = Readonly<{
 export type UpdateResult = Readonly<
   (
     | { outcome: "already-current"; version: string }
-    | { outcome: "updated"; version: string; path: "current-fast" | "migrated" }
+    | { outcome: "updated"; version: string }
     | {
         outcome: "aborted";
         phase: UpdatePhase;
@@ -95,7 +92,6 @@ export type UpdatePhase =
   | "preflight"
   | "coordination"
   | "activate-binary"
-  | "storage-upgrade"
   | "post-verify";
 
 type ControllerLifecycle = Readonly<{
@@ -182,14 +178,9 @@ function runStagedUpdate(
   }
 
   try {
-    const captured = captureControllerLifecycle(
-      ports,
-      staged.version,
-      home,
-      preflight.status === "migration-ready"
-    );
+    const captured = captureControllerLifecycle(ports, staged.version, home);
     if ("outcome" in captured) return captured;
-    return activateAndVerify(ports, staged, home, captured.lifecycle, preflight);
+    return activateAndVerify(ports, staged, home, captured.lifecycle);
   } finally {
     releaseHandover?.();
   }
@@ -199,8 +190,7 @@ function activateAndVerify(
   ports: UpdatePorts,
   staged: StagedPackage,
   home: string,
-  lifecycle: ControllerLifecycle,
-  preflight: Extract<UpdatePreflight, { status: "already-current" | "migration-ready" }>
+  lifecycle: ControllerLifecycle
 ): UpdateResult {
   try {
     ports.activateBinary(staged);
@@ -215,21 +205,6 @@ function activateAndVerify(
     });
   }
 
-  if (preflight.status === "migration-ready") {
-    try {
-      ports.migrate(staged, home);
-    } catch (error) {
-      return {
-        outcome: "aborted",
-        phase: "storage-upgrade",
-        message: `The activated binary could not migrate the Home: ${messageOf(error)}`,
-        action: "Keep the Controller stopped, inspect the migration result, and retry the exact upgrade.",
-        recoverable: false,
-        version: staged.version
-      };
-    }
-  }
-
   try {
     ports.verify(staged, home);
   } catch (error) {
@@ -241,9 +216,7 @@ function activateAndVerify(
       recoverable: false,
       version: staged.version
     };
-    return preflight.status === "migration-ready"
-      ? failure
-      : restoreControllerOrReport(ports, home, lifecycle, failure);
+    return restoreControllerOrReport(ports, home, lifecycle, failure);
   }
 
   if (lifecycle.ensureRunning) {
@@ -268,24 +241,20 @@ function activateAndVerify(
       };
       return unknownActive
         ? failure
-        : preflight.status === "migration-ready"
-          ? failure
-          : restoreControllerOrReport(ports, home, lifecycle, failure);
+        : restoreControllerOrReport(ports, home, lifecycle, failure);
     }
   }
 
   return {
     outcome: "updated",
-    version: staged.version,
-    path: preflight.status === "migration-ready" ? "migrated" : "current-fast"
+    version: staged.version
   };
 }
 
 function captureControllerLifecycle(
   ports: UpdatePorts,
   version: string,
-  home: string,
-  required = false
+  home: string
 ): { lifecycle: ControllerLifecycle } | Extract<UpdateResult, { outcome: "aborted" }> {
   const supplied = [
     ports.controllerStatus,
@@ -294,16 +263,6 @@ function captureControllerLifecycle(
     ports.restoreController
   ].some((port) => port !== undefined);
   if (!supplied) {
-    if (required) {
-      return {
-        outcome: "aborted",
-        phase: "coordination",
-        message: "Storage migration requires exact Controller lifecycle ownership.",
-        action: "Provide status, exact stop, replacement start, and exact restore operations.",
-        recoverable: true,
-        version
-      };
-    }
     return { lifecycle: { ensureRunning: false, wasRunning: false } };
   }
   if (

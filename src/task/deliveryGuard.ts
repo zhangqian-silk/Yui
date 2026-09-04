@@ -1,9 +1,5 @@
-import {
-  nextActionReviewOutcomeEvidence,
-  type NextActionFacts,
-  type NextActionRef
-} from "./nextAction.js";
-import { isSemanticReviewRound } from "../review/reviewOutcomeClassifier.js";
+import type { NextActionFacts, NextActionRef } from "./nextAction.js";
+import { isCompletedTaskReviewEvidenceFromTurns } from "../review/reviewAcceptance.js";
 
 /**
  * Issue 07 (Leader convergence): duplicate/convergence guard and semantic
@@ -200,7 +196,10 @@ function detectReviewDuplicates(
       && [...wanted].every((commit) => commits.has(commit));
     if (!sameCandidate) continue;
     const ref = { kind: "review-round", id: round.id } as const;
-    if (isSemanticReviewRound(round, nextActionReviewOutcomeEvidence(facts))) {
+    if (isCompletedTaskReviewEvidenceFromTurns(
+      round,
+      facts.reviewOutcomeEvidence?.turns ?? []
+    )) {
       duplicates.push({
         severity: "exact",
         reason: `Task-final Review ${round.id} already attests this exact head`,

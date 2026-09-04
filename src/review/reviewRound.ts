@@ -26,21 +26,8 @@ export type ReviewWorkspaceDisposition = "preserved" | "reassigned" | "removed";
 export type ReviewScope = "work-item" | "task";
 
 /**
- * Issue 07: the only dispositions a delta-recheck Reviewer may return.
- * `equivalent-and-accepted` accepts the new frozen head; `finding` records
- * findings; `requires-full-review` returns explicit uncertainty to the Leader.
- */
-export type DeltaRecheckDisposition =
-  | "equivalent-and-accepted"
-  | "finding"
-  | "requires-full-review";
-
-/**
- * Issue 07: lineage of a delta-recheck Task-final ReviewRound.  The record
- * binds the round to the previous completed Round and the exact diff it
- * rechecked, so an acceptance can never be silently copied to a different
- * tree.  `disposition` is absent while the Round is active and is recorded
- * exactly once at terminalization.
+ * Objective lineage of a delta-recheck Task-final ReviewRound. The Reviewer's
+ * judgment remains solely in the exact Turn result.
  */
 export type DeltaRecheckRecord = Readonly<{
   schemaVersion: 1;
@@ -53,12 +40,6 @@ export type DeltaRecheckRecord = Readonly<{
   changedFiles: readonly string[];
   addedLines: number;
   deletedLines: number;
-  /** Present only once the delta Round completed. */
-  disposition?: DeltaRecheckDisposition;
-  /** Reviewer's equivalence/escalation reasoning; present once terminal. */
-  reasoning?: string;
-  /** Full ReviewRound created after a `requires-full-review` escalation. */
-  escalatedToReviewRoundId?: string;
 }>;
 
 /** Immutable heads reviewed by a Task-scoped final ReviewRound. */
@@ -70,35 +51,14 @@ export type TaskReviewCandidate = Readonly<{
   }>[];
 }>;
 
-export type ReviewCheck = Readonly<{
-  name: string;
-  outcome: "passed" | "failed" | "skipped";
-  details?: string;
-}>;
-
-export type ReviewFinding = Readonly<{
-  id: string;
-  severity: "low" | "medium" | "high" | "critical";
-  status: "open" | "resolved";
-  summary: string;
-}>;
-
-export type ReviewResultReport = Readonly<{
-  summary: string;
-  report: string;
-  checks: readonly ReviewCheck[];
-  findings?: readonly ReviewFinding[];
-  evidence?: readonly string[];
-  evidenceCommit?: string;
-  /** Issue 07: delta-recheck disposition; absent for full Reviews. */
-  deltaDisposition?: DeltaRecheckDisposition;
-  /** Issue 07: delta-recheck equivalence/escalation reasoning. */
-  deltaReasoning?: string;
+export type ReviewRoundFailure = Readonly<{
+  kind: "dispatch" | "execution" | "quorum";
+  message: string;
 }>;
 
 export type ReviewRound = {
-  /** v7 uses the unified direct/replicated execution authority. */
-  schemaVersion: 7;
+  /** v8 keeps only Core-owned identity, lifecycle, and objective evidence. */
+  schemaVersion: 8;
   id: string;
   taskId: string;
   workItemId?: string;
@@ -116,15 +76,10 @@ export type ReviewRound = {
   deltaRecheck?: DeltaRecheckRecord;
   /** Present only for replicated producer execution; the main Reviewer is not a Lane. */
   executionGroup?: ReviewExecutionGroup;
-  /** Preserved opaque evidence from a valid pre-v7 Review ExecutionGroup. */
-  legacyExecutionGroup?: Readonly<Record<string, unknown>>;
   workspace?: ManagedWorkspace;
   requestedBy: ReviewRequestSource;
   status: ReviewRoundStatus;
-  summary?: string;
-  report?: string;
-  checks?: readonly ReviewCheck[];
-  evidenceCommit?: string;
+  failure?: ReviewRoundFailure;
   workspaceDisposition?: Readonly<{
     kind: ReviewWorkspaceDisposition;
     recordedAt: string;
@@ -145,7 +100,7 @@ export function createReviewRound(
   executionGroup?: ReviewExecutionGroup
 ): ReviewRound {
   return validateReviewRound({
-    schemaVersion: 7,
+    schemaVersion: 8,
     id: requireIdentity(id, "ReviewRound id"),
     taskId: requireIdentity(taskId, "Task id"),
     workItemId: requireIdentity(workItemId, "Work Item id"),
@@ -171,7 +126,7 @@ export function createTaskReviewRound(
 ): ReviewRound {
   const candidate = validateTaskReviewCandidate(taskCandidate);
   return validateReviewRound({
-    schemaVersion: 7,
+    schemaVersion: 8,
     id: requireIdentity(id, "ReviewRound id"),
     taskId: requireIdentity(taskId, "Task id"),
     reviewerRoleName: requireIdentity(reviewerRoleName, "Reviewer Role"),
@@ -208,7 +163,7 @@ export function createTaskDeltaReviewRound(
 ): ReviewRound {
   const candidate = validateTaskReviewCandidate(taskCandidate);
   return validateReviewRound({
-    schemaVersion: 7,
+    schemaVersion: 8,
     id: requireIdentity(id, "ReviewRound id"),
     taskId: requireIdentity(taskId, "Task id"),
     reviewerRoleName: requireIdentity(reviewerRoleName, "Reviewer Role"),
@@ -279,55 +234,24 @@ export function startReplicatedReviewRound(round: ReviewRound): ReviewRound {
 export function finishReviewRound(
   round: ReviewRound,
   status: "completed" | "failed",
-  summary: string,
   now: Date,
-  result: Readonly<{
-    report?: string;
-    checks?: readonly ReviewCheck[];
-    evidenceCommit?: string;
-    /** Issue 07: delta-recheck disposition extracted from the Reviewer report. */
-    deltaDisposition?: DeltaRecheckDisposition;
-    /** Issue 07: Reviewer's delta-recheck equivalence/escalation reasoning. */
-    deltaReasoning?: string;
-  }> = {}
+  failure?: ReviewRoundFailure
 ): ReviewRound {
   validateReviewRound(round);
   if (round.status !== "pending" && round.status !== "running") {
     throw new Error(`ReviewRound is already terminal: ${round.id}.`);
   }
-  const terminal = validateReviewRound({
+  if (status === "completed" && failure !== undefined) {
+    throw new Error("A completed ReviewRound cannot carry failure metadata.");
+  }
+  if (status === "failed" && failure === undefined) {
+    throw new Error("A failed ReviewRound requires Core-owned failure metadata.");
+  }
+  return validateReviewRound({
     ...round,
     status,
-    summary: requireText(summary, "Review summary"),
-    report: requireText(result.report ?? summary, "Review report"),
-    checks: validateChecks(result.checks ?? []),
-    ...(result.evidenceCommit === undefined
-      ? {}
-      : { evidenceCommit: requireCommit(result.evidenceCommit, "Review evidence commit") }),
+    ...(failure === undefined ? {} : { failure: validateReviewRoundFailure(failure) }),
     endedAt: now.toISOString()
-  });
-  if (round.deltaRecheck === undefined) {
-    if (result.deltaDisposition !== undefined || result.deltaReasoning !== undefined) {
-      throw new Error(`Only a delta-recheck ReviewRound can carry a delta disposition: ${round.id}.`);
-    }
-    return terminal;
-  }
-  if (status !== "completed") {
-    // A failed delta Round is an infra attempt; it records no disposition and
-    // the candidate stays unaccepted.
-    return terminal;
-  }
-  // Fail closed: a completed delta Round without an explicit, valid
-  // disposition remains non-accepting for Leader routing. Uncertainty never accepts.
-  const disposition = result.deltaDisposition ?? "requires-full-review";
-  const reasoning = result.deltaReasoning ?? result.report ?? summary;
-  return validateReviewRound({
-    ...terminal,
-    deltaRecheck: validateDeltaRecheckRecord({
-      ...round.deltaRecheck,
-      disposition,
-      reasoning: requireText(reasoning, "Delta recheck reasoning")
-    })
   });
 }
 
@@ -390,9 +314,6 @@ export function retryReviewRound(
     ...(round.executionGroup === undefined
       ? {}
       : { executionGroup: retryFailedExecutionLanes(round.executionGroup, now) }),
-    ...(round.legacyExecutionGroup === undefined
-      ? {}
-      : { legacyExecutionGroup: round.legacyExecutionGroup }),
     requestedBy: validateReviewRequestSource(requestedBy),
     status: "pending",
     ...(round.workspace === undefined ? {} : { workspace: round.workspace }),
@@ -430,95 +351,6 @@ export function retryRunningReviewExecutionLane(
     );
   }
   return round;
-}
-
-/** Accepts the Reviewer's complete report and extracts only optional known evidence. */
-export function parseReviewResultReport(value: string): ReviewResultReport {
-  const report = requireText(value, "Review report");
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(report) as unknown;
-  } catch {
-    return { summary: report, report, checks: [] };
-  }
-  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
-    return { summary: report, report, checks: [] };
-  }
-  const record = parsed as Record<string, unknown>;
-  const summary = typeof record.summary === "string" && record.summary.trim().length > 0
-    ? requireText(record.summary, "Review summary")
-    : report;
-  const checks = extractChecks(record.checks);
-  const findings = extractFindings(record.findings);
-  const evidence = extractEvidence(record.evidence);
-  const deltaDisposition = extractDeltaDisposition(record.deltaDisposition);
-  return {
-    summary,
-    report,
-    checks,
-    ...(findings.length === 0 ? {} : { findings }),
-    ...(evidence.length === 0 ? {} : { evidence }),
-    ...(deltaDisposition === undefined ? {} : { deltaDisposition }),
-    ...(typeof record.deltaReasoning !== "string"
-      || record.deltaReasoning.trim().length === 0
-      ? {}
-      : { deltaReasoning: requireText(record.deltaReasoning, "Delta recheck reasoning") }),
-    ...(typeof record.evidenceCommit !== "string"
-      ? {}
-      : {
-          evidenceCommit: requireCommit(
-            record.evidenceCommit,
-            "Review evidence commit"
-          )
-        })
-  };
-}
-
-function extractDeltaDisposition(value: unknown): DeltaRecheckDisposition | undefined {
-  if (value !== "equivalent-and-accepted"
-    && value !== "finding"
-    && value !== "requires-full-review") {
-    return undefined;
-  }
-  return value;
-}
-
-function extractFindings(value: unknown): readonly ReviewFinding[] {
-  if (!Array.isArray(value)) return [];
-  return value.flatMap((entry) => {
-    if (typeof entry !== "object" || entry === null || Array.isArray(entry)) {
-      return [];
-    }
-    const finding = entry as Record<string, unknown>;
-    if (typeof finding.id !== "string"
-      || (finding.severity !== "low" && finding.severity !== "medium"
-        && finding.severity !== "high" && finding.severity !== "critical"
-        && finding.severity !== "p1" && finding.severity !== "p2")
-      || (finding.status !== "open" && finding.status !== "resolved")
-      || typeof finding.summary !== "string") {
-      return [];
-    }
-    return [{
-      id: requireIdentity(finding.id, "Review finding id"),
-      // Reviewers may use the product-level P1/P2 vocabulary. Execution
-      // groups keep one canonical severity scale so resolution gates remain
-      // stable across Worker and Reviewer reports.
-      severity: finding.severity === "p1"
-        ? "critical"
-        : finding.severity === "p2"
-          ? "high"
-          : finding.severity,
-      status: finding.status,
-      summary: requireText(finding.summary, "Review finding summary")
-    } as ReviewFinding];
-  });
-}
-
-function extractEvidence(value: unknown): readonly string[] {
-  if (!Array.isArray(value)) return [];
-  return value.flatMap((entry) => (
-    typeof entry === "string" && entry.trim().length > 0 ? [entry.trim()] : []
-  ));
 }
 
 export function recordReviewWorkspaceDisposition(
@@ -589,7 +421,29 @@ export function updateReviewExecutionGroup(
 }
 
 export function validateReviewRound(round: ReviewRound): ReviewRound {
-  if (round.schemaVersion !== 7) throw new Error("ReviewRound must use schemaVersion 7.");
+  rejectUnknownFields(round as unknown as Record<string, unknown>, [
+    "schemaVersion",
+    "id",
+    "taskId",
+    "workItemId",
+    "candidateId",
+    "reviewerRoleName",
+    "reviewerTurnId",
+    "reviewBaseCommit",
+    "scope",
+    "taskCandidate",
+    "taskFinalReviewContract",
+    "deltaRecheck",
+    "executionGroup",
+    "workspace",
+    "requestedBy",
+    "status",
+    "failure",
+    "workspaceDisposition",
+    "createdAt",
+    "endedAt"
+  ], "ReviewRound");
+  if (round.schemaVersion !== 8) throw new Error("ReviewRound must use schemaVersion 8.");
   validateTaskRecordReference({ taskId: round.taskId, localId: round.id }, "reviewRound");
   requireIdentity(round.reviewerRoleName, "Reviewer Role");
   requireCommit(round.reviewBaseCommit, "Review base commit");
@@ -631,12 +485,6 @@ export function validateReviewRound(round: ReviewRound): ReviewRound {
     }
   }
   if (round.executionGroup !== undefined) validateReviewExecutionGroup(round.executionGroup, round);
-  if (round.legacyExecutionGroup !== undefined
-    && (typeof round.legacyExecutionGroup !== "object"
-      || round.legacyExecutionGroup === null
-      || Array.isArray(round.legacyExecutionGroup))) {
-    throw new Error("ReviewRound legacy ExecutionGroup evidence is invalid.");
-  }
   validateReviewRequestSource(round.requestedBy);
   if (!["pending", "running", "completed", "failed"].includes(round.status)) {
     throw new Error(`ReviewRound status is invalid: ${String(round.status)}.`);
@@ -657,22 +505,18 @@ export function validateReviewRound(round: ReviewRound): ReviewRound {
   requireTimestamp(round.createdAt, "ReviewRound createdAt");
   const terminal = round.status === "completed" || round.status === "failed";
   if (terminal) {
-    requireText(round.summary ?? "", "Review summary");
-    requireText(round.report ?? "", "Review report");
-    validateChecks(round.checks ?? []);
-    if (round.evidenceCommit !== undefined) {
-      // The exact commit on which the review's checks ran.  Equals the base
-      // when the reviewer ran checks on the frozen candidate tree; differs
-      // when the reviewer committed diagnostics on top of it.  A dirty
-      // review with uncommitted changes records no evidenceCommit, since no
-      // single commit captures the checked tree.
-      requireCommit(round.evidenceCommit, "Review evidence commit");
+    if (round.status === "completed" && round.reviewerTurnId === undefined) {
+      throw new Error("A completed ReviewRound requires its exact main Reviewer Turn.");
     }
+    if (round.status === "completed" && round.failure !== undefined) {
+      throw new Error("A completed ReviewRound cannot carry failure metadata.");
+    }
+    if (round.status === "failed" && round.failure === undefined) {
+      throw new Error("A failed ReviewRound requires failure metadata.");
+    }
+    if (round.failure !== undefined) validateReviewRoundFailure(round.failure);
     requireTimestamp(round.endedAt ?? "", "ReviewRound endedAt");
-  } else if (round.summary !== undefined
-    || round.report !== undefined
-    || round.checks !== undefined
-    || round.evidenceCommit !== undefined
+  } else if (round.failure !== undefined
     || round.endedAt !== undefined) {
     throw new Error("An active ReviewRound cannot have terminal metadata.");
   }
@@ -695,19 +539,6 @@ export function validateReviewRound(round: ReviewRound): ReviewRound {
     }
     requireTimestamp(round.workspaceDisposition.recordedAt, "Review workspace disposition time");
   }
-  if (round.deltaRecheck?.disposition !== undefined) {
-    if (!terminal) {
-      throw new Error("An active delta-recheck ReviewRound cannot have a disposition.");
-    }
-    if (round.deltaRecheck.reasoning === undefined
-      || round.deltaRecheck.reasoning.trim().length === 0) {
-      throw new Error("A terminal delta-recheck ReviewRound requires reasoning.");
-    }
-    if (round.deltaRecheck.escalatedToReviewRoundId !== undefined
-      && round.deltaRecheck.disposition !== "requires-full-review") {
-      throw new Error("Only a requires-full-review delta-recheck can record an escalation.");
-    }
-  }
   return round;
 }
 
@@ -715,6 +546,15 @@ export function validateReviewRound(round: ReviewRound): ReviewRound {
 export function validateDeltaRecheckRecord(
   record: DeltaRecheckRecord
 ): DeltaRecheckRecord {
+  rejectUnknownFields(record as unknown as Record<string, unknown>, [
+    "schemaVersion",
+    "previousReviewRoundId",
+    "previousBaseCommit",
+    "diffDigest",
+    "changedFiles",
+    "addedLines",
+    "deletedLines"
+  ], "Delta recheck record");
   if (record.schemaVersion !== 1) {
     throw new Error("Delta recheck record must use schemaVersion 1.");
   }
@@ -731,18 +571,6 @@ export function validateDeltaRecheckRecord(
     || !Number.isInteger(record.deletedLines) || record.deletedLines < 0) {
     throw new Error("Delta recheck line counts are invalid.");
   }
-  if (record.disposition !== undefined
-    && record.disposition !== "equivalent-and-accepted"
-    && record.disposition !== "finding"
-    && record.disposition !== "requires-full-review") {
-    throw new Error(`Delta recheck disposition is invalid: ${String(record.disposition)}.`);
-  }
-  if (record.reasoning !== undefined) {
-    requireText(record.reasoning, "Delta recheck reasoning");
-  }
-  if (record.escalatedToReviewRoundId !== undefined) {
-    requireIdentity(record.escalatedToReviewRoundId, "Delta recheck escalation ReviewRound id");
-  }
   return record;
 }
 
@@ -751,25 +579,18 @@ export function isDeltaRecheckRound(round: ReviewRound): boolean {
   return round.deltaRecheck !== undefined;
 }
 
-/** True only when a delta Round explicitly accepted the new head. */
-export function deltaRecheckAccepted(round: ReviewRound): boolean {
-  return round.deltaRecheck?.disposition === "equivalent-and-accepted";
-}
-
-/** True when a delta Round escalated to a full Review. */
-export function deltaRecheckEscalated(round: ReviewRound): boolean {
-  return round.deltaRecheck?.disposition === "requires-full-review";
-}
-
-/**
- * True when a completed delta Round does NOT accept the new head.  A `finding`
- * or `requires-full-review` disposition must keep the completion gate closed.
- */
-export function deltaRecheckBlocksAcceptance(round: ReviewRound): boolean {
-  return round.deltaRecheck !== undefined
-    && round.status === "completed"
-    && round.deltaRecheck.disposition !== undefined
-    && round.deltaRecheck.disposition !== "equivalent-and-accepted";
+function validateReviewRoundFailure(failure: ReviewRoundFailure): ReviewRoundFailure {
+  rejectUnknownFields(failure as unknown as Record<string, unknown>, [
+    "kind",
+    "message"
+  ], "ReviewRound failure");
+  if (failure.kind !== "dispatch"
+    && failure.kind !== "execution"
+    && failure.kind !== "quorum") {
+    throw new Error("ReviewRound failure kind is invalid.");
+  }
+  requireText(failure.message, "ReviewRound failure message");
+  return failure;
 }
 
 function validateReviewExecutionGroup(
@@ -815,24 +636,6 @@ export function validateTaskReviewCandidate(
   return { schemaVersion: 1, projects };
 }
 
-function extractChecks(value: unknown): readonly ReviewCheck[] {
-  if (!Array.isArray(value)) return [];
-  const extracted = value.flatMap((entry): ReviewCheck[] => {
-    if (typeof entry !== "object" || entry === null || Array.isArray(entry)) return [];
-    const check = entry as Record<string, unknown>;
-    if (typeof check.name !== "string"
-      || (check.outcome !== "passed"
-        && check.outcome !== "failed"
-        && check.outcome !== "skipped")) return [];
-    return [{
-      name: check.name,
-      outcome: check.outcome,
-      ...(typeof check.details === "string" ? { details: check.details } : {})
-    }];
-  });
-  return validateChecks(extracted);
-}
-
 function validateReviewWorkspace(round: ReviewRound, workspace: ManagedWorkspace): void {
   validateManagedWorkspace(workspace);
   if (workspace.owner.taskId !== round.taskId) {
@@ -851,24 +654,6 @@ function validateReviewWorkspace(round: ReviewRound, workspace: ManagedWorkspace
   }
 }
 
-function validateChecks(checks: readonly ReviewCheck[]): readonly ReviewCheck[] {
-  if (!Array.isArray(checks)) throw new Error("Review checks are invalid.");
-  return checks.map((check) => {
-    const name = requireText(check.name, "Review check name");
-    if (check.outcome !== "passed" && check.outcome !== "failed"
-      && check.outcome !== "skipped") {
-      throw new Error(`Review check outcome is invalid: ${String(check.outcome)}.`);
-    }
-    return {
-      name,
-      outcome: check.outcome,
-      ...(check.details === undefined
-        ? {}
-        : { details: requireText(check.details, "Review check details") })
-    };
-  });
-}
-
 function requireCommit(value: string, label: string): string {
   const commit = requireText(value, label).toLowerCase();
   if (!/^[a-f0-9]{40}(?:[a-f0-9]{24})?$/u.test(commit)) {
@@ -885,4 +670,14 @@ function validateReviewRequestSource(source: ReviewRequestSource): ReviewRequest
     throw new Error(`Review request source is invalid: ${String(source)}.`);
   }
   return source;
+}
+
+function rejectUnknownFields(
+  value: Record<string, unknown>,
+  fields: readonly string[],
+  label: string
+): void {
+  const allowed = new Set(fields);
+  const unknown = Object.keys(value).find((field) => !allowed.has(field));
+  if (unknown !== undefined) throw new Error(`${label} has unknown field: ${unknown}.`);
 }

@@ -469,25 +469,6 @@ END;
 `;
 
 /**
- * Cross-Round semantic review
- * findings with stable keys and Leader dispositions. Failed execution attempts
- * never create rows; only completed Rounds feed the ledger.
- */
-const BASELINE_REVIEW_FINDING_SQL = `
-CREATE TABLE IF NOT EXISTS review_findings (
-  task_id     TEXT NOT NULL,
-  finding_id  TEXT NOT NULL,
-  stable_key  TEXT NOT NULL,
-  severity    TEXT NOT NULL,
-  payload     TEXT NOT NULL,
-  updated_at  TEXT NOT NULL,
-  PRIMARY KEY (task_id, finding_id)
-);
-CREATE INDEX IF NOT EXISTS idx_review_findings_task ON review_findings(task_id);
-CREATE INDEX IF NOT EXISTS idx_review_findings_stable_key ON review_findings(task_id, stable_key);
-`;
-
-/**
  * Session owner physical identity records.
  *
  * One row per runtime generation, keyed by runtime generation id. The payload column
@@ -687,7 +668,6 @@ const MIGRATION_1_SQL = [
   BASELINE_JOB_AND_RELEASE_SQL,
   BASELINE_JOB_CALLER_SQL,
   BASELINE_TELEMETRY_AGGREGATE_SQL,
-  BASELINE_REVIEW_FINDING_SQL,
   BASELINE_SESSION_OWNER_SQL,
   BASELINE_RESOURCE_REGISTRY_SQL,
   BASELINE_GATE_ARTIFACT_SQL,
@@ -1011,7 +991,6 @@ export const SQLITE_SCHEMA_TABLES: readonly string[] = [
   "turns",
   "active_turns",
   "review_rounds",
-  "review_findings",
   "change_sets",
   "integration_attempts",
   "messages",

@@ -4,7 +4,10 @@ import type { GlobalRole, TaskRole } from "../role/role.js";
 import type { Turn } from "../turn/turn.js";
 import type { Task } from "../task/task.js";
 import type { ReviewConfig } from "./reviewConfig.js";
-import { isAcceptedTaskReviewBaseline, type ReviewAcceptanceEvidenceStore } from "./reviewAcceptance.js";
+import {
+  isCompletedTaskReviewEvidence,
+  type ReviewCompletionEvidenceStore
+} from "./reviewAcceptance.js";
 import type { ReviewRound, TaskReviewCandidate } from "./reviewRound.js";
 import {
   projectReviewerAvailability,
@@ -46,7 +49,7 @@ export type ReviewDecisionProjection = Readonly<{
   }>;
 }>;
 
-export type ReviewDecisionStore = ReviewAcceptanceEvidenceStore & ReviewerAvailabilityStore & Readonly<{
+export type ReviewDecisionStore = ReviewCompletionEvidenceStore & ReviewerAvailabilityStore & Readonly<{
   getGlobalRole(roleName: string): GlobalRole | null;
 }>;
 
@@ -64,7 +67,7 @@ export function projectReviewDecision(input: Readonly<{
   const { store, task, roles, turns, rounds, reviewConfig, currentCandidate } = input;
   const taskRounds = rounds.filter((round) => (round.scope ?? "work-item") === "task");
   const accepted = [...taskRounds]
-    .filter((round) => isAcceptedTaskReviewBaseline(store, round))
+    .filter((round) => isCompletedTaskReviewEvidence(store, round))
     .sort(compareRoundIdentity)
     .at(-1);
   const latestAcceptedBaseline = accepted?.taskCandidate === undefined

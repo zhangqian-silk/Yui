@@ -1,4 +1,4 @@
-/** `yui upgrade` applies the centralized adjacent migration graph. */
+/** `yui upgrade` validates the exact storage contract supported by this release. */
 import { latestStorageVersionState } from "../storage/upgrade/recordVersions.js";
 import {
   runStorageUpgrade,
@@ -30,7 +30,7 @@ export async function runUpgradeCommand(
   return {
     output: renderUpgradeResult(result, mode),
     data: result,
-    exitCode: result.outcome === "blocked" || result.outcome === "failed" ? 5 : 0
+    exitCode: result.outcome === "blocked" ? 5 : 0
   };
 }
 
@@ -56,17 +56,6 @@ export function renderUpgradeResult(
       return `${header}\nStorage is already at the current version; nothing to upgrade.`;
     case "update-preflight":
       return `${header}\nUpdate preflight: ${result.status} (${result.stepCount} steps). Storage was not modified.`;
-    case "upgrade-plan":
-      return `${header}\nDry run: migration-ready (${result.report.steps.length} steps). Storage was not modified.`;
-    case "upgraded":
-      return `${header}\nStorage upgraded through ${result.report.steps.length} adjacent migration steps.`;
-    case "failed":
-      return [
-        header,
-        `Upgrade failed at ${result.stage}: ${result.message}`,
-        `Action: ${result.action}`,
-        "The Home may contain a committed migration prefix; keep it quiesced and rerun the idempotent upgrade."
-      ].join("\n");
     case "blocked": {
       return [
         header,

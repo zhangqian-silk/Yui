@@ -120,15 +120,8 @@ export type ReviewsAudit = Readonly<{
   completed: number;
   failed: number;
   infraFailed: number;
-  semanticNegative: number;
   faultClasses: FaultClassCounts;
-  /** Issue 07: delta-recheck rounds and their terminal dispositions. */
-  deltaRechecks: Readonly<{
-    total: number;
-    equivalentAndAccepted: number;
-    finding: number;
-    requiresFullReview: number;
-  }>;
+  deltaRechecks: number;
 }>;
 
 export type IntegrationsAudit = Readonly<{
@@ -516,7 +509,7 @@ export function runExecutionAudit(
             failedCount += 1;
             failedDurationMs += duration;
             cumulativeDurationMs += duration;
-            addLaunchFailureCounts(launchFailures, turn.result?.output);
+            addLaunchFailureCounts(launchFailures, turn.result?.diagnostic);
             failures.push(classifyTurnFailure(turn));
           }
         }
@@ -647,11 +640,7 @@ export function runExecutionAudit(
       let completed = 0;
       let failedCount = 0;
       let infraFailed = 0;
-      let semanticNegative = 0;
       let deltaTotal = 0;
-      let deltaAccepted = 0;
-      let deltaFinding = 0;
-      let deltaEscalated = 0;
       const classes = [];
       for (const taskId of taskIds) {
         for (const round of store.listReviewRounds(taskId)) {
@@ -661,15 +650,9 @@ export function runExecutionAudit(
           else if (round.status === "failed") failedCount += 1;
           if (round.deltaRecheck !== undefined) {
             deltaTotal += 1;
-            if (round.deltaRecheck.disposition === "equivalent-and-accepted") deltaAccepted += 1;
-            else if (round.deltaRecheck.disposition === "finding") deltaFinding += 1;
-            else if (round.deltaRecheck.disposition === "requires-full-review") deltaEscalated += 1;
           }
-          const classification = classifyReviewRound(round, store);
+          const classification = classifyReviewRound(round);
           if (classification.faultClass === "review-infra") infraFailed += 1;
-          else if (classification.faultClass === "review-semantic-negative") {
-            semanticNegative += 1;
-          }
           if (classification.faultClass !== "other") classes.push(classification);
         }
       }
@@ -678,14 +661,8 @@ export function runExecutionAudit(
         completed,
         failed: failedCount,
         infraFailed,
-        semanticNegative,
         faultClasses: countFaultClasses(classes),
-        deltaRechecks: {
-          total: deltaTotal,
-          equivalentAndAccepted: deltaAccepted,
-          finding: deltaFinding,
-          requiresFullReview: deltaEscalated
-        }
+        deltaRechecks: deltaTotal
       });
     } catch (error) {
       return failed<ReviewsAudit>(error);
@@ -874,11 +851,9 @@ export function runExecutionAudit(
           workItems: withinWindow(store.listWorkItems(taskId), options),
           changeSets: withinWindow(store.listChangeSets(taskId), options),
           reviewRounds: withinWindow(store.listReviewRounds(taskId), options),
-          reviewFindings: withinWindow(store.listReviewFindings(taskId), options),
           integrations: withinWindow(store.listIntegrationAttempts(taskId), options),
           durableJobs: withinWindow(store.listDurableJobs(taskId), options),
           publications: withinWindow(store.listPublicationReferences(taskId), options),
-          decisions: withinWindow(store.listDecisions(taskId), options),
           events: withinWindow(store.listEvents(taskId), options),
           managedWorkspaces: withinWindow(store.listManagedWorkspaces(taskId), options)
         })];

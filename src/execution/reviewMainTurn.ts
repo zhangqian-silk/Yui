@@ -14,11 +14,7 @@ import {
   type ReviewRound
 } from "../review/reviewRound.js";
 import type { TaskStore } from "../storage/taskStore.js";
-import {
-  createTurn,
-  type ProducerTurnResult,
-  type Turn
-} from "../turn/turn.js";
+import { createTurn, type Turn } from "../turn/turn.js";
 import {
   executionGroupSettled,
   MINIMUM_SYNTHESIS_RESULTS,
@@ -29,7 +25,6 @@ export type ReviewSynthesisProducer = Readonly<{
   laneId: string;
   roleName: string;
   turnId: string;
-  result: ProducerTurnResult;
 }>;
 
 export type ReviewMainTurnReconciliation = Readonly<{
@@ -58,7 +53,7 @@ export function successfulReviewSynthesisProducers(
         || turn.reviewRoundId !== round.id
         || turn.executionGroupId !== group.id
         || turn.executionLaneId !== lane.id
-        || turn.result?.producer === undefined) {
+        || turn.result === undefined) {
         throw new Error(
           `Successful Review ExecutionLane has no exact Producer result: `
           + `${group.id}/${lane.id}.`
@@ -67,8 +62,7 @@ export function successfulReviewSynthesisProducers(
       return [{
         laneId: lane.id,
         roleName: lane.roleName,
-        turnId: turn.id,
-        result: turn.result.producer
+        turnId: turn.id
       }];
     });
 }
@@ -105,9 +99,8 @@ export function reconcileReviewMainTurns(
       store.saveReviewRound(taskId, finishReviewRound(
         round,
         "failed",
-        summary,
         now,
-        { report: summary, checks: [] }
+        { kind: "quorum", message: summary }
       ));
       store.saveEvent(taskId, createTaskEvent(
         store.nextEventId(taskId),
@@ -151,7 +144,8 @@ export function reconcileReviewMainTurns(
       roleName: role.name,
       purpose: "review",
       ...(round.workItemId === undefined ? {} : { workItemId: round.workItemId }),
-      reviewRoundId: round.id
+      reviewRoundId: round.id,
+      sourceExecutionGroupId: group.id
     }, now, "controller", group.assignment.contextSnapshotRef);
     const turn = createTurn(
       store.nextTurnId(taskId),
@@ -220,13 +214,13 @@ function synthesisDirective(
   producers: readonly ReviewSynthesisProducer[]
 ): string {
   return [
-    "Act as the authoritative main Reviewer over the frozen successful Producer results below.",
-    "Inspect and synthesize every successful result in stable Lane order. Do not rerun, retry, append, select, or abandon Lanes.",
-    "Only this main Review Turn may establish Review findings, checks, semantic outcome, and completion evidence.",
+    "Act as the main Reviewer over every frozen successful Producer result in stable Lane order.",
+    "Expand each exact source Turn from the frozen Context Snapshot and consume its original result text plus Core-authored system evidence.",
+    "Resolve disagreements through review judgment against the frozen candidate. Do not rerun, retry, append, select, or abandon Lanes.",
+    "Return one complete original review result for the Leader; Yui Core does not parse or validate its semantic structure.",
     JSON.stringify({
       schemaVersion: 1,
       sourceExecutionGroupId: group.id,
-      assignment: group.assignment,
       producers
     }, null, 2)
   ].join("\n\n");

@@ -13,6 +13,14 @@ export type ExecutionLaneGitSnapshot = Readonly<{
   }>[];
 }>;
 
+export type ExecutionLaneGitSnapshotResult =
+  | Readonly<{ status: "captured"; snapshot: ExecutionLaneGitSnapshot }>
+  | Readonly<{
+      status: "failed";
+      cause: "no-writable-project" | "workspace-unavailable" | "workspace-dirty" | "branch-mismatch";
+      diagnostic: string;
+    }>;
+
 /**
  * Freeze the exact committed heads of a durable managed Lane workspace at the
  * synchronous runtime-terminalization boundary. Runtime event folds are
@@ -22,7 +30,7 @@ export type ExecutionLaneGitSnapshot = Readonly<{
 export function snapshotExecutionLaneWorkspaceSync(
   store: Pick<TaskStore, "getManagedWorkspace">,
   workspace: ManagedWorkspace
-): ExecutionLaneGitSnapshot | undefined {
+): ExecutionLaneGitSnapshotResult {
   if (workspace.owner.type !== "execution-lane") {
     throw new Error("Only an Execution Lane workspace can freeze a producer result.");
   }
@@ -31,21 +39,56 @@ export function snapshotExecutionLaneWorkspaceSync(
     throw new Error("Execution Lane managed workspace is not the durable owner.");
   }
   const writable = workspace.entries.filter(({ access }) => access === "write");
-  if (writable.length === 0) return undefined;
+  if (writable.length === 0) {
+    return {
+      status: "failed",
+      cause: "no-writable-project",
+      diagnostic: "Core could not freeze an Execution Lane with no writable Project."
+    };
+  }
   const projects: ExecutionLaneGitSnapshot["projects"][number][] = [];
   for (const entry of writable) {
     const status = git(entry.path, ["status", "--porcelain"]);
-    if (status === undefined || status.length > 0) return undefined;
+    if (status === undefined) {
+      return {
+        status: "failed",
+        cause: "workspace-unavailable",
+        diagnostic: `Core could not inspect writable Project ${entry.projectId} at ${entry.path}.`
+      };
+    }
+    if (status.length > 0) {
+      return {
+        status: "failed",
+        cause: "workspace-dirty",
+        diagnostic: `Writable Project ${entry.projectId} is dirty; Core did not accept the Lane result.`
+      };
+    }
     const branch = git(entry.path, ["symbolic-ref", "--quiet", "--short", "HEAD"]);
     const headCommit = git(entry.path, ["rev-parse", "--verify", "HEAD^{commit}"]);
-    if (branch !== entry.branch || headCommit === undefined) return undefined;
+    if (branch === undefined || headCommit === undefined) {
+      return {
+        status: "failed",
+        cause: "workspace-unavailable",
+        diagnostic: `Core could not resolve the branch and commit for writable Project ${entry.projectId}.`
+      };
+    }
+    if (branch !== entry.branch) {
+      return {
+        status: "failed",
+        cause: "branch-mismatch",
+        diagnostic: `Writable Project ${entry.projectId} is on branch ${branch}; expected ${entry.branch}.`
+      };
+    }
     projects.push({
       projectId: entry.projectId,
       headCommit: headCommit.toLowerCase(),
       branch
     });
   }
-  return { schemaVersion: 1, projects };
+  return {
+    status: "captured",
+    snapshot: { schemaVersion: 1, projects }
+  };
 }
 
 function git(cwd: string, args: readonly string[]): string | undefined {

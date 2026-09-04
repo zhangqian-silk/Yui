@@ -1,32 +1,18 @@
-/**
- * Stable fault classification for execution audit (Issue 11 §2).
- *
- * Classification comes from structured outcomes wherever the current build
- * exposes them. Free-text regex matching exists ONLY for importing historical
- * records (Turn summaries written before this taxonomy existed) and is
- * never the basis of a new state machine: every text-derived result carries
- * `basis: "text-historical"` so consumers can tell the two apart.
- */
+/** Stable fault classification from Core-owned execution facts only. */
 import type { Turn } from "../turn/turn.js";
 import type { ReviewRound } from "../review/reviewRound.js";
 import type { IntegrationAttempt } from "../integration/integrationAttempt.js";
-import {
-  classifyReviewRoundOutcome,
-  type ReviewOutcomeEvidenceStore
-} from "../review/reviewOutcomeClassifier.js";
 
 export const FAULT_CLASSES = [
-  "provider-transient",
-  "policy-denied",
   "session-dead",
   "delivery-uncertain",
-  "storage-backend-lock",
+  "result-missing",
+  "runtime-failure",
+  "workspace-state",
   "review-infra",
-  "review-semantic-negative",
   "integration-environment",
   "integration-candidate-failure",
   "stale-base-target-cas",
-  "archive-resource-leak",
   "other"
 ] as const;
 
@@ -34,7 +20,7 @@ export type FaultClass = (typeof FAULT_CLASSES)[number];
 
 export type FaultClassification = Readonly<{
   faultClass: FaultClass;
-  basis: "structured" | "text-historical" | "none";
+  basis: "core-fact" | "core-diagnostic" | "none";
   /** Short excerpt or field name that justifies the class. */
   evidence: string;
 }>;
@@ -45,25 +31,6 @@ export const NO_FAULT: FaultClassification = Object.freeze({
   evidence: ""
 });
 
-/** Structured hint a future capability provider (other Issues) may supply. */
-export type StructuredFaultHint = Readonly<{
-  faultClass: FaultClass;
-  evidence: string;
-}>;
-
-const PROVIDER_TRANSIENT_PATTERN =
-  /\b5\d{2}\b|gateway time|connection lost|server error|overloaded|rate.?limit|ECONNRESET|socket hang up|API Error|nonstream call error|mid-response/iu;
-const POLICY_DENIED_PATTERN =
-  /policy|permission denied|forbidden|not authorized|\b403\b/iu;
-const SESSION_DEAD_PATTERN =
-  /tmux session exited|session cannot be replaced|could not start|pane[^\n]*(dead|exited)|session[^\n]*(dead|exited|broken)|native session|launch reservation/iu;
-const STORAGE_LOCK_PATTERN =
-  /storage lock|database is locked|SQLITE_BUSY|lock timeout|COMMAND_TIMED_OUT|storage conflict|timed out waiting/iu;
-const DELIVERY_UNCERTAIN_PATTERN =
-  /delivery[^\n]*(uncertain|unknown)|uncertain[^\n]*delivery|push[^\n]*uncertain/iu;
-const STALE_BASE_PATTERN =
-  /stale (role|agent|base|target|state)|expected head|base[^\n]*(changed|moved)|conflict|CAS/iu;
-
 const INTEGRATION_ENVIRONMENT_PATTERN =
   /tsc: not found|command not found|ENOENT|runner disappeared|runner vanished|dirty target|wrong argument|not a git repository|npm error|node: not found/iu;
 
@@ -72,74 +39,64 @@ function excerpt(text: string, max = 160): string {
   return normalized.length <= max ? normalized : `${normalized.slice(0, max)}…`;
 }
 
-/**
- * Classify a failed Turn. A structured hint (from a future capability
- * provider) always wins; otherwise the summary is matched as historical
- * import text. Non-failed Turns return {@link NO_FAULT}.
- */
+/** Classify a failed Turn without inspecting Agent-authored output. */
 export function classifyTurnFailure(
-  run: Pick<Turn, "status" | "result">,
-  structured?: StructuredFaultHint
+  run: Pick<Turn, "status" | "result">
 ): FaultClassification {
   if (run.status !== "failed") return NO_FAULT;
-  if (structured !== undefined) {
+  const failureReason = run.result?.failureReason;
+  if (failureReason === "cancelled") return NO_FAULT;
+  if (failureReason === "delivery-unknown") {
     return {
-      faultClass: structured.faultClass,
-      basis: "structured",
-      evidence: structured.evidence
+      faultClass: "delivery-uncertain",
+      basis: "core-fact",
+      evidence: failureReason
     };
   }
-  const summary = run.result?.output ?? "";
-  if (summary.length === 0) {
-    return { faultClass: "other", basis: "text-historical", evidence: "" };
+  if (failureReason === "startup-failed") {
+    return {
+      faultClass: "session-dead",
+      basis: "core-fact",
+      evidence: failureReason
+    };
   }
-  const text = excerpt(summary);
-  if (POLICY_DENIED_PATTERN.test(summary)) {
-    return { faultClass: "policy-denied", basis: "text-historical", evidence: text };
+  if (failureReason === "missing-result") {
+    return {
+      faultClass: "result-missing",
+      basis: "core-fact",
+      evidence: failureReason
+    };
   }
-  if (PROVIDER_TRANSIENT_PATTERN.test(summary)) {
-    return { faultClass: "provider-transient", basis: "text-historical", evidence: text };
+  if (failureReason === "runtime-failed") {
+    return {
+      faultClass: "runtime-failure",
+      basis: "core-fact",
+      evidence: failureReason
+    };
   }
-  if (STORAGE_LOCK_PATTERN.test(summary)) {
-    return { faultClass: "storage-backend-lock", basis: "text-historical", evidence: text };
+  if (failureReason === "workspace-unavailable"
+    || failureReason === "workspace-dirty"
+    || failureReason === "workspace-branch-mismatch") {
+    return {
+      faultClass: "workspace-state",
+      basis: "core-fact",
+      evidence: failureReason
+    };
   }
-  if (DELIVERY_UNCERTAIN_PATTERN.test(summary)) {
-    return { faultClass: "delivery-uncertain", basis: "text-historical", evidence: text };
-  }
-  if (STALE_BASE_PATTERN.test(summary)) {
-    return { faultClass: "stale-base-target-cas", basis: "text-historical", evidence: text };
-  }
-  if (SESSION_DEAD_PATTERN.test(summary)) {
-    return { faultClass: "session-dead", basis: "text-historical", evidence: text };
-  }
-  return { faultClass: "other", basis: "text-historical", evidence: text };
+  return {
+    faultClass: "other",
+    basis: "core-fact",
+    evidence: failureReason ?? "failed without Core failure reason"
+  };
 }
 
-/**
- * Review execution failure (the Round itself failed to execute/deliver) is
- * `review-infra`; a completed Round with failed checks is a semantic negative.
- */
-export function classifyReviewRound(
-  round: ReviewRound,
-  evidence?: ReviewOutcomeEvidenceStore
-): FaultClassification {
-  const outcome = classifyReviewRoundOutcome(round, evidence);
-  if (outcome?.kind === "non-semantic") {
+/** ReviewRound failure is an execution fault; completed prose is not classified. */
+export function classifyReviewRound(round: ReviewRound): FaultClassification {
+  if (round.status === "failed") {
     return {
       faultClass: "review-infra",
-      basis: "structured",
-      evidence: outcome.reason
-    };
-  }
-  if (outcome?.kind === "semantic" && (round.checks ?? []).some((c) => c.outcome === "failed")) {
-    const failed = (round.checks ?? [])
-      .filter((c) => c.outcome === "failed")
-      .map((c) => c.name)
-      .join(",");
-    return {
-      faultClass: "review-semantic-negative",
-      basis: "structured",
-      evidence: `failed checks: ${failed}`
+      basis: "core-fact",
+      evidence: round.failure?.message ?? "Review execution failed without Core failure detail."
     };
   }
   return NO_FAULT;
@@ -147,8 +104,8 @@ export function classifyReviewRound(
 
 /**
  * Integration failure classes: environment/toolchain failure, stale base/CAS
- * conflict, or candidate failure. Conflict reports are structured; check
- * details are matched as historical text.
+ * conflict, or candidate failure. Conflict/check records are Core-owned, but
+ * environment attribution still uses a regex over their diagnostic text.
  */
 export function classifyIntegrationAttempt(
   attempt: Pick<IntegrationAttempt, "status" | "checks" | "conflict">
@@ -157,7 +114,7 @@ export function classifyIntegrationAttempt(
   if (attempt.conflict !== undefined) {
     return {
       faultClass: "stale-base-target-cas",
-      basis: "structured",
+      basis: "core-fact",
       evidence: excerpt(attempt.conflict.summary)
     };
   }
@@ -167,20 +124,20 @@ export function classifyIntegrationAttempt(
   if (INTEGRATION_ENVIRONMENT_PATTERN.test(checkText)) {
     return {
       faultClass: "integration-environment",
-      basis: "text-historical",
+      basis: "core-diagnostic",
       evidence: excerpt(checkText)
     };
   }
   if ((attempt.checks ?? []).some((c) => c.outcome === "failed")) {
     return {
       faultClass: "integration-candidate-failure",
-      basis: "structured",
+      basis: "core-fact",
       evidence: excerpt(checkText)
     };
   }
   return {
     faultClass: "other",
-    basis: "structured",
+    basis: "core-fact",
     evidence: "failed without checks or conflict"
   };
 }
@@ -199,8 +156,12 @@ export function countFaultClasses(
   const counts = new Map<FaultClass, number>(
     FAULT_CLASSES.map((name) => [name, 0])
   );
-  for (const { faultClass } of classifications) {
-    counts.set(faultClass, (counts.get(faultClass) ?? 0) + 1);
+  for (const classification of classifications) {
+    if (classification.basis === "none") continue;
+    counts.set(
+      classification.faultClass,
+      (counts.get(classification.faultClass) ?? 0) + 1
+    );
   }
   return Object.freeze(Object.fromEntries(counts)) as FaultClassCounts;
 }

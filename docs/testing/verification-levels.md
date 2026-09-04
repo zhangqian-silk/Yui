@@ -24,7 +24,7 @@ happy-path checks:
 
 1. the packaged CLI starts and exposes setup/update/upgrade/Task commands;
 2. one normal SQLite Task and Message survive a reopen;
-3. the production migration graph advances a supported aggregate version;
+3. the current storage contract rejects historical aggregate versions without mutation;
 4. the built-in Codex and Claude Drivers are registered.
 
 The test phase should remain below two seconds on a normal development machine;

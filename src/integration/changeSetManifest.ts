@@ -33,23 +33,22 @@ export const CHANGE_SET_MANIFEST_TAGS: readonly ChangeSetManifestTag[] = [
 /**
  * Lightweight integration manifest for one ChangeSet.
  *
- * `tags` and `deletedPaths` are derived from the diff at capture time; `targetRef` is the
- * intended integration target; `evidenceRefs` point at durable verification
- * evidence (for example `review-round:<id>` or `integration-check:<attempt>`).
+ * `tags` and `deletedPaths` are derived from the diff at capture time;
+ * `targetRef` is the intended integration target. Verification is deliberately
+ * absent: Agent reports are opaque and integration gates verify their own
+ * exact candidate instead of inheriting claims from a ChangeSet.
  */
 export type ChangeSetManifest = Readonly<{
   schemaVersion: 1;
   tags: readonly ChangeSetManifestTag[];
   deletedPaths: readonly string[];
   targetRef?: string;
-  evidenceRefs: readonly string[];
 }>;
 
 export type CreateChangeSetManifestInput = Readonly<{
   tags: readonly ChangeSetManifestTag[];
   deletedPaths: readonly string[];
   targetRef?: string;
-  evidenceRefs?: readonly string[];
 }>;
 
 export function createChangeSetManifest(
@@ -59,7 +58,6 @@ export function createChangeSetManifest(
     schemaVersion: CHANGE_SET_MANIFEST_SCHEMA_VERSION,
     tags: [...input.tags],
     deletedPaths: [...input.deletedPaths],
-    evidenceRefs: [...(input.evidenceRefs ?? [])],
     ...(input.targetRef === undefined ? {} : { targetRef: input.targetRef })
   });
 }
@@ -84,15 +82,10 @@ export function validateChangeSetManifest(manifest: ChangeSetManifest): ChangeSe
     manifest.deletedPaths,
     "ChangeSet manifest deleted path"
   );
-  const evidenceRefs = normalizedUniqueText(
-    manifest.evidenceRefs,
-    "ChangeSet manifest evidence reference"
-  );
   return {
     schemaVersion: CHANGE_SET_MANIFEST_SCHEMA_VERSION,
     tags,
     deletedPaths,
-    evidenceRefs,
     ...(manifest.targetRef === undefined ? {} : {
       targetRef: requireText(manifest.targetRef, "ChangeSet manifest target ref")
     })

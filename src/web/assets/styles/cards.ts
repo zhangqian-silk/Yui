@@ -192,17 +192,6 @@ details.work-item-card>summary.record-head~*{margin-top:0}
 .candidate-summary{flex:1;min-width:0;color:var(--text);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
 .candidate-source{flex:none;font-family:var(--font-mono);font-size:9.5px;letter-spacing:.04em;text-transform:uppercase;color:var(--muted)}
 .candidate-row time{flex:none;color:var(--muted);font-size:10.5px}
-/* Findings */
-.finding-list{display:grid;gap:4px}
-.finding-row{display:flex;align-items:baseline;gap:8px;padding:5px 9px;border-radius:var(--radius);background:var(--bg-3);border:1px solid var(--border);font-size:11.5px}
-.finding-summary{flex:1;min-width:0;color:var(--text)}
-.finding-row.is-critical,.finding-row.is-high{border-left:2px solid var(--danger)}
-.finding-row.is-medium{border-left:2px solid var(--warning)}
-.finding-row.is-low{border-left:2px solid var(--faint)}
-.chip.is-critical{color:var(--danger);border-color:var(--danger)}
-.chip.is-high{color:var(--danger)}
-.chip.is-medium{color:var(--warning)}
-.chip.is-low{color:var(--muted)}
 /* Sidebar derived execution status */
 .task-exec{grid-row:1;grid-column:3;align-self:center;flex:none;font-family:var(--font-mono);font-size:8.5px;letter-spacing:.05em;text-transform:uppercase;color:var(--faint);white-space:nowrap;max-width:90px;overflow:hidden;text-overflow:ellipsis}
 .task-exec.is-blocked,.task-exec.is-attention{color:var(--danger)}

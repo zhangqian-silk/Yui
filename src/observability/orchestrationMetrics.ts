@@ -1,6 +1,5 @@
 import { isDeepStrictEqual } from "node:util";
 
-import type { Decision } from "../decision/decision.js";
 import type { TaskRoleSessionSet } from "../executor/agentExecutor.js";
 import type { TaskEvent } from "../event/taskEvent.js";
 import type { DurableJob } from "../job/durableJob.js";
@@ -8,8 +7,7 @@ import type { ChangeSet } from "../integration/changeSet.js";
 import type { IntegrationAttempt } from "../integration/integrationAttempt.js";
 import type { PublicationReference } from "../task/publicationReference.js";
 import type { Turn } from "../turn/turn.js";
-import type { ReviewFinding } from "../review/reviewFinding.js";
-import { classifyReviewRoundOutcome } from "../review/reviewOutcomeClassifier.js";
+import { isCompletedReviewExecutionFromTurns } from "../review/reviewAcceptance.js";
 import type { ReviewRound } from "../review/reviewRound.js";
 import { projectFirstProgressAdvisory } from "../runtime/firstProgressAdvisory.js";
 import type { Task } from "../task/task.js";
@@ -18,7 +16,6 @@ import type { WorkItem } from "../workItem/workItem.js";
 
 export type OrchestrationAdvisoryCode =
   | "bugfix-workitem-overhead"
-  | "review-repair-fanout"
   | "repeated-integration-check"
   | "repeated-full-review"
   | "provider-first-progress-advisory";
@@ -42,10 +39,7 @@ export type TaskOrchestrationMetrics = Readonly<{
   reviews: Readonly<{
     full: number;
     delta: number;
-    nonSemantic: number;
-    ambiguous: number;
-    p1P2Findings: number;
-    p1P2FindingsPerSemanticReview: number;
+    failed: number;
   }>;
   integrations: Readonly<{
     attempts: number;
@@ -66,11 +60,9 @@ export type TaskOrchestrationFacts = Readonly<{
   workItems: readonly WorkItem[];
   changeSets: readonly ChangeSet[];
   reviewRounds: readonly ReviewRound[];
-  reviewFindings: readonly ReviewFinding[];
   integrations: readonly IntegrationAttempt[];
   durableJobs: readonly DurableJob[];
   publications: readonly PublicationReference[];
-  decisions: readonly Decision[];
   events: readonly TaskEvent[];
   managedWorkspaces: readonly ManagedWorkspace[];
 }>;
@@ -79,23 +71,8 @@ export type TaskOrchestrationFacts = Readonly<{
 export function projectTaskOrchestration(
   facts: TaskOrchestrationFacts
 ): TaskOrchestrationMetrics {
-  const evidence = {
-    listTurns: () => facts.turns,
-    listReviewFindings: () => facts.reviewFindings,
-    listEvents: () => facts.events
-  };
   const fullRounds = facts.reviewRounds.filter((round) => round.deltaRecheck === undefined);
   const deltaRounds = facts.reviewRounds.filter((round) => round.deltaRecheck !== undefined);
-  const classifications = new Map(facts.reviewRounds.map((round) => (
-    [round.id, classifyReviewRoundOutcome(round, evidence)] as const
-  )));
-  const semanticRounds = facts.reviewRounds.filter((round) => (
-    classifications.get(round.id)?.kind === "semantic"
-  ));
-  const p1P2Findings = facts.reviewFindings.filter((finding) => (
-    (finding.severity === "p1" || finding.severity === "p2")
-    && semanticRounds.some((round) => round.id === finding.firstReviewRoundId)
-  )).length;
 
   const candidateTimes = [
     ...facts.changeSets.map(({ createdAt }) => createdAt),
@@ -130,7 +107,6 @@ export function projectTaskOrchestration(
   });
   const advisories = projectAdvisories(
     facts,
-    classifications,
     fullRounds,
     repeatedIdentities,
     firstProgress.attentionRecommended
@@ -158,12 +134,7 @@ export function projectTaskOrchestration(
     reviews: {
       full: fullRounds.length,
       delta: deltaRounds.length,
-      nonSemantic: [...classifications.values()].filter((value) => value?.kind === "non-semantic").length,
-      ambiguous: [...classifications.values()].filter((value) => value?.kind === "ambiguous").length,
-      p1P2Findings,
-      p1P2FindingsPerSemanticReview: semanticRounds.length === 0
-        ? 0
-        : p1P2Findings / semanticRounds.length
+      failed: facts.reviewRounds.filter(({ status }) => status === "failed").length
     },
     integrations: {
       attempts: facts.integrations.length,
@@ -184,7 +155,6 @@ export function projectTaskOrchestration(
 
 function projectAdvisories(
   facts: TaskOrchestrationFacts,
-  classifications: ReadonlyMap<string, ReturnType<typeof classifyReviewRoundOutcome>>,
   fullRounds: readonly ReviewRound[],
   repeatedIdentities: number,
   firstProgressAttention: boolean
@@ -197,26 +167,6 @@ function projectAdvisories(
       refs: facts.workItems.map(({ id }) => `work-item:${id}`)
     });
   }
-  const repairItems = facts.workItems.filter((item) => (
-    item.acceptance.some((line) => line.startsWith("review-finding:"))
-  ));
-  const byRound = new Map<string, WorkItem[]>();
-  for (const item of repairItems) {
-    const roundIds = new Set(item.acceptance.flatMap((line) => {
-      const findingId = line.startsWith("review-finding:") ? line.slice("review-finding:".length) : "";
-      const finding = facts.reviewFindings.find(({ id }) => id === findingId);
-      return finding === undefined ? [] : [finding.firstReviewRoundId];
-    }));
-    for (const roundId of roundIds) byRound.set(roundId, [...(byRound.get(roundId) ?? []), item]);
-  }
-  for (const [roundId, items] of byRound) {
-    if (items.length < 2 || hasRepairFanoutDecision(facts.decisions, roundId, items)) continue;
-    result.push({
-      code: "review-repair-fanout",
-      reason: `Findings from Review ${roundId} were split across ${items.length} WorkItems without a durable Decision explaining independent ownership.`,
-      refs: [`review-round:${roundId}`, ...items.map(({ id }) => `work-item:${id}`)]
-    });
-  }
   if (repeatedIdentities > 0) {
     result.push({
       code: "repeated-integration-check",
@@ -226,11 +176,11 @@ function projectAdvisories(
         .map(({ id }) => `durable-job:${id}`)
     });
   }
-  const semanticFull = fullRounds.filter((round) => classifications.get(round.id)?.kind === "semantic")
+  const completedFull = fullRounds.filter((round) => (
+    isCompletedReviewExecutionFromTurns(round, facts.turns)
+  ))
     .sort((left, right) => left.createdAt.localeCompare(right.createdAt));
-  const recent = semanticFull.slice(-3);
-  const recentIds = new Set(recent.map(({ id }) => id));
-  const newFinding = facts.reviewFindings.some(({ firstReviewRoundId }) => recentIds.has(firstReviewRoundId));
+  const recent = completedFull.slice(-3);
   const sameCandidate = recent.length === 3
     && recent.every((round) => isDeepStrictEqual(
       round.taskCandidate,
@@ -238,10 +188,10 @@ function projectAdvisories(
     ));
   const sameReviewer = recent.length === 3
     && recent.every((round) => round.reviewerRoleName === recent[0]!.reviewerRoleName);
-  if (sameCandidate && sameReviewer && !newFinding) {
+  if (sameCandidate && sameReviewer) {
     result.push({
       code: "repeated-full-review",
-      reason: `The same Reviewer completed three full semantic Reviews of the same frozen candidate without a new finding; this is a cost advisory, not a Review limit.`,
+      reason: `The same Reviewer completed three full Reviews of the same frozen candidate; Core does not inspect their result text, so this is only a cost advisory.`,
       refs: recent.map(({ id }) => `review-round:${id}`)
     });
   }
@@ -253,17 +203,6 @@ function projectAdvisories(
     });
   }
   return result;
-}
-
-function hasRepairFanoutDecision(
-  decisions: readonly Decision[],
-  roundId: string,
-  items: readonly WorkItem[]
-): boolean {
-  return decisions.some((decision) => {
-    const text = `${decision.title}\n${decision.rationale}`;
-    return text.includes(roundId) && items.every(({ id }) => text.includes(id));
-  });
 }
 
 function terminalWorkspaceCount(facts: TaskOrchestrationFacts): number {

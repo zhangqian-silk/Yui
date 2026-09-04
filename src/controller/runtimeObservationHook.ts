@@ -14,8 +14,13 @@ import { runtimeLifecycleSignalKey } from "../runtime/lifecycleReservation.js";
 import type { RuntimeObservation } from "../runtime/runtimeObservation.js";
 import { formatTurnReceiptId } from "../task/taskRecordReference.js";
 import {
+  boundedTurnFailureDiagnostic,
+  transportAgentResult
+} from "../domain/agentResultTransport.js";
+import {
   FileRuntimeEventInbox,
-  MAX_RUNTIME_EVENT_FILE_BYTES
+  MAX_RUNTIME_EVENT_FILE_BYTES,
+  type RuntimeTurnTerminalOutcome
 } from "./runtimeEventInbox.js";
 import { resolveRuntimeHookTurnFence } from "./runtimeHookTurnFence.js";
 import type {
@@ -115,7 +120,7 @@ async function runGlobalRuntimeTurnHook(
   }
   const home = requireIdentity(environment.YUI_HOME, "YUI_HOME");
   const roleName = requireIdentity(environment.YUI_ROLE, "Role name");
-  new FileRuntimeEventInbox(home, () => now).enqueueTurnCompleted({
+  new FileRuntimeEventInbox(home, () => now).enqueueTurnTerminal({
     scope: "global",
     roleName,
     agentId: requireIdentity(environment.YUI_AGENT_ID, "Agent id"),
@@ -126,7 +131,8 @@ async function runGlobalRuntimeTurnHook(
     ...(environment.YUI_SESSION_TITLE === undefined
       ? {}
       : { title: requireIdentity(environment.YUI_SESSION_TITLE, "Session title") }),
-    summary: globalHookSummary(payload, hookEventName)
+    providerStatus: hookEventName === "Stop" ? "completed" : "failed",
+    outcome: globalHookOutcome(payload, hookEventName)
   });
   await call(
     home,
@@ -136,15 +142,21 @@ async function runGlobalRuntimeTurnHook(
   ).catch(() => {});
 }
 
-function globalHookSummary(
+function globalHookOutcome(
   payload: Readonly<Record<string, unknown>>,
   hookEventName: "Stop" | "StopFailure"
-): string {
-  for (const field of ["last_assistant_message", "summary", "message", "error"]) {
-    const value = payload[field];
-    if (typeof value === "string" && value.trim().length > 0) return value.trim();
+): RuntimeTurnTerminalOutcome {
+  if (hookEventName === "Stop") {
+    return transportAgentResult(payload.last_assistant_message);
   }
-  return hookEventName === "Stop" ? "Native Turn completed." : "Native Turn failed.";
+  const diagnostic = [payload.error, payload.error_details]
+    .filter((value): value is string => typeof value === "string" && value.trim().length > 0)
+    .join("\n");
+  return {
+    status: "failed",
+    failureReason: "runtime-failed",
+    diagnostic: boundedTurnFailureDiagnostic(diagnostic)
+  };
 }
 
 export function parseRuntimeObservationHook(

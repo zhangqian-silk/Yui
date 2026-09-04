@@ -28,7 +28,6 @@ import {
 import { resolveOperatorWizardArguments } from "./cli/operatorWizard.js";
 import type { SelectionPorts } from "./cli/selectionPorts.js";
 import { runUpdateCommand } from "./cli/updateCommand.js";
-import type { ControllerIdentity } from "./cli/updateOrchestrator.js";
 import { runUpgradeCommand } from "./cli/upgradeCommand.js";
 import { formatTimestamp } from "./output/timePresentation.js";
 import { resolveTmuxBin, resolveTmuxHistoryLimit } from "./config/yuiConfig.js";
@@ -119,8 +118,6 @@ import { createUpdatePorts } from "./cli/updatePorts.js";
 import { createReleaseWorkflowPorts } from "./release/releaseWorkflowPorts.js";
 import {
   acquireHandoverLock,
-  isForeignHandoverLockHeld,
-  isHandoverLockHeld,
   readRuntimeIdentity,
   type RuntimeIdentityReceipt
 } from "./release/runtimeRelease.js";
@@ -246,7 +243,7 @@ import {
 import { resolveRecordedTaskFinalReviewContract } from "./review/taskFinalReviewContractResolution.js";
 import type { TaskReviewCandidate } from "./review/reviewRound.js";
 import { assessDeltaRecheck, type DeltaRecheckPreflight } from "./review/deltaRecheck.js";
-import { isAcceptedTaskReviewBaseline } from "./review/reviewAcceptance.js";
+import { isCompletedTaskReviewEvidence } from "./review/reviewAcceptance.js";
 import { NodeGitWorkspace } from "./repository/gitWorkspace.js";
 import {
   currentWorkItemExecutionGroup,
@@ -490,7 +487,7 @@ export async function main(): Promise<void> {
     return;
   }
   if (args[0] === "upgrade") {
-    const result = await runCoordinatedUpgradeCommand(args.slice(1), home);
+    const result = await runUpgradeCommand(args.slice(1), home);
     process.exitCode = result.exitCode;
     emit(result.output, false, result.data);
     return;
@@ -1587,7 +1584,7 @@ export async function main(): Promise<void> {
     }
     let releaseReviewHandoverLock: (() => void) | undefined;
     if ((resolved[1] === "review"
-        && ["request", "force-fresh", "retry"].includes(resolved[2] ?? ""))
+        && ["request", "retry"].includes(resolved[2] ?? ""))
       || resolved[1] === "complete") {
       const handoverLock = acquireHandoverLock(home);
       releaseReviewHandoverLock = handoverLock.release;
@@ -1977,100 +1974,6 @@ export async function main(): Promise<void> {
     `Command is not connected to the current TaskStore command routing: ${resolved[0]}.`,
     renderCommandHelp(invocation.node, VERSION)
   );
-}
-
-/**
- * Public execution owns the Controller lifecycle around a migration. The
- * staged update child already runs beneath its parent's exact handover lock;
- * dry-run and update-preflight remain strictly read-only.
- */
-async function runCoordinatedUpgradeCommand(
-  commandArgs: readonly string[],
-  home: string
-): Promise<Awaited<ReturnType<typeof runUpgradeCommand>>> {
-  if (commandArgs.length !== 0 || inheritedUpdateHandover(home)) {
-    return runUpgradeCommand(commandArgs, home);
-  }
-
-  const plan = await runUpgradeCommand(["--dry-run"], home);
-  if (plan.data.outcome !== "upgrade-plan") {
-    const result = await runUpgradeCommand(commandArgs, home);
-    if (result.data.outcome === "already-current") {
-      await ensureFileTaskController(home, { environment: process.env });
-    }
-    return result;
-  }
-
-  const ports = createUpdatePorts(process.env);
-  const release = ports.beginControllerHandover?.(home);
-  if (release === undefined
-    || ports.controllerStatus === undefined
-    || ports.stopController === undefined) {
-    release?.();
-    throw runtimeError("Storage upgrade requires exact Controller lifecycle ownership.");
-  }
-  let stoppedIdentity: ControllerIdentity | undefined;
-  let storageChanged = false;
-  try {
-    const status = ports.controllerStatus(home);
-    if (status.running) {
-      const pid = status.pid;
-      const identity = status.identity;
-      if (typeof pid !== "number" || !Number.isSafeInteger(pid) || pid < 1
-        || identity === undefined) {
-        throw runtimeError(
-          "Storage upgrade could not authenticate the running Controller's exact identity."
-        );
-      }
-      const stopped = ports.stopController(home, pid);
-      if (stopped.stopped !== true || stopped.pid !== pid) {
-        throw runtimeError(
-          `Storage upgrade could not confirm the exact Controller stop for PID ${pid}.`
-        );
-      }
-      stoppedIdentity = identity;
-    }
-
-    const result = await runUpgradeCommand(commandArgs, home);
-    storageChanged = result.data.outcome === "upgraded" || result.data.outcome === "failed";
-    if (result.data.outcome === "upgraded" || result.data.outcome === "already-current") {
-      // From this point a replacement may exist even if readiness later fails;
-      // never restore the captured owner across unknown replacement ownership.
-      storageChanged = true;
-      await ensureFileTaskController(home, {
-        environment: process.env,
-        handoverOwnerPid: process.pid
-      });
-    } else if (stoppedIdentity !== undefined && result.data.outcome === "blocked") {
-      ports.restoreController?.(home, stoppedIdentity);
-      stoppedIdentity = undefined;
-    }
-    return result;
-  } catch (error) {
-    if (!storageChanged && stoppedIdentity !== undefined) {
-      try {
-        ports.restoreController?.(home, stoppedIdentity);
-      } catch (restoreError) {
-        throw runtimeError(
-          `Storage upgrade failed before mutation, and the captured Controller could not be restored: ${runtimeFailureMessage(restoreError)}`
-        );
-      }
-    }
-    throw error;
-  } finally {
-    release();
-  }
-}
-
-function inheritedUpdateHandover(home: string): boolean {
-  const rawOwner = process.env.YUI_UPDATE_HANDOVER_OWNER_PID;
-  if (rawOwner === undefined) return false;
-  const ownerPid = Number(rawOwner);
-  return Number.isSafeInteger(ownerPid)
-    && ownerPid > 0
-    && ownerPid === process.ppid
-    && isHandoverLockHeld(home)
-    && !isForeignHandoverLockHeld(home, ownerPid);
 }
 
 function explicitReleaseActivationDriver(): string | null {
@@ -2636,14 +2539,6 @@ async function actualTaskReviewCandidateForTaskCommand(
     if (round !== null && (round.scope ?? "work-item") === "task") {
       taskId = reference.taskId;
     }
-  } else if (args[1] === "review"
-    && args[2] === "force-fresh"
-    && args[3] !== undefined) {
-    const reference = cliTaskRecordReference(args[3], "reviewRound", environment);
-    const round = store.getReviewRound(reference.taskId, reference.localId);
-    if (round !== null && (round.scope ?? "work-item") === "task") {
-      taskId = reference.taskId;
-    }
   } else if (args[1] === "work"
     && args[2] === "review"
     && args[3] === "retry"
@@ -2759,7 +2654,7 @@ async function deltaRecheckPreflightForTaskCommand(
   // a head (a full Review or an equivalent-and-accepted delta).  A
   // non-accepted delta cannot be the base for a new delta.
   const previous = [...store.listReviewRounds(task.id)]
-    .filter((round) => isAcceptedTaskReviewBaseline(store, round))
+    .filter((round) => isCompletedTaskReviewEvidence(store, round))
     .sort((left, right) => left.id.localeCompare(right.id, undefined, { numeric: true }))
     .at(-1);
   if (previous === undefined) {

@@ -59,7 +59,6 @@ import {
   type ReviewConfig
 } from "../review/reviewConfig.js";
 import type { ReviewRound } from "../review/reviewRound.js";
-import type { ReviewFinding } from "../review/reviewFinding.js";
 import type { Project, ProjectReferenceSummary } from "../repository/project.js";
 import type { HomeIdentity } from "../repository/homeIdentity.js";
 import type { AgentProfile } from "../profile/agentProfile.js";
@@ -96,8 +95,8 @@ export const CURRENT_TASK_BRIEF_SCHEMA_VERSION = 2 as const;
 export const CURRENT_CONTEXT_SNAPSHOT_SCHEMA_VERSION = 1 as const;
 export const CURRENT_TASK_ROLE_SCHEMA_VERSION = 4 as const;
 export const CURRENT_MANAGED_WORKSPACE_SCHEMA_VERSION = 2 as const;
-export const CURRENT_WORK_ITEM_SCHEMA_VERSION = 14 as const;
-export const CURRENT_REVIEW_ROUND_SCHEMA_VERSION = 7 as const;
+export const CURRENT_WORK_ITEM_SCHEMA_VERSION = 15 as const;
+export const CURRENT_REVIEW_ROUND_SCHEMA_VERSION = 8 as const;
 export const CURRENT_CHANGE_SET_SCHEMA_VERSION = 4 as const;
 export const CURRENT_INTEGRATION_ATTEMPT_SCHEMA_VERSION = 6 as const;
 export const CURRENT_MESSAGE_SCHEMA_VERSION = 3 as const;
@@ -205,7 +204,7 @@ export function executionLaneActiveTurnKeyParts(key: string):
  * Nested-record versions consumed by the current SQLite payload validators.
  */
 export const CURRENT_TASK_ROLE_SESSION_SET_SCHEMA_VERSION = 12 as const;
-export const CURRENT_TURN_SCHEMA_VERSION = 4 as const;
+export const CURRENT_TURN_SCHEMA_VERSION = 5 as const;
 export const CURRENT_INTEGRATION_QUEUE_SCHEMA_VERSION = 1 as const;
 export type TaskStore = {
   rootDirectory(): string;
@@ -276,7 +275,7 @@ export type TaskStore = {
   /**
    * Issue 06 (Task terminalization readiness): load the full record set the
    * completion readiness projection consumes, including managed workspaces,
-   * DurableJobs, integration queue entries, Review findings, and the event
+   * DurableJobs, integration queue entries, ReviewRounds, and the event
    * fold. Returns null when the Task does not exist.
    */
   readCompletionReadinessFacts(taskId: string): CompletionReadinessFacts | null;
@@ -359,10 +358,6 @@ export type TaskStore = {
   getReviewRound(taskId: string, reviewRoundId: string): ReviewRound | null;
   listReviewRounds(taskId: string): ReviewRound[];
   saveReviewRound(taskId: string, round: ReviewRound): void;
-  nextReviewFindingId(taskId: string): string;
-  getReviewFinding(taskId: string, reviewFindingId: string): ReviewFinding | null;
-  listReviewFindings(taskId: string): ReviewFinding[];
-  saveReviewFinding(taskId: string, finding: ReviewFinding): void;
   getActiveTurn(taskId: string, roleName: string): Turn | null;
   saveActiveTurn(turn: Turn): void;
   clearActiveTurn(taskId: string, roleName: string): void;

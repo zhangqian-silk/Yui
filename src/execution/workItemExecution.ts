@@ -16,6 +16,7 @@ import {
   validateEffectiveLaunchSnapshot,
   type EffectiveLaunchSnapshot
 } from "../executor/effectiveLaunch.js";
+import { MAX_SYNTHESIS_SOURCE_TURNS } from "../context/sourceTurnContext.js";
 
 export const WORK_ITEM_EXECUTION_GROUP_SCHEMA_VERSION = 2 as const;
 export const WORK_ITEM_EXECUTION_LANE_SCHEMA_VERSION = 2 as const;
@@ -25,6 +26,7 @@ export const EXECUTION_GROUP_SCHEMA_VERSION = WORK_ITEM_EXECUTION_GROUP_SCHEMA_V
 export const EXECUTION_LANE_SCHEMA_VERSION = WORK_ITEM_EXECUTION_LANE_SCHEMA_VERSION;
 export const EXECUTION_ASSIGNMENT_SCHEMA_VERSION = WORK_ITEM_EXECUTION_ASSIGNMENT_SCHEMA_VERSION;
 export const MINIMUM_SYNTHESIS_RESULTS = MINIMUM_WORK_ITEM_SYNTHESIS_RESULTS;
+export const MAXIMUM_SYNTHESIS_RESULTS = MAX_SYNTHESIS_SOURCE_TURNS;
 
 export type WorkItemExecutionProjectBase = Readonly<{
   projectId: string;
@@ -191,6 +193,11 @@ export function createExecutionGroup<Assignment extends ExecutionAssignment>(
 ): ExecutionGroup<Assignment> {
   if (laneInputs.length < MINIMUM_SYNTHESIS_RESULTS) {
     throw new Error("A replicated ExecutionGroup requires at least two Lanes.");
+  }
+  if (laneInputs.length > MAXIMUM_SYNTHESIS_RESULTS) {
+    throw new Error(
+      `A replicated ExecutionGroup supports at most ${MAXIMUM_SYNTHESIS_RESULTS} Lanes.`
+    );
   }
   const groupId = requireIdentity(id, "ExecutionGroup id");
   const normalizedTaskId = requireIdentity(taskId, "Task id");
@@ -463,6 +470,11 @@ export function validateExecutionGroup(
   if (!Array.isArray(group.lanes) || group.lanes.length < MINIMUM_SYNTHESIS_RESULTS) {
     throw new Error("A replicated ExecutionGroup requires at least two Lanes.");
   }
+  if (group.lanes.length > MAXIMUM_SYNTHESIS_RESULTS) {
+    throw new Error(
+      `A replicated ExecutionGroup supports at most ${MAXIMUM_SYNTHESIS_RESULTS} Lanes.`
+    );
+  }
   const ids = new Set<string>();
   const roles = new Set<string>();
   const assignmentProjectIds = assignment.projects.map(({ projectId }) => projectId).sort();
@@ -559,13 +571,6 @@ export function workItemExecutionGroupSettled(group: WorkItemExecutionGroup): bo
 export function executionGroupSettled(group: ExecutionGroup): boolean {
   validateExecutionGroup(group);
   return group.lanes.every(({ disposition }) => disposition !== "open");
-}
-
-export function summarizeWorkItemExecutionGroup(
-  group: WorkItemExecutionGroup
-): WorkItemExecutionGroupSummary {
-  validateWorkItemExecutionGroup(group);
-  return summarizeExecutionGroup(group);
 }
 
 export function summarizeExecutionGroup(
