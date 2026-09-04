@@ -24,7 +24,7 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
@@ -60,14 +60,10 @@ jobs:
           fi
           echo "Core CI run $run_id passed for $head_sha"
 
-      - name: Setup Node.js 24
-        uses: actions/setup-node@v4
+      - name: Install dependencies
+        uses: ./.github/actions/install-repository-dependencies
         with:
           node-version: "24"
-          cache: npm
-
-      - name: Install
-        run: npm ci
 
       - name: Verify release tag
         run: npm run verify:release-tag
@@ -113,7 +109,7 @@ jobs:
           } | tee release-provenance.txt
 
       - name: Upload tested package
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: yui-runtime-tarball
           path: |
@@ -133,10 +129,10 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Setup Node.js ${{ matrix.node }}
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: ${{ matrix.node }}
 
@@ -146,7 +142,7 @@ jobs:
           sudo apt-get install --yes tmux
 
       - name: Download tested package
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: yui-runtime-tarball
           path: release-artifact
@@ -170,13 +166,13 @@ jobs:
 
     steps:
       - name: Setup Node.js 24
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: "24"
           registry-url: "https://registry.npmjs.org"
 
       - name: Download tested package
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           name: yui-runtime-tarball
           path: release-artifact
