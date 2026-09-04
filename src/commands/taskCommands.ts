@@ -151,13 +151,13 @@ import {
   runTaskRemoteDeliveryCommand
 } from "./taskRemoteDeliveryCommand.js";
 import {
+  enqueueRoleTurnDispatch,
   enqueueWork,
   requireCompleteWorkExecution,
   settleExactWorkExecution
 } from "../coordination/workMailboxQueue.js";
 import {
   mailboxHasWork as workMailboxHasWork,
-  nextPendingBatch,
   type MailboxEntityRef,
   type MailboxTarget
 } from "../coordination/workMailbox.js";
@@ -3352,10 +3352,13 @@ function dispatchWork(
       tx.saveWorkItem(task.id, workItemForDispatch);
       tx.saveTurn(withContext);
       tx.saveActiveTurn(withContext);
-      enqueueWork(tx, roleMailbox(task.id, role.name), "turn-dispatched", now, [
-        turnRef(task.id, withContext.id),
-        workItemRef(task.id, item.id)
-      ]);
+      enqueueRoleTurnDispatch(tx, {
+        taskId: task.id,
+        roleName: role.name,
+        turnId: withContext.id,
+        reason: "turn-dispatched",
+        occurredAt: now
+      });
       recordTaskEvent(tx, task.id, "turn.dispatched", turnLaunchEventPayload(withContext), now);
       return { kind: "direct" as const, turns: [withContext] };
     }
@@ -3483,10 +3486,13 @@ function dispatchWork(
       }
       tx.saveTurn(withContext);
       tx.saveActiveTurn(withContext);
-      enqueueWork(tx, roleMailbox(task.id, plan.role.name), "turn-dispatched", now, [
-        turnRef(task.id, withContext.id),
-        workItemRef(task.id, item.id)
-      ]);
+      enqueueRoleTurnDispatch(tx, {
+        taskId: task.id,
+        roleName: plan.role.name,
+        turnId: withContext.id,
+        reason: "turn-dispatched",
+        occurredAt: now
+      });
       recordTaskEvent(tx, task.id, "turn.dispatched", turnLaunchEventPayload(withContext), now);
       return withContext;
     });
@@ -4730,66 +4736,66 @@ function assertTaskReviewRequestLane(
   reviewerRoleName: string,
   reusableRound?: ReviewRound
 ): void {
-  const reviewerMailbox = store.getWorkMailbox(roleMailbox(taskId, reviewerRoleName));
-  const runtimeMailbox = store.getWorkMailbox(runtimeLifecycleTarget({
-    scope: "task",
-    taskId,
-    roleName: reviewerRoleName
-  }));
-  const hasMailboxWork = (mailbox: ReturnType<TaskWorkflowStore["getWorkMailbox"]>): boolean => (
-    mailbox !== null && workMailboxHasWork(mailbox)
-  );
   const activePointer = store.getActiveTurn(taskId, reviewerRoleName);
-  const activeTurns = store.listTurns(taskId).filter((entry) => (
-    entry.roleName === reviewerRoleName && entry.status === "active"
-  ));
-  const assertReviewerIdle = (): void => {
-    if (activePointer !== null || activeTurns.length > 0
-      || hasMailboxWork(reviewerMailbox) || hasMailboxWork(runtimeMailbox)) {
-      throw usageError(`Reviewer has unrelated active execution: ${reviewerRoleName}.`);
-    }
-  };
-  if (reusableRound === undefined || reusableRound.status === "pending") {
-    assertReviewerIdle();
+  if (reusableRound === undefined || reusableRound.status === "completed") {
+    assertReviewerAvailable(store, taskId, reviewerRoleName);
     return;
   }
-  if (reusableRound.status === "completed") {
-    assertReviewerIdle();
+  if (reusableRound.status === "pending") {
+    if (activePointer !== null) {
+      throw usageError(`Reviewer Role already has an active Turn: ${reviewerRoleName}.`);
+    }
+    assertReviewerAvailable(store, taskId, reviewerRoleName, reusableRound);
     return;
   }
   const reviewerTurnId = reusableRound.reviewerTurnId;
   if (reviewerTurnId === undefined
     && reusableRound.executionGroup?.lanes.some(({ disposition }) => disposition === "open")) {
-    assertReviewerIdle();
+    assertReviewerAvailable(store, taskId, reviewerRoleName, reusableRound);
     return;
   }
   const activeMatches = reviewerTurnId !== undefined
     && activePointer?.id === reviewerTurnId
-    && activePointer.status === "active"
-    && activeTurns.length === 1
-    && activeTurns[0]!.id === reviewerTurnId;
+    && activePointer.status === "active";
   if (!activeMatches) {
     throw usageError(
       `Existing Task-final ReviewRound ${reusableRound.id} is running without its exact Reviewer execution.`
     );
   }
-  const exactTurn = turnRef(taskId, reviewerTurnId!);
-  const reviewerPending = reviewerMailbox === null ? null : nextPendingBatch(reviewerMailbox);
-  const processingMatches = reviewerMailbox?.processing !== null
-    && reviewerMailbox?.processing !== undefined
-    && reviewerPending === null
-    && reviewerMailbox.processing.executionRef !== undefined
-    && isDeepStrictEqual(reviewerMailbox.processing.executionRef, exactTurn);
-  const pendingMatches = reviewerPending !== null
-    && reviewerMailbox?.processing === null
-    && reviewerPending.requestCount === 1
-    && reviewerPending.refs.some((ref) => isDeepStrictEqual(ref, exactTurn));
-  if (hasMailboxWork(reviewerMailbox) && !processingMatches && !pendingMatches) {
-    throw usageError(`Reviewer mailbox has unrelated active work: ${reviewerRoleName}.`);
+  assertReviewerAvailable(store, taskId, reviewerRoleName, reusableRound);
+}
+
+function assertReviewerAvailable(
+  store: TaskWorkflowStore,
+  taskId: string,
+  reviewerRoleName: string,
+  reusableRound?: ReviewRound
+): void {
+  const availability = projectReviewerAvailability(store, taskId, reviewerRoleName);
+  if (availability.kind === "available") return;
+  if (reusableRound !== undefined && reviewerBusyBelongsToRound(availability, reusableRound)) {
+    return;
   }
-  if (hasMailboxWork(runtimeMailbox)) {
-    throw usageError(`Reviewer runtime lifecycle has active work: ${reviewerRoleName}.`);
-  }
+  throw usageError(
+    `Reviewer ${reviewerRoleName} is busy (${availability.phase}`
+      + `${availability.activeTurnId === undefined ? "" : `; Turn ${availability.activeTurnId}`}`
+      + `${availability.activeReviewRoundId === undefined
+        ? ""
+        : `; ReviewRound ${availability.activeReviewRoundId}`}).`
+  );
+}
+
+function reviewerBusyBelongsToRound(
+  busy: ReviewerBusy,
+  round: ReviewRound
+): boolean {
+  if (busy.activeReviewRoundId !== round.id) return false;
+  if (busy.phase === "review-slot") return true;
+  if (busy.phase !== "active-turn" || busy.activeTurnId === undefined) return false;
+  return round.reviewerTurnId === busy.activeTurnId
+    || round.executionGroup?.lanes.some(({ currentTurnId }) => (
+      currentTurnId === busy.activeTurnId
+    )) === true;
 }
 
 function retryFailedTaskReviewRound(
@@ -4871,27 +4877,11 @@ function retryFailedTaskReviewRound(
       tx.saveRole(task.id, reviewer);
     }
 
-    const reviewerMailboxTarget = roleMailbox(task.id, reviewer.name);
-    const reviewerMailbox = tx.getWorkMailbox(reviewerMailboxTarget);
-    const runtimeMailbox = tx.getWorkMailbox(runtimeLifecycleTarget({
-      scope: "task",
-      taskId: task.id,
-      roleName: reviewer.name
-    }));
-    const hasMailboxWork = (mailbox: ReturnType<typeof tx.getWorkMailbox>): boolean => (
-      mailbox !== null && workMailboxHasWork(mailbox)
-    );
-    const activeReviewerTurns = tx.listTurns(task.id).filter((entry) => (
-      entry.roleName === reviewer.name && entry.status === "active"
-    ));
     const activePointer = tx.getActiveTurn(task.id, reviewer.name);
-
-    if (activePointer !== null || activeReviewerTurns.length > 0) {
+    if (activePointer !== null) {
       throw usageError(`Reviewer Role already has an active Turn: ${reviewer.name}.`);
     }
-    if (hasMailboxWork(reviewerMailbox) || hasMailboxWork(runtimeMailbox)) {
-      throw usageError(`Reviewer has unrelated mailbox work: ${reviewer.name}.`);
-    }
+    assertReviewerAvailable(tx, task.id, reviewer.name, round);
 
     // Issue 06: an already-pending Round is the idempotent retry result.
     if (round.status === "pending") {
@@ -5433,16 +5423,10 @@ function settleStaleFinalReviewTurn(
         `Review Turn ${run.id} identity does not match its ReviewRound or frozen Task state changed: ${validation.reason ?? "mismatch"}.`
       );
     }
-    const activeReviewerTurn = tx.listTurns(task.id).find((entry) => (
-      entry.purpose === "review"
-      && entry.roleName === round.reviewerRoleName
-      && entry.status === "active"
-    ));
     const activeRoleTurn = tx.getActiveTurn(task.id, round.reviewerRoleName);
-    if (activeReviewerTurn !== undefined || activeRoleTurn !== null) {
-      const active = activeReviewerTurn ?? activeRoleTurn!;
+    if (activeRoleTurn !== null) {
       throw usageError(
-        `${task.id}/${round.reviewerRoleName} already has active Turn ${active.id}.`
+        `${task.id}/${round.reviewerRoleName} already has active Turn ${activeRoleTurn.id}.`
       );
     }
 
@@ -5482,48 +5466,7 @@ function settleStaleFinalReviewTurn(
       throw usageError(`Final ReviewRound is not stranded running: ${round.id}/${round.status}.`);
     }
 
-    const reviewerTarget = roleMailbox(task.id, round.reviewerRoleName);
-    const reviewerMailbox = tx.getWorkMailbox(reviewerTarget);
-    const reviewerPending = reviewerMailbox === null ? null : nextPendingBatch(reviewerMailbox);
-    const exactTurnRef = turnRef(task.id, run.id);
-    if (reviewerMailbox?.processing !== null && reviewerMailbox?.processing !== undefined) {
-      const processing = reviewerMailbox.processing;
-      if (
-        processing.executionRef === undefined
-        || !isDeepStrictEqual(processing.executionRef, exactTurnRef)
-        || reviewerPending !== null
-      ) {
-        throw usageError(`Reviewer mailbox has unrelated processing work: ${round.reviewerRoleName}.`);
-      }
-    } else if (reviewerPending !== null) {
-      const pending = reviewerPending;
-      if (
-        pending.requestCount !== 1
-        || !pending.refs.some((ref) => isDeepStrictEqual(ref, exactTurnRef))
-      ) {
-        throw usageError(`Reviewer mailbox has unrelated pending work: ${round.reviewerRoleName}.`);
-      }
-    }
-    const runtimeMailbox = tx.getWorkMailbox(runtimeLifecycleTarget({
-      scope: "task",
-      taskId: task.id,
-      roleName: round.reviewerRoleName
-    }));
-    if (runtimeMailbox?.processing !== null && runtimeMailbox?.processing !== undefined) {
-      throw usageError(`Reviewer runtime lifecycle is pending: ${round.reviewerRoleName}.`);
-    }
-    if (runtimeMailbox !== null && workMailboxHasWork(runtimeMailbox)) {
-      throw usageError(`Reviewer runtime lifecycle has pending work: ${round.reviewerRoleName}.`);
-    }
-
-    // A matching pending/processing dispatch belongs to this failed Turn and
-    // is safe to settle here. It is never merged with unrelated mailbox work.
-    if (reviewerMailbox !== null && reviewerMailbox !== undefined) {
-      const settlement = settleExactWorkExecution(tx, reviewerTarget, exactTurnRef);
-      if (settlement === "absent") {
-        throw usageError(`Reviewer mailbox changed before stale final settlement: ${round.reviewerRoleName}.`);
-      }
-    }
+    assertReviewerAvailable(tx, task.id, round.reviewerRoleName, round);
 
     // Preserve any report/check/evidence already attached to the old Round;
     // terminalization only adds the missing failure boundary and end time.
@@ -5847,7 +5790,13 @@ function retryTurn(
         );
       }
     }
-    enqueueWork(tx, roleMailbox(task.id, role.name), "turn-retried", now, [turnRef(task.id, created.id)]);
+    enqueueRoleTurnDispatch(tx, {
+      taskId: task.id,
+      roleName: role.name,
+      turnId: created.id,
+      reason: "turn-retried",
+      occurredAt: now
+    });
     recordTaskEvent(tx, task.id, "turn.retried", {
       ...turnLaunchEventPayload(created),
       previousTurnId: previous.id
@@ -6446,91 +6395,48 @@ function retryFailedReviewRun(
       );
     }
 
-    const reviewerMailboxTarget = roleMailbox(task.id, retryReviewerRoleName);
-    const reviewerMailbox = tx.getWorkMailbox(reviewerMailboxTarget);
-    const reviewerPending = reviewerMailbox === null ? null : nextPendingBatch(reviewerMailbox);
-    const runtimeMailbox = tx.getWorkMailbox(runtimeLifecycleTarget({
-      scope: "task",
-      taskId: task.id,
-      roleName: retryReviewerRoleName
-    }));
-
-    const hasMailboxWork = (mailbox: ReturnType<typeof tx.getWorkMailbox>): boolean => (
-      mailbox !== null && workMailboxHasWork(mailbox)
-    );
-
     const reviewer = requireRole(tx, task.id, retryReviewerRoleName);
     const activePointer = tx.getActiveTurn(task.id, reviewer.name);
-    const activeReviewerTurns = tx.listTurns(task.id).filter((entry) => (
-      entry.roleName === reviewer.name && entry.status === "active"
-    ));
 
     // Issue 06: a completed same-Round retry is a no-write idempotent result.
     if (round.status === "completed") {
-      if (activePointer !== null || activeReviewerTurns.length > 0) {
-        throw usageError(`Reviewer Role already has an active Turn: ${reviewer.name}.`);
-      }
-      if (hasMailboxWork(reviewerMailbox) || hasMailboxWork(runtimeMailbox)) {
-        throw usageError(`Reviewer has unrelated mailbox work: ${reviewer.name}.`);
-      }
+      assertReviewerAvailable(tx, task.id, reviewer.name);
       return { round, previousRun: run, created: false };
     }
 
     // Issue 06: a running same Round is reusable only with its exact active
-    // Turn and mailbox execution. A stranded Turn (no active pointer) falls
-    // through and resets the Round after the identity fences below.
+    // Turn. A stranded Turn (no active pointer) falls through and resets the
+    // Round after the identity fences below.
     if (round.status === "running" && !runningPanelLaneRetry) {
       const reviewerTurnId = round.reviewerTurnId;
       const activeMatches = reviewerTurnId !== undefined
         && activePointer !== null
         && activePointer.id === reviewerTurnId
-        && activePointer.status === "active"
-        && activeReviewerTurns.length === 1
-        && activeReviewerTurns[0]!.id === reviewerTurnId;
-      const processingMatches = reviewerTurnId !== undefined
-        && reviewerMailbox?.processing?.executionRef !== undefined
-        && isDeepStrictEqual(
-          reviewerMailbox.processing.executionRef,
-          turnRef(task.id, reviewerTurnId)
-        )
-        && reviewerPending === null;
-      const pendingMatches = reviewerTurnId !== undefined
-        && reviewerMailbox?.processing === null
-        && reviewerPending?.requestCount === 1
-        && reviewerPending.refs.some((ref) => (
-          isDeepStrictEqual(ref, turnRef(task.id, reviewerTurnId))
-        ));
-      if (activePointer !== null
-        && (!activeMatches
-          || (!processingMatches && !pendingMatches)
-          || hasMailboxWork(runtimeMailbox))) {
+        && activePointer.status === "active";
+      if (activePointer !== null && !activeMatches) {
         throw usageError(
           `Existing running ReviewRound ${round.id} lacks its exact active Reviewer execution.`
         );
       }
-      if (activeMatches) return { round, previousRun: run, created: false };
+      if (activeMatches) {
+        assertReviewerAvailable(tx, task.id, reviewer.name, round);
+        return { round, previousRun: run, created: false };
+      }
     }
 
     // Issue 06: an already-pending Round is the idempotent retry result.
     if (round.status === "pending") {
-      if (activePointer !== null || activeReviewerTurns.length > 0) {
+      if (activePointer !== null) {
         throw usageError(`Reviewer Role already has an active Turn: ${reviewer.name}.`);
       }
-      if (hasMailboxWork(reviewerMailbox) || hasMailboxWork(runtimeMailbox)) {
-        throw usageError(`Reviewer has unrelated mailbox work: ${reviewer.name}.`);
-      }
+      assertReviewerAvailable(tx, task.id, reviewer.name, round);
       return { round, previousRun: run, created: false };
     }
 
-    if (activePointer !== null || activeReviewerTurns.length > 0) {
+    if (activePointer !== null) {
       throw usageError(`Reviewer Role already has an active Turn: ${reviewer.name}.`);
     }
-    if (runtimeMailbox?.processing !== null && runtimeMailbox?.processing !== undefined) {
-      throw usageError(`Reviewer runtime lifecycle is pending: ${reviewer.name}.`);
-    }
-    if (runtimeMailbox !== null && workMailboxHasWork(runtimeMailbox)) {
-      throw usageError(`Reviewer runtime lifecycle has pending work: ${reviewer.name}.`);
-    }
+    assertReviewerAvailable(tx, task.id, reviewer.name, round);
 
     const validation = validateExactTurnReviewRound(tx, run, { allowTerminal: true });
     if (validation.disposition !== "applied" || validation.round === null) {
@@ -6539,29 +6445,6 @@ function retryFailedReviewRun(
       );
     }
 
-    // A stranded pre-delivery Turn can leave its exact pending or processing
-    // dispatch behind; settle only that exact reference while holding the
-    // same aggregate lock. Any merged or unrelated batch fails closed.
-    const exactOldTurnRef = turnRef(task.id, run.id);
-    if (reviewerMailbox?.processing !== null && reviewerMailbox?.processing !== undefined) {
-      if (
-        reviewerMailbox.processing.executionRef === undefined
-        || !isDeepStrictEqual(reviewerMailbox.processing.executionRef, exactOldTurnRef)
-        || reviewerPending !== null
-      ) {
-        throw usageError(`Reviewer mailbox is busy: ${reviewer.name}.`);
-      }
-      settleExactWorkExecution(tx, reviewerMailboxTarget, exactOldTurnRef);
-    } else if (reviewerPending !== null) {
-      const exact = reviewerPending.refs.some((ref) => (
-        isDeepStrictEqual(ref, exactOldTurnRef)
-      ));
-      if (!exact) throw usageError(`Reviewer mailbox has unrelated pending work: ${reviewer.name}.`);
-      if (reviewerPending.requestCount !== 1) {
-        throw usageError(`Reviewer mailbox has merged pending work: ${reviewer.name}.`);
-      }
-      settleExactWorkExecution(tx, reviewerMailboxTarget, exactOldTurnRef);
-    }
     if (runningPanelLaneRetry) {
       const resetRound = retryRunningReviewExecutionLane(
         round,
@@ -7213,10 +7096,13 @@ export function dispatchPreparedReviewRound(
       tx.saveTurn(created);
       tx.saveReviewRound(taskId, startReviewRound(round, created.id));
       tx.saveActiveTurn(created);
-      enqueueWork(tx, roleMailbox(taskId, reviewer.name), "review-requested", now, [
-        turnRef(taskId, created.id),
-        ...(item === undefined ? [] : [workItemRef(taskId, item.id)])
-      ]);
+      enqueueRoleTurnDispatch(tx, {
+        taskId,
+        roleName: reviewer.name,
+        turnId: created.id,
+        reason: "review-requested",
+        occurredAt: now
+      });
       recordTaskEvent(tx, taskId, "turn.review-dispatched", turnLaunchEventPayload(created), now);
       createdTurns.push(created);
       return createdTurns;
@@ -7332,10 +7218,13 @@ export function dispatchPreparedReviewRound(
       const laneReviewer = requireRole(tx, taskId, unboundTurn.roleName);
       tx.saveTurn(created);
       tx.saveActiveTurn(created);
-      enqueueWork(tx, roleMailbox(taskId, laneReviewer.name), "review-requested", now, [
-        turnRef(taskId, created.id),
-        ...(item === undefined ? [] : [workItemRef(taskId, item.id)])
-      ]);
+      enqueueRoleTurnDispatch(tx, {
+        taskId,
+        roleName: laneReviewer.name,
+        turnId: created.id,
+        reason: "review-requested",
+        occurredAt: now
+      });
       recordTaskEvent(tx, taskId, "turn.review-dispatched", turnLaunchEventPayload(created), now);
     }
     const reconciliation = reconcileReviewMainTurns(tx, taskId, now);

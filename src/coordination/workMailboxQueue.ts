@@ -16,6 +16,33 @@ export type WorkMailboxQueueStore = Readonly<{
   saveWorkMailbox(mailbox: WorkMailbox): void;
 }>;
 
+export type RoleTurnDispatchIdentity = Readonly<{
+  taskId: string;
+  roleName: string;
+  turnId: string;
+}>;
+
+export type RoleTurnDispatchToken =
+  | Readonly<{
+      kind: "pending";
+      fromSequence: number;
+      toSequence: number;
+    }>
+  | Readonly<{
+      kind: "processing";
+      batchId: string;
+    }>;
+
+export type RoleTurnDispatchSettlement = "settled" | "absent" | "state-changed";
+
+const LEGACY_ROLE_TURN_DISPATCH_REASONS = new Set([
+  "turn-dispatched",
+  "turn-retried",
+  "review-requested",
+  "workitem-synthesis-ready",
+  "review-synthesis-ready"
+]);
+
 /** Atomically useful when called inside the caller's TaskStore transaction. */
 export function enqueueWork(
   store: WorkMailboxQueueStore,
@@ -34,6 +61,125 @@ export function enqueueWork(
   });
   store.saveWorkMailbox(queued);
   return queued;
+}
+
+/**
+ * The sole ordinary Role Turn wake shape. The Turn is durable execution
+ * authority; this signal only asks the Controller to deliver that exact Turn.
+ * Leader is deliberately excluded because its Role mailbox is reserved for
+ * semantic event wakes and force-steer batches. A Leader active Turn is
+ * selected directly from durable state by its targeted Controller pass.
+ */
+export function enqueueRoleTurnDispatch(
+  store: WorkMailboxQueueStore,
+  input: RoleTurnDispatchIdentity & Readonly<{
+    reason: string;
+    occurredAt: Date | string;
+  }>
+): WorkMailbox | null {
+  if (input.roleName === "leader") return null;
+  return enqueueWork(
+    store,
+    roleTurnTarget(input),
+    input.reason,
+    input.occurredAt,
+    [roleTurnRef(input)],
+    {
+      source: "turn-dispatch",
+      dedupeKey: roleTurnDispatchDedupeKey(input)
+    }
+  );
+}
+
+/**
+ * Captures only the mailbox prefix that contains one exact Role Turn dispatch.
+ * A later signal may append while Provider delivery is in flight; its suffix
+ * remains pending when this token is settled.
+ */
+export function captureRoleTurnDispatch(
+  mailbox: WorkMailbox | null,
+  input: RoleTurnDispatchIdentity
+): RoleTurnDispatchToken | null {
+  if (input.roleName === "leader"
+    || mailbox === null
+    || mailbox.target.kind !== "role"
+    || mailbox.target.taskId !== input.taskId
+    || mailbox.target.roleName !== input.roleName) {
+    return null;
+  }
+  const exactRef = roleTurnRef(input);
+  if (mailbox.processing?.executionRef !== undefined
+    && mailboxEntityRefKey(mailbox.processing.executionRef) === mailboxEntityRefKey(exactRef)) {
+    return {
+      kind: "processing",
+      batchId: mailbox.processing.batchId
+    };
+  }
+  const pending = mailbox.pending;
+  if (pending === null) return null;
+  const dedupeKey = roleTurnDispatchDedupeKey(input);
+  if (mailbox.recentDedupeKeys.includes(dedupeKey)) return null;
+  const keyIndex = pending.dedupeKeys.indexOf(dedupeKey);
+  if (keyIndex >= 0 && pending.dedupeKeys.length === pending.requestCount) {
+    const turnSequence = pending.fromSequence + keyIndex;
+    if (turnSequence <= pending.toSequence) {
+      return {
+        kind: "pending",
+        fromSequence: pending.fromSequence,
+        toSequence: turnSequence
+      };
+    }
+  }
+  // Valid earlier dispatches used sequence-generated dedupe keys and could
+  // include a companion WorkItem ref. Consume that complete legacy batch once
+  // the exact Turn reaches an accepted or terminal boundary.
+  if (pending.requestCount === 1
+    && pending.sources.length === 1
+    && pending.sources[0] === "yui"
+    && pending.reasons.some((reason) => LEGACY_ROLE_TURN_DISPATCH_REASONS.has(reason))
+    && pending.refs.some((ref) => (
+      mailboxEntityRefKey(ref) === mailboxEntityRefKey(exactRef)
+    ))) {
+    return {
+      kind: "pending",
+      fromSequence: pending.fromSequence,
+      toSequence: pending.toSequence
+    };
+  }
+  return null;
+}
+
+/**
+ * Settles one exact ordinary Role Turn dispatch. Provider acceptance is the
+ * normal boundary; terminalization calls the same operation for conclusively
+ * unaccepted and valid earlier dispatches.
+ */
+export function settleRoleTurnDispatch(
+  store: WorkMailboxQueueStore,
+  input: RoleTurnDispatchIdentity,
+  expected?: RoleTurnDispatchToken | null
+): RoleTurnDispatchSettlement {
+  if (expected === null) return "absent";
+  const target = roleTurnTarget(input);
+  const mailbox = store.getWorkMailbox(target);
+  const current = captureRoleTurnDispatch(mailbox, input);
+  if (current === null || mailbox === null) return "absent";
+  if (expected !== undefined && !sameRoleTurnDispatchToken(current, expected)) {
+    return "state-changed";
+  }
+  const token = expected ?? current;
+  if (token.kind === "processing") {
+    if (mailbox.processing?.batchId !== token.batchId) return "state-changed";
+    store.saveWorkMailbox(completeProcessing(mailbox, token.batchId));
+    return "settled";
+  }
+  if (mailbox.pending === null
+    || mailbox.pending.fromSequence !== token.fromSequence
+    || mailbox.pending.toSequence < token.toSequence) {
+    return "state-changed";
+  }
+  store.saveWorkMailbox(consumePendingBatch(mailbox, token));
+  return "settled";
 }
 
 /** Completes only the batch owned by the matching durable execution. */
@@ -122,6 +268,40 @@ export function settleExactWorkExecution(
 
 function timestamp(value: Date | string): string {
   return value instanceof Date ? value.toISOString() : value;
+}
+
+function roleTurnTarget(
+  input: Pick<RoleTurnDispatchIdentity, "taskId" | "roleName">
+): Extract<MailboxTarget, { kind: "role" }> {
+  return {
+    kind: "role",
+    taskId: input.taskId,
+    roleName: input.roleName
+  };
+}
+
+function roleTurnRef(input: RoleTurnDispatchIdentity): MailboxEntityRef {
+  return {
+    type: "turn",
+    taskId: input.taskId,
+    id: input.turnId
+  };
+}
+
+function roleTurnDispatchDedupeKey(input: RoleTurnDispatchIdentity): string {
+  return `role-turn:${input.taskId}:${input.roleName}:${input.turnId}`;
+}
+
+function sameRoleTurnDispatchToken(
+  left: RoleTurnDispatchToken,
+  right: RoleTurnDispatchToken
+): boolean {
+  return left.kind === right.kind
+    && (left.kind === "pending"
+      ? right.kind === "pending"
+        && left.fromSequence === right.fromSequence
+        && left.toSequence === right.toSequence
+      : right.kind === "processing" && left.batchId === right.batchId);
 }
 
 function targetLabel(target: MailboxTarget): string {

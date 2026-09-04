@@ -15,6 +15,11 @@ import {
   enqueueSignal,
   releaseProcessing
 } from "../../dist/coordination/workMailbox.js";
+import {
+  captureRoleTurnDispatch,
+  enqueueRoleTurnDispatch,
+  settleRoleTurnDispatch
+} from "../../dist/coordination/workMailboxQueue.js";
 import { createTaskEvent } from "../../dist/event/taskEvent.js";
 import {
   configuredAgentToDefinition,
@@ -766,16 +771,97 @@ test("Provider acceptance consumes only the submitted mailbox prefix", () => {
   assert.deepEqual(consumed.recentDedupeKeys, ["message-1"]);
 });
 
-test("a terminal Reviewer Turn signal does not reserve the next Review slot", () => {
+test("Role dispatch settlement preserves merged work and Leader wakes", () => {
+  const workerTarget = { kind: "role", taskId: "task-1", roleName: "worker" };
+  let workerMailbox = createWorkMailbox(workerTarget);
+  const workerStore = {
+    getWorkMailbox: () => workerMailbox,
+    saveWorkMailbox: (updated) => { workerMailbox = updated; }
+  };
+  enqueueRoleTurnDispatch(workerStore, {
+    taskId: "task-1",
+    roleName: "worker",
+    turnId: "turn-1",
+    reason: "turn-dispatched",
+    occurredAt: "2026-09-03T00:00:00.000Z"
+  });
+  const acceptedToken = captureRoleTurnDispatch(workerMailbox, {
+    taskId: "task-1",
+    roleName: "worker",
+    turnId: "turn-1"
+  });
+  workerMailbox = enqueueSignal(workerMailbox, {
+    reason: "future-work",
+    refs: [{ type: "turn", taskId: "task-1", id: "turn-2" }],
+    occurredAt: "2026-09-03T00:00:01.000Z",
+    dedupeKey: "future-work"
+  });
+  assert.equal(settleRoleTurnDispatch(workerStore, {
+    taskId: "task-1",
+    roleName: "worker",
+    turnId: "turn-1"
+  }, acceptedToken), "settled");
+  assert.equal(workerMailbox.pending.fromSequence, 2);
+  assert.equal(workerMailbox.pending.requestCount, 1);
+  assert.deepEqual(workerMailbox.pending.dedupeKeys, ["future-work"]);
+  assert.equal(settleRoleTurnDispatch(workerStore, {
+    taskId: "task-1",
+    roleName: "worker",
+    turnId: "turn-2"
+  }), "absent");
+  assert.equal(workerMailbox.pending.requestCount, 1);
+
+  let legacyMerged = enqueueSignal(createWorkMailbox(workerTarget), {
+    reason: "legacy-turn-dispatched",
+    refs: [{ type: "turn", taskId: "task-1", id: "turn-9" }],
+    occurredAt: "2026-09-03T00:00:02.000Z"
+  });
+  legacyMerged = enqueueSignal(legacyMerged, {
+    reason: "future-work",
+    refs: [{ type: "turn", taskId: "task-1", id: "turn-10" }],
+    occurredAt: "2026-09-03T00:00:03.000Z"
+  });
+  const legacyStore = {
+    getWorkMailbox: () => legacyMerged,
+    saveWorkMailbox: (updated) => { legacyMerged = updated; }
+  };
+  assert.equal(settleRoleTurnDispatch(legacyStore, {
+    taskId: "task-1",
+    roleName: "worker",
+    turnId: "turn-9"
+  }), "absent");
+  assert.equal(legacyMerged.pending.requestCount, 2);
+
+  const leaderTarget = { kind: "role", taskId: "task-1", roleName: "leader" };
+  let leaderMailbox = enqueueSignal(createWorkMailbox(leaderTarget), {
+    reason: "operator-input",
+    refs: [{ type: "turn", taskId: "task-1", id: "turn-1" }],
+    occurredAt: "2026-09-03T00:00:04.000Z"
+  });
+  const leaderStore = {
+    getWorkMailbox: () => leaderMailbox,
+    saveWorkMailbox: (updated) => { leaderMailbox = updated; }
+  };
+  assert.equal(settleRoleTurnDispatch(leaderStore, {
+    taskId: "task-1",
+    roleName: "leader",
+    turnId: "turn-1"
+  }), "absent");
+  assert.equal(leaderMailbox.pending.requestCount, 1);
+});
+
+test("Reviewer availability ignores Role delivery residue", () => {
   const target = { kind: "role", taskId: "task-1", roleName: "reviewer" };
   const mailbox = enqueueSignal(createWorkMailbox(target), {
     reason: "review-requested",
-    refs: [{ type: "turn", taskId: "task-1", id: "turn-1" }],
+    refs: [
+      { type: "turn", taskId: "task-1", id: "turn-1" },
+      { type: "work-item", taskId: "task-1", id: "work-item-1" }
+    ],
     occurredAt: "2026-09-02T00:00:00.000Z"
   });
   const availability = projectReviewerAvailability({
     getActiveTurn: () => null,
-    listTurns: () => [{ id: "turn-1", roleName: "reviewer", status: "completed" }],
     listReviewRounds: () => [],
     getWorkMailbox: (candidate) => candidate.kind === "role" ? mailbox : null
   }, "task-1", "reviewer");
@@ -783,10 +869,9 @@ test("a terminal Reviewer Turn signal does not reserve the next Review slot", ()
   assert.equal(availability.kind, "available");
   assert.equal(projectReviewerAvailability({
     getActiveTurn: () => null,
-    listTurns: () => [],
     listReviewRounds: () => [],
     getWorkMailbox: (candidate) => candidate.kind === "role" ? mailbox : null
-  }, "task-1", "reviewer").kind, "busy");
+  }, "task-1", "reviewer").kind, "available");
   const processing = claimPending(mailbox, {
     batchId: "review-delivery",
     owner: "reviewer",
@@ -794,10 +879,36 @@ test("a terminal Reviewer Turn signal does not reserve the next Review slot", ()
   });
   assert.equal(projectReviewerAvailability({
     getActiveTurn: () => null,
-    listTurns: () => [{ id: "turn-1", roleName: "reviewer", status: "completed" }],
     listReviewRounds: () => [],
     getWorkMailbox: (candidate) => candidate.kind === "role" ? processing : null
-  }, "task-1", "reviewer").kind, "busy");
+  }, "task-1", "reviewer").kind, "available");
+  const runtime = enqueueSignal(createWorkMailbox(runtimeLifecycleTarget({
+    scope: "task",
+    taskId: "task-1",
+    roleName: "reviewer"
+  })), {
+    reason: "runtime-launch",
+    refs: [{ type: "turn", taskId: "task-1", id: "turn-2" }],
+    occurredAt: "2026-09-02T00:00:02.000Z"
+  });
+  const runtimeBusy = projectReviewerAvailability({
+    getActiveTurn: () => null,
+    listReviewRounds: () => [],
+    getWorkMailbox: (candidate) => candidate.kind === "role-runtime" ? runtime : mailbox
+  }, "task-1", "reviewer");
+  assert.equal(runtimeBusy.kind, "busy");
+  assert.equal(runtimeBusy.phase, "runtime-lifecycle");
+
+  let storedMailbox = mailbox;
+  assert.equal(settleRoleTurnDispatch({
+    getWorkMailbox: () => storedMailbox,
+    saveWorkMailbox: (updated) => { storedMailbox = updated; }
+  }, {
+    taskId: "task-1",
+    roleName: "reviewer",
+    turnId: "turn-1"
+  }), "settled");
+  assert.equal(storedMailbox.pending, null);
 });
 
 test("Yui and direct Turns share one Provider conversation", () => {
@@ -1188,7 +1299,7 @@ test("an active Task without a durable event remains quiet", async (t) => {
   assert.equal(store.getWorkMailbox({ kind: "role", taskId: task.id, roleName: "leader" }), null);
 });
 
-test("an unowned ended Provider binding does not block the next Turn", async (t) => {
+test("active Role Turns deliver from durable state and Worker hints settle at acceptance", async (t) => {
   const home = mkdtempSync(join(tmpdir(), "yui-unowned-provider-smoke-"));
   t.after(() => rmSync(home, { recursive: true, force: true }));
   ensureStorageSchema(home);
@@ -1207,18 +1318,18 @@ test("an unowned ended Provider binding does not block the next Turn", async (t)
     entries: []
   }, startedAt));
   const agent = createRoleAgentBinding({ id: "codex", adapterId: "codex" });
-  const leader = createRole(
+  const role = createRole(
     task.id,
-    "leader",
+    "worker",
     [agent],
     agent.agentId,
     workspaceRoot,
     startedAt
   );
-  store.saveRole(task.id, leader);
-  const effective = resolveEffectiveLaunch({ role: leader, purpose: "execution" });
+  store.saveRole(task.id, role);
+  const effective = resolveEffectiveLaunch({ role, purpose: "execution" });
   let sessions = recordRoleAgentSession(createRoleSessionSet(
-    { scope: "task", taskId: task.id, roleName: leader.name },
+    { scope: "task", taskId: task.id, roleName: role.name },
     agent.agentId,
     startedAt
   ), {
@@ -1259,13 +1370,24 @@ test("an unowned ended Provider binding does not block the next Turn", async (t)
   const turn = createTurn(
     "turn-1",
     task.id,
-    leader.name,
+    role.name,
     "new",
-    turnInput("turn-1", task.id, leader.name, "Continue from durable Task context."),
+    turnInput("turn-1", task.id, role.name, "Continue from durable Task context."),
     nextAt,
     { effective }
   );
   store.saveActiveTurn(turn);
+  const deliveryTarget = { kind: "role", taskId: task.id, roleName: role.name };
+  const dispatchMailbox = enqueueRoleTurnDispatch(store, {
+    taskId: task.id,
+    roleName: role.name,
+    turnId: turn.id,
+    reason: "turn-dispatched",
+    occurredAt: nextAt
+  });
+  assert.deepEqual(dispatchMailbox.pending.refs, [
+    { type: "turn", taskId: task.id, id: turn.id }
+  ]);
 
   let preparedCalls = 0;
   const prepared = {
@@ -1273,7 +1395,7 @@ test("an unowned ended Provider binding does not block the next Turn", async (t)
     launchId: "activation-new",
     turnId: turn.id,
     taskId: task.id,
-    roleName: leader.name,
+    roleName: role.name,
     agentId: agent.agentId,
     adapterId: agent.adapterId,
     mode: "new",
@@ -1292,7 +1414,7 @@ test("an unowned ended Provider binding does not block the next Turn", async (t)
     prepareRoleSession: async (request) => {
       preparedCalls += 1;
       request.beforeHostStart({
-        owner: { scope: "task", taskId: task.id, roleName: leader.name },
+        owner: { scope: "task", taskId: task.id, roleName: role.name },
         launchId: "activation-new",
         turnId: turn.id,
         agentId: agent.agentId,
@@ -1315,7 +1437,7 @@ test("an unowned ended Provider binding does not block the next Turn", async (t)
         ordinal: 0,
         fence: {
           taskId: task.id,
-          roleName: leader.name,
+          roleName: role.name,
           turnId: turn.id,
           agentId: agent.agentId,
           driverId: "openai/codex",
@@ -1341,12 +1463,119 @@ test("an unowned ended Provider binding does not block the next Turn", async (t)
   );
   assert.equal(result.status, "delivered", JSON.stringify(result));
   assert.equal(preparedCalls, 1);
-  const replacedProvider = store.getTaskRoleSessionSet(task.id, leader.name).providerBinding;
+  assert.equal(store.getWorkMailbox(deliveryTarget).pending, null);
+  const replacedProvider = store.getTaskRoleSessionSet(task.id, role.name).providerBinding;
   assert.equal(replacedProvider.currentConversationEpoch, 2);
   assert.equal(
     replacedProvider.conversations.find(({ status }) => status === "current").conversationId,
     "thread-new"
   );
+  const workerTerminal = store.transaction((tx) => terminalizeExactTaskTurn(tx, {
+    taskId: task.id,
+    roleName: role.name,
+    agentId: agent.agentId,
+    turnId: turn.id,
+    outcome: {
+      status: "failed",
+      failureReason: "runtime-failed",
+      summary: "Worker delivery path verified."
+    }
+  }, new Date(nextAt.getTime() + 1_000)));
+  assert.equal(workerTerminal.disposition, "applied");
+
+  const leaderTask = activateTask(createTask("task-2", "Deliver a Leader Turn", nextAt, {
+    cwd: workspaceRoot
+  }), nextAt);
+  store.saveTask(leaderTask);
+  store.saveManagedWorkspace(createManagedWorkspace({
+    owner: { type: "task", taskId: leaderTask.id },
+    root: workspaceRoot,
+    entries: []
+  }, nextAt));
+  const leader = createRole(
+    leaderTask.id,
+    "leader",
+    [agent],
+    agent.agentId,
+    workspaceRoot,
+    nextAt
+  );
+  store.saveRole(leaderTask.id, leader);
+  const leaderEffective = resolveEffectiveLaunch({ role: leader, purpose: "execution" });
+  const leaderTurn = createTurn(
+    "turn-1",
+    leaderTask.id,
+    leader.name,
+    "new",
+    turnInput("turn-1", leaderTask.id, leader.name, "Continue from durable Task state."),
+    nextAt,
+    { effective: leaderEffective }
+  );
+  store.saveActiveTurn(leaderTurn);
+  assert.equal(store.getWorkMailbox({
+    kind: "role",
+    taskId: leaderTask.id,
+    roleName: leader.name
+  }), null);
+  const leaderPrepared = {
+    deliveryId: "delivery-leader",
+    launchId: "activation-leader",
+    turnId: leaderTurn.id,
+    taskId: leaderTask.id,
+    roleName: leader.name,
+    agentId: agent.agentId,
+    adapterId: agent.adapterId,
+    mode: "new",
+    sessionStarted: true,
+    session: {
+      agentId: agent.agentId,
+      adapterId: agent.adapterId,
+      nativeSessionId: "thread-leader",
+      launchId: "activation-leader",
+      status: "active",
+      effective: leaderEffective
+    }
+  };
+  let leaderDeliveryCalls = 0;
+  const leaderPass = await runControllerSchedulerPass(
+    adapter,
+    {
+      prepareRoleSession: async (request) => {
+        leaderDeliveryCalls += 1;
+        request.beforeHostStart({
+          owner: { scope: "task", taskId: leaderTask.id, roleName: leader.name },
+          launchId: "activation-leader",
+          turnId: leaderTurn.id,
+          agentId: agent.agentId,
+          adapterId: agent.adapterId,
+          effective: leaderEffective,
+          nativeSessionId: "thread-leader"
+        });
+        return leaderPrepared;
+      },
+      waitUntilReady: async () => ({
+        prepared: leaderPrepared,
+        session: leaderPrepared.session
+      }),
+      sendOnce: async () => "sent",
+      inspectRole: async () => "present"
+    },
+    nextAt,
+    undefined,
+    { kind: "full" },
+    false
+  );
+  const leaderResult = leaderPass.activeTurnDeliveries.find((candidate) => (
+    candidate.taskId === leaderTask.id && candidate.roleName === leader.name
+  ));
+  assert.notEqual(leaderResult, undefined);
+  assert.equal(leaderResult.status, "delivered", JSON.stringify(leaderResult));
+  assert.equal(leaderDeliveryCalls, 1);
+  assert.equal(store.getWorkMailbox({
+    kind: "role",
+    taskId: leaderTask.id,
+    roleName: leader.name
+  }), null);
 });
 
 test("Task completion leaves its reusable Provider Session running", async (t) => {
@@ -1709,6 +1938,10 @@ test("direct and replicated WorkItem execution converge through exact Lane retry
   const directTurn = store.getActiveTurn(task.id, "leader");
   assert.equal(directTurn.executionGroupId, undefined);
   assert.equal(directTurn.sourceExecutionGroupId, undefined);
+  assert.equal(
+    store.getWorkMailbox({ kind: "role", taskId: task.id, roleName: "leader" }),
+    null
+  );
   finish(directTurn, "failed", new Date("2026-09-02T00:00:30.000Z"));
   const directProjection = projectWorkItemExecution(
     store.getWorkItem(task.id, directItem.id),
@@ -1757,7 +1990,20 @@ test("direct and replicated WorkItem execution converge through exact Lane retry
   });
   const producerA = store.getActiveExecutionLaneTurn(task.id, groupId, `${groupId}-lane-1`);
   const producerB = store.getActiveExecutionLaneTurn(task.id, groupId, `${groupId}-lane-2`);
+  const producerAMailbox = store.getWorkMailbox({
+    kind: "role",
+    taskId: task.id,
+    roleName: producerA.roleName
+  });
+  assert.deepEqual(producerAMailbox.pending.refs, [
+    { type: "turn", taskId: task.id, id: producerA.id }
+  ]);
   finish(producerA, "completed", new Date("2026-09-02T00:03:00.000Z"));
+  assert.equal(store.getWorkMailbox({
+    kind: "role",
+    taskId: task.id,
+    roleName: producerA.roleName
+  }).pending, null);
   stopTaskExecutionCommand(
     { taskId: task.id, reason: "Exercise exact Lane recovery" },
     store,

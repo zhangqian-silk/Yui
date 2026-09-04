@@ -1,6 +1,10 @@
 import { isDeepStrictEqual } from "node:util";
 
 import { completeProcessing } from "../coordination/workMailbox.js";
+import {
+  captureRoleTurnDispatch,
+  settleRoleTurnDispatch
+} from "../coordination/workMailboxQueue.js";
 import type { TaskRoleSessionSet } from "../executor/agentExecutor.js";
 import { createTaskEvent } from "../event/taskEvent.js";
 import {
@@ -509,6 +513,20 @@ export function terminalizeExactTaskTurn(
     }
   }
   store.saveTurn(terminal);
+  const dispatchIdentity = {
+    taskId: terminal.taskId,
+    roleName: terminal.roleName,
+    turnId: terminal.id
+  };
+  const dispatchToken = captureRoleTurnDispatch(
+    store.getWorkMailbox({
+      kind: "role",
+      taskId: terminal.taskId,
+      roleName: terminal.roleName
+    }),
+    dispatchIdentity
+  );
+  settleRoleTurnDispatch(store, dispatchIdentity, dispatchToken);
   if (terminal.status === "completed"
     && terminal.purpose === "review"
     && terminal.executionGroupId === undefined

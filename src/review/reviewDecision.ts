@@ -27,7 +27,7 @@ export type ReviewDecisionProjection = Readonly<{
   reviewers: readonly Readonly<{
     reviewerRoleName: string;
     status: "available" | "busy" | "unavailable";
-    phase?: "review-slot" | "active-turn" | "mailbox" | "runtime-lifecycle";
+    phase?: "review-slot" | "active-turn" | "runtime-lifecycle";
     activeTurnId?: string;
     activeReviewRoundId?: string;
     startedAt?: string;

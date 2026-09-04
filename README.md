@@ -1009,7 +1009,8 @@ Its recovery reconciliation runs every 120 seconds by default. Normal durable st
 
 1. dispatch pending Leader wakes whose Task workspaces are already ready;
 2. prepare active Project Task main worktrees with durable orchestration work;
-3. deliver queued Worker Turns;
+3. deliver active Role Turns from durable active-Turn state, using ordinary
+   Role mailboxes only as optional delivery hints;
 4. resolve due Turn completions and reconcile Role liveness;
 5. dispatch Leader work created or unblocked by the later recovery phases.
 

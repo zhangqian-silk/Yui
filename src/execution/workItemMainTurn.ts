@@ -1,6 +1,6 @@
 import { isDeepStrictEqual } from "node:util";
 
-import { enqueueWork } from "../coordination/workMailboxQueue.js";
+import { enqueueRoleTurnDispatch } from "../coordination/workMailboxQueue.js";
 import { createTurnInput } from "../context/turnInputContract.js";
 import {
   contextSnapshotDeltaRefIds,
@@ -183,16 +183,13 @@ export function reconcileWorkItemMainTurns(
     );
     store.saveTurn(turn);
     store.saveActiveTurn(turn);
-    enqueueWork(
-      store,
-      { kind: "role", taskId, roleName: role.name },
-      "workitem-synthesis-ready",
-      now,
-      [
-        { type: "turn", taskId, id: turn.id },
-        { type: "work-item", taskId, id: item.id }
-      ]
-    );
+    enqueueRoleTurnDispatch(store, {
+      taskId,
+      roleName: role.name,
+      turnId: turn.id,
+      reason: "workitem-synthesis-ready",
+      occurredAt: now
+    });
     store.saveEvent(taskId, createTaskEvent(
       store.nextEventId(taskId),
       taskId,

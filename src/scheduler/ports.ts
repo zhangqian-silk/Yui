@@ -14,6 +14,10 @@ import type {
   WorkMailbox
 } from "../coordination/workMailbox.js";
 import type {
+  RoleTurnDispatchSettlement,
+  RoleTurnDispatchToken
+} from "../coordination/workMailboxQueue.js";
+import type {
   RuntimeLifecycleTarget,
   RuntimeRoleOwner
 } from "../runtime/lifecycleReservation.js";
@@ -380,11 +384,13 @@ export interface SchedulerStorePort {
    */
   listReadyWorkMailboxes?(): readonly WorkMailbox[];
   claimWorkMailbox(input: SchedulerMailboxClaimInput): SchedulerMailboxClaimResult;
-  /** Consumes one exact coalesced wake batch after its Provider Turn is accepted. */
-  consumeWorkMailbox(
-    target: MailboxTarget,
-    expected: Readonly<{ fromSequence: number; toSequence: number }>
-  ): boolean;
+  /** Settles the exact ordinary Role dispatch after acceptance or terminalization. */
+  settleRoleTurnDispatch(input: Readonly<{
+    taskId: string;
+    roleName: string;
+    turnId: string;
+    expected?: RoleTurnDispatchToken | null;
+  }>): RoleTurnDispatchSettlement;
   completeWorkMailbox(target: MailboxTarget, batchId: string): boolean;
   releaseWorkMailbox(target: MailboxTarget, batchId: string): boolean;
   /**

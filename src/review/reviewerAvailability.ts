@@ -11,7 +11,7 @@ import type { ReviewRound } from "./reviewRound.js";
 export type ReviewerBusy = Readonly<{
   kind: "busy";
   reviewerRoleName: string;
-  phase: "review-slot" | "active-turn" | "mailbox" | "runtime-lifecycle";
+  phase: "review-slot" | "active-turn" | "runtime-lifecycle";
   activeTurnId?: string;
   activeReviewRoundId?: string;
   startedAt?: string;
@@ -29,7 +29,6 @@ export type ReviewerAvailability = ReviewerBusy | ReviewerAvailable;
 
 export type ReviewerAvailabilityStore = Readonly<{
   getActiveTurn(taskId: string, roleName: string): Turn | null;
-  listTurns(taskId: string): readonly Turn[];
   listReviewRounds(taskId: string): readonly ReviewRound[];
   getWorkMailbox(target: MailboxTarget): WorkMailbox | null;
 }>;
@@ -40,12 +39,8 @@ export function projectReviewerAvailability(
   taskId: string,
   reviewerRoleName: string
 ): ReviewerAvailability {
-  const turns = store.listTurns(taskId);
-  const active = store.getActiveTurn(taskId, reviewerRoleName)
-    ?? turns.find((run) => (
-      run.roleName === reviewerRoleName && run.status === "active"
-    ));
-  if (active !== null && active !== undefined) {
+  const active = store.getActiveTurn(taskId, reviewerRoleName);
+  if (active !== null) {
     return {
       kind: "busy",
       reviewerRoleName,
@@ -58,6 +53,14 @@ export function projectReviewerAvailability(
       retryable: true,
       retryAfterSeconds: 5
     };
+  }
+  const runtimeMailbox = store.getWorkMailbox(runtimeLifecycleTarget({
+    scope: "task",
+    taskId,
+    roleName: reviewerRoleName
+  }));
+  if (runtimeMailbox !== null && mailboxHasWork(runtimeMailbox)) {
+    return runtimeLifecycleBusy(reviewerRoleName, runtimeMailbox);
   }
   const activeRound = store.listReviewRounds(taskId).find((round) => (
     (round.status === "pending" || round.status === "running")
@@ -75,27 +78,6 @@ export function projectReviewerAvailability(
       retryAfterSeconds: 5
     };
   }
-  const reviewerMailbox = store.getWorkMailbox({
-    kind: "role",
-    taskId,
-    roleName: reviewerRoleName
-  });
-  if (reviewerMailbox !== null && reviewerMailboxHasActionableWork(
-    reviewerMailbox,
-    turns,
-    taskId,
-    reviewerRoleName
-  )) {
-    return mailboxBusy(reviewerRoleName, "mailbox", reviewerMailbox);
-  }
-  const runtimeMailbox = store.getWorkMailbox(runtimeLifecycleTarget({
-    scope: "task",
-    taskId,
-    roleName: reviewerRoleName
-  }));
-  if (runtimeMailbox !== null && mailboxHasWork(runtimeMailbox)) {
-    return mailboxBusy(reviewerRoleName, "runtime-lifecycle", runtimeMailbox);
-  }
   return {
     kind: "available",
     reviewerRoleName,
@@ -103,28 +85,8 @@ export function projectReviewerAvailability(
   };
 }
 
-function reviewerMailboxHasActionableWork(
-  mailbox: WorkMailbox,
-  turns: readonly Turn[],
-  taskId: string,
-  reviewerRoleName: string
-): boolean {
-  if (mailbox.processing !== null) return true;
-  const pending = nextPendingBatch(mailbox);
-  if (pending === null) return false;
-  if (pending.refs.length === 0) return true;
-  return pending.refs.some((ref) => {
-    if (ref.type !== "turn" || ref.taskId !== taskId) return true;
-    const turn = turns.find(({ id }) => id === ref.id);
-    return turn === undefined
-      || turn.roleName !== reviewerRoleName
-      || turn.status === "active";
-  });
-}
-
-function mailboxBusy(
+function runtimeLifecycleBusy(
   reviewerRoleName: string,
-  phase: "mailbox" | "runtime-lifecycle",
   mailbox: WorkMailbox
 ): ReviewerBusy {
   const pending = nextPendingBatch(mailbox);
@@ -132,7 +94,7 @@ function mailboxBusy(
   return {
     kind: "busy",
     reviewerRoleName,
-    phase,
+    phase: "runtime-lifecycle",
     ...(startedAt === undefined ? {} : { startedAt }),
     retryable: true,
     retryAfterSeconds: 5
