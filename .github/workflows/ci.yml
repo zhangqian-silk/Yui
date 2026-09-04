@@ -22,19 +22,15 @@ concurrency:
 jobs:
   verify:
     runs-on: ubuntu-latest
-    timeout-minutes: 3
+    timeout-minutes: 5
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Node.js 24
-        uses: actions/setup-node@v4
+      - name: Install dependencies
+        uses: ./.github/actions/install-repository-dependencies
         with:
           node-version: "24"
-          cache: npm
-
-      - name: Install
-        run: npm ci
 
       - name: Core path smoke
         run: npm run test:core

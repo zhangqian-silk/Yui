@@ -60,14 +60,10 @@ jobs:
           fi
           echo "Core CI run $run_id passed for $head_sha"
 
-      - name: Setup Node.js 24
-        uses: actions/setup-node@v4
+      - name: Install dependencies
+        uses: ./.github/actions/install-repository-dependencies
         with:
           node-version: "24"
-          cache: npm
-
-      - name: Install
-        run: npm ci
 
       - name: Verify release tag
         run: npm run verify:release-tag

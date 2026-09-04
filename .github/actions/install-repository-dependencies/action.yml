@@ -1,0 +1,43 @@
+name: Install repository dependencies
+description: Install JavaScript dependencies quickly and restore ABI-specific native builds.
+
+inputs:
+  node-version:
+    description: Node.js version used by the job.
+    required: true
+
+runs:
+  using: composite
+  steps:
+    - name: Setup Node.js ${{ inputs.node-version }}
+      uses: actions/setup-node@v4
+      with:
+        node-version: ${{ inputs.node-version }}
+        cache: npm
+
+    - name: Install JavaScript dependencies
+      shell: bash
+      run: npm ci --ignore-scripts --prefer-offline --no-audit --no-fund
+
+    - name: Fingerprint native dependencies
+      id: native-fingerprint
+      shell: bash
+      run: echo "key=$(node scripts/ci-native-dependencies.mjs fingerprint)" >> "$GITHUB_OUTPUT"
+
+    - name: Restore native dependency builds
+      id: native-cache
+      uses: actions/cache@v4
+      with:
+        path: |
+          node_modules/better-sqlite3/build
+          node_modules/node-pty/build
+        key: yui-native-v1-${{ steps.native-fingerprint.outputs.key }}
+
+    - name: Build native dependencies
+      if: steps.native-cache.outputs.cache-hit != 'true'
+      shell: bash
+      run: npm rebuild better-sqlite3 node-pty --prefer-offline --no-audit --no-fund
+
+    - name: Verify native dependencies
+      shell: bash
+      run: node scripts/ci-native-dependencies.mjs verify
