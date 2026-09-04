@@ -104,6 +104,8 @@ export type RuntimeObservationPayload = Readonly<{
   input?: string;
   /** Exact final Agent result text; Core treats it as opaque transport. */
   output?: string;
+  /** Core-owned explanation when final Agent text failed transport validation. */
+  resultTransportDiagnostic?: string;
   summary?: string;
   execution?: "active" | "quiescent" | "unknown";
   outcome?: "pending" | "succeeded" | "failed" | "cancelled" | "unknown";
@@ -490,6 +492,12 @@ function normalizePayload(
   if (kind === "turn.failed" && input.failure === undefined) {
     throw new Error("turn.failed requires normalized failure evidence.");
   }
+  if (input.resultTransportDiagnostic !== undefined && kind !== "turn.completed") {
+    throw new Error("Only turn.completed may carry a result transport diagnostic.");
+  }
+  if (input.output !== undefined && input.resultTransportDiagnostic !== undefined) {
+    throw new Error("A runtime observation cannot carry Agent output and a result diagnostic.");
+  }
   if (kind === "conversation.observed"
     && !["unknown", "recoverable", "unrecoverable"].includes(input.recoverability ?? "")) {
     throw new Error("conversation.observed requires recoverability.");
@@ -575,6 +583,14 @@ function normalizePayload(
     ...(input.output === undefined
       ? {}
       : { output: requireResultText(input.output, "Runtime Turn output") }),
+    ...(input.resultTransportDiagnostic === undefined
+      ? {}
+      : {
+          resultTransportDiagnostic: requireText(
+            input.resultTransportDiagnostic,
+            "Runtime Turn result diagnostic"
+          )
+        }),
     ...(input.summary === undefined ? {} : { summary: requireText(input.summary, "Runtime summary") }),
     ...(input.execution === undefined ? {} : { execution: input.execution }),
     ...(input.outcome === undefined ? {} : { outcome: input.outcome }),

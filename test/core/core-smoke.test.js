@@ -94,7 +94,6 @@ import {
   MAX_TURN_RESULT_OUTPUT_BYTES,
   completeTurn,
   createTurn,
-  transportAgentResult,
   validateTurn
 } from "../../dist/turn/turn.js";
 import { createTurnInput } from "../../dist/context/turnInputContract.js";
@@ -1342,15 +1341,38 @@ test("a direct Provider Turn records visible input and output without workflow s
   assert.equal(store.listTurns(task.id).length, 2);
   assert.equal(store.getPendingWakeup(task.id), null);
 
-  assert.equal(adapter.observeRuntimeObservation(observation("goal.updated", 7, {
+  assert.equal(adapter.observeRuntimeObservation(observation("turn.accepted", 7, {
+    fence: { nativeTurnId: "turn-missing-result-3", receiptId: "direct:turn-missing-result-3" }
+  }), new Date("2026-08-31T00:31:01.000Z")), "applied");
+  const missingResultTurn = store.getActiveTurn(task.id, role.name);
+  assert.notEqual(missingResultTurn, null);
+  const preciseDiagnostic = "Provider Agent result is 900000 bytes and exceeds the durable result limit.";
+  assert.equal(adapter.observeRuntimeObservation(observation("turn.completed", 8, {
+    fence: {
+      turnId: missingResultTurn.id,
+      nativeTurnId: "turn-missing-result-3",
+      receiptId: "direct:turn-missing-result-3"
+    },
+    payload: { resultTransportDiagnostic: preciseDiagnostic }
+  }), new Date("2026-08-31T00:31:02.000Z")), "applied");
+  const failedResultTurn = store.getTurn(task.id, missingResultTurn.id);
+  assert.equal(failedResultTurn.status, "failed");
+  assert.equal(failedResultTurn.result.output, undefined);
+  assert.equal(failedResultTurn.result.diagnostic, preciseDiagnostic);
+  assert.equal(failedResultTurn.result.failureReason, "missing-result");
+
+  assert.equal(adapter.observeRuntimeObservation(observation("goal.updated", 9, {
     payload: {
       goalStatus: "complete",
       goalObjective: "Continue until the delegated work is actually complete.",
-      goalUpdatedAt: "2026-08-31T00:31:01.000Z",
+      goalUpdatedAt: "2026-08-31T00:31:03.000Z",
       goalNativeTurnId: "turn-ordinary-1"
     }
-  }), new Date("2026-08-31T00:31:01.000Z")), "applied");
-  assert.deepEqual(store.getPendingWakeup(task.id).reasons, ["provider-goal-complete"]);
+  }), new Date("2026-08-31T00:31:03.000Z")), "applied");
+  assert.deepEqual(store.getPendingWakeup(task.id).reasons, [
+    "role-turn-result",
+    "provider-goal-complete"
+  ]);
 });
 
 test("a wake names a completed Turn even when that Turn predates the delta cursor", (t) => {
@@ -4103,9 +4125,11 @@ test("native terminal ingress preserves valid output and durably fails missing o
       output: `${boundary}x`
     }
   }).event;
-  assert.deepEqual(oversized.outcome, transportAgentResult(`${boundary}x`));
   assert.equal(oversized.outcome.status, "failed");
   assert.equal(oversized.outcome.failureReason, "missing-result");
+  assert.equal(oversized.outcome.output, undefined);
+  assert.match(oversized.outcome.diagnostic, /524289 bytes/u);
+  assert.match(oversized.outcome.diagnostic, /524288-byte durable result limit/u);
 
   const missing = inbox.enqueueTurnTerminal({
     ...base,
@@ -4113,7 +4137,11 @@ test("native terminal ingress preserves valid output and durably fails missing o
     turnId: "turn-3",
     outcome: { status: "completed", output: null }
   }).event;
-  assert.deepEqual(missing.outcome, transportAgentResult(null));
+  assert.deepEqual(missing.outcome, {
+    status: "failed",
+    diagnostic: "Provider terminal event did not include an Agent result.",
+    failureReason: "missing-result"
+  });
 
   const longDiagnostic = `failed:${"🔥".repeat(20_000)}`;
   const failed = inbox.enqueueTurnTerminal({

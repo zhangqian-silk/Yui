@@ -314,7 +314,9 @@ export async function publishStructuredProviderTerminal(input: Readonly<{
   const payload: RuntimeObservationPayload = kind === "turn.completed"
     ? {
         ...(input.terminal.input === undefined ? {} : { input: input.terminal.input }),
-        ...(transported.status === "completed" ? { output: transported.output } : {})
+        ...(transported.status === "completed"
+          ? { output: transported.output }
+          : { resultTransportDiagnostic: transported.diagnostic })
       }
     : kind === "turn.failed"
       ? {

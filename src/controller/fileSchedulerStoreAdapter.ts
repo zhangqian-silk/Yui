@@ -424,7 +424,13 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
     now: Date
   ): ProviderLifecycleObservation {
     const outcome = providerStatus === "completed"
-      ? transportAgentResult(input.payload.output)
+      ? input.payload.resultTransportDiagnostic === undefined
+        ? transportAgentResult(input.payload.output)
+        : {
+            status: "failed" as const,
+            diagnostic: input.payload.resultTransportDiagnostic,
+            failureReason: "missing-result" as const
+          }
       : {
           status: "failed" as const,
           diagnostic: providerStatus === "cancelled"

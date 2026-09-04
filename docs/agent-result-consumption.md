@@ -231,7 +231,8 @@ The required deterministic evidence is:
   Agent result;
 - main synthesis receives every successful source Turn in stable Lane order;
 - Review completion depends on the exact completed main Turn, not its wording;
-- wake inspection includes a long-running Turn referenced by a terminal Event;
+- wake inspection includes a cursor-predating Turn referenced by a later
+  terminal Event;
 - old parsed-result and finding commands are absent;
 - build, focused tests, and the complete Core test suite pass.
 
