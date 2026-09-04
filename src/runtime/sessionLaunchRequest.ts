@@ -10,7 +10,7 @@ import {
 } from "./taskRuntimeIsolation.js";
 
 type SessionLaunchRequestBase = Readonly<{
-  launchId: string;
+  runtimeGenerationId: string;
   owner: RuntimeOwner;
   agentId: string;
   adapterId: string;
@@ -51,14 +51,14 @@ export function createSessionLaunchRequest(
     input.owner.scope !== "task"
     || runtimeIsolation.taskId !== input.owner.taskId
     || runtimeIsolation.workspace.root !== workspace
-    || runtimeIsolation.generation.launchId !== input.launchId
+    || runtimeIsolation.generation.runtimeGenerationId !== input.runtimeGenerationId
   )) {
     throw new TypeError(
       "Session launch request does not match its Task runtime isolation descriptor."
     );
   }
   const common = {
-    launchId: requireSafeIdentity(input.launchId, "Launch id"),
+    runtimeGenerationId: requireSafeIdentity(input.runtimeGenerationId, "Runtime generation id"),
     owner: normalizeRuntimeOwner(input.owner),
     agentId,
     adapterId,

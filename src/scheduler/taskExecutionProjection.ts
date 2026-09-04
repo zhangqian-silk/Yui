@@ -156,7 +156,7 @@ export type TaskExecutionReadStore = Readonly<{
     agentId: string;
     adapterId: string;
     nativeSessionId?: string;
-    launchId?: string;
+    runtimeGenerationId?: string;
     status?: string;
   }> | null;
   getConfig?(): Readonly<{ runtimeHealth?: unknown }>;
@@ -193,7 +193,7 @@ export type TaskExecutionFacts = Readonly<{
     agentId: string;
     adapterId: string;
     nativeSessionId?: string;
-    launchId?: string;
+    runtimeGenerationId?: string;
     status?: string;
   }>[];
   contextSnapshots?: readonly ContextSnapshot[];

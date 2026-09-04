@@ -278,7 +278,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
           roleName: input.fence.roleName,
           agentId: input.fence.agentId,
           adapterId,
-          launchId: input.fence.launchId,
+          runtimeGenerationId: input.fence.runtimeGenerationId,
           nativeSessionId: input.fence.nativeSessionId!,
           nativeTurnId: input.fence.nativeTurnId!,
           attemptId: input.fence.receiptId,
@@ -417,9 +417,8 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
         && run.effective.agentId === input.fence.agentId
         && this.drivers.requireByAdapterId(run.effective.adapterId).id === input.fence.driverId
         && (knownContinuation || (
-          session?.launchId === input.fence.launchId
+          session?.runtimeGenerationId === input.fence.runtimeGenerationId
           && session.nativeSessionId === input.fence.nativeSessionId
-          && input.fence.sessionGenerationId === input.fence.launchId
         ))
         && runtimeReceiptBelongsToTurn(store, input);
       if (!valid) {
@@ -442,7 +441,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
       roleName: input.fence.roleName,
       agentId: input.fence.agentId,
       adapterId,
-      launchId: input.fence.launchId,
+      runtimeGenerationId: input.fence.runtimeGenerationId,
       nativeSessionId: input.fence.nativeSessionId!,
       nativeTurnId: input.fence.nativeTurnId!,
       attemptId: input.fence.receiptId,
@@ -469,9 +468,8 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
         || run.roleName !== input.fence.roleName
         || run.effective.agentId !== input.fence.agentId
         || this.drivers.requireByAdapterId(run.effective.adapterId).id !== input.fence.driverId
-        || session?.launchId !== input.fence.launchId
-        || session.nativeSessionId !== input.fence.nativeSessionId
-        || input.fence.sessionGenerationId !== input.fence.launchId) {
+        || session?.runtimeGenerationId !== input.fence.runtimeGenerationId
+        || session.nativeSessionId !== input.fence.nativeSessionId) {
         recordCanonicalObservationObsolete(store, input, "runtime-session-not-current", now);
         return "obsolete";
       }
@@ -484,7 +482,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
         input.kind === "session.failed" ? "failed" : "stopped"
       );
       if (updatedSessions.providerBinding !== null) {
-        const activationId = input.fence.activationId ?? input.fence.launchId;
+        const activationId = input.fence.activationId ?? input.fence.runtimeGenerationId;
         updatedSessions = updateTaskRoleProviderRuntime(
           updatedSessions,
           endProviderActivation(updatedSessions.providerBinding, activationId, {
@@ -503,13 +501,13 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
           || continuation.identity.conversationId
             !== (input.fence.conversationId ?? input.fence.nativeSessionId)
           || continuation.identity.activationId
-            !== (input.fence.activationId ?? input.fence.launchId)
+            !== (input.fence.activationId ?? input.fence.runtimeGenerationId)
           || continuation.execution === "quiescent"
           || continuation.attachment === "detached") continue;
         const key = providerContinuationKey(continuation.identity);
         const identityDigest = createHash("sha256").update(key).digest("hex");
         const detached = createRuntimeObservation({
-          schemaVersion: 2,
+          schemaVersion: 3,
           eventId: `derived-continuation-detached:${identityDigest}`,
           semanticKey: `continuation-detached:${identityDigest}`,
           kind: "continuation.started",
@@ -538,23 +536,21 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
           }
         });
         const eventId = store.nextEventId(input.fence.taskId!);
-        store.saveEvent(input.fence.taskId!, createTaskEvent(
+        const detachedEvent = createTaskEvent(
           eventId,
           input.fence.taskId!,
           RUNTIME_OBSERVATION_TASK_EVENT,
           runtimeObservationTaskEventPayload(detached),
           now
-        ));
-        enqueueWork(store, {
-          kind: "role",
-          taskId: input.fence.taskId!,
-          roleName: "leader"
-        }, "provider-continuation-detached", now, [
-          { type: "event", taskId: input.fence.taskId!, id: eventId }
-        ], {
-          source: input.fence.driverId,
-          dedupeKey: detached.semanticKey
-        });
+        );
+        store.saveEvent(input.fence.taskId!, detachedEvent);
+        routeContinuationResult(
+          store,
+          detached,
+          detachedEvent,
+          "provider-continuation-detached",
+          now
+        );
       }
       const active = store.getActiveTurn(input.fence.taskId!, input.fence.roleName);
       const role = store.getRole(input.fence.taskId!, input.fence.roleName);
@@ -619,7 +615,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
             .update(`${input.semanticKey}\u0000${identityKey}`)
             .digest("hex");
           const settled = createRuntimeObservation({
-            schemaVersion: 2,
+            schemaVersion: 3,
             eventId: `native-snapshot-settled:${digest}`,
             semanticKey: `native-snapshot-settled:${digest}`,
             kind: "continuation.settled",
@@ -646,40 +642,33 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
             }
           });
           const settledEventId = store.nextEventId(taskId);
-          store.saveEvent(taskId, createTaskEvent(
+          const settledEvent = createTaskEvent(
             settledEventId,
             taskId,
             RUNTIME_OBSERVATION_TASK_EVENT,
             runtimeObservationTaskEventPayload(settled),
             now
-          ));
-          enqueueWork(
+          );
+          store.saveEvent(taskId, settledEvent);
+          routeContinuationResult(
             store,
-            { kind: "role", taskId, roleName: "leader" },
+            settled,
+            settledEvent,
             "provider-continuation-settled",
-            now,
-            [{ type: "event", taskId, id: settledEventId }],
-            {
-              source: input.fence.driverId,
-              dedupeKey: settled.semanticKey
-            }
+            now
           );
         }
       }
       if (input.kind === "continuation.reported"
         || input.kind === "continuation.settled") {
-        enqueueWork(
+        routeContinuationResult(
           store,
-          { kind: "role", taskId, roleName: "leader" },
+          input,
+          observationEvent,
           input.kind === "continuation.reported"
             ? "provider-continuation-report"
             : "provider-continuation-settled",
-          now,
-          [{ type: "event", taskId, id: observationEventId }],
-          {
-            source: input.fence.driverId,
-            dedupeKey: input.semanticKey
-          }
+          now
         );
       }
       if ((input.kind === "goal.cleared"
@@ -713,7 +702,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
             agentId: input.fence.agentId,
             adapterId: run?.effective.adapterId ?? "unknown",
             driverId: input.fence.driverId,
-            launchId: input.fence.launchId,
+            runtimeGenerationId: input.fence.runtimeGenerationId,
             nativeSessionId: input.fence.nativeSessionId ?? "",
             nativeTurnId: input.fence.nativeTurnId ?? "",
             source: error.source,
@@ -1215,7 +1204,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
     roleName: string;
     turnId?: string;
     agentId: string;
-    launchId: string;
+    runtimeGenerationId: string;
     nativeSessionId: string;
     attemptId: string;
     authorityEpoch: number;
@@ -1232,7 +1221,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
         || binding === null || binding === undefined
         || (input.turnId !== undefined
           && (active?.id !== input.turnId || active.effective.agentId !== input.agentId))
-        || session?.launchId !== input.launchId
+        || session?.runtimeGenerationId !== input.runtimeGenerationId
         || session.nativeSessionId !== input.nativeSessionId
         || currentProviderConversation(binding).conversationId !== input.nativeSessionId
         || binding.authority.owner !== input.authorityOwner
@@ -1322,7 +1311,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
           agentId: run?.effective.agentId ?? sessions.activeAgentId,
           adapterId: run?.effective.adapterId ?? session?.adapterId ?? "unknown",
           driverId: driver?.id ?? "unknown",
-          launchId: session?.launchId ?? "",
+          runtimeGenerationId: session?.runtimeGenerationId ?? "",
           nativeSessionId: session?.nativeSessionId ?? "",
           nativeTurnId: "",
           source: error.source,
@@ -1361,7 +1350,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
     roleName: string;
     turnId: string;
     agentId: string;
-    launchId: string;
+    runtimeGenerationId: string;
     nativeSessionId: string;
   }>): Readonly<{
     conversationId: string;
@@ -1374,7 +1363,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
     const session = sessions?.sessions[input.agentId];
     const binding = sessions?.providerBinding;
     if (binding === null || binding === undefined
-      || session?.launchId !== input.launchId
+      || session?.runtimeGenerationId !== input.runtimeGenerationId
       || session.nativeSessionId !== input.nativeSessionId
       || currentProviderConversation(binding).conversationId !== input.nativeSessionId) return null;
     const activation = currentProviderActivation(binding);
@@ -1470,7 +1459,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
           agentId: run?.effective.agentId ?? session?.agentId ?? "unknown",
           adapterId: run?.effective.adapterId ?? session?.adapterId ?? "unknown",
           driverId: driver?.id ?? "unknown",
-          launchId: session?.launchId ?? "",
+          runtimeGenerationId: session?.runtimeGenerationId ?? "",
           nativeSessionId: session?.nativeSessionId ?? "",
           nativeTurnId: "",
           source: error.source,
@@ -1743,7 +1732,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
         agentId: candidate.agentId,
         adapterId: candidate.adapterId,
         nativeSessionId: candidate.nativeSessionId,
-        ...(candidate.launchId === undefined ? {} : { launchId: candidate.launchId }),
+        ...(candidate.runtimeGenerationId === undefined ? {} : { runtimeGenerationId: candidate.runtimeGenerationId }),
         sessionUpdatedAt: candidate.sessionUpdatedAt
       }];
     });
@@ -1964,12 +1953,12 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
           && existing.status === "active";
         if (!defersConversationReplacement
           && (existing?.nativeSessionId !== input.session.nativeSessionId
-          || (input.launchId !== undefined && existing.launchId !== input.launchId)
+          || (input.runtimeGenerationId !== undefined && existing.runtimeGenerationId !== input.runtimeGenerationId)
           || existing.status !== "active")) {
           saveTaskSession(store, role, {
             ...input.session,
             nativeSessionId: input.session.nativeSessionId
-          }, "active", input.now, input.launchId);
+          }, "active", input.now, input.runtimeGenerationId);
         }
       }
     });
@@ -2008,7 +1997,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
         ...(session?.nativeSessionId === undefined
           ? {}
           : { nativeSessionId: session.nativeSessionId }),
-        ...(input.launchId === undefined ? {} : { launchId: input.launchId }),
+        ...(input.runtimeGenerationId === undefined ? {} : { runtimeGenerationId: input.runtimeGenerationId }),
         outcome: { status: "failed", summary, failureReason: input.failureReason }
       }, input.now);
       if (result.disposition !== "applied" || result.turn === null) {
@@ -2056,7 +2045,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
     roleName: string;
     agentId: string;
     adapterId: string;
-    launchId?: string;
+    runtimeGenerationId?: string;
     nativeSessionId: string;
   }>, now = new Date()): RoleAgentSession {
     return this.store.transaction((store) => (
@@ -2065,12 +2054,12 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
   }
 
   reserveRuntimeLaunch(
-    input: Readonly<{ owner: RuntimeRoleOwner; launchId: string }>,
+    input: Readonly<{ owner: RuntimeRoleOwner; runtimeGenerationId: string }>,
     assertCurrent: () => void,
     now = new Date()
   ): Readonly<{
     status: "reserved" | "existing";
-    launchId: string;
+    runtimeGenerationId: string;
   }> {
     return this.store.transaction((store) => {
       assertCurrent();
@@ -2082,7 +2071,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
         }
         return {
           status: "existing",
-          launchId: existing!.processing!.batchId
+          runtimeGenerationId: existing!.processing!.batchId
         };
       }
       if (hasRuntimeLifecycleWork(existing)) {
@@ -2106,26 +2095,26 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
         throw new Error("Runtime launch reservation could not be queued.");
       }
       const claimed = claimPending(queued, {
-        batchId: input.launchId,
+        batchId: input.runtimeGenerationId,
         owner: RUNTIME_LIFECYCLE_OWNER,
         startedAt: now.toISOString()
       });
       store.saveWorkMailbox(claimed);
       return {
         status: "reserved",
-        launchId: input.launchId
+        runtimeGenerationId: input.runtimeGenerationId
       };
     });
   }
 
   confirmRuntimeLaunchReservation(
-    input: Readonly<{ owner: RuntimeRoleOwner; launchId: string }>,
+    input: Readonly<{ owner: RuntimeRoleOwner; runtimeGenerationId: string }>,
     assertCurrent: () => void
   ): "reserved" | "provider-bound" {
     return this.store.transaction((store) => {
       assertCurrent();
       const mailbox = store.getWorkMailbox(runtimeLifecycleTarget(input.owner));
-      if (isRuntimeLaunchReservation(mailbox?.processing, input.launchId)) {
+      if (isRuntimeLaunchReservation(mailbox?.processing, input.runtimeGenerationId)) {
         return "reserved" as const;
       }
       if (hasRuntimeCleanupObligation(mailbox)) {
@@ -2139,7 +2128,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
       const active = sessions?.sessions[sessions.activeAgentId];
       if (
         active?.status === "active"
-        && active.launchId === input.launchId
+        && active.runtimeGenerationId === input.runtimeGenerationId
       ) return "provider-bound" as const;
       throw new Error("Runtime launch reservation no longer matches the launch.");
     });
@@ -2147,7 +2136,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
 
   recordReservedRuntimeNativeSession(input: Readonly<{
     owner: RuntimeRoleOwner;
-    launchId: string;
+    runtimeGenerationId: string;
     agentId: string;
     adapterId: string;
     nativeSessionId: string;
@@ -2158,7 +2147,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
       const mailbox = requireRuntimeLaunchReservation(
         store,
         input.owner,
-        input.launchId
+        input.runtimeGenerationId
       );
       if (hasRuntimeCleanupObligation(mailbox)) {
         throw new Error("Runtime cleanup is still pending.");
@@ -2170,7 +2159,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
             agentId: input.agentId,
             adapterId: input.adapterId,
             nativeSessionId: input.nativeSessionId,
-            launchId: input.launchId,
+            runtimeGenerationId: input.runtimeGenerationId,
             effective: input.effective
           }, now)
         : recordGlobalRuntimeNativeSession(store, {
@@ -2178,12 +2167,12 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
             agentId: input.agentId,
             adapterId: input.adapterId,
             nativeSessionId: input.nativeSessionId,
-            launchId: input.launchId,
+            runtimeGenerationId: input.runtimeGenerationId,
             effective: input.effective
           }, now);
       saveRuntimeLifecycleMailbox(
         store,
-        completeProcessing(mailbox, input.launchId)
+        completeProcessing(mailbox, input.runtimeGenerationId)
       );
       return session;
     });
@@ -2191,17 +2180,17 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
 
   completeRuntimeLaunchReservation(
     owner: RuntimeRoleOwner,
-    launchId: string,
+    runtimeGenerationId: string,
     beforeComplete?: () => void
   ): boolean {
     return this.store.transaction((store) => {
       const target = runtimeLifecycleTarget(owner);
       const mailbox = store.getWorkMailbox(target);
-      if (!isRuntimeLaunchReservation(mailbox?.processing, launchId)) return false;
+      if (!isRuntimeLaunchReservation(mailbox?.processing, runtimeGenerationId)) return false;
       beforeComplete?.();
       saveRuntimeLifecycleMailbox(
         store,
-        completeProcessing(mailbox!, launchId)
+        completeProcessing(mailbox!, runtimeGenerationId)
       );
       return true;
     });
@@ -2217,7 +2206,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
    */
   settleStoppedRuntimeLaunch(input: Readonly<{
     owner: RuntimeRoleOwner;
-    launchId: string;
+    runtimeGenerationId: string;
     agentId: string;
     adapterId: string;
     nativeSessionId?: string;
@@ -2225,7 +2214,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
     return this.store.transaction((store) => {
       const target = runtimeLifecycleTarget(input.owner);
       const mailbox = store.getWorkMailbox(target);
-      if (isRuntimeLaunchReservation(mailbox?.processing, input.launchId)) {
+      if (isRuntimeLaunchReservation(mailbox?.processing, input.runtimeGenerationId)) {
         const sessions = runtimeOwnerSessionSet(store, input.owner);
         const active = sessions?.sessions[sessions.activeAgentId];
         if (runtimeSessionMatchesSettledLaunch(active, input)) {
@@ -2233,7 +2222,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
         }
         saveRuntimeLifecycleMailbox(
           store,
-          completeProcessing(mailbox!, input.launchId)
+          completeProcessing(mailbox!, input.runtimeGenerationId)
         );
         return true;
       }
@@ -2268,7 +2257,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
     roleName: string;
     agentId: string;
     adapterId: string;
-    launchId?: string;
+    runtimeGenerationId?: string;
     nativeSessionId: string;
     nativeTurnId: string;
     attemptId?: string;
@@ -2286,7 +2275,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
     };
     if (
       existing === undefined
-      && !runtimeHookMatchesReservation(this.store, owner, input.launchId)
+      && !runtimeHookMatchesReservation(this.store, owner, input.runtimeGenerationId)
     ) return "obsolete";
     try {
       const effectiveExisting = nativeTransitionExisting(
@@ -2294,7 +2283,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
         owner,
         existing,
         input.nativeSessionId,
-        input.launchId,
+        input.runtimeGenerationId,
         "Runtime turn completion conflicts with the fixed Role session."
       );
       const effective = taskSessionEffective(
@@ -2337,7 +2326,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
     roleName: string;
     agentId: string;
     adapterId: string;
-    launchId?: string;
+    runtimeGenerationId?: string;
     nativeSessionId: string;
     nativeTurnId: string;
     attemptId?: string;
@@ -2387,7 +2376,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
       };
       if (
         existing === undefined
-        && !runtimeHookMatchesReservation(store, owner, input.launchId)
+        && !runtimeHookMatchesReservation(store, owner, input.runtimeGenerationId)
       ) {
         throw new Error("Runtime turn completion does not match the launch reservation.");
       }
@@ -2396,7 +2385,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
         owner,
         existing,
         input.nativeSessionId,
-        input.launchId,
+        input.runtimeGenerationId,
         "Runtime turn completion conflicts with the fixed Role session."
       );
       const effective = taskSessionEffective(
@@ -2407,7 +2396,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
         effectiveExisting
       );
       if (effective.agentId !== input.agentId || effective.adapterId !== input.adapterId) {
-        throw new Error("Runtime turn completion does not match the effective launch identity.");
+        throw new Error("Runtime turn completion does not match the effective runtime generation identity.");
       }
       if (effectiveExisting !== undefined
         && hasRecentTurnId(effectiveExisting.recentCompletedTurnIds, canonicalTurnId)) {
@@ -2434,7 +2423,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
         agentId: input.agentId,
         adapterId: input.adapterId,
         nativeSessionId: input.nativeSessionId,
-        ...(input.launchId === undefined ? {} : { launchId: input.launchId }),
+        ...(input.runtimeGenerationId === undefined ? {} : { runtimeGenerationId: input.runtimeGenerationId }),
         policy: "fixed",
         status: sessionStatus,
         ...(effectiveExisting?.endReason === undefined
@@ -2454,13 +2443,13 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
         turnId: canonicalTurnId
       }, now);
       store.saveTaskRoleSessionSet(sessions);
-      completeRuntimeHookReservation(store, owner, input.launchId);
+      completeRuntimeHookReservation(store, owner, input.runtimeGenerationId);
       let terminalTurn: Turn | undefined;
       if (recordedProviderTurn && observedTurn?.status === "active") {
         const binding = sessions.providerBinding!;
         const conversation = currentProviderConversation(binding);
         const activation = binding.activations.find((entry) => (
-          entry.activationId === input.launchId
+          entry.activationId === input.runtimeGenerationId
             || (entry.conversationId === conversation.conversationId && entry.status === "active")
         ));
         if (activation === undefined) {
@@ -2507,7 +2496,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
           agentId: input.agentId,
           turnId: observedTurn.id,
           nativeSessionId: input.nativeSessionId,
-          ...(input.launchId === undefined ? {} : { launchId: input.launchId }),
+          ...(input.runtimeGenerationId === undefined ? {} : { runtimeGenerationId: input.runtimeGenerationId }),
           outcome: {
             status: providerStatus === "completed" ? "completed" : "failed",
             summary: input.summary,
@@ -2574,7 +2563,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
     taskId: string;
     roleName: string;
     turnId: string;
-    launchId?: string;
+    runtimeGenerationId?: string;
     nativeSessionId?: string;
     deadStatus?: number;
     observedAt: Date;
@@ -2584,7 +2573,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
         input.taskId,
         input.roleName,
         input.turnId,
-        input.launchId ?? "unknown-launch",
+        input.runtimeGenerationId ?? "unknown-runtime-generation",
         String(input.deadStatus ?? "unknown-status")
       ].join("\0");
       const observationId = `tmux-host-exit-${createHash("sha256").update(identity).digest("hex")}`;
@@ -2596,19 +2585,19 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
       const stopReceipt = [...events].reverse().find((event) => (
         event.type === "runtime.session-termination"
         && event.payload.roleName === input.roleName
-        && (input.launchId === undefined || event.payload.launchId === input.launchId)
+        && (input.runtimeGenerationId === undefined || event.payload.runtimeGenerationId === input.runtimeGenerationId)
         && ["stop-requested", "graceful-stop", "forced-stop", "stop-confirmed"]
           .includes(event.payload.outcome ?? "")
       ));
       const observation = validateRuntimeProcessExitObservation({
-        schemaVersion: 1,
+        schemaVersion: 2,
         observationId,
         hostSequence: 1,
-        hostInstanceId: `tmux-${input.launchId ?? input.roleName}`,
+        hostInstanceId: `tmux-${input.runtimeGenerationId ?? input.roleName}`,
         taskId: input.taskId,
         roleName: input.roleName,
         turnId: input.turnId,
-        launchId: input.launchId ?? `unknown-${input.turnId}`,
+        runtimeGenerationId: input.runtimeGenerationId ?? `unknown-${input.turnId}`,
         ...(input.nativeSessionId === undefined
           ? {}
           : { nativeSessionId: input.nativeSessionId }),
@@ -2626,7 +2615,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
           observationId,
           processKind: "agent-host",
           roleName: input.roleName,
-          launchId: observation.launchId,
+          runtimeGenerationId: observation.runtimeGenerationId,
           observedAt: observation.observedAt,
           classification,
           observation: JSON.stringify(observation)
@@ -2793,7 +2782,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
               agentId: input.fence.agentId,
               adapterId,
               nativeSessionId: decision.outcome.nativeSessionId,
-              launchId: input.fence.launchId,
+              runtimeGenerationId: input.fence.runtimeGenerationId,
               policy: "fixed" as const,
               status: "active" as const,
               effective: run.effective
@@ -2816,7 +2805,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
             completeRuntimeHookReservation(
               store,
               { scope: "task", taskId, roleName: input.fence.roleName },
-              input.fence.launchId
+              input.fence.runtimeGenerationId
             );
           }
           const current = store.getTaskRoleSessionSet(
@@ -2877,7 +2866,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
         const active = store.getActiveTurn(taskId, input.fence.roleName);
         if (sessions === null || sessions === undefined
           || binding === null || binding === undefined
-          || session?.launchId !== input.fence.launchId
+          || session?.runtimeGenerationId !== input.fence.runtimeGenerationId
           || session.nativeSessionId !== input.fence.nativeSessionId
           || currentProviderConversation(binding).conversationId !== input.fence.nativeSessionId) {
           recordCanonicalObservationObsolete(store, input, "direct-turn-session-mismatch", now);
@@ -2947,7 +2936,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
           && binding !== null && binding !== undefined
           && binding.turn?.turnId === undefined
           && binding.turn?.attemptId === ordinaryAttemptId) {
-          if (session?.launchId !== input.fence.launchId
+          if (session?.runtimeGenerationId !== input.fence.runtimeGenerationId
             || session.nativeSessionId !== input.fence.nativeSessionId) {
             recordCanonicalObservationObsolete(store, input, "ordinary-turn-session-mismatch", now);
             return "obsolete";
@@ -2972,7 +2961,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
           || active.status !== "active"
           || sessions === null
           || sessions === undefined
-          || session?.launchId !== input.fence.launchId
+          || session?.runtimeGenerationId !== input.fence.runtimeGenerationId
           || session.nativeSessionId !== input.fence.nativeSessionId) {
           recordCanonicalObservationObsolete(store, input, "continuation-fence-mismatch", now);
           return "obsolete";
@@ -2990,7 +2979,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
             attemptId: input.fence.receiptId!,
             turnId: active.id,
             conversationId: input.fence.conversationId ?? input.fence.nativeSessionId!,
-            activationId: input.fence.activationId ?? input.fence.launchId,
+            activationId: input.fence.activationId ?? input.fence.runtimeGenerationId,
             ...(input.fence.nativeTurnId === undefined
               ? {}
               : { nativeTurnId: input.fence.nativeTurnId })
@@ -3100,15 +3089,15 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
     if (run === null || run.status !== "active") return null;
     const owner = { scope: "task" as const, taskId: fence.taskId, roleName: fence.roleName };
     const freshConversationLaunch = run.mode === "new"
-      && runtimeHookMatchesReservation(store, owner, fence.launchId);
+      && runtimeHookMatchesReservation(store, owner, fence.runtimeGenerationId);
     const boundNativeSessionId = freshConversationLaunch
       ? undefined
       : session?.nativeSessionId;
-    const launchId = freshConversationLaunch
-      ? fence.launchId
-      : session?.launchId
-        ?? (runtimeHookMatchesReservation(store, owner, fence.launchId) ? fence.launchId : undefined);
-    if (launchId === undefined) return null;
+    const runtimeGenerationId = freshConversationLaunch
+      ? fence.runtimeGenerationId
+      : session?.runtimeGenerationId
+        ?? (runtimeHookMatchesReservation(store, owner, fence.runtimeGenerationId) ? fence.runtimeGenerationId : undefined);
+    if (runtimeGenerationId === undefined) return null;
     const providerTurn = sessionSet?.providerBinding?.turn;
     const managedTurnMatches = managedProviderTurnId(providerTurn) === run.id;
     const expectedFence: CanonicalIdentityFence = {
@@ -3117,7 +3106,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
       agentId: run.effective.agentId,
       adapterId: run.effective.adapterId,
       turnId: run.id,
-      launchId,
+      runtimeGenerationId,
       receiptId: managedTurnMatches && providerTurn !== null && providerTurn !== undefined
         ? providerTurn.attemptId
         : formatTurnReceiptId(run.taskId, run.id),
@@ -3131,7 +3120,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
         && observation.fence.roleName === fence.roleName
         && observation.fence.agentId === run.effective.agentId
         && observation.fence.driverId === driverId
-        && observation.fence.launchId === launchId
+        && observation.fence.runtimeGenerationId === runtimeGenerationId
         && observation.fence.nativeSessionId === (boundNativeSessionId ?? fence.nativeSessionId)
         ? [observation]
         : [];
@@ -3156,7 +3145,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
     roleName: string;
     agentId: string;
     turnId?: string;
-    launchId?: string;
+    runtimeGenerationId?: string;
     nativeSessionId: string;
     reason: string;
   }>, now = new Date()): void {
@@ -3170,7 +3159,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
     roleName: string;
     agentId: string;
     adapterId: string;
-    launchId?: string;
+    runtimeGenerationId?: string;
     nativeSessionId: string;
   }>, now = new Date()): RoleAgentSession {
     return this.store.transaction((store) => (
@@ -3182,7 +3171,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
     roleName: string;
     agentId: string;
     adapterId: string;
-    launchId?: string;
+    runtimeGenerationId?: string;
     nativeSessionId: string;
     nativeTurnId: string;
     title?: string;
@@ -3204,7 +3193,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
       };
       if (
         existing === undefined
-        && !runtimeHookMatchesReservation(store, owner, input.launchId)
+        && !runtimeHookMatchesReservation(store, owner, input.runtimeGenerationId)
       ) {
         throw new Error(
           "Runtime turn completion does not match the global launch reservation."
@@ -3216,19 +3205,19 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
         owner,
         existing,
         nativeSessionId,
-        input.launchId,
+        input.runtimeGenerationId,
         "Runtime turn completion conflicts with the fixed global Role session."
       );
       const effective = globalSessionEffective(role, effectiveExisting);
       if (effective.agentId !== input.agentId || effective.adapterId !== input.adapterId) {
-        throw new Error("Runtime turn completion does not match the effective global launch identity.");
+        throw new Error("Runtime turn completion does not match the effective global runtime generation identity.");
       }
       const completedStatus = effectiveExisting?.status ?? "active";
       current = recordRoleAgentSession(current, {
         agentId: input.agentId,
         adapterId: input.adapterId,
         nativeSessionId,
-        ...(input.launchId === undefined ? {} : { launchId: input.launchId }),
+        ...(input.runtimeGenerationId === undefined ? {} : { runtimeGenerationId: input.runtimeGenerationId }),
         title: effectiveExisting?.title ?? input.title,
         preview: effectiveExisting?.preview ?? (
           input.summary === undefined ? undefined : sessionPreview(input.summary)
@@ -3248,7 +3237,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
         now
       );
       store.saveGlobalRoleSessionSet(current);
-      completeRuntimeHookReservation(store, owner, input.launchId);
+      completeRuntimeHookReservation(store, owner, input.runtimeGenerationId);
       if (
         input.roleName === SYSTEM_OPERATOR_ROLE
         && input.adapterId === "codex"
@@ -3275,7 +3264,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
     roleName: string;
     agentId: string;
     adapterId: string;
-    launchId?: string;
+    runtimeGenerationId?: string;
     nativeSessionId: string;
   }>): "apply" | "obsolete" {
     const role = this.store.getGlobalRole(input.roleName);
@@ -3288,7 +3277,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
     };
     if (
       existing === undefined
-      && !runtimeHookMatchesReservation(this.store, owner, input.launchId)
+      && !runtimeHookMatchesReservation(this.store, owner, input.runtimeGenerationId)
     ) return "obsolete";
     const nativeSessionId = globalCompletionNativeSessionId(existing, input);
     let effectiveExisting: RoleAgentSession | undefined;
@@ -3298,7 +3287,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
         owner,
         existing,
         nativeSessionId,
-        input.launchId,
+        input.runtimeGenerationId,
         "Runtime turn completion conflicts with the fixed global Role session."
       );
     } catch {
@@ -3321,13 +3310,42 @@ function runtimeObservationLifecycleFence(
     roleName: input.fence.roleName,
     agentId: input.fence.agentId,
     adapterId,
-    launchId: input.fence.launchId,
+    runtimeGenerationId: input.fence.runtimeGenerationId,
     ...(input.fence.turnId === undefined ? {} : { turnId: input.fence.turnId }),
     ...(input.fence.nativeSessionId === undefined
       ? {}
       : { nativeSessionId: input.fence.nativeSessionId }),
     ...(input.fence.receiptId === undefined ? {} : { receiptId: input.fence.receiptId })
   };
+}
+
+/**
+ * A live parent Turn still owns its native child result. Only after that Turn
+ * is terminal or absent does Yui route the continuation fact to the original
+ * Role's supervisor. Mailbox coalescing remains the downstream batching
+ * mechanism; this guard decides ownership before any wake is enqueued.
+ */
+function routeContinuationResult(
+  store: TaskStore,
+  observation: RuntimeObservation,
+  event: TaskEvent,
+  reason: string,
+  now: Date
+): void {
+  const taskId = observation.fence.taskId;
+  if (taskId === undefined) return;
+  const parentTurn = observation.fence.turnId === undefined
+    ? null
+    : store.getTurn(taskId, observation.fence.turnId);
+  if (parentTurn?.status === "active") return;
+  if (store.getRole(taskId, observation.fence.roleName) === null) return;
+  routeRoleEvent(
+    store,
+    event,
+    observation.fence.roleName,
+    reason,
+    now
+  );
 }
 
 /** Accepts the original Turn receipt or a later mailbox activation receipt. */
@@ -3346,7 +3364,7 @@ function runtimeReceiptBelongsToTurn(
       && accepted.fence.turnId === turnId
       && accepted.fence.roleName === input.fence.roleName
       && accepted.fence.agentId === input.fence.agentId
-      && accepted.fence.launchId === input.fence.launchId
+      && accepted.fence.runtimeGenerationId === input.fence.runtimeGenerationId
       && accepted.fence.nativeSessionId === input.fence.nativeSessionId
       && accepted.fence.receiptId === receiptId;
   });
@@ -3368,8 +3386,8 @@ function recordCanonicalObservationObsolete(
     roleName: input.fence.roleName,
     agentId: input.fence.agentId,
     ...(input.fence.turnId === undefined ? {} : { turnId: input.fence.turnId }),
-    launchId: input.fence.launchId,
-    nativeSessionId: input.fence.nativeSessionId ?? input.fence.sessionGenerationId
+    runtimeGenerationId: input.fence.runtimeGenerationId,
+    nativeSessionId: input.fence.nativeSessionId ?? input.fence.runtimeGenerationId
   }, reason, now);
 }
 
@@ -3384,7 +3402,7 @@ function recordObsoleteRuntimeEvent(
     roleName: string;
     agentId: string;
     turnId?: string;
-    launchId?: string;
+    runtimeGenerationId?: string;
     nativeSessionId: string;
   }>,
   reason: string,
@@ -3406,7 +3424,7 @@ function recordObsoleteRuntimeEvent(
       agentId: input.agentId,
       nativeSessionId: input.nativeSessionId,
       ...(input.turnId === undefined ? {} : { turnId: input.turnId }),
-      ...(input.launchId === undefined ? {} : { launchId: input.launchId }),
+      ...(input.runtimeGenerationId === undefined ? {} : { runtimeGenerationId: input.runtimeGenerationId }),
       reason
     },
     now
@@ -3471,10 +3489,10 @@ function sessionPreview(value: string): string {
 function requireRuntimeLaunchReservation(
   store: TaskStore,
   owner: RuntimeRoleOwner,
-  launchId: string
+  runtimeGenerationId: string
 ) {
   const mailbox = store.getWorkMailbox(runtimeLifecycleTarget(owner));
-  if (!isRuntimeLaunchReservation(mailbox?.processing, launchId)) {
+  if (!isRuntimeLaunchReservation(mailbox?.processing, runtimeGenerationId)) {
     throw new Error("Runtime launch reservation no longer matches the launch.");
   }
   return mailbox!;
@@ -3483,13 +3501,13 @@ function requireRuntimeLaunchReservation(
 function runtimeHookMatchesReservation(
   store: TaskStore,
   owner: RuntimeRoleOwner,
-  launchId: string | undefined
+  runtimeGenerationId: string | undefined
 ): boolean {
   const mailbox = store.getWorkMailbox(runtimeLifecycleTarget(owner));
   if (hasRuntimeCleanupObligation(mailbox)) return false;
   const processing = mailbox?.processing;
-  return launchId !== undefined
-    && isRuntimeLaunchReservation(processing, launchId);
+  return runtimeGenerationId !== undefined
+    && isRuntimeLaunchReservation(processing, runtimeGenerationId);
 }
 
 function preallocatedRuntimeReadyAwaitingProjection(
@@ -3526,11 +3544,11 @@ function preallocatedRuntimeReadyAwaitingProjection(
     taskId,
     roleName: observation.fence.roleName
   }));
-  return isRuntimeLaunchReservation(mailbox?.processing, observation.fence.launchId)
+  return isRuntimeLaunchReservation(mailbox?.processing, observation.fence.runtimeGenerationId)
     && !hasRuntimeCleanupObligation(mailbox)
     && nativeSessionId === nativeSessionIdForLaunch(
       store.rootDirectory(),
-      observation.fence.launchId,
+      observation.fence.runtimeGenerationId,
       observation.fence.agentId,
       driver.adapterId
     );
@@ -3539,14 +3557,14 @@ function preallocatedRuntimeReadyAwaitingProjection(
 function completeRuntimeHookReservation(
   store: TaskStore,
   owner: RuntimeRoleOwner,
-  launchId: string | undefined
+  runtimeGenerationId: string | undefined
 ): void {
-  if (launchId === undefined) return;
+  if (runtimeGenerationId === undefined) return;
   const mailbox = store.getWorkMailbox(runtimeLifecycleTarget(owner));
-  if (!isRuntimeLaunchReservation(mailbox?.processing, launchId)) return;
+  if (!isRuntimeLaunchReservation(mailbox?.processing, runtimeGenerationId)) return;
   saveRuntimeLifecycleMailbox(
     store,
-    completeProcessing(mailbox!, launchId)
+    completeProcessing(mailbox!, runtimeGenerationId)
   );
 }
 
@@ -3610,7 +3628,7 @@ function dormantRuntimeCandidateIsCurrent(
     && active.agentId === candidate.agentId
     && active.adapterId === candidate.adapterId
     && active.nativeSessionId === candidate.nativeSessionId
-    && active.launchId === candidate.launchId
+    && active.runtimeGenerationId === candidate.runtimeGenerationId
     && active.updatedAt === candidate.sessionUpdatedAt;
 }
 
@@ -3722,7 +3740,7 @@ function recordTaskRuntimeNativeSession(
     roleName: string;
     agentId: string;
     adapterId: string;
-    launchId?: string;
+    runtimeGenerationId?: string;
     nativeSessionId: string;
     effective?: EffectiveLaunchSnapshot;
   }>,
@@ -3751,11 +3769,11 @@ function recordTaskRuntimeNativeSession(
     { scope: "task", taskId: input.taskId, roleName: input.roleName },
     existing,
     input.nativeSessionId,
-    input.launchId,
+    input.runtimeGenerationId,
     "Native session registration conflicts with the fixed Role session."
   );
   if (existing?.status === "active"
-    && (input.launchId === undefined || existing.launchId === input.launchId)) return existing;
+    && (input.runtimeGenerationId === undefined || existing.runtimeGenerationId === input.runtimeGenerationId)) return existing;
   const resolvedEffective = taskSessionEffective(
     store,
     input.taskId,
@@ -3773,13 +3791,13 @@ function recordTaskRuntimeNativeSession(
     throw new Error("Reserved native Session effective launch changed before persistence.");
   }
   if (effective.agentId !== input.agentId || effective.adapterId !== input.adapterId) {
-    throw new Error("Native session registration does not match the effective launch identity.");
+    throw new Error("Native session registration does not match the effective runtime generation identity.");
   }
   const updated = recordRoleAgentSession(current, {
     agentId: input.agentId,
     adapterId: input.adapterId,
     nativeSessionId: input.nativeSessionId,
-    ...(input.launchId === undefined ? {} : { launchId: input.launchId }),
+    ...(input.runtimeGenerationId === undefined ? {} : { runtimeGenerationId: input.runtimeGenerationId }),
     policy: "fixed",
     status: "active",
     effective: effectiveExisting?.effective ?? effective
@@ -3794,7 +3812,7 @@ function recordGlobalRuntimeNativeSession(
     roleName: string;
     agentId: string;
     adapterId: string;
-    launchId?: string;
+    runtimeGenerationId?: string;
     nativeSessionId: string;
     effective?: EffectiveLaunchSnapshot;
   }>,
@@ -3814,11 +3832,11 @@ function recordGlobalRuntimeNativeSession(
     { scope: "global", roleName: input.roleName },
     existing,
     input.nativeSessionId,
-    input.launchId,
+    input.runtimeGenerationId,
     "Native session registration conflicts with the fixed global Role session."
   );
   if (existing?.status === "active"
-    && (input.launchId === undefined || existing.launchId === input.launchId)) return existing;
+    && (input.runtimeGenerationId === undefined || existing.runtimeGenerationId === input.runtimeGenerationId)) return existing;
   const resolvedEffective = globalSessionEffective(role, effectiveExisting);
   const effective = input.effective === undefined
     ? resolvedEffective
@@ -3827,13 +3845,13 @@ function recordGlobalRuntimeNativeSession(
     throw new Error("Reserved global native Session effective launch changed before persistence.");
   }
   if (effective.agentId !== input.agentId || effective.adapterId !== input.adapterId) {
-    throw new Error("Native session registration does not match the effective global launch identity.");
+    throw new Error("Native session registration does not match the effective global runtime generation identity.");
   }
   const updated = recordRoleAgentSession(current, {
     agentId: input.agentId,
     adapterId: input.adapterId,
     nativeSessionId: input.nativeSessionId,
-    ...(input.launchId === undefined ? {} : { launchId: input.launchId }),
+    ...(input.runtimeGenerationId === undefined ? {} : { runtimeGenerationId: input.runtimeGenerationId }),
     policy: "fixed",
     status: "active",
     effective
@@ -3847,7 +3865,7 @@ function nativeTransitionExisting(
   owner: RuntimeRoleOwner,
   existing: RoleAgentSession | undefined,
   nativeSessionId: string,
-  launchId: string | undefined,
+  runtimeGenerationId: string | undefined,
   conflictMessage: string
 ): RoleAgentSession | undefined {
   if (existing === undefined || existing.nativeSessionId === nativeSessionId) {
@@ -3855,7 +3873,7 @@ function nativeTransitionExisting(
   }
   if (
     existing.status === "ended"
-    && runtimeHookMatchesReservation(store, owner, launchId)
+    && runtimeHookMatchesReservation(store, owner, runtimeGenerationId)
   ) {
     return undefined;
   }
@@ -3867,15 +3885,15 @@ function globalCompletionNativeSessionId(
   input: Readonly<{
     agentId: string;
     adapterId: string;
-    launchId?: string;
+    runtimeGenerationId?: string;
     nativeSessionId: string;
   }>
 ): string {
   // Codex structured event sources can expose different native IDs for the
-  // same launch. The launch generation remains the authoritative fence.
+  // same runtime generation. That generation remains the authoritative fence.
   return input.adapterId === "codex"
-    && input.launchId !== undefined
-    && existing?.launchId === input.launchId
+    && input.runtimeGenerationId !== undefined
+    && existing?.runtimeGenerationId === input.runtimeGenerationId
     && existing.agentId === input.agentId
     && existing.adapterId === input.adapterId
     ? existing.nativeSessionId
@@ -3990,7 +4008,7 @@ function mapSession(session: RoleAgentSession): SchedulerRoleSession {
     agentId: session.agentId,
     adapterId: session.adapterId,
     nativeSessionId: session.nativeSessionId,
-    ...(session.launchId === undefined ? {} : { launchId: session.launchId }),
+    ...(session.runtimeGenerationId === undefined ? {} : { runtimeGenerationId: session.runtimeGenerationId }),
     ...(session.title === undefined ? {} : { title: session.title }),
     status: session.status,
     ...(session.endReason === undefined ? {} : { endReason: session.endReason }),
@@ -4005,7 +4023,7 @@ function saveTaskSession(
   session: SchedulerRoleSession & { nativeSessionId: string },
   status: AgentSessionStatus,
   now: Date,
-  launchId?: string
+  runtimeGenerationId?: string
 ): void {
   const current = store.getRoleSessionSet(role.taskId, role.name)
     ?? createRoleSessionSet(
@@ -4017,7 +4035,7 @@ function saveTaskSession(
     agentId: session.agentId,
     adapterId: session.adapterId,
     nativeSessionId: session.nativeSessionId,
-    ...(launchId === undefined ? {} : { launchId }),
+    ...(runtimeGenerationId === undefined ? {} : { runtimeGenerationId }),
     ...(session.title === undefined ? {} : { title: session.title }),
     policy: "fixed",
     status,
@@ -4037,7 +4055,7 @@ function matchesStallSessionFence(
   return current.agentId === expected.agentId
     && current.adapterId === expected.adapterId
     && current.nativeSessionId === expected.nativeSessionId
-    && current.launchId === expected.launchId
+    && current.runtimeGenerationId === expected.runtimeGenerationId
     && current.status === expected.status;
 }
 
@@ -4068,7 +4086,7 @@ function runtimeObservationTelemetryEntry(
     taskId: input.fence.taskId!,
     roleName: input.fence.roleName,
     turnId: input.fence.turnId!,
-    generation: input.fence.sessionGenerationId,
+    generation: input.fence.runtimeGenerationId,
     progressId: [
       input.kind,
       input.payload.operationId ?? input.payload.activity ?? "state"
@@ -4079,7 +4097,7 @@ function runtimeObservationTelemetryEntry(
       kind: input.kind,
       authority: input.authority,
       driverId: input.fence.driverId,
-      launchId: input.fence.launchId,
+      runtimeGenerationId: input.fence.runtimeGenerationId,
       nativeSessionId: input.fence.nativeSessionId ?? "",
       nativeTurnId: input.fence.nativeTurnId ?? "",
       ...(input.payload.operation === undefined
@@ -4231,7 +4249,7 @@ function bindOrSupersedeProviderRuntime(
   replacementBasis?: "terminal-session"
 ): TaskRoleSessionSet {
   const conversationId = input.fence.conversationId ?? input.fence.nativeSessionId!;
-  const activationId = input.fence.activationId ?? input.fence.launchId;
+  const activationId = input.fence.activationId ?? input.fence.runtimeGenerationId;
   if (sessions.providerBinding === null) {
     return bindTaskRoleProviderRuntime(sessions, createProviderRuntimeBinding({
       providerNamespace: input.fence.driverId,
@@ -4288,7 +4306,7 @@ function terminalProviderReplacementBasis(
   if (current === undefined
     || current.status !== "active"
     || current.nativeSessionId !== input.fence.nativeSessionId
-    || current.launchId !== input.fence.launchId) {
+    || current.runtimeGenerationId !== input.fence.runtimeGenerationId) {
     return undefined;
   }
   const replaced = [...(sessions.history ?? [])].reverse().find((session) => (

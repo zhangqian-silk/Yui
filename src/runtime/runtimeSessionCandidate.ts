@@ -17,7 +17,7 @@ export type RuntimeSessionCandidate = Readonly<{
   agentId: string;
   adapterId: string;
   nativeSessionId: string;
-  launchId?: string;
+  runtimeGenerationId?: string;
   sessionUpdatedAt: string;
   cleanupRequired: boolean;
 }>;
@@ -51,9 +51,9 @@ export function projectRuntimeSessionCandidate(
     agentId: active.agentId,
     adapterId: active.adapterId,
     nativeSessionId: active.nativeSessionId,
-    ...(active.launchId === undefined ? {} : { launchId: active.launchId }),
+    ...(active.runtimeGenerationId === undefined ? {} : { runtimeGenerationId: active.runtimeGenerationId }),
     sessionUpdatedAt: active.updatedAt,
-    cleanupRequired: active.launchId !== undefined
+    cleanupRequired: active.runtimeGenerationId !== undefined
   };
 }
 

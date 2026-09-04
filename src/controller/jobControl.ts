@@ -48,7 +48,7 @@ export type DurableJobCaller = Readonly<{
   role?: string;
   agentId?: string;
   adapterId?: string;
-  launchId?: string;
+  runtimeGenerationId?: string;
   nativeSessionId?: string;
   turnId?: string;
   /**
@@ -369,7 +369,7 @@ function assertCallerAuthorized(
       || binding === undefined
       || agentId === undefined
       || caller.adapterId === undefined
-      || caller.launchId === undefined
+      || caller.runtimeGenerationId === undefined
       || sessions === null
       || sessions.activeAgentId !== role.activeAgentId
       || session === null
@@ -377,7 +377,7 @@ function assertCallerAuthorized(
       || binding.adapterId !== caller.adapterId
       || session.agentId !== agentId
       || session.adapterId !== caller.adapterId
-      || session.launchId !== caller.launchId
+      || session.runtimeGenerationId !== caller.runtimeGenerationId
       || (caller.nativeSessionId !== undefined
         && session.nativeSessionId !== caller.nativeSessionId)) {
       throw jobControlError(
@@ -675,7 +675,7 @@ function parseCaller(value: JsonValue | undefined): DurableJobCaller {
   }
   const record = value as Readonly<Record<string, JsonValue>>;
   const allowed = new Set([
-    "scope", "taskId", "role", "agentId", "adapterId", "launchId", "nativeSessionId",
+    "scope", "taskId", "role", "agentId", "adapterId", "runtimeGenerationId", "nativeSessionId",
     "turnId", "callerKey"
   ]);
   for (const key of Object.keys(record)) {
@@ -686,7 +686,7 @@ function parseCaller(value: JsonValue | undefined): DurableJobCaller {
   if (record.scope !== "user" && record.scope !== "global" && record.scope !== "task") {
     throw jobControlError("INVALID_PARAMS", "job caller scope is invalid.");
   }
-  const optionalId = (key: "taskId" | "role" | "agentId" | "adapterId" | "launchId"
+  const optionalId = (key: "taskId" | "role" | "agentId" | "adapterId" | "runtimeGenerationId"
     | "nativeSessionId" | "turnId"): string | undefined => {
     const entry = record[key];
     if (entry === undefined) return undefined;
@@ -696,7 +696,7 @@ function parseCaller(value: JsonValue | undefined): DurableJobCaller {
   const role = optionalId("role");
   const agentId = optionalId("agentId");
   const adapterId = optionalId("adapterId");
-  const launchId = optionalId("launchId");
+  const runtimeGenerationId = optionalId("runtimeGenerationId");
   const nativeSessionId = optionalId("nativeSessionId");
   const turnId = optionalId("turnId");
   const callerKey = record.callerKey === undefined
@@ -708,7 +708,7 @@ function parseCaller(value: JsonValue | undefined): DurableJobCaller {
     ...(role === undefined ? {} : { role }),
     ...(agentId === undefined ? {} : { agentId }),
     ...(adapterId === undefined ? {} : { adapterId }),
-    ...(launchId === undefined ? {} : { launchId }),
+    ...(runtimeGenerationId === undefined ? {} : { runtimeGenerationId }),
     ...(nativeSessionId === undefined ? {} : { nativeSessionId }),
     ...(turnId === undefined ? {} : { turnId }),
     ...(callerKey === undefined ? {} : { callerKey })

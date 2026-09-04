@@ -18,6 +18,21 @@ import { validateReviewRound } from "../../review/reviewRound.js";
 import { validateExecutionGroup } from "../../execution/legacyExecutionGroup.js";
 import { validateTask } from "../../task/task.js";
 import { validateIntegrationAttempt } from "../../integration/integrationAttempt.js";
+import {
+  validateRoleSessionSet,
+  type RoleAgentSession,
+  type RoleSessionSet
+} from "../../executor/agentExecutor.js";
+import {
+  createRuntimeObservation,
+  RUNTIME_OBSERVATION_TASK_EVENT,
+  type RuntimeObservation
+} from "../../runtime/runtimeObservation.js";
+import {
+  RUNTIME_PROCESS_EXIT_TASK_EVENT,
+  validateRuntimeProcessExitObservation,
+  type RuntimeProcessExitObservation
+} from "../../runtime/processExitObservation.js";
 import { SqliteTaskStore } from "../sqliteStore.js";
 import {
   inspectStorageSchema,
@@ -25,7 +40,11 @@ import {
   writeCurrentStorageManifest,
   type ParsedStorageManifest
 } from "../storageSchema.js";
-import { validateYuiConfig, type YuiConfig } from "../taskStore.js";
+import {
+  CURRENT_EVENT_SCHEMA_VERSION,
+  validateYuiConfig,
+  type YuiConfig
+} from "../taskStore.js";
 import type { StorageVersionState } from "./recordVersions.js";
 
 const CURRENT_DATABASE_FILENAME = "yui.db";
@@ -40,7 +59,9 @@ export type StorageUpgradeStep = Readonly<{
     | "reviewRound"
     | "task"
     | "integrationAttempt"
-    | "agentProfile";
+    | "agentProfile"
+    | "globalRoleSessionSet"
+    | "taskRoleSessionSet";
   fromRecordVersion: number;
   toRecordVersion: number;
 }>;
@@ -276,7 +297,9 @@ function migrationPlan(
     { fromAggregate: 25, toAggregate: 26, recordKind: "integrationAttempt", fromRecordVersion: 5, toRecordVersion: 6 },
     { fromAggregate: 26, toAggregate: 27, recordKind: "agentProfile", fromRecordVersion: 2, toRecordVersion: 3 },
     { fromAggregate: 27, toAggregate: 28, recordKind: "reviewRound", fromRecordVersion: 6, toRecordVersion: 7 },
-    { fromAggregate: 28, toAggregate: 29, recordKind: "turn", fromRecordVersion: 3, toRecordVersion: 4 }
+    { fromAggregate: 28, toAggregate: 29, recordKind: "turn", fromRecordVersion: 3, toRecordVersion: 4 },
+    { fromAggregate: 29, toAggregate: 30, recordKind: "globalRoleSessionSet", fromRecordVersion: 4, toRecordVersion: 5 },
+    { fromAggregate: 29, toAggregate: 30, recordKind: "taskRoleSessionSet", fromRecordVersion: 11, toRecordVersion: 12 }
   ];
   return all.filter(({ fromAggregate }) => fromAggregate >= manifest.aggregateSchemaVersion);
 }
@@ -297,6 +320,10 @@ function recordVersionsMatchAggregate(
   if (aggregate <= 25) expected.integrationAttempt = 5;
   if (aggregate <= 26) expected.agentProfile = 2;
   if (aggregate <= 27) expected.reviewRound = 6;
+  if (aggregate <= 29) {
+    expected.globalRoleSessionSet = 4;
+    expected.taskRoleSessionSet = 11;
+  }
   const actualKinds = Object.keys(actual).sort();
   const expectedKinds = Object.keys(expected).sort();
   return actualKinds.length === expectedKinds.length
@@ -365,6 +392,7 @@ function validateMigrationDatabase(home: string, manifest: ParsedStorageManifest
         );
       }
     }
+    validateRuntimeGenerationMigrationSource(database, manifest.aggregateSchemaVersion);
   } finally {
     database.close();
   }
@@ -387,6 +415,7 @@ function applyMigration(home: string, manifest: ParsedStorageManifest, now: Date
       if (manifest.aggregateSchemaVersion <= 26) migrateAgentProfiles2To3(database);
       if (manifest.aggregateSchemaVersion <= 27) migrateReviewRounds6To7(database, now);
       if (manifest.aggregateSchemaVersion <= 28) migrateTurns(database, 3, 4);
+      if (manifest.aggregateSchemaVersion <= 29) migrateRuntimeGenerationIdentity(database);
     }).immediate();
   } finally {
     database.close();
@@ -890,6 +919,341 @@ function migrateIntegrations5To6(database: Database.Database, now: Date): void {
   }
 }
 
+/**
+ * Aggregate 30 gives the runtime fence one canonical name. The physical
+ * `launch_id` columns stay layout-private inside SQLite layout 8; every
+ * versioned JSON record and public/domain field is migrated to
+ * `runtimeGenerationId`, and RuntimeObservation drops its duplicate
+ * `sessionGenerationId` fence.
+ */
+function migrateRuntimeGenerationIdentity(database: Database.Database): void {
+  migrateRoleSessionSets(database, "global_role_session_sets", "global");
+  migrateRoleSessionSets(database, "role_session_sets", "task");
+
+  const ownerRows = database.prepare(
+    "SELECT launch_id, payload FROM session_owners"
+  ).all() as { launch_id: string; payload: string }[];
+  for (const row of ownerRows) {
+    const owner = jsonRecord(row.payload, "SessionOwnerIdentity");
+    const migrated = migrateRuntimeGenerationKeys(owner);
+    if (migrated.schemaVersion !== 1 && migrated.schemaVersion !== 2) {
+      throw new Error(
+        `Session owner ${row.launch_id} cannot migrate from version ${String(migrated.schemaVersion)}.`
+      );
+    }
+    migrated.schemaVersion = 2;
+    if (migrated.runtimeGenerationId !== row.launch_id) {
+      throw new Error(`Session owner generation does not match its physical key: ${row.launch_id}.`);
+    }
+    database.prepare(
+      "UPDATE session_owners SET payload = ? WHERE launch_id = ?"
+    ).run(JSON.stringify(migrated), row.launch_id);
+  }
+
+  const eventRows = database.prepare(
+    "SELECT task_id, event_id, payload FROM events"
+  ).all() as { task_id: string; event_id: string; payload: string }[];
+  for (const row of eventRows) {
+    const event = jsonRecord(row.payload, "TaskEvent");
+    const migrated = migrateTaskEventRuntimeGeneration(
+      event,
+      `${row.task_id}/${row.event_id}`
+    );
+    database.prepare(
+      "UPDATE events SET payload = ? WHERE task_id = ? AND event_id = ?"
+    ).run(JSON.stringify(migrated), row.task_id, row.event_id);
+  }
+
+  migrateTelemetryRuntimeGenerationKeys(database);
+}
+
+function migrateRoleSessionSets(
+  database: Database.Database,
+  table: "global_role_session_sets" | "role_session_sets",
+  scope: "global" | "task"
+): void {
+  const rows = database.prepare(`SELECT rowid AS row_id, payload FROM ${table}`)
+    .all() as { row_id: number; payload: string }[];
+  for (const row of rows) {
+    const record = jsonRecord(row.payload, "RoleSessionSet");
+    const expectedOld = scope === "global" ? 4 : 11;
+    const expectedCurrent = scope === "global" ? 5 : 12;
+    if (record.schemaVersion !== expectedOld && record.schemaVersion !== expectedCurrent) {
+      throw new Error(
+        `${scope} RoleSessionSet cannot migrate from version ${String(record.schemaVersion)}.`
+      );
+    }
+    const sessions = migrateRoleAgentSessionCollection(record.sessions, "map");
+    const history = record.history === undefined
+      ? undefined
+      : migrateRoleAgentSessionCollection(
+          record.history,
+          scope === "global" ? "map" : "array"
+        );
+    const migrated = {
+      ...migrateRuntimeGenerationKeys(record),
+      schemaVersion: expectedCurrent,
+      sessions,
+      ...(history === undefined ? {} : { history })
+    };
+    validateRoleSessionSet(migrated as unknown as RoleSessionSet);
+    database.prepare(`UPDATE ${table} SET payload = ? WHERE rowid = ?`)
+      .run(JSON.stringify(migrated), row.row_id);
+  }
+}
+
+function migrateRoleAgentSessionCollection(
+  value: unknown,
+  kind: "map" | "array"
+): Record<string, RoleAgentSession> | RoleAgentSession[] {
+  if (kind === "array") {
+    if (!Array.isArray(value)) throw new Error("Task Role Session history is invalid.");
+    return value.map((entry) => migrateRoleAgentSession(entry));
+  }
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new Error("Role Session map is invalid.");
+  }
+  return Object.fromEntries(
+    Object.entries(value).map(([key, entry]) => [key, migrateRoleAgentSession(entry)])
+  );
+}
+
+function migrateRoleAgentSession(value: unknown): RoleAgentSession {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new Error("Role Agent Session is invalid.");
+  }
+  const record = migrateRuntimeGenerationKeys(value as Record<string, unknown>);
+  if (record.schemaVersion !== 4 && record.schemaVersion !== 5) {
+    throw new Error(
+      `Role Agent Session cannot migrate from version ${String(record.schemaVersion)}.`
+    );
+  }
+  record.schemaVersion = 5;
+  return record as unknown as RoleAgentSession;
+}
+
+function migrateRuntimeObservation(value: unknown): RuntimeObservation {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new Error("RuntimeObservation payload is invalid.");
+  }
+  const observation = migrateRuntimeGenerationKeys(
+    value as Record<string, unknown>
+  );
+  if (observation.schemaVersion !== 2 && observation.schemaVersion !== 3) {
+    throw new Error(
+      `RuntimeObservation cannot migrate from version ${String(observation.schemaVersion)}.`
+    );
+  }
+  observation.schemaVersion = 3;
+  return createRuntimeObservation(observation as unknown as RuntimeObservation);
+}
+
+function migrateRuntimeProcessExitObservation(value: unknown): RuntimeProcessExitObservation {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new Error("Runtime process-exit observation payload is invalid.");
+  }
+  const observation = migrateRuntimeGenerationKeys(
+    value as Record<string, unknown>
+  );
+  if (observation.schemaVersion !== 1 && observation.schemaVersion !== 2) {
+    throw new Error(
+      `Runtime process-exit observation cannot migrate from version ${
+        String(observation.schemaVersion)
+      }.`
+    );
+  }
+  observation.schemaVersion = 2;
+  return validateRuntimeProcessExitObservation(
+    observation as unknown as RuntimeProcessExitObservation
+  );
+}
+
+function migrateTaskEventRuntimeGeneration(
+  event: Record<string, unknown>,
+  identity: string
+): Record<string, unknown> {
+  if (event.schemaVersion !== CURRENT_EVENT_SCHEMA_VERSION) {
+    throw new Error(
+      `TaskEvent ${identity} has invalid schema version: ${String(event.schemaVersion)}.`
+    );
+  }
+  const payload = event.payload;
+  if (typeof payload !== "object" || payload === null || Array.isArray(payload)) {
+    throw new Error(`TaskEvent payload is invalid: ${identity}.`);
+  }
+  const migratedPayload = migrateRuntimeGenerationKeys(
+    payload as Record<string, unknown>
+  );
+  if (event.type === RUNTIME_OBSERVATION_TASK_EVENT) {
+    const encoded = migratedPayload.observation;
+    if (typeof encoded !== "string") {
+      throw new Error(`Runtime observation event has no observation payload: ${identity}.`);
+    }
+    const observation = migrateRuntimeObservation(JSON.parse(encoded) as unknown);
+    assertMatchingEventRuntimeGeneration(
+      migratedPayload.runtimeGenerationId,
+      observation.fence.runtimeGenerationId,
+      identity
+    );
+    migratedPayload.observation = JSON.stringify(observation);
+    migratedPayload.runtimeGenerationId = observation.fence.runtimeGenerationId;
+  } else if (event.type === RUNTIME_PROCESS_EXIT_TASK_EVENT) {
+    const encoded = migratedPayload.observation;
+    if (typeof encoded !== "string") {
+      throw new Error(
+        `Runtime process-exit event has no observation payload: ${identity}.`
+      );
+    }
+    const observation = migrateRuntimeProcessExitObservation(
+      JSON.parse(encoded) as unknown
+    );
+    assertMatchingEventRuntimeGeneration(
+      migratedPayload.runtimeGenerationId,
+      observation.runtimeGenerationId,
+      identity
+    );
+    migratedPayload.observation = JSON.stringify(observation);
+    migratedPayload.runtimeGenerationId = observation.runtimeGenerationId;
+  }
+  return { ...event, payload: migratedPayload };
+}
+
+function assertMatchingEventRuntimeGeneration(
+  outer: unknown,
+  inner: string,
+  identity: string
+): void {
+  if (outer !== undefined && outer !== inner) {
+    throw new Error(
+      `TaskEvent runtime generation identities disagree: ${identity}.`
+    );
+  }
+}
+
+function migrateTelemetryRuntimeGenerationKeys(database: Database.Database): void {
+  const rows = database.prepare(
+    `SELECT task_id, role_name, turn_id, generation, progress_id, payload
+     FROM telemetry`
+  ).all() as Array<{
+    task_id: string;
+    role_name: string;
+    turn_id: string;
+    generation: string;
+    progress_id: string;
+    payload: string;
+  }>;
+  for (const row of rows) {
+    const payload = JSON.parse(row.payload) as unknown;
+    database.prepare(
+      `UPDATE telemetry SET payload = ?
+       WHERE task_id = ? AND role_name = ? AND turn_id = ?
+         AND generation = ? AND progress_id = ?`
+    ).run(
+      JSON.stringify(migrateRuntimeGenerationValue(payload)),
+      row.task_id,
+      row.role_name,
+      row.turn_id,
+      row.generation,
+      row.progress_id
+    );
+  }
+}
+
+function migrateRuntimeGenerationValue(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(migrateRuntimeGenerationValue);
+  if (typeof value !== "object" || value === null) return value;
+  return migrateRuntimeGenerationKeys(value as Record<string, unknown>);
+}
+
+function migrateRuntimeGenerationKeys(
+  value: Record<string, unknown>
+): Record<string, unknown> {
+  const migrated: Record<string, unknown> = {};
+  assertOptionalStringMember(value, "launchId");
+  assertOptionalStringMember(value, "sessionGenerationId");
+  assertOptionalStringMember(value, "runtimeGenerationId");
+  assertOptionalStringMember(value, "YUI_LAUNCH_ID");
+  assertOptionalStringMember(value, "YUI_RUNTIME_GENERATION_ID");
+  const oldGeneration = value.launchId;
+  const duplicateGeneration = value.sessionGenerationId;
+  const currentGeneration = value.runtimeGenerationId;
+  const candidates = [oldGeneration, duplicateGeneration, currentGeneration]
+    .filter((candidate): candidate is string => typeof candidate === "string");
+  if (new Set(candidates).size > 1) {
+    throw new Error("Persisted runtime generation identities disagree.");
+  }
+  const environmentCandidates = [
+    value.YUI_LAUNCH_ID,
+    value.YUI_RUNTIME_GENERATION_ID
+  ].filter((candidate): candidate is string => typeof candidate === "string");
+  if (new Set(environmentCandidates).size > 1) {
+    throw new Error("Persisted runtime generation environment identities disagree.");
+  }
+  for (const [key, member] of Object.entries(value)) {
+    if (key === "launchId"
+      || key === "sessionGenerationId"
+      || key === "YUI_LAUNCH_ID") continue;
+    migrated[key] = migrateRuntimeGenerationValue(member);
+  }
+  const generation = candidates[0];
+  if (generation !== undefined) migrated.runtimeGenerationId = generation;
+  const environmentGeneration = environmentCandidates[0];
+  if (environmentGeneration !== undefined) {
+    migrated.YUI_RUNTIME_GENERATION_ID = environmentGeneration;
+  }
+  return migrated;
+}
+
+function assertOptionalStringMember(
+  value: Record<string, unknown>,
+  key: string
+): void {
+  if (Object.hasOwn(value, key)
+    && value[key] !== undefined
+    && typeof value[key] !== "string") {
+    throw new Error(`Persisted runtime generation member is invalid: ${key}.`);
+  }
+}
+
+function validateRuntimeGenerationMigrationSource(
+  database: Database.Database,
+  aggregate: number
+): void {
+  const globalVersion = aggregate <= 29 ? 4 : 5;
+  const taskVersion = aggregate <= 29 ? 11 : 12;
+  // A crash can commit the SQLite transaction before the manifest rename.
+  // Accept current payloads under an old aggregate so rerunning the adjacent
+  // migration remains idempotent; a current manifest uses validateCurrentStore.
+  for (const { payload } of database.prepare(
+    "SELECT payload FROM global_role_session_sets"
+  ).all() as { payload: string }[]) {
+    const set = jsonRecord(payload, "GlobalRoleSessionSet");
+    if (![globalVersion, 5].includes(set.schemaVersion as number)) {
+      throw new Error(
+        `GlobalRoleSessionSet payload version ${String(set.schemaVersion)} does not match its manifest.`
+      );
+    }
+  }
+  for (const { payload } of database.prepare(
+    "SELECT payload FROM role_session_sets"
+  ).all() as { payload: string }[]) {
+    const set = jsonRecord(payload, "TaskRoleSessionSet");
+    if (![taskVersion, 12].includes(set.schemaVersion as number)) {
+      throw new Error(
+        `TaskRoleSessionSet payload version ${String(set.schemaVersion)} does not match its manifest.`
+      );
+    }
+  }
+  for (const row of database.prepare(
+    "SELECT task_id, event_id, payload FROM events"
+  ).all() as { task_id: string; event_id: string; payload: string }[]) {
+    migrateTaskEventRuntimeGeneration(
+      jsonRecord(row.payload, "TaskEvent"),
+      `${row.task_id}/${row.event_id}`
+    );
+  }
+}
+
 function isCommit(value: string): boolean {
   return /^[a-f0-9]{40}(?:[a-f0-9]{24})?$/iu.test(value);
 }
@@ -917,10 +1281,34 @@ function validateCurrentStore(home: string): void {
   try {
     store.getConfig();
     for (const profile of store.listAgentProfiles()) validateAgentProfile(profile);
+    for (const sessions of store.listGlobalRoleSessionSets()) {
+      validateRoleSessionSet(sessions);
+    }
+    for (const owner of store.listSessionOwners()) {
+      if (owner.schemaVersion !== 2
+        || typeof owner.runtimeGenerationId !== "string"
+        || Object.hasOwn(owner, "launchId")) {
+        throw new Error("Session owner runtime generation identity is invalid.");
+      }
+    }
     for (const taskId of store.listTasks().map(({ id }) => id)) {
       for (const item of store.listWorkItems(taskId)) validateWorkItem(item);
       for (const round of store.listReviewRounds(taskId)) validateReviewRound(round);
       for (const turn of store.listTurns(taskId)) validateTurn(turn);
+      for (const sessions of store.listRoleSessionSets(taskId)) {
+        validateRoleSessionSet(sessions);
+      }
+      for (const event of store.listEvents(taskId)) {
+        if (event.type === RUNTIME_OBSERVATION_TASK_EVENT) {
+          const observation = JSON.parse(event.payload.observation ?? "") as RuntimeObservation;
+          createRuntimeObservation(observation);
+        } else if (event.type === RUNTIME_PROCESS_EXIT_TASK_EVENT) {
+          const observation = JSON.parse(
+            event.payload.observation ?? ""
+          ) as RuntimeProcessExitObservation;
+          validateRuntimeProcessExitObservation(observation);
+        }
+      }
     }
   } finally {
     store.close();

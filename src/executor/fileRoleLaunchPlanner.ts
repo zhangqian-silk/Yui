@@ -97,12 +97,12 @@ export type GlobalRoleLaunchPlanInput = Readonly<{
   effective?: EffectiveLaunchSnapshot;
   mode: RoleSessionLaunchMode;
   nativeSessionId?: string;
-  launchId?: string;
+  runtimeGenerationId?: string;
   environment?: Readonly<Record<string, string>>;
 }>;
 
 type TaskRoleLaunchPlanInput = Parameters<RoleLaunchPlanner["plan"]>[0] & Readonly<{
-  launchId?: string;
+  runtimeGenerationId?: string;
   environment?: Readonly<Record<string, string>>;
 }>;
 
@@ -360,7 +360,7 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
       adapterId: string;
       mode: RoleSessionLaunchMode;
       nativeSessionId?: string;
-      launchId?: string;
+      runtimeGenerationId?: string;
       turnId?: string;
       runtimeIsolation?: TaskRuntimeIsolationDescriptor;
       environment?: Readonly<Record<string, string>>;
@@ -375,7 +375,7 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
     const launchRole = effectiveRoleForLaunch(role, effective);
     const binding = activeRoleAgentBinding(launchRole);
     if (binding.agentId !== input.agentId || binding.adapterId !== input.adapterId) {
-      throw new Error(`Role launch identity changed: ${role.name}.`);
+      throw new Error(`Role runtime generation identity changed: ${role.name}.`);
     }
     const configured = this.store.getConfiguredAgent(input.agentId);
     if (configured === null) throw new Error(`Configured Agent not found: ${input.agentId}.`);
@@ -416,7 +416,7 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
       owner.scope !== "task"
       || runtimeIsolation.taskId !== owner.taskId
       || runtimeIsolation.workspace.root !== effectiveWorkspace
-      || runtimeIsolation.generation.launchId !== input.launchId
+      || runtimeIsolation.generation.runtimeGenerationId !== input.runtimeGenerationId
     )) {
       throw new Error("Role launch does not match its Task runtime isolation descriptor.");
     }
@@ -519,11 +519,11 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
     const preallocatedNativeSessionId = binding.adapterId === "claude"
       && resumeNativeSessionId === undefined
       ? requireText(
-          input.launchId === undefined
+          input.runtimeGenerationId === undefined
             ? this.#createNativeSessionId()
             : nativeSessionIdForLaunch(
                 this.home,
-                input.launchId,
+                input.runtimeGenerationId,
                 input.agentId,
                 input.adapterId
               ),
@@ -621,7 +621,7 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
       ? this.#providerAuthorityForLaunch(
           owner.taskId,
           role.name,
-          input.launchId,
+          input.runtimeGenerationId,
           input.mode
         )
       : undefined;
@@ -700,9 +700,9 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
                   }
                 : {})
             }),
-        ...(input.launchId === undefined
+        ...(input.runtimeGenerationId === undefined
           ? {}
-          : { YUI_LAUNCH_ID: input.launchId }),
+          : { YUI_RUNTIME_GENERATION_ID: input.runtimeGenerationId }),
         // No Turn is exported into the Session environment. A native pane
         // outlives its Turn, so a Turn id frozen here would be stale for every
         // later Turn. The Agent Host sets it explicitly per spawned Provider
@@ -742,10 +742,10 @@ export class FileRoleLaunchPlanner implements RoleLaunchPlanner, AgentEnvironmen
   #providerAuthorityForLaunch(
     taskId: string,
     roleName: string,
-    launchId: string | undefined,
+    runtimeGenerationId: string | undefined,
     mode: "new" | "resume"
   ): ProviderAuthorityFence {
-    const activationId = requireText(launchId, "Managed Provider Activation id");
+    const activationId = requireText(runtimeGenerationId, "Managed Provider Activation id");
     const binding = this.store.getTaskRoleSessionSet(taskId, roleName)?.providerBinding;
     if (binding === null || binding === undefined) {
       return { epoch: 1, owner: "controller", holderId: activationId };

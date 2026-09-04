@@ -6,13 +6,13 @@ import { requireText } from "./validation.js";
 /** Deterministic native identity preallocated for one exact provider launch. */
 export function nativeSessionIdForLaunch(
   home: string,
-  launchId: string,
+  runtimeGenerationId: string,
   agentId: string,
   adapterId: string
 ): string {
   const hex = createHash("sha256").update(JSON.stringify([
     resolve(requireText(home, "YUI_HOME")),
-    requireText(launchId, "Launch id"),
+    requireText(runtimeGenerationId, "Runtime generation id"),
     requireText(agentId, "Agent id"),
     requireText(adapterId, "Agent adapter id")
   ])).digest("hex");

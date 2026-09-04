@@ -1,4 +1,5 @@
-export const RUNTIME_PROCESS_EXIT_SCHEMA_VERSION = 1 as const;
+export const RUNTIME_PROCESS_EXIT_SCHEMA_VERSION = 2 as const;
+export const RUNTIME_PROCESS_EXIT_TASK_EVENT = "runtime.process-exit-observed";
 
 export type RuntimeProcessExitObservation = Readonly<{
   schemaVersion: typeof RUNTIME_PROCESS_EXIT_SCHEMA_VERSION;
@@ -9,7 +10,7 @@ export type RuntimeProcessExitObservation = Readonly<{
   taskId?: string;
   roleName: string;
   turnId?: string;
-  launchId: string;
+  runtimeGenerationId: string;
   nativeSessionId?: string;
   processKind: "agent-host" | "provider-child";
   exitCode?: number;
@@ -32,7 +33,7 @@ export function validateRuntimeProcessExitObservation(
   optionalIdentity(observation.taskId, "taskId");
   identity(observation.roleName, "roleName");
   optionalIdentity(observation.turnId, "turnId");
-  identity(observation.launchId, "launchId");
+  identity(observation.runtimeGenerationId, "runtimeGenerationId");
   optionalIdentity(observation.nativeSessionId, "nativeSessionId");
   if (observation.processKind !== "agent-host" && observation.processKind !== "provider-child") {
     throw new Error("Runtime process kind is invalid.");

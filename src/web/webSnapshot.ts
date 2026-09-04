@@ -293,7 +293,7 @@ function projectWebTurnRuntimeHealth(
   const sessions = reader.getTaskRoleSessionSet(taskId, turn.roleName);
   const session = sessions?.sessions[turn.effective.agentId];
   const stallReason = "the live active Turn has no durable progress in the configured stall window";
-  if (session?.launchId === undefined) {
+  if (session?.runtimeGenerationId === undefined) {
     return {
       turnId: turn.id,
       roleName: turn.roleName,
@@ -323,8 +323,7 @@ function projectWebTurnRuntimeHealth(
     turnId: turn.id,
     agentId: turn.effective.agentId,
     driverId,
-    launchId: session.launchId,
-    sessionGenerationId: session.launchId,
+    runtimeGenerationId: session.runtimeGenerationId,
     nativeSessionId: session.nativeSessionId,
     nativeTurnId: providerTurn?.turnId === turn.id
       ? providerTurn.nativeTurnId ?? turn.id

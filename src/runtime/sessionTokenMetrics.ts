@@ -7,15 +7,14 @@ import {
   type RuntimeUsageSnapshot
 } from "./runtimeObservation.js";
 
-/** Exact native Session generation whose token observations may be combined. */
+/** Exact native Runtime generation whose token observations may be combined. */
 export type SessionTokenIdentity = Readonly<{
   taskId: string;
   roleName: string;
   agentId: string;
   driverId: string;
-  launchId: string;
+  runtimeGenerationId: string;
   nativeSessionId: string;
-  sessionGenerationId: string;
 }>;
 
 export type SessionCumulativeTokenMetric =
@@ -49,7 +48,7 @@ export type SessionTokenIdentityInput = Readonly<{
   roleName?: string;
   agentId?: string;
   adapterId?: string;
-  launchId?: string;
+  runtimeGenerationId?: string;
   nativeSessionId?: string;
 }>;
 
@@ -62,7 +61,7 @@ export function resolveSessionTokenIdentity(
     || input.roleName === undefined
     || input.agentId === undefined
     || input.adapterId === undefined
-    || input.launchId === undefined
+    || input.runtimeGenerationId === undefined
     || input.nativeSessionId === undefined) return null;
   let driverId: string;
   try {
@@ -75,9 +74,8 @@ export function resolveSessionTokenIdentity(
     roleName: input.roleName,
     agentId: input.agentId,
     driverId,
-    launchId: input.launchId,
-    nativeSessionId: input.nativeSessionId,
-    sessionGenerationId: input.launchId
+    runtimeGenerationId: input.runtimeGenerationId,
+    nativeSessionId: input.nativeSessionId
   });
 }
 
@@ -240,9 +238,8 @@ function matchesSessionGeneration(
     && fence.roleName === identity.roleName
     && fence.agentId === identity.agentId
     && fence.driverId === identity.driverId
-    && fence.launchId === identity.launchId
-    && fence.nativeSessionId === identity.nativeSessionId
-    && fence.sessionGenerationId === identity.sessionGenerationId;
+    && fence.runtimeGenerationId === identity.runtimeGenerationId
+    && fence.nativeSessionId === identity.nativeSessionId;
 }
 
 function compareObservations(left: RuntimeObservation, right: RuntimeObservation): number {

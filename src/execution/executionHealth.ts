@@ -118,7 +118,7 @@ export type ExecutionHealthSession = Readonly<{
   adapterId: string;
   status?: string;
   nativeSessionId?: string;
-  launchId?: string;
+  runtimeGenerationId?: string;
 }>;
 
 export type ExecutionGroupHealthInput = Readonly<{
@@ -416,7 +416,7 @@ function exactTurnObservations(
       && observation.fence.turnId === turn.id
       && observation.fence.roleName === turn.roleName
       && observation.fence.agentId === turn.effective.agentId
-      && (session?.launchId === undefined || observation.fence.launchId === session.launchId)
+      && (session?.runtimeGenerationId === undefined || observation.fence.runtimeGenerationId === session.runtimeGenerationId)
       && (session?.nativeSessionId === undefined
         || observation.fence.nativeSessionId === session.nativeSessionId)
     ));
@@ -452,7 +452,7 @@ function latestExactProcessExit(
       if (observation.taskId !== turn.taskId
         || observation.turnId !== turn.id
         || observation.roleName !== turn.roleName
-        || (session?.launchId !== undefined && observation.launchId !== session.launchId)
+        || (session?.runtimeGenerationId !== undefined && observation.runtimeGenerationId !== session.runtimeGenerationId)
         || (session?.nativeSessionId !== undefined
           && observation.nativeSessionId !== session.nativeSessionId)) return [];
       return [{

@@ -9,6 +9,7 @@ export type PublicationVerificationInput = Readonly<{
   repository: string;
   externalKind: PublicationExternalKind;
   externalId: string;
+  externalUrl?: string;
   expectedLocalCommit: string;
 }>;
 

@@ -55,6 +55,16 @@ import { materializeSessionBootstrap } from "../../dist/context/sessionBootstrap
 import { builtinAgentDriverRegistry } from "../../dist/runtime/builtinAgentDrivers.js";
 import { serializeAgentErrorRaw, standardAgentError } from "../../dist/runtime/agentError.js";
 import { runtimeLifecycleTarget } from "../../dist/runtime/lifecycleReservation.js";
+import {
+  createRuntimeObservation,
+  runtimeObservationTaskEventPayload
+} from "../../dist/runtime/runtimeObservation.js";
+import { createSessionOwnerIdentity } from "../../dist/runtime/sessionOwnerIdentity.js";
+import {
+  RuntimeGenerationMismatchError,
+  RuntimeLaunchError
+} from "../../dist/runtime/ports.js";
+import { RuntimeLaunchCoordinator } from "../../dist/controller/runtimeLaunchCoordinator.js";
 import { createExactControlPlaneDescriptor } from "../../dist/runtime/exactControlPlane.js";
 import { resolveManagedTaskCaller } from "../../dist/runtime/managedCaller.js";
 import { taskLeaderActionTurnId } from "../../dist/commands/taskActor.js";
@@ -112,6 +122,7 @@ import { SqliteTaskStore } from "../../dist/storage/sqliteStore.js";
 import * as taskStoreContract from "../../dist/storage/taskStore.js";
 import { ensureStorageSchema, StorageSchemaError } from "../../dist/storage/storageSchema.js";
 import { latestStorageVersionState } from "../../dist/storage/upgrade/recordVersions.js";
+import { runStorageUpgrade } from "../../dist/storage/upgrade/upgradeOrchestrator.js";
 import { initializeCurrentTaskStore } from "../../dist/storage/currentTaskStore.js";
 import { createProject } from "../../dist/repository/project.js";
 import {
@@ -500,7 +511,7 @@ test("Global Codex Sessions use the shared daemon and retain a process-independe
     agentId: agent.id,
     adapterId: agent.adapterId,
     mode: "new",
-    launchId: "operator-launch-1"
+    runtimeGenerationId: "operator-launch-1"
   });
   assert.ok(planned.launch.args.includes("--remote"));
   assert.ok(planned.launch.args.includes("unix://"));
@@ -533,7 +544,7 @@ test("Managed Codex performs the App Server WebSocket handshake through its prox
   const attemptId = "fake-attempt-1";
   const started = await startStructuredProviderSession({
     schemaVersion: 1,
-    launchId: "fake-launch-1",
+    runtimeGenerationId: "fake-launch-1",
     command: process.execPath,
     args: [join(root, "test", "fixtures", "fake-codex-app-server-proxy.mjs")],
     environment: bareEnv,
@@ -607,7 +618,7 @@ test("SQLite projects an active native Session and its Host activation", (t) => 
     agentId: binding.agentId,
     adapterId: binding.adapterId,
     nativeSessionId: "native-session-1",
-    launchId: "launch-1",
+    runtimeGenerationId: "launch-1",
     policy: "fixed",
     status: "active",
     effective: resolveEffectiveLaunch({ role: leader, purpose: "execution" })
@@ -619,10 +630,202 @@ test("SQLite projects an active native Session and its Host activation", (t) => 
     agentId: binding.agentId,
     adapterId: binding.adapterId,
     nativeSessionId: "native-session-1",
-    launchId: "launch-1",
+    runtimeGenerationId: "launch-1",
     sessionUpdatedAt: now.toISOString(),
     cleanupRequired: true
   }]);
+});
+
+test("a reused Host generation mismatch is terminal and settles the stale reservation", async () => {
+  const now = new Date("2026-09-03T09:00:00.000Z");
+  const binding = createRoleAgentBinding({ id: "codex", adapterId: "codex" });
+  const role = createGlobalRole(
+    "operator",
+    [binding],
+    binding.agentId,
+    "/tmp/yui-generation-mismatch",
+    now
+  );
+  const runtimeGenerationId = "runtime-fingerprint:generation:existing";
+  let inspectCount = 0;
+  let settled = 0;
+  let cleanup = 0;
+  const coordinator = new RuntimeLaunchCoordinator({
+    reserveRuntimeLaunch: () => ({
+      status: "existing",
+      runtimeGenerationId
+    }),
+    confirmRuntimeLaunchReservation: () => "reserved",
+    recordReservedRuntimeNativeSession: () => {},
+    completeRuntimeLaunchReservation: () => true,
+    settleStoppedRuntimeLaunch: (input) => {
+      assert.equal(input.runtimeGenerationId, runtimeGenerationId);
+      settled += 1;
+      return true;
+    },
+    enqueueRuntimeCleanup: () => {
+      cleanup += 1;
+      return null;
+    }
+  }, {
+    start: async () => { throw new Error("unexpected new Session"); },
+    restore: async () => {
+      throw new RuntimeGenerationMismatchError(
+        runtimeGenerationId,
+        "runtime-fingerprint:generation:other",
+        "ready",
+        "generation acknowledgement mismatch"
+      );
+    },
+    stop: async () => {},
+    inspect: async () => ({ state: "stopped" }),
+    inspectOwner: async () => {
+      inspectCount += 1;
+      return { state: inspectCount < 3 ? "running" : "stopped" };
+    },
+    stopOwner: async () => true
+  }, {
+    createGenerationId: () => "new",
+    launchFingerprint: () => "fingerprint",
+    now: () => now
+  });
+
+  await assert.rejects(
+    coordinator.prepare({
+      owner: { scope: "global", roleName: role.name },
+      agentId: binding.agentId,
+      adapterId: binding.adapterId,
+      effective: resolveEffectiveLaunch({ role, purpose: "execution" }),
+      workspace: role.workspace,
+      mode: "resume",
+      nativeSessionId: "native-session-1",
+      hostActivationId: runtimeGenerationId
+    }, "deferred"),
+    (error) => {
+      assert.ok(error instanceof RuntimeLaunchError);
+      assert.equal(error.retryable, false);
+      assert.equal(error.reason, "generation-mismatch");
+      return true;
+    }
+  );
+  assert.equal(settled, 1);
+  assert.equal(cleanup, 0);
+});
+
+test("native continuation results wake the supervisor only after the parent Turn is terminal", (t) => {
+  const home = mkdtempSync(join(tmpdir(), "yui-continuation-owner-smoke-"));
+  t.after(() => rmSync(home, { recursive: true, force: true }));
+  ensureStorageSchema(home);
+  const store = new SqliteTaskStore(home);
+  t.after(() => store.close());
+  const now = new Date("2026-09-03T09:15:00.000Z");
+  const task = activateTask(createTask("task-1", "Route native continuation", now), now);
+  store.saveTask(task);
+  const agent = createRoleAgentBinding({ id: "codex", adapterId: "codex" });
+  const worker = createRole(task.id, "worker", [agent], agent.agentId, home, now);
+  const leader = createRole(task.id, "leader", [agent], agent.agentId, home, now);
+  store.saveRole(task.id, worker);
+  store.saveRole(task.id, leader);
+  const turn = createTurn(
+    "turn-1",
+    task.id,
+    worker.name,
+    "new",
+    turnInput("turn-1", task.id, worker.name, "Delegate and aggregate."),
+    now,
+    { effective: resolveEffectiveLaunch({ role: worker, purpose: "execution" }) }
+  );
+  store.saveActiveTurn(turn);
+  store.saveTaskRoleSessionSet(recordRoleAgentSession(createRoleSessionSet(
+    { scope: "task", taskId: task.id, roleName: worker.name },
+    agent.agentId,
+    now
+  ), {
+    agentId: agent.agentId,
+    adapterId: agent.adapterId,
+    nativeSessionId: "thread-1",
+    runtimeGenerationId: "generation-1",
+    policy: "fixed",
+    status: "active",
+    effective: turn.effective
+  }, now));
+  const adapter = new FileSchedulerStoreAdapter(store);
+  const fence = {
+    taskId: task.id,
+    roleName: worker.name,
+    turnId: turn.id,
+    agentId: agent.agentId,
+    driverId: "openai/codex",
+    runtimeGenerationId: "generation-1",
+    nativeSessionId: "thread-1",
+    nativeTurnId: "provider-turn-1",
+    receiptId: `turn:${task.id}/${turn.id}`,
+    conversationId: "thread-1",
+    activationId: "generation-1",
+    continuationId: "child-1",
+    continuationGeneration: 1
+  };
+  const observation = (kind, payload, minute) => createRuntimeObservation({
+    schemaVersion: 3,
+    eventId: `continuation-${kind}-${minute}`,
+    semanticKey: `continuation-${kind}-${minute}`,
+    kind,
+    authority: "provider-structured",
+    receivedAt: `2026-09-03T09:${minute}:00.000Z`,
+    fence,
+    payload
+  });
+  const common = {
+    attachment: "attached",
+    observationQuality: "exact",
+    mayWriteWorkspace: true
+  };
+  assert.equal(adapter.observeRuntimeObservation(observation(
+    "continuation.started",
+    { ...common, execution: "active", outcome: "pending" },
+    "11"
+  ), now), "applied");
+  assert.equal(adapter.observeRuntimeObservation(observation(
+    "continuation.reported",
+    {
+      ...common,
+      execution: "active",
+      outcome: "pending",
+      reportId: "report-1",
+      summary: "Intermediate child result."
+    },
+    "12"
+  ), now), "applied");
+  assert.equal(store.getWorkMailbox({
+    kind: "role",
+    taskId: task.id,
+    roleName: leader.name
+  }), null);
+
+  store.saveTurn(completeTurn(
+    turn,
+    "Parent Turn finished.",
+    new Date("2026-09-03T09:13:00.000Z")
+  ));
+  store.clearActiveTurn(task.id, worker.name);
+  assert.equal(adapter.observeRuntimeObservation(observation(
+    "continuation.settled",
+    {
+      ...common,
+      execution: "quiescent",
+      outcome: "succeeded",
+      mayWriteWorkspace: false,
+      resultRef: "result-1"
+    },
+    "14"
+  ), now), "applied");
+  const leaderMailbox = store.getWorkMailbox({
+    kind: "role",
+    taskId: task.id,
+    roleName: leader.name
+  });
+  assert.notEqual(leaderMailbox, null);
+  assert.deepEqual(leaderMailbox.pending.reasons, ["provider-continuation-settled"]);
 });
 
 test("runtime pre-start persists the empty Session binding before Provider discovery", (t) => {
@@ -653,7 +856,7 @@ test("runtime pre-start persists the empty Session binding before Provider disco
     role,
     turn: run,
     session: null,
-    launchId: "activation-1",
+    runtimeGenerationId: "activation-1",
     now
   });
 
@@ -701,7 +904,7 @@ test("Turns record provider-visible input without delivery handshake state", () 
   for (const legacyField of ["pushedAt", "deliveredAt", "deliveryReceiptId", "controlRequest"]) {
     assert.equal(Object.hasOwn(run, legacyField), false);
   }
-  assert.equal(sessions.schemaVersion, 11);
+  assert.equal(sessions.schemaVersion, 12);
   assert.equal(Object.hasOwn(sessions, "inFlight"), false);
   assert.equal(mailbox.schemaVersion, 5);
   assert.equal(mailbox.pending, null);
@@ -976,7 +1179,7 @@ test("a direct Provider Turn records visible input and output without workflow s
     agentId: agent.agentId,
     adapterId: agent.adapterId,
     nativeSessionId: "thread-1",
-    launchId: "activation-1",
+    runtimeGenerationId: "activation-1",
     policy: "fixed",
     status: "active",
     effective
@@ -1001,14 +1204,13 @@ test("a direct Provider Turn records visible input and output without workflow s
     roleName: role.name,
     agentId: agent.agentId,
     driverId: "openai/codex",
-    launchId: "activation-1",
-    sessionGenerationId: "activation-1",
+    runtimeGenerationId: "activation-1",
     conversationId: "thread-1",
     activationId: "activation-1",
     nativeSessionId: "thread-1"
   };
   const observation = (kind, ordinal, extra = {}) => ({
-    schemaVersion: 2,
+    schemaVersion: 3,
     eventId: `direct-turn-${ordinal}`,
     semanticKey: `direct-turn-${kind}-${ordinal}`,
     kind,
@@ -1043,7 +1245,7 @@ test("a direct Provider Turn records visible input and output without workflow s
     roleName: role.name,
     agentId: agent.agentId,
     adapterId: agent.adapterId,
-    launchId: "activation-1",
+    runtimeGenerationId: "activation-1",
     nativeSessionId: "thread-1",
     nativeTurnId: "turn-ordinary-1",
     attemptId: "direct:turn-ordinary-1",
@@ -1076,7 +1278,7 @@ test("a direct Provider Turn records visible input and output without workflow s
     roleName: role.name,
     agentId: agent.agentId,
     adapterId: agent.adapterId,
-    launchId: "activation-1",
+    runtimeGenerationId: "activation-1",
     nativeSessionId: "thread-1",
     nativeTurnId: "turn-goal-2",
     attemptId: "direct:turn-goal-2",
@@ -1140,7 +1342,7 @@ test("Leader wakeups aggregate for one minute and force-steer after ten", async 
     agentId: agent.agentId,
     adapterId: agent.adapterId,
     nativeSessionId: "thread-1",
-    launchId: "activation-1",
+    runtimeGenerationId: "activation-1",
     policy: "fixed",
     status: "active",
     effective
@@ -1336,7 +1538,7 @@ test("active Role Turns deliver from durable state and Worker hints settle at ac
     agentId: agent.agentId,
     adapterId: agent.adapterId,
     nativeSessionId: "thread-old",
-    launchId: "activation-old",
+    runtimeGenerationId: "activation-old",
     policy: "fixed",
     status: "ended",
     endReason: "stopped",
@@ -1392,7 +1594,7 @@ test("active Role Turns deliver from durable state and Worker hints settle at ac
   let preparedCalls = 0;
   const prepared = {
     deliveryId: "delivery-1",
-    launchId: "activation-new",
+    runtimeGenerationId: "activation-new",
     turnId: turn.id,
     taskId: task.id,
     roleName: role.name,
@@ -1404,7 +1606,7 @@ test("active Role Turns deliver from durable state and Worker hints settle at ac
       agentId: agent.agentId,
       adapterId: agent.adapterId,
       nativeSessionId: "thread-new",
-      launchId: "activation-new",
+      runtimeGenerationId: "activation-new",
       status: "active",
       effective
     }
@@ -1415,7 +1617,7 @@ test("active Role Turns deliver from durable state and Worker hints settle at ac
       preparedCalls += 1;
       request.beforeHostStart({
         owner: { scope: "task", taskId: task.id, roleName: role.name },
-        launchId: "activation-new",
+        runtimeGenerationId: "activation-new",
         turnId: turn.id,
         agentId: agent.agentId,
         adapterId: agent.adapterId,
@@ -1426,7 +1628,7 @@ test("active Role Turns deliver from durable state and Worker hints settle at ac
     },
     waitUntilReady: async () => {
       assert.equal(adapter.observeRuntimeObservation({
-        schemaVersion: 2,
+        schemaVersion: 3,
         eventId: "new-session-ready",
         semanticKey: "new-session-ready",
         kind: "session.ready",
@@ -1441,8 +1643,7 @@ test("active Role Turns deliver from durable state and Worker hints settle at ac
           turnId: turn.id,
           agentId: agent.agentId,
           driverId: "openai/codex",
-          launchId: "activation-new",
-          sessionGenerationId: "activation-new",
+          runtimeGenerationId: "activation-new",
           nativeSessionId: "thread-new",
           receiptId: "turn:task-1/turn-1",
           conversationId: "thread-new",
@@ -1519,7 +1720,7 @@ test("active Role Turns deliver from durable state and Worker hints settle at ac
   }), null);
   const leaderPrepared = {
     deliveryId: "delivery-leader",
-    launchId: "activation-leader",
+    runtimeGenerationId: "activation-leader",
     turnId: leaderTurn.id,
     taskId: leaderTask.id,
     roleName: leader.name,
@@ -1531,7 +1732,7 @@ test("active Role Turns deliver from durable state and Worker hints settle at ac
       agentId: agent.agentId,
       adapterId: agent.adapterId,
       nativeSessionId: "thread-leader",
-      launchId: "activation-leader",
+      runtimeGenerationId: "activation-leader",
       status: "active",
       effective: leaderEffective
     }
@@ -1544,7 +1745,7 @@ test("active Role Turns deliver from durable state and Worker hints settle at ac
         leaderDeliveryCalls += 1;
         request.beforeHostStart({
           owner: { scope: "task", taskId: leaderTask.id, roleName: leader.name },
-          launchId: "activation-leader",
+          runtimeGenerationId: "activation-leader",
           turnId: leaderTurn.id,
           agentId: agent.agentId,
           adapterId: agent.adapterId,
@@ -1606,7 +1807,7 @@ test("Task completion leaves its reusable Provider Session running", async (t) =
     agentId: agent.agentId,
     adapterId: agent.adapterId,
     nativeSessionId: "session-1",
-    launchId: "activation-1",
+    runtimeGenerationId: "activation-1",
     policy: "fixed",
     status: "active",
     effective
@@ -1680,7 +1881,7 @@ test("the exact Provider Turn terminal atomically completes its Turn once", asyn
     agentId: agent.agentId,
     adapterId: agent.adapterId,
     nativeSessionId: "thread-1",
-    launchId: "activation-1",
+    runtimeGenerationId: "activation-1",
     policy: "fixed",
     status: "active",
     effective: run.effective
@@ -1711,7 +1912,7 @@ test("the exact Provider Turn terminal atomically completes its Turn once", asyn
     roleName: role.name,
     agentId: agent.agentId,
     adapterId: agent.adapterId,
-    launchId: "activation-1",
+    runtimeGenerationId: "activation-1",
     nativeSessionId: "thread-1",
     nativeTurnId: "turn-1",
     attemptId: "run:task-1/turn-1",
@@ -3285,9 +3486,118 @@ test("a valid aggregate-21 Home upgrades through every adjacent record step", as
     }, new Date(now.getTime() + index)));
   }
   const binding = createRoleAgentBinding({ id: "codex", adapterId: "codex" });
-  for (const roleName of ["leader", "producer", "reviewer"]) {
+  for (const roleName of ["leader", "producer", "reviewer", "legacy-runtime"]) {
     store.saveRole(task.id, createRole(task.id, roleName, [binding], binding.agentId, home, now));
   }
+  const legacyRuntimeGenerationId = "legacy-generation-1";
+  const taskSessionSet = recordRoleAgentSession(createRoleSessionSet(
+    { scope: "task", taskId: task.id, roleName: "legacy-runtime" },
+    binding.agentId,
+    now
+  ), {
+    agentId: binding.agentId,
+    adapterId: binding.adapterId,
+    nativeSessionId: "legacy-task-session",
+    runtimeGenerationId: legacyRuntimeGenerationId,
+    policy: "fixed",
+    status: "active",
+    effective: resolveEffectiveLaunch({
+      role: store.getRole(task.id, "legacy-runtime"),
+      purpose: "execution"
+    })
+  }, now);
+  store.saveTaskRoleSessionSet(taskSessionSet);
+  const globalWorker = store.getGlobalRole("worker");
+  const globalSessionSet = recordRoleAgentSession(createRoleSessionSet(
+    { scope: "global", roleName: globalWorker.name },
+    globalWorker.activeAgentId,
+    now
+  ), {
+    agentId: globalWorker.activeAgentId,
+    adapterId: globalWorker.agentBindings[globalWorker.activeAgentId].adapterId,
+    nativeSessionId: "legacy-global-session",
+    runtimeGenerationId: "legacy-global-generation",
+    policy: "fixed",
+    status: "active",
+    effective: resolveEffectiveLaunch({
+      role: globalWorker,
+      purpose: "execution"
+    })
+  }, now);
+  store.saveGlobalRoleSessionSet(globalSessionSet);
+  store.saveSessionOwner(createSessionOwnerIdentity({
+    owner: { scope: "task", taskId: task.id, roleName: "legacy-runtime" },
+    agentId: binding.agentId,
+    adapterId: binding.adapterId,
+    runtimeGenerationId: legacyRuntimeGenerationId,
+    nativeSessionId: "legacy-task-session",
+    tmux: {
+      serverName: "yui-test",
+      socketPath: join(home, "tmux.sock"),
+      sessionName: task.id,
+      windowName: "producer",
+      panePid: 4242
+    },
+    providerRoot: {
+      pid: 4243,
+      startIdentity: "12345",
+      attribution: "launch-env"
+    },
+    recordedAt: now
+  }));
+  const legacyObservation = createRuntimeObservation({
+    schemaVersion: 3,
+    eventId: "legacy-observation-1",
+    semanticKey: "legacy-observation-1",
+    kind: "host.observed",
+    authority: "host",
+    receivedAt: now.toISOString(),
+    fence: {
+      taskId: task.id,
+      roleName: "legacy-runtime",
+      agentId: binding.agentId,
+      driverId: "openai/codex",
+      runtimeGenerationId: legacyRuntimeGenerationId,
+      nativeSessionId: "legacy-task-session"
+    },
+    payload: { alive: true }
+  });
+  store.saveEvent(task.id, createTaskEvent(
+    store.nextEventId(task.id),
+    task.id,
+    "runtime.observation",
+    runtimeObservationTaskEventPayload(legacyObservation),
+    now
+  ));
+  const legacyProcessExitObservationId = "legacy-process-exit-1";
+  const legacyProcessExitObservation = {
+    schemaVersion: 2,
+    observationId: legacyProcessExitObservationId,
+    hostSequence: 1,
+    hostInstanceId: "legacy-host-1",
+    taskId: task.id,
+    roleName: "legacy-runtime",
+    runtimeGenerationId: legacyRuntimeGenerationId,
+    nativeSessionId: "legacy-task-session",
+    processKind: "provider-child",
+    exitCode: 0,
+    observedAt: now.toISOString()
+  };
+  store.saveEvent(task.id, createTaskEvent(
+    store.nextEventId(task.id),
+    task.id,
+    "runtime.process-exit-observed",
+    {
+      observationId: legacyProcessExitObservationId,
+      processKind: "provider-child",
+      roleName: "legacy-runtime",
+      runtimeGenerationId: legacyRuntimeGenerationId,
+      observedAt: now.toISOString(),
+      classification: "expected-per-turn-exit",
+      observation: JSON.stringify(legacyProcessExitObservation)
+    },
+    now
+  ));
   const oldItem = createWorkItem("work-item-1", task.id, {
     title: "Existing valid WorkItem",
     assignee: "producer"
@@ -3467,6 +3777,62 @@ test("a valid aggregate-21 Home upgrades through every adjacent record step", as
       database.prepare("UPDATE integration_attempts SET payload = ? WHERE rowid = ?")
         .run(JSON.stringify(payload), row.rowid);
     }
+    for (const table of ["global_role_session_sets", "role_session_sets"]) {
+      const rows = database.prepare(`SELECT rowid, payload FROM ${table}`).all();
+      for (const row of rows) {
+        const payload = JSON.parse(row.payload);
+        payload.schemaVersion = table === "global_role_session_sets" ? 4 : 11;
+        const sessions = [
+          ...Object.values(payload.sessions),
+          ...(Array.isArray(payload.history)
+            ? payload.history
+            : Object.values(payload.history ?? {}))
+        ];
+        for (const session of sessions) {
+          session.schemaVersion = 4;
+          if (session.runtimeGenerationId !== undefined) {
+            session.launchId = session.runtimeGenerationId;
+            delete session.runtimeGenerationId;
+          }
+        }
+        database.prepare(`UPDATE ${table} SET payload = ? WHERE rowid = ?`)
+          .run(JSON.stringify(payload), row.rowid);
+      }
+    }
+    const ownerRows = database.prepare(
+      "SELECT launch_id, payload FROM session_owners"
+    ).all();
+    for (const row of ownerRows) {
+      const payload = JSON.parse(row.payload);
+      payload.schemaVersion = 1;
+      payload.launchId = payload.runtimeGenerationId;
+      delete payload.runtimeGenerationId;
+      database.prepare("UPDATE session_owners SET payload = ? WHERE launch_id = ?")
+        .run(JSON.stringify(payload), row.launch_id);
+    }
+    const eventRows = database.prepare(
+      `SELECT rowid, type, payload FROM events
+       WHERE type IN ('runtime.observation', 'runtime.process-exit-observed')`
+    ).all();
+    for (const row of eventRows) {
+      const event = JSON.parse(row.payload);
+      const observation = JSON.parse(event.payload.observation);
+      if (row.type === "runtime.observation") {
+        observation.schemaVersion = 2;
+        observation.fence.launchId = observation.fence.runtimeGenerationId;
+        observation.fence.sessionGenerationId = observation.fence.runtimeGenerationId;
+        delete observation.fence.runtimeGenerationId;
+      } else {
+        observation.schemaVersion = 1;
+        observation.launchId = observation.runtimeGenerationId;
+        delete observation.runtimeGenerationId;
+      }
+      event.payload.launchId = event.payload.runtimeGenerationId;
+      delete event.payload.runtimeGenerationId;
+      event.payload.observation = JSON.stringify(observation);
+      database.prepare("UPDATE events SET payload = ? WHERE rowid = ?")
+        .run(JSON.stringify(event), row.rowid);
+    }
   } finally {
     database.close();
   }
@@ -3479,6 +3845,8 @@ test("a valid aggregate-21 Home upgrades through every adjacent record step", as
   manifest.recordVersions.task = 6;
   manifest.recordVersions.integrationAttempt = 5;
   manifest.recordVersions.agentProfile = 2;
+  manifest.recordVersions.globalRoleSessionSet = 4;
+  manifest.recordVersions.taskRoleSessionSet = 11;
   writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
 
   const preflight = JSON.parse(execFileSync(
@@ -3488,14 +3856,13 @@ test("a valid aggregate-21 Home upgrades through every adjacent record step", as
   ));
   assert.equal(preflight.ok, true);
   assert.equal(preflight.data.outcome, "upgrade-plan");
-  assert.equal(preflight.data.report.steps.length, 8);
-  const upgraded = JSON.parse(execFileSync(
-    process.execPath,
-    [join(root, "dist", "cli.js"), "--json", "upgrade"],
-    { cwd: root, encoding: "utf8", env: upgradeEnvironment }
-  ));
-  assert.equal(upgraded.ok, true);
-  assert.equal(upgraded.data.outcome, "upgraded");
+  assert.equal(preflight.data.report.steps.length, 10);
+  const upgraded = await runStorageUpgrade({
+    home,
+    latest: latestStorageVersionState(),
+    mode: "execute"
+  });
+  assert.equal(upgraded.outcome, "upgraded");
 
   const reopened = new SqliteTaskStore(home);
   t.after(() => reopened.close());
@@ -3531,6 +3898,46 @@ test("a valid aggregate-21 Home upgrades through every adjacent record step", as
     model: "legacy-model",
     effort: "high"
   });
+  const migratedTaskSessions = reopened.getTaskRoleSessionSet(task.id, "legacy-runtime");
+  assert.equal(migratedTaskSessions.schemaVersion, 12);
+  assert.equal(migratedTaskSessions.sessions[binding.agentId].schemaVersion, 5);
+  assert.equal(
+    migratedTaskSessions.sessions[binding.agentId].runtimeGenerationId,
+    legacyRuntimeGenerationId
+  );
+  assert.equal(
+    Object.hasOwn(migratedTaskSessions.sessions[binding.agentId], "launchId"),
+    false
+  );
+  const migratedGlobalSessions = reopened.getGlobalRoleSessionSet("worker");
+  assert.equal(migratedGlobalSessions.schemaVersion, 5);
+  assert.equal(
+    migratedGlobalSessions.sessions[globalWorker.activeAgentId].runtimeGenerationId,
+    "legacy-global-generation"
+  );
+  const migratedOwner = reopened.getSessionOwner(legacyRuntimeGenerationId);
+  assert.equal(migratedOwner.schemaVersion, 2);
+  assert.equal(migratedOwner.runtimeGenerationId, legacyRuntimeGenerationId);
+  assert.equal(Object.hasOwn(migratedOwner, "launchId"), false);
+  const migratedObservationEvent = reopened.listEvents(task.id)
+    .find(({ payload }) => payload.semanticKey === legacyObservation.semanticKey);
+  const migratedObservation = JSON.parse(migratedObservationEvent.payload.observation);
+  assert.equal(migratedObservation.schemaVersion, 3);
+  assert.equal(
+    migratedObservation.fence.runtimeGenerationId,
+    legacyRuntimeGenerationId
+  );
+  assert.equal(Object.hasOwn(migratedObservation.fence, "launchId"), false);
+  assert.equal(Object.hasOwn(migratedObservation.fence, "sessionGenerationId"), false);
+  const migratedProcessExitEvent = reopened.listEvents(task.id)
+    .find(({ payload }) => payload.observationId === legacyProcessExitObservationId);
+  const migratedProcessExit = JSON.parse(migratedProcessExitEvent.payload.observation);
+  assert.equal(migratedProcessExit.schemaVersion, 2);
+  assert.equal(
+    migratedProcessExit.runtimeGenerationId,
+    legacyRuntimeGenerationId
+  );
+  assert.equal(Object.hasOwn(migratedProcessExit, "launchId"), false);
   runTaskCommand(
     ["role", "add", task.id, "migrated-profile-role", "--profile", legacyProfile.id],
     reopened,
@@ -3611,6 +4018,8 @@ test("aggregate-24 Profile hints migrate through the sole configured Agent witho
   manifest.recordVersions.task = 6;
   manifest.recordVersions.integrationAttempt = 5;
   manifest.recordVersions.agentProfile = 2;
+  manifest.recordVersions.globalRoleSessionSet = 4;
+  manifest.recordVersions.taskRoleSessionSet = 11;
   writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
 
   const upgraded = JSON.parse(execFileSync(
@@ -3851,7 +4260,7 @@ test("Claude global Stop hooks publish the native completion boundary", async (t
     YUI_ADAPTER_ID: "claude",
     YUI_ROLE: "operator",
     YUI_AGENT_ID: "claude",
-    YUI_LAUNCH_ID: "launch-1",
+    YUI_RUNTIME_GENERATION_ID: "launch-1",
     YUI_NATIVE_SESSION_ID: "claude-session-1"
   }, async (_home, _method, params) => {
     signal = params;
@@ -3888,7 +4297,7 @@ test("managed Session authority follows durable state, not a frozen environment"
   );
 
   // A native pane's environment is frozen at launch. It names only the
-  // process's own immutable identity: no Turn, no launch generation, and no
+  // process's own immutable identity: no Turn, no runtime generation, and no
   // descriptor path that a Yui upgrade or workspace move could invalidate.
   const environment = {
     YUI_SESSION_SCOPE: "task",

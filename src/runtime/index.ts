@@ -48,6 +48,7 @@ export {
   type ActivePromptPushRequest,
   type ActivePromptSteerRequest,
   type PromptPushResult,
+  RuntimeGenerationMismatchError,
   RuntimeHostContentionError,
   RuntimeLaunchError,
   type RuntimeLaunchRetryReason,

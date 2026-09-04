@@ -51,12 +51,14 @@ accepted observer source --> Controller sampler --> usage -+--> runtime-observat
                                                         runtime status projection
 ```
 
-Every Turn-scoped observation carries Task, Role, Turn, Agent, Driver, launch,
-Session generation, native Session, native Turn, and transport receipt
-identity. `turn.accepted` durably binds the provider's native Turn to that exact
-Turn. Every later fact resolves through this binding, so a delayed terminal event
-cannot refresh, fail, or complete a successor Turn after a reused process has
-advanced.
+Every Turn-scoped observation carries Task, Role, Turn, Agent, Driver, runtime
+generation, native Session, native Turn, and transport receipt identity.
+`runtimeGenerationId` identifies the exact reusable Agent Host activation
+boundary; it is not a Session or Turn id, and direct user Turns do not change
+it. `turn.accepted` durably binds the provider's native Turn to that exact Yui
+Turn. Every later fact resolves through this binding, so a delayed terminal
+event cannot refresh, fail, or complete a successor Turn after a reused process
+has advanced.
 
 The stable vocabulary separates:
 
@@ -134,7 +136,7 @@ Usage is a normalized, read-only Session projection:
 - `inputTokens` and `outputTokens` are totals;
 - cached input and reasoning tokens are breakdowns, not values to add again;
 - cumulative total consumption is `inputTokens + outputTokens` for one exact
-  Task/Role/launch/native Session/session generation;
+  Task/Role/native Session/runtime generation;
 - maximum request input is the direct `request-context` input value, or the
   largest non-negative delta between consecutive `cumulative-session` input
   snapshots in that same generation;
@@ -159,7 +161,7 @@ Controller-owned sampler tails that source independently of Hooks, keeps an
 opaque per-source cursor, reads bounded increments, and emits each usage
 occurrence in source order with a stable occurrence identity. It never rescans
 a full transcript on the Hook path. Source and cursor continuity are scoped to
-the exact Session generation rather than one native Turn. After Controller
+the exact Runtime generation rather than one native Turn. After Controller
 restart it restores the latest durable usage occurrence and activity identity
 before rereading a bounded tail, so replayed history remains idempotent and
 cannot become a fresh activity edge. A clipped initial tail marks its evidence
@@ -208,6 +210,11 @@ Replays with the same content digest are idempotent and never create a second
 report. The parent prompt receives a bounded excerpt (512 characters) plus the
 event reference; the full content is read on demand through
 `yui task event show <task> <event>`.
+
+An active parent Turn owns its continuation results, so reported or settled
+facts are stored without a supervisor wake. If the parent Turn is terminal or
+missing, Yui routes the result once from the original Role to its supervisor;
+the existing mailbox aggregation window performs batching.
 
 Size and retention boundaries:
 

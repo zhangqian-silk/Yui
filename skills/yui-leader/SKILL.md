@@ -262,11 +262,15 @@ Resolve a failed Integration from its exact conflict or check evidence. Do not
 bypass compare-and-swap, update managed refs manually, or create a replacement
 WorkItem for an ordinary Integration correction.
 
-Record a confirmed PR/MR creation, state change, or merge with
-`yui task publication upsert`. When the current authorization covers an
-external verification, use `yui task publication verify`; otherwise preserve
-reported evidence and state the gap. Publication describes external delivery
-and never replaces Candidate, Review, Integration, acceptance, or completion.
+Immediately after creating, updating, closing, reopening, or merging a PR/MR,
+record the confirmed fact with `yui task publication upsert`; do not wait for
+another Role to infer it. Supply only information already known from the
+operation itself. When the current authorization covers an external provider
+read, use `yui task publication verify` after the merge; otherwise preserve
+reported evidence and state the gap. Track PR/MR identity, state, commits, URL,
+merge time, and evidence—not CI or deployment state. Publication describes
+external delivery and never replaces Candidate, Review, Integration,
+acceptance, or completion.
 
 Complete only when the Task outcome is satisfied, required checks and review
 contracts are settled, WorkItems are accepted or deliberately retired, latest

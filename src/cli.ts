@@ -100,6 +100,7 @@ import {
 } from "./commands/taskRemoteDeliveryCommand.js";
 import { runTaskPublicationVerifyCommand } from "./commands/taskPublicationVerifyCommand.js";
 import { createGitHubCliPublicationVerifier } from "./external/githubPublicationVerifier.js";
+import { createGitLabCliPublicationVerifier } from "./external/gitlabPublicationVerifier.js";
 import { taskActor } from "./commands/taskActor.js";
 import {
   parseTaskExecutionStartRequest,
@@ -517,7 +518,7 @@ export async function main(): Promise<void> {
     if (args[1] === "agent-host" && args.length === 4) {
       process.exitCode = await runAgentHost({
         home,
-        launchId: args[2]!,
+        runtimeGenerationId: args[2]!,
         ticket: args[3]!
       });
       return;
@@ -1119,6 +1120,9 @@ export async function main(): Promise<void> {
         {
           verifiers: {
             github: createGitHubCliPublicationVerifier({
+              environmentPath: process.env.PATH
+            }),
+            gitlab: createGitLabCliPublicationVerifier({
               environmentPath: process.env.PATH
             })
           },
@@ -1828,7 +1832,7 @@ export async function main(): Promise<void> {
             agentId: result.agentId,
             adapterId: result.adapterId,
             nativeSessionId: result.nativeSessionId,
-            ...(result.launchId === undefined ? {} : { launchId: result.launchId }),
+            ...(result.runtimeGenerationId === undefined ? {} : { runtimeGenerationId: result.runtimeGenerationId }),
             sessionUpdatedAt: result.sessionUpdatedAt
           });
         } catch (error) {

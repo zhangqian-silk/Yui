@@ -839,7 +839,7 @@ function loadHomeState(
           agentId,
           ...(adapterId === undefined ? {} : { adapterId }),
           ...(session === null ? {} : { nativeSessionId: session.nativeSessionId }),
-          ...(session?.launchId === undefined ? {} : { launchId: session.launchId })
+          ...(session?.runtimeGenerationId === undefined ? {} : { runtimeGenerationId: session.runtimeGenerationId })
         };
       });
     const appendTaskRole = (task: Task, role: TaskRole): void => {
@@ -857,7 +857,7 @@ function loadHomeState(
         agentId,
         ...(adapterId === undefined ? {} : { adapterId }),
         ...(session === null ? {} : { nativeSessionId: session.nativeSessionId }),
-        ...(session?.launchId === undefined ? {} : { launchId: session.launchId }),
+        ...(session?.runtimeGenerationId === undefined ? {} : { runtimeGenerationId: session.runtimeGenerationId }),
         ...(run === null ? {} : { turnId: run.id })
       });
     };

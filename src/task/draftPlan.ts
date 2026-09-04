@@ -154,7 +154,7 @@ function firstDraftExecutionFact(store: TaskStore, task: Task): string | undefin
   const hostOwner = store.listSessionOwners().find(({ owner }) => (
     owner.scope === "task" && owner.taskId === task.id
   ));
-  if (hostOwner !== undefined) return `Host owner (${hostOwner.launchId})`;
+  if (hostOwner !== undefined) return `Host owner (${hostOwner.runtimeGenerationId})`;
   if (store.listTurns(task.id).length > 0) return "Turn";
   if (store.listRoleSessionSets(task.id).length > 0) return "Role Session";
   if (store.listDurableJobs(task.id).length > 0) return "DurableJob";

@@ -17,7 +17,7 @@ export type RuntimeHookTurnFence = Readonly<{
   taskId: string;
   roleName: string;
   agentId: string;
-  launchId: string;
+  runtimeGenerationId: string;
   turnId?: string;
   receiptId?: string;
   nativeSessionId: string;
@@ -43,7 +43,7 @@ export type RuntimeHookTurnFenceOptions = Readonly<{
  * exception is a Driver-declared startup Session Hook, which can arrive before
  * Session projection and is fenced by the exact Turn-bound launch reservation.
  * Preallocated identities are additionally checked against Yui's deterministic
- * launch identity. The immutable event is revalidated by the inbox fold.
+ * runtime generation identity. The immutable event is revalidated by the inbox fold.
  */
 export function resolveRuntimeHookTurnFence(
   environment: NodeJS.ProcessEnv,
@@ -93,10 +93,10 @@ export function resolveRuntimeHookTurnFence(
     taskId,
     roleName
   }));
-  const reservedLaunchId = isRuntimeLaunchReservation(lifecycleMailbox?.processing)
+  const reservedRuntimeGenerationId = isRuntimeLaunchReservation(lifecycleMailbox?.processing)
     ? lifecycleMailbox?.processing?.batchId
     : undefined;
-  const launchId = requireIdentity(session?.launchId ?? reservedLaunchId, "Launch id");
+  const runtimeGenerationId = requireIdentity(session?.runtimeGenerationId ?? reservedRuntimeGenerationId, "Runtime generation id");
   const durableTurnId = activeTurn?.id
     ?? managedProviderTurnId(providerTurn)
     ?? undefined;
@@ -111,7 +111,7 @@ export function resolveRuntimeHookTurnFence(
   if (directProviderTurn || sessionOnlyObservation) {
     if (session === undefined
       || session.adapterId !== adapterId
-      || session.launchId !== launchId
+      || session.runtimeGenerationId !== runtimeGenerationId
       || session.nativeSessionId !== nativeSessionId
       || session.effective.workspace.root !== workspace) {
       throw new Error("Runtime observation Hook Session does not match durable state.");
@@ -120,7 +120,7 @@ export function resolveRuntimeHookTurnFence(
       taskId,
       roleName,
       agentId,
-      launchId,
+      runtimeGenerationId,
       ...(directProviderTurn ? { receiptId: providerTurn.attemptId } : {}),
       nativeSessionId,
       workspace
@@ -154,7 +154,7 @@ export function resolveRuntimeHookTurnFence(
     )
   );
   const mailbox = lifecycleMailbox;
-  const exactReservation = isRuntimeLaunchReservation(mailbox?.processing, launchId)
+  const exactReservation = isRuntimeLaunchReservation(mailbox?.processing, runtimeGenerationId)
     && !hasRuntimeCleanupObligation(mailbox);
   const startupTurnId = options.startupSession === undefined
     ? undefined
@@ -173,14 +173,14 @@ export function resolveRuntimeHookTurnFence(
     && session.status === "ended";
   // The startup mode itself says whether Yui preallocated the native Session
   // id or the Provider reports it. A preallocated startup is proven against
-  // Yui's deterministic launch identity, which is stronger than comparing a
+  // Yui's deterministic runtime generation identity, which is stronger than comparing a
   // value the launch envelope carried.
   const preallocatedStartup = options.startupSession === "preallocated"
     && (session === undefined || replacementStartup)
     && startupReservation
     && nativeSessionId === nativeSessionIdForLaunch(
       home,
-      launchId,
+      runtimeGenerationId,
       agentId,
       adapterId
     );
@@ -212,7 +212,7 @@ export function resolveRuntimeHookTurnFence(
     ?? activeTurn?.id
     ?? startupTurnId
     ?? terminalTurnId!;
-  const effectiveLaunchId = acceptedBinding?.fence.launchId ?? launchId;
+  const effectiveRuntimeGenerationId = acceptedBinding?.fence.runtimeGenerationId ?? runtimeGenerationId;
   const turn = acceptedBinding !== null || exactTerminal
     ? terminalTurn
     : store.getActiveTurn(taskId, roleName);
@@ -228,7 +228,7 @@ export function resolveRuntimeHookTurnFence(
   }
   if (session !== undefined && acceptedBinding === null && !replacementStartup) {
     if (session.adapterId !== adapterId
-      || session.launchId !== effectiveLaunchId
+      || session.runtimeGenerationId !== effectiveRuntimeGenerationId
       || session.nativeSessionId !== nativeSessionId
       || session.effective.workspace.root !== workspace) {
       throw new Error("Runtime observation Hook Session does not match its durable generation.");
@@ -242,7 +242,7 @@ export function resolveRuntimeHookTurnFence(
     taskId,
     roleName,
     agentId,
-    launchId: effectiveLaunchId,
+    runtimeGenerationId: effectiveRuntimeGenerationId,
     turnId,
     ...(acceptedBinding?.fence.receiptId === undefined
       ? activationReceiptId === undefined ? {} : { receiptId: activationReceiptId }
@@ -283,7 +283,7 @@ function knownContinuationBinding(
   const binding = matches.at(-1) ?? null;
   if (binding === null) return null;
   if (matches.some((candidate) => candidate.fence.turnId !== binding.fence.turnId
-    || candidate.fence.launchId !== binding.fence.launchId
+    || candidate.fence.runtimeGenerationId !== binding.fence.runtimeGenerationId
     || candidate.fence.receiptId !== binding.fence.receiptId)) {
     throw new Error("Runtime observation Hook continuation has conflicting durable Turn bindings.");
   }
@@ -319,7 +319,7 @@ function acceptedTurnBinding(
   const binding = matches.at(-1) ?? null;
   if (binding === null) return null;
   if (matches.some((candidate) => candidate.fence.turnId !== binding.fence.turnId
-    || candidate.fence.launchId !== binding.fence.launchId
+    || candidate.fence.runtimeGenerationId !== binding.fence.runtimeGenerationId
     || candidate.fence.receiptId !== binding.fence.receiptId)) {
     throw new Error("Runtime observation Hook native Turn has conflicting durable Turn bindings.");
   }

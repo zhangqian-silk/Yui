@@ -55,7 +55,7 @@ export type LifecycleEvidenceLevel =
 /**
  * Exact identity fences carried by every canonical event. Turn-scoped phases
  * (pushed/accepted/progress/terminal) require `turnId`; generation-scoped phases
- * (host/session/ready) may omit it. `launchId` and `nativeSessionId` fence the
+ * (host/session/ready) may omit it. `runtimeGenerationId` and `nativeSessionId` fence the
  * external process generation so a stale generation can never rebind a live one.
  */
 export type CanonicalIdentityFence = Readonly<{
@@ -65,7 +65,7 @@ export type CanonicalIdentityFence = Readonly<{
   adapterId: string;
   turnId?: string;
   nativeSessionId?: string;
-  launchId?: string;
+  runtimeGenerationId?: string;
   receiptId?: string;
 }>;
 
@@ -182,7 +182,7 @@ const TURN_SCOPED_PHASES: ReadonlySet<CanonicalLifecyclePhase> = new Set([
 /**
  * Phases that assert durable provider truth about a Turn. Every one must carry
  * the complete turn-scoped identity — turnId AND the generation fences
- * (nativeSessionId + launchId) AND, where the transport owns it, the receiptId —
+ * (nativeSessionId + runtimeGenerationId) AND, where the transport owns it, the receiptId —
  * because a missing or wrong fence must fail closed rather than advance a Turn or
  * its successor.
  */
@@ -261,8 +261,8 @@ export function createCanonicalLifecycleEvent(
     if (fence.nativeSessionId === undefined) {
       throw new CanonicalLifecycleError(`Phase ${input.phase} requires a nativeSessionId fence.`);
     }
-    if (fence.launchId === undefined) {
-      throw new CanonicalLifecycleError(`Phase ${input.phase} requires a launchId fence.`);
+    if (fence.runtimeGenerationId === undefined) {
+      throw new CanonicalLifecycleError(`Phase ${input.phase} requires a runtimeGenerationId fence.`);
     }
   }
   if (input.phase === "prompt-pushed" && fence.receiptId === undefined) {
@@ -337,8 +337,8 @@ export function foldCanonicalLifecycleEvent(
       if (
         expectation.boundNativeSessionId === undefined
         && event.fence.nativeSessionId !== undefined
-        && event.fence.launchId !== undefined
-        && event.fence.launchId === expectation.fence.launchId
+        && event.fence.runtimeGenerationId !== undefined
+        && event.fence.runtimeGenerationId === expectation.fence.runtimeGenerationId
       ) {
         return { outcome: "bind-native-session", nativeSessionId: event.fence.nativeSessionId };
       }
@@ -398,7 +398,7 @@ export function foldCanonicalLifecycleEvent(
  * Returns null when the event belongs to the expected generation/Turn, or a
  * mismatch reason otherwise. Owner/adapter and turn-scoped turnId are always
  * compared. Provider-truth phases (acceptance/progress/terminal) require the
- * COMPLETE generation fence — nativeSessionId, launchId, and (for acceptance)
+ * COMPLETE generation fence — nativeSessionId, runtimeGenerationId, and (for acceptance)
  * receiptId must be present and equal, so a missing or wrong generation/receipt
  * fails closed rather than advancing a Turn or its successor. Where a native id
  * is already bound, every turn-scoped fact must match it.
@@ -431,9 +431,11 @@ function matchesFence(
   // provider-accepted event additionally must carry the exact receipt it accepts.
   if (PROVIDER_TRUTH_PHASES.has(phase)) {
     if (actual.nativeSessionId === undefined) return "fence-mismatch:missing-native-session";
-    if (actual.launchId === undefined) return "fence-mismatch:missing-launch";
-    if (expected.launchId !== undefined && actual.launchId !== expected.launchId) {
-      return "fence-mismatch:launchId";
+    if (actual.runtimeGenerationId === undefined) {
+      return "fence-mismatch:missing-runtime-generation";
+    }
+    if (expected.runtimeGenerationId !== undefined && actual.runtimeGenerationId !== expected.runtimeGenerationId) {
+      return "fence-mismatch:runtimeGenerationId";
     }
     // Once a native id is bound, every provider-truth fact must match it. Before
     // binding (discovery still open) the expected fence's own nativeSessionId, if
@@ -469,11 +471,11 @@ function matchesFence(
     return "fence-mismatch:nativeSessionId";
   }
   if (
-    actual.launchId !== undefined
-    && expected.launchId !== undefined
-    && actual.launchId !== expected.launchId
+    actual.runtimeGenerationId !== undefined
+    && expected.runtimeGenerationId !== undefined
+    && actual.runtimeGenerationId !== expected.runtimeGenerationId
   ) {
-    return "fence-mismatch:launchId";
+    return "fence-mismatch:runtimeGenerationId";
   }
   if (
     phase === "prompt-pushed"
@@ -502,7 +504,7 @@ function normalizeFence(fence: CanonicalIdentityFence): CanonicalIdentityFence {
     ...(fence.nativeSessionId === undefined
       ? {}
       : { nativeSessionId: requireFenceText(fence.nativeSessionId, "nativeSessionId") }),
-    ...(fence.launchId === undefined ? {} : { launchId: requireFenceText(fence.launchId, "launchId") }),
+    ...(fence.runtimeGenerationId === undefined ? {} : { runtimeGenerationId: requireFenceText(fence.runtimeGenerationId, "runtimeGenerationId") }),
     ...(fence.receiptId === undefined ? {} : { receiptId: requireFenceText(fence.receiptId, "receiptId") })
   });
 }

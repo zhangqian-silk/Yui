@@ -6,6 +6,7 @@ import {
 } from "../runtime/lifecycleReservation.js";
 import {
   createRuntimeBinding,
+  RuntimeGenerationMismatchError,
   RuntimeHostContentionError,
   RuntimeLaunchError,
   type RuntimeBinding,
@@ -30,20 +31,20 @@ export type CoordinatedRuntimeLaunchRequest = RuntimeLaunchPreparationRequest;
 
 export type RuntimeLaunchReservationPort = Readonly<{
   reserveRuntimeLaunch(
-    input: Readonly<{ owner: RuntimeRoleOwner; launchId: string }>,
+    input: Readonly<{ owner: RuntimeRoleOwner; runtimeGenerationId: string }>,
     assertCurrent: () => void,
     now?: Date
   ): Readonly<{
     status: "reserved" | "existing";
-    launchId: string;
+    runtimeGenerationId: string;
   }>;
   confirmRuntimeLaunchReservation(
-    input: Readonly<{ owner: RuntimeRoleOwner; launchId: string }>,
+    input: Readonly<{ owner: RuntimeRoleOwner; runtimeGenerationId: string }>,
     assertCurrent: () => void
   ): "reserved" | "provider-bound";
   recordReservedRuntimeNativeSession(input: Readonly<{
     owner: RuntimeRoleOwner;
-    launchId: string;
+    runtimeGenerationId: string;
     agentId: string;
     adapterId: string;
     nativeSessionId: string;
@@ -51,13 +52,13 @@ export type RuntimeLaunchReservationPort = Readonly<{
   }>, assertCurrent: () => void, now?: Date): void;
   completeRuntimeLaunchReservation(
     owner: RuntimeRoleOwner,
-    launchId: string,
+    runtimeGenerationId: string,
     /** Runs after the exact reservation/terminal fence passes, before it clears. */
     beforeComplete?: () => void
   ): boolean;
   settleStoppedRuntimeLaunch(input: Readonly<{
     owner: RuntimeRoleOwner;
-    launchId: string;
+    runtimeGenerationId: string;
     agentId: string;
     adapterId: string;
     nativeSessionId?: string;
@@ -211,7 +212,7 @@ export class RuntimeLaunchCoordinator implements RuntimeLaunchPreparationPort {
       this.#createGenerationId(),
       "Launch generation id"
     );
-    let proposedLaunchId = `${generationPrefix}${proposedGenerationId}`;
+    let proposedRuntimeGenerationId = `${generationPrefix}${proposedGenerationId}`;
     let reusedConfirmedRunningHost = false;
     if (request.mode === "resume" && request.hostActivationId !== undefined) {
       if (!request.hostActivationId.startsWith(generationPrefix)) {
@@ -226,7 +227,7 @@ export class RuntimeLaunchCoordinator implements RuntimeLaunchPreparationPort {
         );
       }
       if (inspection.state === "running") {
-        proposedLaunchId = request.hostActivationId;
+        proposedRuntimeGenerationId = request.hostActivationId;
         reusedConfirmedRunningHost = true;
       }
     }
@@ -234,16 +235,16 @@ export class RuntimeLaunchCoordinator implements RuntimeLaunchPreparationPort {
       ? undefined
       : this.#preflightRuntimeIsolation(
           request,
-          proposedLaunchId,
+          proposedRuntimeGenerationId,
           proposedGenerationId,
           false
         );
     let reservation = this.reservations.reserveRuntimeLaunch({
       owner: request.owner,
-      launchId: proposedLaunchId
+      runtimeGenerationId: proposedRuntimeGenerationId
     }, assertLaunchCurrent, this.#now());
     if (reservation.status === "existing") {
-      if (!reservation.launchId.startsWith(generationPrefix)) {
+      if (!reservation.runtimeGenerationId.startsWith(generationPrefix)) {
         this.#requireCleanup(request.owner);
         throw new Error(
           `Runtime launch reservation belongs to stale Role or Agent state: ${
@@ -255,8 +256,8 @@ export class RuntimeLaunchCoordinator implements RuntimeLaunchPreparationPort {
       if (inspection.state === "unavailable" || inspection.state === "starting") {
         throw new RuntimeLaunchError(
           true,
-          reservation.launchId,
-          `Runtime is temporarily ${inspection.state}: ${request.owner.roleName}/${reservation.launchId}.`
+          reservation.runtimeGenerationId,
+          `Runtime is temporarily ${inspection.state}: ${request.owner.roleName}/${reservation.runtimeGenerationId}.`
         );
       }
       if (inspection.state === "stopped") {
@@ -268,11 +269,11 @@ export class RuntimeLaunchCoordinator implements RuntimeLaunchPreparationPort {
         try {
           completed = this.reservations.completeRuntimeLaunchReservation(
             request.owner,
-            reservation.launchId,
+            reservation.runtimeGenerationId,
             taskOwner !== undefined && this.#runtimeIsolation !== undefined
               ? () => {
                   exactCleanupAttempted = true;
-                  this.#cleanupTaskLaunch(taskOwner, reservation.launchId);
+                  this.#cleanupTaskLaunch(taskOwner, reservation.runtimeGenerationId);
                 }
               : undefined
           );
@@ -286,7 +287,7 @@ export class RuntimeLaunchCoordinator implements RuntimeLaunchPreparationPort {
         }
         reservation = this.reservations.reserveRuntimeLaunch({
           owner: request.owner,
-          launchId: proposedLaunchId
+          runtimeGenerationId: proposedRuntimeGenerationId
         }, assertLaunchCurrent, this.#now());
         if (reservation.status !== "reserved") {
           throw new Error("Runtime launch reservation could not be renewed.");
@@ -298,13 +299,13 @@ export class RuntimeLaunchCoordinator implements RuntimeLaunchPreparationPort {
       }
     }
 
-    const launchId = reservation.launchId;
+    const runtimeGenerationId = reservation.runtimeGenerationId;
     let preflightObserved = beforeHostStart === undefined;
     const observePreflight = (preflight: RuntimeLaunchPreflight): void => {
       if (preflightObserved) {
         throw new Error("Runtime host reported its pre-start launch fence more than once.");
       }
-      validateRuntimeLaunchPreflight(preflight, request, launchId);
+      validateRuntimeLaunchPreflight(preflight, request, runtimeGenerationId);
       preflightObserved = true;
       beforeHostStart?.(preflight);
     };
@@ -319,7 +320,7 @@ export class RuntimeLaunchCoordinator implements RuntimeLaunchPreparationPort {
       const rawBinding = request.mode === "new"
         ? await this.host.start({
             mode: "new",
-            launchId,
+            runtimeGenerationId,
             owner: request.owner,
             agentId: request.agentId,
             adapterId: request.adapterId,
@@ -335,7 +336,7 @@ export class RuntimeLaunchCoordinator implements RuntimeLaunchPreparationPort {
           }, beforeHostStart === undefined ? undefined : observePreflight)
         : await this.host.restore({
             mode: "resume",
-            launchId,
+            runtimeGenerationId,
             owner: request.owner,
             agentId: request.agentId,
             adapterId: request.adapterId,
@@ -356,19 +357,34 @@ export class RuntimeLaunchCoordinator implements RuntimeLaunchPreparationPort {
       binding = requireMatchingRuntimeBinding(
         rawBinding,
         request,
-        launchId
+        runtimeGenerationId
       );
       if (!preflightObserved) {
         throw new Error("Runtime session host did not expose a pre-host-start launch fence.");
       }
     } catch (error) {
+      if (error instanceof RuntimeGenerationMismatchError) {
+        await this.#settleFailedStart(
+          request,
+          runtimeGenerationId,
+          reusedConfirmedRunningHost,
+          runtimeIsolation,
+          true
+        );
+        throw new RuntimeLaunchError(
+          false,
+          runtimeGenerationId,
+          error.message,
+          "generation-mismatch"
+        );
+      }
       if (error instanceof RuntimeHostContentionError && reusedConfirmedRunningHost) {
         // The exact recovered generation remains authoritative. A late human
         // writer is transient backpressure and must not settle, clean, or
         // terminalize that reservation.
         throw new RuntimeLaunchError(
           true,
-          launchId,
+          runtimeGenerationId,
           error.message,
           error.reason
         );
@@ -382,7 +398,7 @@ export class RuntimeLaunchCoordinator implements RuntimeLaunchPreparationPort {
         try {
           completed = this.reservations.completeRuntimeLaunchReservation(
             request.owner,
-            launchId,
+            runtimeGenerationId,
             runtimeIsolation === undefined
               ? undefined
               : () => {
@@ -400,7 +416,7 @@ export class RuntimeLaunchCoordinator implements RuntimeLaunchPreparationPort {
         }
         throw new RuntimeLaunchError(
           true,
-          launchId,
+          runtimeGenerationId,
           error.message,
           error instanceof RuntimeHostContentionError
             ? error.reason
@@ -415,7 +431,7 @@ export class RuntimeLaunchCoordinator implements RuntimeLaunchPreparationPort {
       }
       await this.#settleFailedStart(
         request,
-        launchId,
+        runtimeGenerationId,
         reusedConfirmedRunningHost,
         runtimeIsolation
       );
@@ -426,7 +442,7 @@ export class RuntimeLaunchCoordinator implements RuntimeLaunchPreparationPort {
       await this.#compensateStartedHost(
         request.owner,
         binding,
-        launchId,
+        runtimeGenerationId,
         runtimeIsolation,
         new Error(
           `Runtime host was recreated while recovering an existing generation: ${
@@ -440,13 +456,13 @@ export class RuntimeLaunchCoordinator implements RuntimeLaunchPreparationPort {
       assertLaunchCurrent();
       const reservationState = this.reservations.confirmRuntimeLaunchReservation({
         owner: request.owner,
-        launchId
+        runtimeGenerationId
       }, assertLaunchCurrent);
       if (reservationState === "reserved") {
         if (binding.nativeSessionId !== undefined) {
           this.reservations.recordReservedRuntimeNativeSession({
             owner: request.owner,
-            launchId,
+            runtimeGenerationId,
             agentId: request.agentId,
             adapterId: request.adapterId,
             nativeSessionId: binding.nativeSessionId,
@@ -454,7 +470,7 @@ export class RuntimeLaunchCoordinator implements RuntimeLaunchPreparationPort {
           }, assertLaunchCurrent, this.#now());
         } else if (!this.reservations.completeRuntimeLaunchReservation(
           request.owner,
-          launchId
+          runtimeGenerationId
         )) {
           throw new Error("Runtime Host-start reservation changed before completion.");
         }
@@ -463,7 +479,7 @@ export class RuntimeLaunchCoordinator implements RuntimeLaunchPreparationPort {
       await this.#compensateStartedHost(
         request.owner,
         binding,
-        launchId,
+        runtimeGenerationId,
         runtimeIsolation,
         error
       );
@@ -473,9 +489,10 @@ export class RuntimeLaunchCoordinator implements RuntimeLaunchPreparationPort {
 
   async #settleFailedStart(
     request: CoordinatedRuntimeLaunchRequest,
-    launchId: string,
+    runtimeGenerationId: string,
     reusedConfirmedRunningHost: boolean,
-    runtimeIsolation: TaskRuntimeIsolationPreparation | undefined
+    runtimeIsolation: TaskRuntimeIsolationPreparation | undefined,
+    forceCleanup = false
   ): Promise<void> {
     let inspection;
     try {
@@ -483,7 +500,7 @@ export class RuntimeLaunchCoordinator implements RuntimeLaunchPreparationPort {
     } catch {
       // A rebind/preflight failure did not create the already-confirmed host.
       // Preserve its generation when the follow-up probe is merely unknown.
-      if (!reusedConfirmedRunningHost) this.#requireCleanup(request.owner);
+      if (!reusedConfirmedRunningHost || forceCleanup) this.#requireCleanup(request.owner);
       return;
     }
     if (inspection.state === "stopped") {
@@ -500,19 +517,19 @@ export class RuntimeLaunchCoordinator implements RuntimeLaunchPreparationPort {
           );
         }
       }
-      if (!this.#settleConfirmedStopped(request, launchId)) {
+      if (!this.#settleConfirmedStopped(request, runtimeGenerationId)) {
         this.#requireCleanup(request.owner);
       }
       return;
     }
-    if (reusedConfirmedRunningHost) return;
+    if (reusedConfirmedRunningHost && !forceCleanup) return;
     this.#requireCleanup(request.owner);
   }
 
   async #compensateStartedHost(
     owner: RuntimeRoleOwner,
     binding: RuntimeBinding,
-    launchId: string,
+    runtimeGenerationId: string,
     runtimeIsolation: TaskRuntimeIsolationPreparation | undefined,
     cause: unknown
   ): Promise<never> {
@@ -550,7 +567,7 @@ export class RuntimeLaunchCoordinator implements RuntimeLaunchPreparationPort {
       !stopped
       || !this.reservations.settleStoppedRuntimeLaunch({
         owner,
-        launchId,
+        runtimeGenerationId,
         agentId: binding.agentId,
         adapterId: binding.adapterId,
         ...(binding.nativeSessionId === undefined
@@ -569,7 +586,7 @@ export class RuntimeLaunchCoordinator implements RuntimeLaunchPreparationPort {
 
   #preflightRuntimeIsolation(
     request: CoordinatedRuntimeLaunchRequest,
-    launchId: string,
+    runtimeGenerationId: string,
     generationId: string,
     allowExactActive: boolean
   ): TaskRuntimeIsolationPreparation | undefined {
@@ -578,7 +595,7 @@ export class RuntimeLaunchCoordinator implements RuntimeLaunchPreparationPort {
     }
     return this.#runtimeIsolation.preflight({
       workspace: request.managedWorkspace!,
-      launchId,
+      runtimeGenerationId,
       generationId: requireText(generationId, "Launch generation id"),
       ...(request.runtimePolicy === undefined ? {} : { policy: request.runtimePolicy }),
       ...(allowExactActive ? { allowExactActive: true } : {})
@@ -587,7 +604,7 @@ export class RuntimeLaunchCoordinator implements RuntimeLaunchPreparationPort {
 
   #cleanupTaskLaunch(
     owner: Extract<RuntimeRoleOwner, { scope: "task" }>,
-    launchId: string
+    runtimeGenerationId: string
   ): void {
     const cleanupTaskLaunch = this.#runtimeIsolation?.cleanupTaskLaunch;
     if (cleanupTaskLaunch === undefined) {
@@ -595,18 +612,18 @@ export class RuntimeLaunchCoordinator implements RuntimeLaunchPreparationPort {
     }
     cleanupTaskLaunch.call(this.#runtimeIsolation, {
       taskId: owner.taskId,
-      launchId,
+      runtimeGenerationId,
       reason: "interruption"
     });
   }
 
   #settleConfirmedStopped(
     request: CoordinatedRuntimeLaunchRequest,
-    launchId: string
+    runtimeGenerationId: string
   ): boolean {
     return this.reservations.settleStoppedRuntimeLaunch({
       owner: request.owner,
-      launchId,
+      runtimeGenerationId,
       agentId: request.agentId,
       adapterId: request.adapterId,
       ...(request.nativeSessionId === undefined
@@ -629,7 +646,7 @@ export class RuntimeLaunchCoordinator implements RuntimeLaunchPreparationPort {
 function validateRuntimeLaunchPreflight(
   preflight: RuntimeLaunchPreflight,
   request: CoordinatedRuntimeLaunchRequest,
-  launchId: string
+  runtimeGenerationId: string
 ): void {
   const ownerMatches = preflight.owner.scope === request.owner.scope
     && preflight.owner.roleName === request.owner.roleName
@@ -641,7 +658,7 @@ function validateRuntimeLaunchPreflight(
       )
     );
   if (
-    preflight.launchId !== launchId
+    preflight.runtimeGenerationId !== runtimeGenerationId
     || !ownerMatches
     || preflight.turnId !== request.turnId
     || preflight.agentId !== request.agentId
@@ -663,7 +680,7 @@ function validateRuntimeLaunchPreflight(
 function requireMatchingRuntimeBinding(
   raw: RuntimeBinding,
   request: CoordinatedRuntimeLaunchRequest,
-  launchId: string
+  runtimeGenerationId: string
 ): RuntimeBinding {
   let binding: RuntimeBinding;
   try {
@@ -684,7 +701,7 @@ function requireMatchingRuntimeBinding(
       )
     );
   if (
-    binding.launchId !== launchId
+    binding.runtimeGenerationId !== runtimeGenerationId
     || !ownerMatches
     || binding.agentId !== request.agentId
     || binding.adapterId !== request.adapterId

@@ -64,12 +64,12 @@ export function runtimeLifecycleSignalKey(owner: RuntimeRoleOwner): string {
 
 export function isRuntimeLaunchReservation(
   processing: ProcessingBatch | null | undefined,
-  launchId?: string
+  runtimeGenerationId?: string
 ): boolean {
   return processing?.owner === RUNTIME_LIFECYCLE_OWNER
     && processing.batch.reasons.length === 1
     && processing.batch.reasons[0] === RUNTIME_LAUNCH_RESERVED_REASON
-    && (launchId === undefined || processing.batchId === launchId);
+    && (runtimeGenerationId === undefined || processing.batchId === runtimeGenerationId);
 }
 
 export function hasRuntimeLaunchReservation(

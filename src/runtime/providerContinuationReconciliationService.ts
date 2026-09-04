@@ -184,7 +184,7 @@ function reconciliationObservation(
   const settled = continuation.execution === "quiescent"
     && continuation.observation === "exact";
   return createRuntimeObservation({
-    schemaVersion: 2,
+    schemaVersion: 3,
     eventId: `continuation-reconcile:${digest}`,
     semanticKey: `continuation-reconcile:${digest}`,
     kind: settled ? "continuation.settled" : "continuation.started",

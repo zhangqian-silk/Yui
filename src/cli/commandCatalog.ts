@@ -1167,7 +1167,7 @@ export const ROOT_COMMAND = buildNode({
         },
         {
           name: "live-identity",
-          summary: "Read the authenticated live Controller launch identity.",
+          summary: "Read the authenticated live Controller runtime generation identity.",
           hidden: true
         },
         { name: "stop", summary: "Stop the Controller." },

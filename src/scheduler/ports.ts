@@ -69,7 +69,7 @@ export type SchedulerRoleSession = Readonly<{
   adapterId: string;
   nativeSessionId?: string;
   /** Exact external-process generation, when runtime coordination recorded it. */
-  launchId?: string;
+  runtimeGenerationId?: string;
   title?: string;
   status: AgentSessionStatus;
   endReason?: "stopped" | "failed";
@@ -89,7 +89,7 @@ export type RoleTurnStallPersistence = Readonly<{
     agentId: string;
     adapterId: string;
     nativeSessionId?: string;
-    launchId?: string;
+    runtimeGenerationId?: string;
     status: SchedulerRoleSession["status"];
   }> | null;
   kind: "delivery-stalled" | "workflow-not-progressing";
@@ -113,7 +113,7 @@ export type SchedulerRoleResourceIdentity = Readonly<{
   agentId: string;
   adapterId: string;
   nativeSessionId?: string;
-  launchId?: string;
+  runtimeGenerationId?: string;
 }>;
 
 export type SchedulerRoleResourceEvidence = Readonly<{
@@ -146,7 +146,7 @@ export type SchedulerRoleResourceInput = Readonly<{
   agentId: string;
   adapterId: string;
   nativeSessionId?: string;
-  launchId?: string;
+  runtimeGenerationId?: string;
   progressAt?: string;
 }>;
 
@@ -177,7 +177,7 @@ export type DormantRuntimeOwnerCandidate = Readonly<{
   agentId: string;
   adapterId: string;
   nativeSessionId: string;
-  launchId?: string;
+  runtimeGenerationId?: string;
   sessionUpdatedAt: string;
 }>;
 
@@ -244,7 +244,7 @@ export type RoleTurnDeliveryPersistence = Readonly<{
   turn: SchedulerTurn;
   session: SchedulerRoleSession | null;
   /** Matching external-process generation, when lifecycle coordination is enabled. */
-  launchId?: string;
+  runtimeGenerationId?: string;
   now: Date;
 }>;
 
@@ -256,7 +256,7 @@ export type RoleTurnDeliveryFailurePersistence = Readonly<{
   turnId: string;
   nativeSessionId?: string;
   /** Exact external-process generation prepared for this undelivered Turn. */
-  launchId?: string;
+  runtimeGenerationId?: string;
   /** Exact terminal explanation for this conclusively unaccepted delivery. */
   summary?: string;
   failureReason: TurnFailureReason;
@@ -307,7 +307,7 @@ export interface SchedulerStorePort {
     taskId: string;
     roleName: string;
     turnId: string;
-    launchId?: string;
+    runtimeGenerationId?: string;
     nativeSessionId?: string;
     deadStatus?: number;
     observedAt: Date;
@@ -355,7 +355,7 @@ export interface SchedulerStorePort {
     roleName: string;
     turnId: string;
     agentId: string;
-    launchId: string;
+    runtimeGenerationId: string;
     nativeSessionId: string;
   }>): Readonly<{
     conversationId: string;
@@ -587,7 +587,7 @@ export type RoleSessionLaunchMode = "new" | "resume";
 export type PreparedRoleDelivery = Readonly<{
   deliveryId: string;
   /** External process generation; distinct from the per-Turn delivery id. */
-  launchId?: string;
+  runtimeGenerationId?: string;
   /** Durable Turn identity whose transient preparation this entry serves. */
   turnId?: string;
   taskId: string;
@@ -648,7 +648,7 @@ export interface TmuxDeliveryPort {
     roleName: string;
     agentId: string;
     adapterId: string;
-    launchId: string;
+    runtimeGenerationId: string;
     nativeSessionId: string;
     nativeTurnId: string;
     authority: import("../runtime/providerAuthorityFence.js").ProviderAuthorityFence;
@@ -665,7 +665,7 @@ export interface TmuxDeliveryPort {
     taskId: string;
     roleName: string;
     turnId?: string;
-    launchId?: string;
+    runtimeGenerationId?: string;
   }>): void;
   /** Best-effort nudge to an already-running global Operator process. */
   notifyOperatorInputOnce?(input: Readonly<{
@@ -696,7 +696,7 @@ export interface TmuxDeliveryPort {
     adapterId: string;
     nativeSessionId?: string;
     turnId?: string;
-    launchId?: string;
+    runtimeGenerationId?: string;
     progressAt?: string;
   }>[], resourceInputs?: readonly SchedulerRoleResourceInput[]):
     Promise<readonly Readonly<{

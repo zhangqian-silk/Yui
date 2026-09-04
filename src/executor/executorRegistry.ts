@@ -238,12 +238,12 @@ export class ExecutorRegistry implements TmuxDeliveryPort {
         const request = input.mode === "new"
           ? createSessionLaunchRequest({
               ...common,
-              launchId: deliveryBase.deliveryId,
+              runtimeGenerationId: deliveryBase.deliveryId,
               mode: "new"
             })
           : createSessionLaunchRequest({
               ...common,
-              launchId: deliveryBase.deliveryId,
+              runtimeGenerationId: deliveryBase.deliveryId,
               mode: "resume",
               nativeSessionId: input.nativeSessionId!
             });
@@ -264,7 +264,7 @@ export class ExecutorRegistry implements TmuxDeliveryPort {
     }
     const delivery: PreparedRoleDelivery = {
       ...deliveryBase,
-      ...(binding === undefined ? {} : { launchId: binding.launchId }),
+      ...(binding === undefined ? {} : { runtimeGenerationId: binding.runtimeGenerationId }),
       sessionStarted,
       session,
     };
@@ -342,7 +342,7 @@ export class ExecutorRegistry implements TmuxDeliveryPort {
     roleName: string;
     agentId: string;
     adapterId: string;
-    launchId: string;
+    runtimeGenerationId: string;
     nativeSessionId: string;
     nativeTurnId: string;
     authority: import("../runtime/providerAuthorityFence.js").ProviderAuthorityFence;
@@ -354,7 +354,7 @@ export class ExecutorRegistry implements TmuxDeliveryPort {
     if (this.runtimePorts === undefined) return "unavailable";
     const outcome = await this.runtimePorts.promptPush.trySteer({
       owner: { scope: "task", taskId: input.taskId, roleName: input.roleName },
-      launchId: input.launchId,
+      runtimeGenerationId: input.runtimeGenerationId,
       agentId: input.agentId,
       adapterId: input.adapterId,
       nativeSessionId: input.nativeSessionId,
@@ -390,7 +390,7 @@ export class ExecutorRegistry implements TmuxDeliveryPort {
     taskId: string;
     roleName: string;
     turnId?: string;
-    launchId?: string;
+    runtimeGenerationId?: string;
   }>): void {
     for (const [deliveryId, prepared] of this.#prepared) {
       const delivery = prepared.delivery;
@@ -402,8 +402,8 @@ export class ExecutorRegistry implements TmuxDeliveryPort {
           && delivery.turnId !== input.turnId
         )
         || (
-          input.launchId !== undefined
-          && delivery.launchId !== input.launchId
+          input.runtimeGenerationId !== undefined
+          && delivery.runtimeGenerationId !== input.runtimeGenerationId
         )
       ) {
         continue;
@@ -457,7 +457,7 @@ export class ExecutorRegistry implements TmuxDeliveryPort {
     adapterId: string;
     nativeSessionId?: string;
     turnId?: string;
-    launchId?: string;
+    runtimeGenerationId?: string;
     progressAt?: string;
   }>[], resourceInputs?: readonly SchedulerRoleResourceInput[]): Promise<readonly Readonly<{
     taskId: string;
@@ -496,7 +496,7 @@ export class ExecutorRegistry implements TmuxDeliveryPort {
       ...(input.nativeSessionId === undefined
         ? {}
         : { nativeSessionId: input.nativeSessionId }),
-      ...(input.launchId === undefined ? {} : { launchId: input.launchId }),
+      ...(input.runtimeGenerationId === undefined ? {} : { runtimeGenerationId: input.runtimeGenerationId }),
       ...(input.progressAt === undefined ? {} : { progressAt: input.progressAt })
     }));
     if (

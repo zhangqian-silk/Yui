@@ -1403,7 +1403,7 @@ export class SqliteTaskStore implements TaskStore {
            provider_root_pid = excluded.provider_root_pid,
            payload = excluded.payload, recorded_at = excluded.recorded_at`
       ).run(
-        identity.launchId,
+        identity.runtimeGenerationId,
         owner.scope,
         owner.scope === "task" ? owner.taskId : null,
         owner.roleName,
@@ -1416,10 +1416,10 @@ export class SqliteTaskStore implements TaskStore {
     });
   }
 
-  getSessionOwner(launchId: string): SessionOwnerIdentity | null {
+  getSessionOwner(runtimeGenerationId: string): SessionOwnerIdentity | null {
     const row = this.#db.prepare(
       "SELECT payload FROM session_owners WHERE launch_id = ?"
-    ).get(launchId) as { payload: string } | undefined;
+    ).get(runtimeGenerationId) as { payload: string } | undefined;
     return row === undefined ? null : this.#parse<SessionOwnerIdentity>(row.payload);
   }
 
@@ -1441,9 +1441,9 @@ export class SqliteTaskStore implements TaskStore {
     );
   }
 
-  removeSessionOwner(launchId: string): void {
+  removeSessionOwner(runtimeGenerationId: string): void {
     this.#mutate(() => {
-      this.#db.prepare("DELETE FROM session_owners WHERE launch_id = ?").run(launchId);
+      this.#db.prepare("DELETE FROM session_owners WHERE launch_id = ?").run(runtimeGenerationId);
     });
   }
 
@@ -1604,7 +1604,7 @@ export class SqliteTaskStore implements TaskStore {
       : ` WHERE ${predicates.join(" AND ")}`;
     const rows = this.#db.prepare(
       `SELECT scope, task_id, role_name, agent_id, adapter_id,
-              native_session_id, launch_id, session_updated_at,
+              native_session_id, launch_id AS runtime_generation_id, session_updated_at,
               cleanup_required
        FROM runtime_session_candidates${where}`
     ).all(...parameters) as Array<{
@@ -1614,7 +1614,7 @@ export class SqliteTaskStore implements TaskStore {
       agent_id: string;
       adapter_id: string;
       native_session_id: string;
-      launch_id: string | null;
+      runtime_generation_id: string | null;
       session_updated_at: string;
       cleanup_required: 0 | 1;
     }>;
@@ -1625,7 +1625,7 @@ export class SqliteTaskStore implements TaskStore {
       agentId: row.agent_id,
       adapterId: row.adapter_id,
       nativeSessionId: row.native_session_id,
-      ...(row.launch_id === null ? {} : { launchId: row.launch_id }),
+      ...(row.runtime_generation_id === null ? {} : { runtimeGenerationId: row.runtime_generation_id }),
       sessionUpdatedAt: row.session_updated_at,
       cleanupRequired: row.cleanup_required === 1
     })).sort(compareRuntimeSessionCandidates);
@@ -1669,7 +1669,7 @@ export class SqliteTaskStore implements TaskStore {
       agent_id: string | null;
       adapter_id: string | null;
       native_session_id: string | null;
-      launch_id: string | null;
+      runtime_generation_id: string | null;
       is_active: 0 | 1 | null;
       session_updated_at: string | null;
       cleanup_required: 0 | 1 | null;
@@ -1699,7 +1699,7 @@ export class SqliteTaskStore implements TaskStore {
            json_extract(active_session, '$.agentId') AS agent_id,
            json_extract(active_session, '$.adapterId') AS adapter_id,
            json_extract(active_session, '$.nativeSessionId') AS native_session_id,
-           json_extract(active_session, '$.launchId') AS launch_id,
+           json_extract(active_session, '$.runtimeGenerationId') AS runtime_generation_id,
            CASE
              WHEN json_extract(active_session, '$.status') = 'active'
              THEN 1 ELSE 0
@@ -1707,7 +1707,7 @@ export class SqliteTaskStore implements TaskStore {
            json_extract(active_session, '$.updatedAt') AS session_updated_at,
            CASE
              WHEN json_extract(active_session, '$.status') = 'active'
-               AND json_type(active_session, '$.launchId') = 'text'
+               AND json_type(active_session, '$.runtimeGenerationId') = 'text'
              THEN 1 ELSE 0
            END AS cleanup_required
          FROM active`
@@ -1732,7 +1732,7 @@ export class SqliteTaskStore implements TaskStore {
       && row.agent_id === candidate.agentId
       && row.adapter_id === candidate.adapterId
       && row.native_session_id === candidate.nativeSessionId
-      && (row.launch_id ?? undefined) === candidate.launchId
+      && (row.runtime_generation_id ?? undefined) === candidate.runtimeGenerationId
       && row.is_active === 1
       && row.session_updated_at === candidate.sessionUpdatedAt
       && row.cleanup_required === (candidate.cleanupRequired ? 1 : 0);
@@ -1790,7 +1790,7 @@ export class SqliteTaskStore implements TaskStore {
       candidate.agentId,
       candidate.adapterId,
       candidate.nativeSessionId,
-      candidate.launchId ?? null,
+      candidate.runtimeGenerationId ?? null,
       candidate.sessionUpdatedAt,
       candidate.cleanupRequired ? 1 : 0
     );

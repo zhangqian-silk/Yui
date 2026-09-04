@@ -35,7 +35,7 @@ function ownerLabel(owner: ManagedWorkspace["owner"]): string {
  * Quick Win (EXE-04/EXE-08): classified workspace preflight failures.
  *
  * A split-brain workspace state must never be reported as a transient
- * Provider failure, because retrying the same launch will not change the
+ * Provider failure, because retrying the same runtime generation will not change the
  * configuration.  Each classification carries the precise diff between the
  * authoritative records so the Operator can decide whether to repair the
  * workspace, re-sync the baseline, or recreate the Task.

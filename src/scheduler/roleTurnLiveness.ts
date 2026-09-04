@@ -56,7 +56,7 @@ export async function reconcileExitedRoleTurns(
           adapterId: run.effective.adapterId,
           turnId: run.id,
           progressAt: run.createdAt,
-          ...(session?.launchId === undefined ? {} : { launchId: session.launchId }),
+          ...(session?.runtimeGenerationId === undefined ? {} : { runtimeGenerationId: session.runtimeGenerationId }),
           ...(session?.nativeSessionId === undefined
             ? {}
             : { nativeSessionId: session.nativeSessionId })
@@ -102,7 +102,7 @@ export async function reconcileExitedRoleTurns(
                     ...(session?.nativeSessionId === undefined
                       ? {}
                       : { nativeSessionId: session.nativeSessionId }),
-                    ...(session?.launchId === undefined ? {} : { launchId: session.launchId })
+                    ...(session?.runtimeGenerationId === undefined ? {} : { runtimeGenerationId: session.runtimeGenerationId })
                   }]
                 : []
             ))
@@ -135,7 +135,7 @@ export async function reconcileExitedRoleTurns(
           taskId: task.id,
           roleName: role.name,
           turnId: run.id,
-          ...(session?.launchId === undefined ? {} : { launchId: session.launchId }),
+          ...(session?.runtimeGenerationId === undefined ? {} : { runtimeGenerationId: session.runtimeGenerationId }),
           ...(session?.nativeSessionId === undefined
             ? {}
             : { nativeSessionId: session.nativeSessionId }),
@@ -165,16 +165,16 @@ export async function reconcileExitedRoleTurns(
           mode: "resume",
           turnId: run.id,
           nativeSessionId: session.nativeSessionId,
-          ...(session.launchId === undefined
+          ...(session.runtimeGenerationId === undefined
             ? {}
-            : { hostActivationId: session.launchId })
+            : { hostActivationId: session.runtimeGenerationId })
         });
         store.saveRoleTurnPrepared({
           task,
           role,
           turn: run,
           session: recovered.session ?? session,
-          ...(recovered.launchId === undefined ? {} : { launchId: recovered.launchId }),
+          ...(recovered.runtimeGenerationId === undefined ? {} : { runtimeGenerationId: recovered.runtimeGenerationId }),
           now
         });
         liveStatuses?.set(`${task.id}\0${role.name}`, "present");
@@ -199,7 +199,7 @@ type RoleTurnCandidate = Readonly<{
     turnId: string;
     progressAt: string;
     nativeSessionId?: string;
-    launchId?: string;
+    runtimeGenerationId?: string;
   }>;
 }>;
 

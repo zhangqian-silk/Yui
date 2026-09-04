@@ -19,7 +19,7 @@ export type SessionTerminationStage =
 export type SessionTerminationEvent = Readonly<{
   stage: SessionTerminationStage;
   owner: RuntimeOwner;
-  launchId?: string;
+  runtimeGenerationId?: string;
   nativeSessionId?: string;
   detail?: string;
   at: Date;
@@ -36,11 +36,11 @@ export type SessionTerminationPorts = Readonly<{
    */
   procEntryExists(pid: number): boolean;
   /**
-   * Lists live processes carrying the exact `YUI_LAUNCH_ID` fence. Used to
+   * Lists live processes carrying the exact `YUI_RUNTIME_GENERATION_ID` fence. Used to
    * verify Provider children after the root has exited; a process without
    * the fence is unattributed and is never signaled.
    */
-  listLaunchFencedProcesses(launchId: string): readonly number[];
+  listLaunchFencedProcesses(runtimeGenerationId: string): readonly number[];
   signalProcess(pid: number, signal: "SIGTERM" | "SIGKILL"): void;
   signalProcessGroup(processGroupId: number, signal: "SIGTERM" | "SIGKILL"): void;
   sleep(milliseconds: number): Promise<void>;
@@ -117,7 +117,7 @@ export async function terminateSessionOwners(
     ports.emit({
       stage: "stop-requested",
       owner,
-      launchId: record.launchId,
+      runtimeGenerationId: record.runtimeGenerationId,
       ...(record.nativeSessionId === undefined
         ? {}
         : { nativeSessionId: record.nativeSessionId }),
@@ -130,7 +130,7 @@ export async function terminateSessionOwners(
   // environment reads. Retain every exact child identity observed during the
   // stop so one later scan miss cannot be mistaken for physical zero.
   const trackedChildren: TrackedFencedChildren = new Map(
-    records.map((record) => [record.launchId, new Map<number, string>()])
+    records.map((record) => [record.runtimeGenerationId, new Map<number, string>()])
   );
   for (const record of records) {
     refreshTrackedFencedChildren(record, ports, trackedChildren);
@@ -200,7 +200,7 @@ export async function terminateSessionOwners(
       continue;
     }
     if (verdict.kind === "gap") {
-      verificationGap = `/proc unreadable for launch ${record.launchId}`;
+      verificationGap = `/proc unreadable for launch ${record.runtimeGenerationId}`;
       remaining.push({ record, detail: verificationGap });
       continue;
     }
@@ -209,7 +209,7 @@ export async function terminateSessionOwners(
       record,
       detail: root.kind === "live"
         ? `provider root pid ${record.providerRoot.pid} still live`
-        : `provider children still live for launch ${record.launchId}`
+        : `provider children still live for launch ${record.runtimeGenerationId}`
     });
   }
   const outcome = remaining.length === 0 ? "stop-confirmed" : "stop-blocked";
@@ -219,7 +219,7 @@ export async function terminateSessionOwners(
     ...(outcome === "stop-blocked"
       ? {
           detail: remaining
-            .map(({ record, detail }) => `${record.launchId}: ${detail}`)
+            .map(({ record, detail }) => `${record.runtimeGenerationId}: ${detail}`)
             .join("; ")
         }
       : {}),
@@ -278,10 +278,10 @@ function refreshTrackedFencedChildren(
   ports: SessionTerminationPorts,
   trackedChildren: TrackedFencedChildren
 ): boolean {
-  const tracked = trackedChildren.get(record.launchId);
+  const tracked = trackedChildren.get(record.runtimeGenerationId);
   if (tracked === undefined) return true;
   let verificationGap = false;
-  for (const pid of ports.listLaunchFencedProcesses(record.launchId)) {
+  for (const pid of ports.listLaunchFencedProcesses(record.runtimeGenerationId)) {
     if (pid === record.providerRoot.pid) continue;
     const identity = ports.processIdentity(pid);
     if (identity === undefined) {
@@ -299,7 +299,7 @@ function trackedChildrenVerdict(
   ports: SessionTerminationPorts,
   trackedChildren: TrackedFencedChildren
 ): { kind: "absent" } | { kind: "live" } | { kind: "gap" } {
-  const tracked = trackedChildren.get(record.launchId);
+  const tracked = trackedChildren.get(record.runtimeGenerationId);
   if (tracked === undefined) return { kind: "gap" };
   let verificationGap = false;
   for (const [pid, startIdentity] of tracked) {
@@ -353,7 +353,7 @@ function escalateRecord(
   }
   if (root.kind !== "absent") return;
   refreshTrackedFencedChildren(record, ports, trackedChildren);
-  const tracked = trackedChildren.get(record.launchId);
+  const tracked = trackedChildren.get(record.runtimeGenerationId);
   if (tracked === undefined) return;
   for (const [pid, startIdentity] of tracked) {
     const current = ports.processIdentity(pid);

@@ -81,7 +81,7 @@ export type FileControllerClientOptions = Readonly<{
   onError?: (error: unknown) => void;
 }>;
 
-export type ControllerLaunchIdentity = Readonly<{
+export type ControllerRuntimeGenerationIdentity = Readonly<{
   executablePath: string;
   args: readonly string[];
   version: string;
@@ -153,10 +153,10 @@ export async function ensureFileTaskController(
 /** Start and await readiness for a captured Controller identity. */
 export async function ensureFileTaskControllerIdentity(
   home: string,
-  identity: ControllerLaunchIdentity,
+  identity: ControllerRuntimeGenerationIdentity,
   options: FileControllerClientOptions = {}
 ): Promise<JsonValue> {
-  assertExpectedControllerLaunchIdentity(identity);
+  assertExpectedControllerRuntimeGenerationIdentity(identity);
   const status = await ensureFileTaskController(home, {
     ...options,
     expectedVersion: identity.version
@@ -170,12 +170,12 @@ export async function ensureFileTaskControllerIdentity(
   const actual = await call(home, "controller.identity", {}, {
     timeoutMs: options.requestTimeoutMs
   });
-  assertControllerLaunchIdentity(actual, identity);
+  assertControllerRuntimeGenerationIdentity(actual, identity);
   return status;
 }
 
-function assertExpectedControllerLaunchIdentity(
-  identity: ControllerLaunchIdentity
+function assertExpectedControllerRuntimeGenerationIdentity(
+  identity: ControllerRuntimeGenerationIdentity
 ): void {
   if (
     typeof identity.executablePath !== "string"
@@ -186,18 +186,18 @@ function assertExpectedControllerLaunchIdentity(
     || identity.version.length === 0
   ) {
     throw new Error(
-      "Expected Controller launch identity is malformed; refusing to start or accept a Controller."
+      "Expected Controller runtime generation identity is malformed; refusing to start or accept a Controller."
     );
   }
 }
 
-function assertControllerLaunchIdentity(
+function assertControllerRuntimeGenerationIdentity(
   actual: JsonValue,
-  expected: ControllerLaunchIdentity
+  expected: ControllerRuntimeGenerationIdentity
 ): void {
   if (!isJsonRecord(actual)) {
     throw new Error(
-      "Authenticated Controller launch identity is malformed; refusing to accept readiness."
+      "Authenticated Controller runtime generation identity is malformed; refusing to accept readiness."
     );
   }
   const actualArgs = actual.args;
@@ -208,7 +208,7 @@ function assertControllerLaunchIdentity(
     || typeof actual.version !== "string"
   ) {
     throw new Error(
-      "Authenticated Controller launch identity is malformed; refusing to accept readiness."
+      "Authenticated Controller runtime generation identity is malformed; refusing to accept readiness."
     );
   }
   const argsMatch = actualArgs.length === expected.args.length
@@ -219,7 +219,7 @@ function assertControllerLaunchIdentity(
     || actual.version !== expected.version
   ) {
     throw new Error(
-      "Authenticated Controller launch identity does not match the captured executable, argv, and version; refusing readiness."
+      "Authenticated Controller runtime generation identity does not match the captured executable, argv, and version; refusing readiness."
     );
   }
 }
@@ -652,7 +652,7 @@ export class FileTaskWorkflowRuntime implements TaskWorkflowRuntimePort {
     agentId: string;
     adapterId: string;
     nativeSessionId: string;
-    launchId?: string;
+    runtimeGenerationId?: string;
     sessionUpdatedAt: string;
   }>): Promise<void> {
     if (this.store.getActiveTurn(input.taskId, input.roleName) !== null) {
@@ -671,7 +671,7 @@ export class FileTaskWorkflowRuntime implements TaskWorkflowRuntimePort {
         agentId: input.agentId,
         adapterId: input.adapterId,
         nativeSessionId: input.nativeSessionId,
-        ...(input.launchId === undefined ? {} : { launchId: input.launchId }),
+        ...(input.runtimeGenerationId === undefined ? {} : { runtimeGenerationId: input.runtimeGenerationId }),
         sessionUpdatedAt: input.sessionUpdatedAt
       }
     );
@@ -786,7 +786,7 @@ export class FileTaskWorkflowRuntime implements TaskWorkflowRuntimePort {
       true,
       `Task archive blocked: ${blockers.length} owned physical resource(s) still live: `
         + blockers.map((entry) => (
-          `${entry.owner.roleName}/${entry.launchId}`
+          `${entry.owner.roleName}/${entry.runtimeGenerationId}`
             + ` (pid ${entry.physical?.alive === true ? entry.physical.pid : "?"})`
         )).join("; ")
     );
@@ -857,11 +857,11 @@ export class FileTaskWorkflowRuntime implements TaskWorkflowRuntimePort {
       throw new Error(
         `Role runtime cleanup could not prove physical exit: ${runtimeOwnerLabel(candidate.owner)}; `
           + termination.remaining
-            .map(({ record, detail }) => `${record.launchId}: ${detail}`)
+            .map(({ record, detail }) => `${record.runtimeGenerationId}: ${detail}`)
             .join("; ")
       );
     }
-    if (candidate.owner.scope === "task" && candidate.launchId !== undefined) {
+    if (candidate.owner.scope === "task" && candidate.runtimeGenerationId !== undefined) {
       const isolation = new FileTaskRuntimeIsolation({
         runtimeRoot: `${this.home}.task-runtimes`,
         controlPlane: {
@@ -873,7 +873,7 @@ export class FileTaskWorkflowRuntime implements TaskWorkflowRuntimePort {
       });
       isolation.cleanupTaskLaunch({
         taskId: candidate.owner.taskId,
-        launchId: candidate.launchId,
+        runtimeGenerationId: candidate.runtimeGenerationId,
         reason: this.store.getTask(candidate.owner.taskId)?.status === "completed"
           ? "completion"
           : "interruption"

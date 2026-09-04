@@ -388,12 +388,12 @@ export function isCurrentGlobalOperator(
   if (role === null) return false;
   const agentId = exactIdentity(environment.YUI_AGENT_ID);
   const adapterId = exactIdentity(environment.YUI_ADAPTER_ID);
-  const launchId = exactIdentity(environment.YUI_LAUNCH_ID);
+  const runtimeGenerationId = exactIdentity(environment.YUI_RUNTIME_GENERATION_ID);
   const nativeSessionId = exactIdentity(environment.YUI_NATIVE_SESSION_ID);
   const binding = role.agentBindings[role.activeAgentId];
   if (agentId === undefined
     || adapterId === undefined
-    || launchId === undefined
+    || runtimeGenerationId === undefined
     || binding === undefined
     || binding.agentId !== agentId
     || binding.adapterId !== adapterId) return false;
@@ -409,7 +409,7 @@ export function isCurrentGlobalOperator(
         roleName: role.name,
         agentId,
         adapterId,
-        launchId
+        runtimeGenerationId
       });
   }
   // A fresh Codex launch discovers its native Session asynchronously. Its
@@ -423,15 +423,15 @@ export function isCurrentGlobalOperator(
       || (nativeSessionId === undefined
         && binding.adapterId === "codex"
         && session.adapterId === "codex"
-        && session.launchId !== undefined
-        && session.launchId === launchId)
+        && session.runtimeGenerationId !== undefined
+        && session.runtimeGenerationId === runtimeGenerationId)
   );
   return binding.agentId === session.agentId
     && binding.adapterId === session.adapterId
     && session.agentId === agentId
     && session.adapterId === adapterId
-    && session.launchId !== undefined
-    && session.launchId === launchId
+    && session.runtimeGenerationId !== undefined
+    && session.runtimeGenerationId === runtimeGenerationId
     && nativeSessionMatches;
 }
 
@@ -441,7 +441,7 @@ function currentProcessBelongsToReservedGlobalLaunch(
     roleName: string;
     agentId: string;
     adapterId: string;
-    launchId: string;
+    runtimeGenerationId: string;
   }>
 ): boolean {
   if (store.getSessionOwner === undefined || store.getWorkMailbox === undefined) return false;
@@ -449,15 +449,15 @@ function currentProcessBelongsToReservedGlobalLaunch(
     scope: "global",
     roleName: input.roleName
   }));
-  if (!isRuntimeLaunchReservation(mailbox?.processing, input.launchId)
+  if (!isRuntimeLaunchReservation(mailbox?.processing, input.runtimeGenerationId)
     || hasRuntimeCleanupObligation(mailbox)) return false;
-  const owner = store.getSessionOwner(input.launchId);
+  const owner = store.getSessionOwner(input.runtimeGenerationId);
   if (owner === null
     || owner.owner.scope !== "global"
     || owner.owner.roleName !== input.roleName
     || owner.agentId !== input.agentId
     || owner.adapterId !== input.adapterId
-    || owner.launchId !== input.launchId
+    || owner.runtimeGenerationId !== input.runtimeGenerationId
     || owner.providerRoot.attribution !== "launch-env"
     || !isLinuxProcessLive(owner.providerRoot.pid, owner.providerRoot.startIdentity)) {
     return false;
