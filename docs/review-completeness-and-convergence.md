@@ -160,10 +160,27 @@ design can authorize Session replacement.
 
 ## Runtime and mailbox boundary
 
+Each live question has one owner:
+
+- the active Turn pointer says which Turn a Role is executing;
+- the ReviewRound says whether a semantic review slot is pending, running, or
+  terminal;
+- the `role-runtime` mailbox serializes Session launch and cleanup;
+- an ordinary non-Leader Role mailbox is only a delivery hint for one exact
+  durable Turn and is consumed at Provider acceptance, with exact Turn
+  terminalization as the fallback boundary;
+- the Leader Role mailbox is reserved for semantic event wakes and force-steer
+  batches. A directly created Leader Turn is selected from durable active-Turn
+  state and never writes a delivery hint into that mailbox.
+
+Reviewer availability is projected only from the first three authoritative
+facts. Ordinary Role delivery residue is observable recovery state, not a
+second review lock.
+
 Review orchestration follows these shared rules:
 
 1. A completed Review writes its ReviewRound, finding-ledger changes, and
-   durable mailbox references.
+   any semantic Leader wake references.
 2. It does not pre-create a future Leader Turn.
 3. If the Leader is active, the Review result remains pending until a natural
    Turn boundary; Yui does not interrupt the Leader.

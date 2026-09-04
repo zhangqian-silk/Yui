@@ -10,6 +10,10 @@ import { RuntimeLaunchFailure } from "../runtime/launchDiagnostics.js";
 import { RuntimeLaunchError, type RuntimeLaunchPreflight } from "../runtime/ports.js";
 import { formatTurnReceiptId } from "../task/taskRecordReference.js";
 import { turnInputEnvelope } from "../turn/turn.js";
+import {
+  captureRoleTurnDispatch,
+  type RoleTurnDispatchToken
+} from "../coordination/workMailboxQueue.js";
 import type {
   PreparedRoleDelivery,
   SchedulerTurn,
@@ -72,6 +76,15 @@ async function deliverActiveTurn(
     return { ...base, status: "skipped", reason: "workspace-not-ready" };
   }
 
+  const dispatchToken = captureRoleTurnDispatch(store.getWorkMailbox({
+    kind: "role",
+    taskId: task.id,
+    roleName: role.name
+  }), {
+    taskId: task.id,
+    roleName: role.name,
+    turnId: turn.id
+  });
   const sessionSet = store.getTaskRoleSessionSet?.(task.id, role.name) ?? null;
   const binding = sessionSet?.providerBinding ?? null;
   const observedTurn = binding?.turn ?? null;
@@ -82,8 +95,11 @@ async function deliverActiveTurn(
     || binding?.authority.owner === "unknown") {
     return { ...base, status: "skipped", reason: "writer-attached" };
   }
-  if (currentProviderTurn !== null
-    && ["submitting", "accepted"].includes(currentProviderTurn.status)) {
+  if (currentProviderTurn?.status === "accepted") {
+    settleAcceptedRoleTurnDispatch(store, turn, dispatchToken);
+    return { ...base, status: "skipped", reason: "not-ready" };
+  }
+  if (currentProviderTurn?.status === "submitting") {
     return { ...base, status: "skipped", reason: "not-ready" };
   }
   if (currentProviderTurn?.status === "delivery-unknown") {
@@ -181,6 +197,7 @@ async function deliverActiveTurn(
       );
     }
     forget(delivery, task.id, role.name, turn.id, ready.prepared.launchId);
+    settleAcceptedRoleTurnDispatch(store, turn, dispatchToken);
     return {
       ...base,
       status: outcome === "sent" ? "delivered" : "already-delivered"
@@ -245,6 +262,19 @@ function failTurnDelivery(
     error: summary,
     ...(disposition === "failed" ? { terminalized: true } : {})
   };
+}
+
+function settleAcceptedRoleTurnDispatch(
+  store: SchedulerStorePort,
+  turn: SchedulerTurn,
+  expected?: RoleTurnDispatchToken | null
+): void {
+  store.settleRoleTurnDispatch({
+    taskId: turn.taskId,
+    roleName: turn.roleName,
+    turnId: turn.id,
+    ...(expected === undefined ? {} : { expected })
+  });
 }
 
 function persistPreStartSession(

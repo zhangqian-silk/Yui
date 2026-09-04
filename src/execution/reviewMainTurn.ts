@@ -1,4 +1,4 @@
-import { enqueueWork } from "../coordination/workMailboxQueue.js";
+import { enqueueRoleTurnDispatch } from "../coordination/workMailboxQueue.js";
 import { createTurnInput } from "../context/turnInputContract.js";
 import {
   contextSnapshotDeltaRefIds,
@@ -184,18 +184,13 @@ export function reconcileReviewMainTurns(
     store.saveTurn(turn);
     store.saveReviewRound(taskId, startReviewRound(round, turn.id));
     store.saveActiveTurn(turn);
-    enqueueWork(
-      store,
-      { kind: "role", taskId, roleName: role.name },
-      "review-synthesis-ready",
-      now,
-      [
-        { type: "turn", taskId, id: turn.id },
-        ...(round.workItemId === undefined
-          ? []
-          : [{ type: "work-item" as const, taskId, id: round.workItemId }])
-      ]
-    );
+    enqueueRoleTurnDispatch(store, {
+      taskId,
+      roleName: role.name,
+      turnId: turn.id,
+      reason: "review-synthesis-ready",
+      occurredAt: now
+    });
     store.saveEvent(taskId, createTaskEvent(
       store.nextEventId(taskId),
       taskId,

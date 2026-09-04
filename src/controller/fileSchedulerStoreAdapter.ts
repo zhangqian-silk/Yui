@@ -137,7 +137,10 @@ import {
   type MailboxTarget,
   type WorkMailbox
 } from "../coordination/workMailbox.js";
-import { enqueueWork } from "../coordination/workMailboxQueue.js";
+import {
+  enqueueWork,
+  settleRoleTurnDispatch as settleRoleTurnDispatchMailbox
+} from "../coordination/workMailboxQueue.js";
 import type { SchedulerMailboxClaimInput, SchedulerMailboxClaimResult } from "../scheduler/ports.js";
 import {
   RUNTIME_CLEANUP_REQUIRED_REASON,
@@ -1616,20 +1619,16 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
     });
   }
 
-  consumeWorkMailbox(
-    target: MailboxTarget,
-    expected: Readonly<{ fromSequence: number; toSequence: number }>
-  ): boolean {
-    return this.store.transaction((store) => {
-      const mailbox = store.getWorkMailbox(target);
-      if (mailbox?.pending === null || mailbox?.pending === undefined
-        || mailbox.pending.fromSequence !== expected.fromSequence
-        || mailbox.pending.toSequence < expected.toSequence) {
-        return false;
-      }
-      store.saveWorkMailbox(consumePendingBatch(mailbox, expected));
-      return true;
-    });
+  settleRoleTurnDispatch(
+    input: Parameters<SchedulerStorePort["settleRoleTurnDispatch"]>[0]
+  ): ReturnType<SchedulerStorePort["settleRoleTurnDispatch"]> {
+    return this.store.transaction((store) => (
+      settleRoleTurnDispatchMailbox(
+        store,
+        input,
+        input.expected
+      )
+    ));
   }
 
   completeWorkMailbox(target: MailboxTarget, batchId: string): boolean {
