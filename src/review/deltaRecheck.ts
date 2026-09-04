@@ -6,7 +6,6 @@ import {
   type ReviewRound,
   type TaskReviewCandidate
 } from "./reviewRound.js";
-import { isSemanticReviewRound } from "./reviewOutcomeClassifier.js";
 
 /**
  * Issue 07: delta-recheck protocol.
@@ -66,7 +65,8 @@ export async function assessDeltaRecheck(input: Readonly<{
   git: DeltaRecheckGitPort;
 }>): Promise<DeltaRecheckAssessment> {
   const { repositoryPaths, previousRound, candidate, git } = input;
-  if (!isSemanticReviewRound(previousRound)
+  if (previousRound.status !== "completed"
+    || previousRound.reviewerTurnId === undefined
     || (previousRound.scope ?? "work-item") !== "task") {
     return {
       kind: "ineligible",
@@ -181,9 +181,8 @@ export function buildDeltaRecheckDispatchContext(input: Readonly<{
   round: ReviewRound;
   previousRound: ReviewRound;
   diffByProject: Readonly<Record<string, string>>;
-  ledgerContext: string;
 }>): string {
-  const { round, previousRound, diffByProject, ledgerContext } = input;
+  const { round, previousRound, diffByProject } = input;
   const record = round.deltaRecheck;
   if (record === undefined) {
     throw new Error(`ReviewRound is not a delta-recheck: ${round.id}.`);
@@ -198,7 +197,8 @@ export function buildDeltaRecheckDispatchContext(input: Readonly<{
     "  semantic change, evidence doubt). This is the safe default.",
     "Yui verified only the technical delta boundary; a Task-control Agent selected this mode.",
     `Previous accepted ReviewRound: ${previousRound.id}@${record.previousBaseCommit}`,
-    `Previous acceptance summary: ${compact(previousRound.summary ?? previousRound.report ?? "")}`,
+    `Previous Reviewer Turn: ${previousRound.reviewerTurnId ?? "unavailable"}`,
+    "Read that exact source Turn's original result from the frozen Context Snapshot.",
     ...(round.taskCandidate?.projects.map((project) => {
       const previous = previousRound.taskCandidate?.projects
         .find((entry) => entry.projectId === project.projectId)?.commit;
@@ -214,23 +214,11 @@ export function buildDeltaRecheckDispatchContext(input: Readonly<{
         ? []
         : [`--- ${projectId} ---`, diff]
     )),
-    ...(previousEvidenceReferences(previousRound).length === 0
-      ? []
-      : [
-          "Previous evidence references:",
-          ...previousEvidenceReferences(previousRound).map((entry) => `- ${entry}`)
-        ]),
-    ledgerContext,
-    "Report JSON with deltaDisposition (one of the three values above) and deltaReasoning",
-    "(the explicit proof or the reason a full Review is required). Findings, checks, and",
-    "evidence use the same fields as a full Review."
+    "Return one complete result with the chosen disposition, reasoning, findings,",
+    "verification, uncertainty, and recommended next action. Markdown or JSON is acceptable;",
+    "Yui Core preserves the original text and does not parse or validate its structure."
   ];
   return lines.join("\n");
-}
-
-function compact(text: string, limit = 600): string {
-  const flattened = text.replace(/\s+/gu, " ").trim();
-  return flattened.length <= limit ? flattened : `${flattened.slice(0, limit)}...`;
 }
 
 function digestDiff(diffByProject: Readonly<Record<string, string>>): string {
@@ -240,52 +228,4 @@ function digestDiff(diffByProject: Readonly<Record<string, string>>): string {
       .map(([projectId, diff]) => [projectId, diff])
   );
   return createHash("sha256").update(canonical).digest("hex");
-}
-
-/** All path-like evidence references from Markdown or JSON Review reports. */
-function previousEvidenceReferences(round: ReviewRound): string[] {
-  const report = round.report ?? "";
-  return [...new Set([
-    ...extractDeclaredEvidence(report),
-    ...extractEvidenceReferences(report)
-  ])];
-}
-
-/** Preserve the free-form evidence array that older JSON reports exposed. */
-function extractDeclaredEvidence(report: string): string[] {
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(report) as unknown;
-  } catch {
-    return [];
-  }
-  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return [];
-  const evidence = (parsed as Record<string, unknown>).evidence;
-  if (!Array.isArray(evidence)) return [];
-  return evidence.flatMap((entry) => (
-    typeof entry === "string" && entry.trim().length > 0 ? [entry.trim()] : []
-  ));
-}
-
-/**
- * Reviewer reports intentionally accept clear Markdown or JSON without a
- * fixed schema. Extract likely repo-relative references from the preserved
- * report so the next Reviewer can inspect the earlier evidence directly.
- */
-function extractEvidenceReferences(report: string): string[] {
-  const references = report.match(
-    /(?:\.{0,2}\/)?[A-Za-z0-9_.-]+(?:\/[A-Za-z0-9_.-]+)+|[A-Za-z0-9_.-]+\.[A-Za-z0-9]{1,12}/gu
-  ) ?? [];
-  return [...new Set(references.map((entry) => entry.replace(/^\.\//u, "")))]
-    .filter((entry) => isPathLike(entry));
-}
-
-function isPathLike(value: string): boolean {
-  if (value.length === 0 || value.length > 512) return false;
-  if (/\s/u.test(value)) return false;
-  if (value.includes("://")) return false;
-  // A repo-relative path: at least one slash or a known file extension, no
-  // shell/argument metacharacters.
-  if (/[;&|`$(){}!<>]/u.test(value)) return false;
-  return value.includes("/") || /\.[A-Za-z0-9]{1,12}$/u.test(value);
 }

@@ -214,9 +214,8 @@ evidence enough to repay its coordination cost. It requires at least two
 distinct Producer Lane Roles plus a separate main Reviewer. Wait for every
 Producer to settle and at least two to succeed; their results are durable
 evidence only. The main Reviewer receives all successful results, resolves
-disagreement against the frozen sources, and submits the one authoritative
-finding batch and outcome. Automatic policy-triggered Candidate Review remains
-direct.
+disagreement against the frozen sources, and submits one original result.
+Automatic policy-triggered Candidate Review remains direct.
 
 When several WorkItems contribute to one outcome, prefer one independent
 Task-final Review after their accepted results are integrated over repeating a
@@ -224,21 +223,22 @@ complete Review for every WorkItem. Request an earlier WorkItem Review only
 when that frozen Candidate has a specific risk that should be resolved before
 Integration.
 
-When a Review result arrives, read the complete submitted finding batch before
-starting new work or waiting again. Decide whether to accept, repair, review
-again, or ask for a genuinely user-owned decision. Route reachable findings to
-the original execution owner. Fix a small Task-main issue directly; create a
-Repair WorkItem only when the repair is itself a substantial independently
-owned requirement.
+When a Worker or Reviewer result arrives, resolve its exact Turn and read the
+complete original `TurnResult.output` before starting new work or waiting
+again. Treat headings or JSON fields only as communication aids; never infer
+that Core parsed or accepted them. Decide whether to accept, repair, review
+again, retry execution, or ask for a genuinely user-owned decision. Route
+reachable issues to the original execution owner. Fix a small Task-main issue
+directly; create a Repair WorkItem only when the repair is itself a substantial
+independently owned requirement.
 
-A failed or ambiguous Review is evidence, not an automatic retry or repair
-wave. Inspect its exact Round, Turn, candidate, and `task next-action` facts,
-then choose the smallest recovery that preserves the frozen boundary. Do not
-invent a retry loop or silently replace the Reviewer Session. For a replicated
-Task-final Round below quorum before main synthesis, retry the Round so only
-unsettled or failed Producers rerun. Retry a failed main synthesis through its
-exact Turn. Use `force-fresh` only for an eligible direct, durably
-non-semantic Round, never for replicated or ambiguous evidence.
+A failed ReviewRound is an execution failure, not an automatic retry or repair
+wave. Inspect its exact Round, Turn, candidate, Core failure, and
+`task next-action` facts, then choose the smallest recovery that preserves the
+frozen boundary. Do not invent a retry loop or silently replace the Reviewer
+Session. For a replicated Task-final Round below quorum before main synthesis,
+retry the Round so only unsettled or failed Producers rerun. Retry a failed
+main synthesis through its exact Turn.
 
 ## Accept, integrate, and complete
 
@@ -288,8 +288,9 @@ user-authorized Operator action.
 
 Before ending the Turn:
 
-1. Consume any completed Worker, child, Reviewer, or Integration result that
-   caused this wake and make the next semantic decision.
+1. Inspect the wake delta, resolve every referenced Worker or Reviewer Turn
+   with `yui task turn show`, read each original result in full, and make the
+   next decision.
 2. Persist actual WorkItem lifecycle and material Brief, Decision, Milestone,
    Message, or Knowledge changes.
 3. Choose one truthful outcome: continue through an owned native child, complete

@@ -19,7 +19,7 @@ export type CodexSessionNotification = Readonly<{
   nativeSessionId: string;
   nativeTurnId: string;
   title?: string;
-  lastAssistantMessage: string;
+  output: string;
 }>;
 
 type ControllerCall = (
@@ -31,7 +31,7 @@ type ControllerCall = (
 
 type CodexThreadNameSetter = (request: CodexThreadNameRequest) => Promise<void>;
 
-const NO_FINAL_ASSISTANT_MESSAGE_SUMMARY =
+const NO_FINAL_ASSISTANT_MESSAGE_OUTPUT =
   "Native Turn completed without a final assistant message.";
 
 /** Hidden CLI entrypoint used by Codex's structured notify hook. */
@@ -58,7 +58,7 @@ export async function runSessionNotifyCommand(
     nativeTurnId: params.nativeTurnId,
     ...(current.turnId === undefined ? {} : { turnId: current.turnId }),
     ...(params.title === undefined ? {} : { title: params.title }),
-    summary: params.lastAssistantMessage
+    output: params.output
   });
   // The durable write is authoritative. This short socket call is only a
   // wake-up hint and never starts or waits for a Controller process.
@@ -124,7 +124,7 @@ export function parseCodexSessionNotification(
   }
   const nativeSessionId = requireText(payload["thread-id"], "Codex thread-id");
   const nativeTurnId = requireText(payload["turn-id"], "Codex turn-id");
-  const lastAssistantMessage = requireAssistantMessage(payload["last-assistant-message"]);
+  const output = requireAssistantMessage(payload["last-assistant-message"]);
   const title = environment.YUI_SESSION_TITLE === undefined
     ? undefined
     : requireText(environment.YUI_SESSION_TITLE, "YUI_SESSION_TITLE");
@@ -143,7 +143,7 @@ export function parseCodexSessionNotification(
     nativeSessionId,
     nativeTurnId,
     ...(title === undefined ? {} : { title }),
-    lastAssistantMessage
+    output
   } as const;
   return scope === "task"
     ? {
@@ -181,15 +181,14 @@ function requireText(value: unknown, label: string): string {
 }
 
 function requireAssistantMessage(value: unknown): string {
-  if (value === null) return NO_FINAL_ASSISTANT_MESSAGE_SUMMARY;
+  if (value === null) return NO_FINAL_ASSISTANT_MESSAGE_OUTPUT;
   if (typeof value !== "string" || value.includes("\0")) {
     throw new Error("Codex last assistant message is required.");
   }
-  const text = value.trim();
-  if (text.length === 0 || Buffer.byteLength(text) > 524_288) {
+  if (value.trim().length === 0 || Buffer.byteLength(value) > 524_288) {
     throw new Error("Codex last assistant message is invalid.");
   }
-  return text;
+  return value;
 }
 
 function shouldSetThreadName(

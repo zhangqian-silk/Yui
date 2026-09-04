@@ -284,7 +284,7 @@ function failExecutionAttempts(
     if (original === null) continue;
     const changed = JSON.stringify(original.executionGroup) !== JSON.stringify(round.executionGroup);
     const terminal = round.status === "pending" || round.status === "running"
-      ? finishReviewRound(round, "failed", summary, now)
+      ? finishReviewRound(round, "failed", now, { kind: "execution", message: summary })
       : round;
     if (changed || terminal !== round) store.saveReviewRound(round.taskId, terminal);
   }

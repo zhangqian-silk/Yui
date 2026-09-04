@@ -64,7 +64,6 @@ import {
 import { SYSTEM_OPERATOR_ROLE } from "../role/systemRoles.js";
 import { appendTurnInput, createTurn, type Turn } from "../turn/turn.js";
 import { createTurnInput } from "../context/turnInputContract.js";
-import { parseReviewResultReport } from "../review/reviewRound.js";
 import {
   classifyRuntimeProcessExit,
   validateRuntimeProcessExitObservation
@@ -289,7 +288,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
           input,
           adapterId,
           "completed",
-          input.payload.summary ?? "Agent turn completed without a workflow outcome.",
+          input.payload.output ?? "Agent turn completed without a workflow outcome.",
           now
         );
         break;
@@ -433,7 +432,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
     input: RuntimeObservation,
     adapterId: string,
     providerStatus: "completed" | "failed" | "cancelled",
-    summary: string,
+    output: string,
     now: Date
   ): ProviderLifecycleObservation {
     const completed = {
@@ -447,7 +446,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
       attemptId: input.fence.receiptId,
       turnId: input.fence.turnId,
       ...(input.payload.input === undefined ? {} : { input: input.payload.input }),
-      summary,
+      output,
       providerStatus
     };
     const classification = this.classifyRuntimeTurnCompleted(completed);
@@ -507,7 +506,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
         const key = providerContinuationKey(continuation.identity);
         const identityDigest = createHash("sha256").update(key).digest("hex");
         const detached = createRuntimeObservation({
-          schemaVersion: 3,
+          schemaVersion: 4,
           eventId: `derived-continuation-detached:${identityDigest}`,
           semanticKey: `continuation-detached:${identityDigest}`,
           kind: "continuation.started",
@@ -615,7 +614,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
             .update(`${input.semanticKey}\u0000${identityKey}`)
             .digest("hex");
           const settled = createRuntimeObservation({
-            schemaVersion: 3,
+            schemaVersion: 4,
             eventId: `native-snapshot-settled:${digest}`,
             semanticKey: `native-snapshot-settled:${digest}`,
             kind: "continuation.settled",
@@ -1998,7 +1997,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
           ? {}
           : { nativeSessionId: session.nativeSessionId }),
         ...(input.runtimeGenerationId === undefined ? {} : { runtimeGenerationId: input.runtimeGenerationId }),
-        outcome: { status: "failed", summary, failureReason: input.failureReason }
+        outcome: { status: "failed", output: summary, failureReason: input.failureReason }
       }, input.now);
       if (result.disposition !== "applied" || result.turn === null) {
         return "state-changed";
@@ -2332,7 +2331,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
     attemptId?: string;
     turnId?: string;
     input?: string;
-    summary: string;
+    output: string;
     providerStatus?: "completed" | "failed" | "cancelled";
   }>, now = new Date()): Readonly<{
     session: RoleAgentSession;
@@ -2456,30 +2455,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
           throw new Error("Provider Turn result has no matching Activation.");
         }
         const providerStatus = input.providerStatus ?? "completed";
-        let reviewResult: Parameters<typeof terminalizeExactTaskTurn>[1]["reviewResult"];
-        if (observedTurn.purpose === "review" || observedTurn.executionGroupId !== undefined) {
-          try {
-            const parsed = parseReviewResultReport(input.summary);
-            reviewResult = {
-              summary: parsed.summary,
-              report: parsed.report,
-              checks: parsed.checks,
-              ...(parsed.findings === undefined ? {} : { findings: parsed.findings }),
-              ...(parsed.evidence === undefined ? {} : { evidence: parsed.evidence }),
-              ...(parsed.evidenceCommit === undefined
-                ? {}
-                : { evidenceCommit: parsed.evidenceCommit }),
-              ...(parsed.deltaDisposition === undefined
-                ? {}
-                : { deltaDisposition: parsed.deltaDisposition }),
-              ...(parsed.deltaReasoning === undefined
-                ? {}
-                : { deltaReasoning: parsed.deltaReasoning })
-            };
-          } catch {
-            reviewResult = { summary: input.summary, report: input.summary, checks: [] };
-          }
-        }
+        let systemEvidence: Parameters<typeof terminalizeExactTaskTurn>[1]["systemEvidence"];
         if ((observedTurn.purpose === "execution" || observedTurn.purpose === "review")
           && observedTurn.executionGroupId !== undefined
           && observedTurn.executionLaneId !== undefined
@@ -2487,7 +2463,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
           && providerStatus === "completed") {
           const gitSnapshot = this.snapshotExecutionLaneWorkspace(store, observedTurn.workspace);
           if (gitSnapshot !== undefined) {
-            reviewResult = { ...(reviewResult ?? {}), gitSnapshot };
+            systemEvidence = { workspaceSnapshot: gitSnapshot };
           }
         }
         const terminalized = terminalizeExactTaskTurn(store, {
@@ -2499,7 +2475,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
           ...(input.runtimeGenerationId === undefined ? {} : { runtimeGenerationId: input.runtimeGenerationId }),
           outcome: {
             status: providerStatus === "completed" ? "completed" : "failed",
-            summary: input.summary,
+            output: input.output,
             ...(providerStatus === "completed"
               ? {}
               : {
@@ -2516,7 +2492,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
               status: providerStatus
             }
           },
-          ...(reviewResult === undefined ? {} : { reviewResult })
+          ...(systemEvidence === undefined ? {} : { systemEvidence })
         }, now);
         if (terminalized.disposition !== "applied" || terminalized.turn === null) {
           throw new Error(
@@ -2534,8 +2510,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
             turnId: terminalTurn.id,
             roleName: terminalTurn.roleName,
             providerTurnId: canonicalTurnId,
-            providerStatus,
-            summary: input.summary
+            providerStatus
           },
           now
         );
@@ -3175,7 +3150,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
     nativeSessionId: string;
     nativeTurnId: string;
     title?: string;
-    summary?: string;
+    output?: string;
   }>, now = new Date()): RoleAgentSession {
     return this.store.transaction((store) => {
       const role = store.getGlobalRole(input.roleName);
@@ -3220,7 +3195,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
         ...(input.runtimeGenerationId === undefined ? {} : { runtimeGenerationId: input.runtimeGenerationId }),
         title: effectiveExisting?.title ?? input.title,
         preview: effectiveExisting?.preview ?? (
-          input.summary === undefined ? undefined : sessionPreview(input.summary)
+          input.output === undefined ? undefined : sessionPreview(input.output)
         ),
         policy: "fixed",
         status: completedStatus,

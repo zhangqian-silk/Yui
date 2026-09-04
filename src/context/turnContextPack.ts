@@ -4,6 +4,7 @@ import { operationalTaskRecords } from "../task/taskRecordRetirement.js";
 import { TASK_COMPLETION_PUBLISHED_TREE_AUTHORIZED_EVENT } from "../task/publicationReference.js";
 import { TURN_INPUT_MAX_DELTAS } from "./turnInputContract.js";
 import { assertWorkItemDependenciesCompleted } from "../workItem/dependencyGate.js";
+import { workItemExecutionGroupById } from "../workItem/workItem.js";
 import {
   contextContentDigest,
   contextSnapshotRef,
@@ -98,7 +99,8 @@ export function freezeTurnContextSnapshot(
   store: TaskStore,
   run: Readonly<Pick<
     Turn,
-    "taskId" | "roleName" | "purpose" | "workItemId" | "reviewRoundId" | "workspace"
+    "taskId" | "roleName" | "purpose" | "workItemId" | "reviewRoundId"
+      | "sourceExecutionGroupId" | "workspace"
   >>,
   now: Date,
   frozenBy: "leader" | "controller" = "controller",
@@ -117,7 +119,10 @@ export function freezeTurnContextSnapshot(
       throw new Error(`Turn Context baseline is missing or drifted: ${baselineRef.id}.`);
     }
     validateContextSnapshot(baseline);
-    const overlays = collectTurnContextOverlays(store, run);
+    const overlays = [
+      ...collectTurnContextOverlays(store, run),
+      ...collectSourceTurnContext(store, run)
+    ];
     const resources = [...new Map([...baseline.resources, ...overlays].map((entry) => [
       contextRefIdentity(entry.ref),
       entry
@@ -500,7 +505,8 @@ function collectAuthorizedContext(
   store: TaskStore,
   run: Readonly<Pick<
     Turn,
-    "taskId" | "roleName" | "purpose" | "workItemId" | "reviewRoundId" | "workspace"
+    "taskId" | "roleName" | "purpose" | "workItemId" | "reviewRoundId"
+      | "sourceExecutionGroupId" | "workspace"
   >>
 ): MaterializedRef[] {
   const task = store.getTask(run.taskId);
@@ -512,6 +518,7 @@ function collectAuthorizedContext(
     result.push(materialize("L2", "task-brief", task.id, brief));
   }
   result.push(...collectTurnContextOverlays(store, run));
+  result.push(...collectSourceTurnContext(store, run));
   if (run.workItemId !== undefined) {
     const item = store.getWorkItem(task.id, run.workItemId);
     if (item === null) throw new Error(`Turn WorkItem not found: ${run.workItemId}.`);
@@ -529,12 +536,25 @@ function collectAuthorizedContext(
     const round = store.getReviewRound(task.id, run.reviewRoundId);
     if (round === null) throw new Error(`Turn ReviewRound not found: ${run.reviewRoundId}.`);
     result.push(materialize("L3", "review-round", round.id, round));
-    for (const finding of store.listReviewFindings(task.id).filter((candidate) => (
-      candidate.firstReviewRoundId === round.id
-      || candidate.lastReviewRoundId === round.id
-      || candidate.repair?.workItemId === round.workItemId
-    ))) {
-      result.push(materialize("L3", "review-finding", finding.id, finding));
+    if (round.deltaRecheck !== undefined) {
+      const previous = store.getReviewRound(task.id, round.deltaRecheck.previousReviewRoundId);
+      const previousTurn = previous?.reviewerTurnId === undefined
+        ? null
+        : store.getTurn(task.id, previous.reviewerTurnId);
+      if (previous === null
+        || previous === undefined
+        || previous.status !== "completed"
+        || previousTurn === null
+        || previousTurn.status !== "completed"
+        || previousTurn.result === undefined) {
+        throw new Error(
+          `Delta recheck source Review result is unavailable: ${
+            round.deltaRecheck.previousReviewRoundId
+          }.`
+        );
+      }
+      result.push(materialize("L3", "review-round", previous.id, previous));
+      result.push(materialize("L4", "source-turn", previousTurn.id, previousTurn));
     }
   }
   for (const binding of task.projectBindings) {
@@ -564,9 +584,6 @@ function collectAuthorizedContext(
     }
     for (const round of store.listReviewRounds(task.id).slice(-16)) {
       result.push(materialize("L3", "review-round", round.id, round));
-    }
-    for (const finding of store.listReviewFindings(task.id)) {
-      result.push(materialize("L3", "review-finding", finding.id, finding));
     }
     for (const turn of operationalTaskRecords(
       store.listTurns(task.id),
@@ -608,7 +625,8 @@ function collectTurnContextOverlays(
   store: TaskStore,
   run: Readonly<Pick<
     Turn,
-    "taskId" | "roleName" | "purpose" | "workItemId" | "reviewRoundId" | "workspace"
+    "taskId" | "roleName" | "purpose" | "workItemId" | "reviewRoundId"
+      | "sourceExecutionGroupId" | "workspace"
   >>
 ): MaterializedRef[] {
   const role = store.getRole(run.taskId, run.roleName);
@@ -633,6 +651,53 @@ function collectTurnContextOverlays(
         )]
       : [])
   ];
+}
+
+function collectSourceTurnContext(
+  store: TaskStore,
+  run: Readonly<Pick<
+    Turn,
+    "taskId" | "purpose" | "workItemId" | "reviewRoundId" | "sourceExecutionGroupId"
+  >>
+): MaterializedRef[] {
+  if (run.sourceExecutionGroupId === undefined) return [];
+  const group = run.purpose === "execution"
+    ? (() => {
+        if (run.workItemId === undefined) {
+          throw new Error("Execution synthesis source requires a WorkItem.");
+        }
+        const item = store.getWorkItem(run.taskId, run.workItemId);
+        if (item === null) throw new Error(`Turn WorkItem not found: ${run.workItemId}.`);
+        return workItemExecutionGroupById(item, run.sourceExecutionGroupId);
+      })()
+    : (() => {
+        if (run.reviewRoundId === undefined) {
+          throw new Error("Review synthesis source requires a ReviewRound.");
+        }
+        const round = store.getReviewRound(run.taskId, run.reviewRoundId);
+        if (round === null) throw new Error(`Turn ReviewRound not found: ${run.reviewRoundId}.`);
+        return round.executionGroup?.id === run.sourceExecutionGroupId
+          ? round.executionGroup
+          : undefined;
+      })();
+  if (group === undefined) {
+    throw new Error(`Source ExecutionGroup not found: ${run.sourceExecutionGroupId}.`);
+  }
+  return [...group.lanes]
+    .sort((left, right) => left.ordinal - right.ordinal || left.id.localeCompare(right.id))
+    .flatMap((lane): MaterializedRef[] => {
+      if (lane.disposition !== "succeeded" || lane.successfulTurnId === undefined) return [];
+      const source = store.getTurn(run.taskId, lane.successfulTurnId);
+      if (source === null
+        || source.status !== "completed"
+        || source.result === undefined
+        || source.executionGroupId !== group.id
+        || source.executionLaneId !== lane.id
+        || source.roleName !== lane.roleName) {
+        throw new Error(`Successful source Turn is missing or drifted: ${group.id}/${lane.id}.`);
+      }
+      return [materialize("L4", "source-turn", source.id, source)];
+    });
 }
 
 function materialize(layer: ContextRef["layer"], store: string, refId: string, value: unknown): MaterializedRef {

@@ -26,7 +26,7 @@ export type TaskRuntimeTurnCompleted = Readonly<{
   nativeTurnId: string;
   turnId?: string;
   input?: string;
-  summary: string;
+  output: string;
 }>;
 
 export type GlobalRuntimeTurnCompleted = Readonly<{
@@ -38,7 +38,7 @@ export type GlobalRuntimeTurnCompleted = Readonly<{
   nativeSessionId: string;
   nativeTurnId: string;
   title?: string;
-  summary: string;
+  output: string;
 }>;
 
 export type RuntimeTurnEventObserver = Readonly<{
@@ -351,7 +351,7 @@ export class FileRuntimeEventProcessor implements RuntimeEventProcessorPort {
         nativeSessionId: event.nativeSessionId,
         nativeTurnId: event.nativeTurnId,
         ...(event.turnId === undefined ? {} : { turnId: event.turnId }),
-        summary: event.summary
+        output: event.output
       };
       if (task === null) return "obsolete";
       if (task.status !== "active" || task.executionGate.state !== "enabled") {
@@ -384,7 +384,7 @@ export class FileRuntimeEventProcessor implements RuntimeEventProcessorPort {
       nativeSessionId: event.nativeSessionId,
       nativeTurnId: event.nativeTurnId,
       ...(event.title === undefined ? {} : { title: event.title }),
-      summary: event.summary
+      output: event.output
     };
     if (this.observer.classifyGlobalRuntimeTurnCompleted?.(input) !== "obsolete") {
       this.observer.observeGlobalRuntimeTurnCompleted(input, now);
@@ -890,7 +890,7 @@ export class AsyncRuntimeEventProcessor {
         nativeSessionId: event.nativeSessionId,
         nativeTurnId: event.nativeTurnId,
         ...(event.turnId === undefined ? {} : { turnId: event.turnId }),
-        summary: event.summary
+        output: event.output
       };
       if (task === null) return "obsolete";
       if (task.status !== "active" || task.executionGate.state !== "enabled") {
@@ -923,7 +923,7 @@ export class AsyncRuntimeEventProcessor {
       nativeSessionId: event.nativeSessionId,
       nativeTurnId: event.nativeTurnId,
       ...(event.title === undefined ? {} : { title: event.title }),
-      summary: event.summary
+      output: event.output
     };
     if ((await this.observer.classifyGlobalRuntimeTurnCompleted?.(input)) !== "obsolete") {
       await this.observer.observeGlobalRuntimeTurnCompleted(input, now);

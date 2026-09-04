@@ -17,7 +17,7 @@ import type { Task } from "../task/task.js";
 import { publicationExternalKey } from "../task/publicationReference.js";
 import type { TaskStore } from "../storage/taskStore.js";
 import type { ReviewRound, TaskReviewCandidate } from "../review/reviewRound.js";
-import { isAcceptedTaskReviewBaseline } from "../review/reviewAcceptance.js";
+import { isCompletedTaskReviewEvidence } from "../review/reviewAcceptance.js";
 import {
   workspaceProjectEntry,
   type ManagedWorkspace,
@@ -190,7 +190,7 @@ export function assertTaskCompletionPublishedTreeProof(
   if (proof.reviewRoundId !== undefined) {
     const review = store.getReviewRound(task.id, proof.reviewRoundId);
     if (review === null
-      || !isAcceptedTaskReviewBaseline(store, review)
+      || !isCompletedTaskReviewEvidence(store, review)
       || review.taskCandidate === undefined
       || !sameTaskCandidate(review.taskCandidate, actualCandidate)) {
       throw usageError(
@@ -240,7 +240,7 @@ function acceptedTaskFinalReviews(
   taskId: string
 ): readonly ReviewRound[] {
   return store.listReviewRounds(taskId)
-    .filter((round) => isAcceptedTaskReviewBaseline(store, round))
+    .filter((round) => isCompletedTaskReviewEvidence(store, round))
     .sort((left, right) => (
       right.id.localeCompare(left.id, undefined, { numeric: true })
     ));

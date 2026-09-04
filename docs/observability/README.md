@@ -144,15 +144,15 @@ Sections:
   settles, so a suppression is scheduler backpressure, never a failed Turn.
 - **sessions** — generations, broken/stopped, resets, lifecycle events, stop
   failures.
-- **reviews** — total/completed/failed, non-semantic infrastructure vs
-  semantic-negative; mixed evidence remains ambiguous and fail-closed.
+- **reviews** — total/completed/failed execution counts. Reviewer prose is not
+  parsed into outcome classes.
 - **integrations** — total/committed/failed, environment failures, gate reuse.
 - **publications** — total/merged/verified/open/closed/superseded external
   PR/MR references.
 - **events** — total, progress vs semantic, obsolete, message count.
 - **workItems** — total/completed/retired.
 - **orchestration** — per-Task intent type, Turn/WorkItem counts, full/delta/
-  non-semantic Reviews, finding results, Integration attempts/failures/repeated
+  failed Reviews, Integration attempts/failures/repeated
   identities/evidence reuse, generations before first durable progress,
   publication-to-completion latency, terminal workspaces, and non-blocking
   cost advisories. `--since`/`--until` filters every underlying record family.

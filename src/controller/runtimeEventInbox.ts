@@ -24,7 +24,7 @@ import {
   type RuntimeObservation
 } from "../runtime/runtimeObservation.js";
 
-export const MAX_RUNTIME_TURN_SUMMARY_BYTES = 32 * 1024;
+export const MAX_RUNTIME_TURN_OUTPUT_BYTES = 512 * 1024;
 export const MAX_RUNTIME_EVENT_FILE_BYTES = 16 * 1024 * 1024;
 
 const RUNTIME_EVENT_DIRECTORY = join("runtime", "inbox");
@@ -52,11 +52,11 @@ export type RuntimeTurnCompletedInput = Readonly<{
   nativeTurnId: string;
   turnId?: string;
   title?: string;
-  summary: string;
+  output: string;
 }>;
 
 export type RuntimeTurnCompletedEvent = Readonly<{
-  schemaVersion: 1;
+  schemaVersion: 2;
   id: string;
   type: "native-turn-completed";
   receivedAt: string;
@@ -140,7 +140,7 @@ export class FileRuntimeEventInbox {
   ): RuntimeEventEnqueueResult<RuntimeTurnCompletedEvent> {
     const normalized = normalizeNativeTurnCompletedInput(input);
     return this.publish(Object.freeze({
-      schemaVersion: 1,
+      schemaVersion: 2,
       id: runtimeEventId("native-turn-completed", normalized),
       type: "native-turn-completed",
       receivedAt: this.now().toISOString(),
@@ -407,7 +407,12 @@ function normalizeNativeTurnCompletedInput(
 ): RuntimeTurnCompletedInput {
   const scope = input.scope;
   if (scope !== "task" && scope !== "global") throw invalidEvent();
-  if (typeof input.summary !== "string" || input.summary.includes("\0")) throw invalidEvent();
+  if (typeof input.output !== "string"
+    || input.output.includes("\0")
+    || input.output.trim().length === 0
+    || Buffer.byteLength(input.output, "utf8") > MAX_RUNTIME_TURN_OUTPUT_BYTES) {
+    throw invalidEvent();
+  }
   const common = {
     scope,
     roleName: requireIdentityText(input.roleName, "Role name"),
@@ -424,10 +429,10 @@ function normalizeNativeTurnCompletedInput(
     ...(input.title === undefined
       ? {}
       : { title: requireIdentityText(input.title, "Session title") }),
-    summary: truncateUtf8(input.summary.trim(), MAX_RUNTIME_TURN_SUMMARY_BYTES)
+    output: input.output
   } as const;
   if ((common.adapterId !== "codex" && common.adapterId !== "claude")
-    || common.summary.length === 0) throw invalidEvent();
+    || common.output.length === 0) throw invalidEvent();
   return scope === "task"
     ? { ...common, taskId: requireIdentityText(input.taskId, "Task id") }
     : common;
@@ -513,20 +518,20 @@ function parseNativeTurnCompletedEvent(value: Record<string, any>): RuntimeTurnC
   const expected = scope === "task"
     ? [
         "schemaVersion", "id", "type", "receivedAt", "scope", "taskId",
-        "roleName", "agentId", "adapterId", "nativeSessionId", "nativeTurnId", "summary",
+        "roleName", "agentId", "adapterId", "nativeSessionId", "nativeTurnId", "output",
         ...(value.runtimeGenerationId === undefined ? [] : ["runtimeGenerationId"]),
         ...(value.turnId === undefined ? [] : ["turnId"]),
         ...(value.title === undefined ? [] : ["title"])
       ]
     : [
         "schemaVersion", "id", "type", "receivedAt", "scope",
-        "roleName", "agentId", "adapterId", "nativeSessionId", "nativeTurnId", "summary",
+        "roleName", "agentId", "adapterId", "nativeSessionId", "nativeTurnId", "output",
         ...(value.runtimeGenerationId === undefined ? [] : ["runtimeGenerationId"]),
         ...(value.turnId === undefined ? [] : ["turnId"]),
         ...(value.title === undefined ? [] : ["title"])
       ];
   if ((scope !== "task" && scope !== "global")
-    || value.schemaVersion !== 1
+    || value.schemaVersion !== 2
     || !hasExactKeys(value, expected)) throw invalidEvent();
   const receivedAt = requireTimestamp(value.receivedAt);
   const normalized = normalizeNativeTurnCompletedInput({
@@ -540,10 +545,10 @@ function parseNativeTurnCompletedEvent(value: Record<string, any>): RuntimeTurnC
     nativeTurnId: value.nativeTurnId,
     ...(value.turnId === undefined ? {} : { turnId: value.turnId }),
     ...(value.title === undefined ? {} : { title: value.title }),
-    summary: value.summary
+    output: value.output
   });
   return Object.freeze({
-    schemaVersion: 1,
+    schemaVersion: 2,
     id: requireIdentityText(value.id, "Event id"),
     type: "native-turn-completed",
     receivedAt,
@@ -564,14 +569,6 @@ function requireTimestamp(value: unknown): string {
   const timestamp = requireIdentityText(value, "Received at");
   if (!Number.isFinite(Date.parse(timestamp))) throw invalidEvent();
   return timestamp;
-}
-
-function truncateUtf8(value: string, maximumBytes: number): string {
-  const encoded = Buffer.from(value, "utf8");
-  if (encoded.length <= maximumBytes) return value;
-  let end = maximumBytes;
-  while (end > 0 && (encoded[end] & 0b1100_0000) === 0b1000_0000) end -= 1;
-  return encoded.subarray(0, end).toString("utf8");
 }
 
 function ensureInboxDirectory(directory: string): void {

@@ -566,15 +566,7 @@ function renderReviewRounds(
             ? [`      Review mode: full`]
             : [
                 `      Review mode: delta-recheck (rechecks ${latest.deltaRecheck.previousReviewRoundId}@${latest.deltaRecheck.previousBaseCommit.slice(0, 12)})`,
-                `      Delta: ${latest.deltaRecheck.changedFiles.length} file(s), +${latest.deltaRecheck.addedLines}/-${latest.deltaRecheck.deletedLines}, digest ${latest.deltaRecheck.diffDigest.slice(0, 12)}`,
-                ...(latest.deltaRecheck.disposition === undefined
-                  ? []
-                  : [
-                      `      Delta disposition: ${latest.deltaRecheck.disposition}`,
-                      ...(latest.deltaRecheck.escalatedToReviewRoundId === undefined
-                        ? []
-                        : [`      Escalated to: ${latest.deltaRecheck.escalatedToReviewRoundId}`])
-                    ])
+                `      Delta: ${latest.deltaRecheck.changedFiles.length} file(s), +${latest.deltaRecheck.addedLines}/-${latest.deltaRecheck.deletedLines}, digest ${latest.deltaRecheck.diffDigest.slice(0, 12)}`
               ])
         ]
       : []),
@@ -582,13 +574,10 @@ function renderReviewRounds(
       ? "not prepared"
       : `${latest.workspace.root} (${latest.workspace.entries.length} writable Projects)`}`,
     `      Workspace disposition: ${latest.workspaceDisposition?.kind ?? "pending"}`,
-    `      Diagnostic evidence: ${latest.evidenceCommit ?? "none"}`,
-    `      Checks: ${latest.checks === undefined || latest.checks.length === 0
-      ? "none"
-      : latest.checks.map(({ name, outcome }) => `${name}=${outcome}`).join(", ")}`,
-    ...(latest.summary === undefined
+    `      Main Reviewer Turn: ${latest.reviewerTurnId ?? "not dispatched"}`,
+    ...(latest.failure === undefined
       ? []
-      : [`      Review summary: ${compactText(latest.summary)}`]),
+      : [`      Core failure: ${latest.failure.kind} · ${compactText(latest.failure.message)}`]),
     ...(latest.executionGroup === undefined
       ? []
       : [
@@ -737,5 +726,5 @@ function resourceUsageLabel(
 function renderWorkItemObservability(
   item: WorkItemObservabilityProjection
 ): string {
-  return `    Observability (read-only): tokens=${item.cost.tokensObservable ? item.cost.tokens : "unobserved"}; tools=${item.cost.toolCallsObservable ? item.cost.toolCalls : "unobserved"}; wall=${item.cost.wallClockSeconds}s; retries=${item.cost.retryCount}; snapshots=${item.context.snapshotCount}; evidence=${item.evidenceCount ?? "unobserved"}; open-findings=${item.openFindingCount ?? "unobserved"}; compression=${item.context.compressionStatus}`;
+  return `    Observability (read-only): tokens=${item.cost.tokensObservable ? item.cost.tokens : "unobserved"}; tools=${item.cost.toolCallsObservable ? item.cost.toolCalls : "unobserved"}; wall=${item.cost.wallClockSeconds}s; retries=${item.cost.retryCount}; snapshots=${item.context.snapshotCount}; agent-results=${item.resultCount ?? "unobserved"}; compression=${item.context.compressionStatus}`;
 }

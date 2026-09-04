@@ -10,13 +10,7 @@ import {
 } from "../integration/deliveryObligation.js";
 import type { Turn } from "../turn/turn.js";
 import type { ReviewRound, TaskReviewCandidate } from "../review/reviewRound.js";
-import { isAcceptedTaskReviewBaselineFromEvidence } from "../review/reviewAcceptance.js";
-import {
-  classifyReviewRoundOutcome,
-  isSemanticReviewRound,
-  type ReviewOutcomeEvidenceStore
-} from "../review/reviewOutcomeClassifier.js";
-import type { ReviewFinding } from "../review/reviewFinding.js";
+import { isCompletedTaskReviewEvidenceFromTurns } from "../review/reviewAcceptance.js";
 import {
   actionableExecutionLaneRecoveries,
   type ActionableExecutionLaneRecovery,
@@ -30,7 +24,6 @@ import {
   resolveRecordedTaskFinalReviewContract,
   type TaskFinalReviewContractResolution
 } from "../review/taskFinalReviewContractResolution.js";
-import type { TaskEvent } from "../event/taskEvent.js";
 import type { ReviewConfig } from "../review/reviewConfig.js";
 import type { Task } from "./task.js";
 import { draftWorkItemDependencyIssue } from "./draftPlan.js";
@@ -60,7 +53,6 @@ export type NextActionKind =
   | "accept-or-reject-candidate"
   | "integrate-work-item"
   | "request-final-review"
-  | "route-review-findings"
   | "resolve-execution-stage"
   | "resume-review"
   | "retry-execution-lane"
@@ -119,11 +111,9 @@ export type NextActionFacts = Readonly<{
   activeTurns: readonly Turn[];
   /** Recent Leader Turns (any status), newest last; consumed by the semantic budget. */
   leaderTurns: readonly Turn[];
-  /** Bounded corroboration for terminal Review outcome classification. */
+  /** Exact Review Turns needed to validate structural Review completion. */
   reviewOutcomeEvidence?: Readonly<{
     turns: readonly Turn[];
-    reviewFindings: readonly ReviewFinding[];
-    events: readonly TaskEvent[];
   }>;
   /** Current unresolved Lane health supplied by canonical Task read surfaces. */
   executionGroups?: readonly ExecutionGroupHealthSummary[];
@@ -420,22 +410,15 @@ export function projectNextAction(facts: NextActionFacts): NextAction {
   const failedWork = facts.workItems.find((item) => item.status === "failed");
   if (failedWork !== undefined) {
     const failedReview = latestFailedReviewFor(facts.reviewRounds, failedWork.id);
-    if (failedReview !== undefined) {
-      return buildAction(facts, {
-        kind: "route-review-findings",
-        reason: `Work Item ${failedWork.id} failed with Review ${failedReview.id}; route its open findings into a repair wave.`,
-        refs: [ref("work-item", failedWork.id), ref("review-round", failedReview.id)],
-        preconditions: [
-          { fact: "Work Item is failed", satisfied: true, ref: ref("work-item", failedWork.id) },
-          { fact: "Review Round is failed", satisfied: true, ref: ref("review-round", failedReview.id) }
-        ],
-        recommendedCommand: `yui task review finding repair-wave ${task.id} --create`
-      });
-    }
     return buildAction(facts, {
       kind: "implement-current-work-item",
-      reason: `Work Item ${failedWork.id} failed without a Review verdict; retry implementation.`,
-      refs: [ref("work-item", failedWork.id)],
+      reason: failedReview === undefined
+        ? `Work Item ${failedWork.id} failed; retry implementation after Leader diagnosis.`
+        : `Work Item ${failedWork.id} failed after Review ${failedReview.id}; the Leader must read its exact Reviewer Turn result and choose the repair.`,
+      refs: [
+        ref("work-item", failedWork.id),
+        ...(failedReview === undefined ? [] : [ref("review-round", failedReview.id)])
+      ],
       preconditions: [
         { fact: "Work Item is failed", satisfied: true, ref: ref("work-item", failedWork.id) }
       ],
@@ -553,11 +536,8 @@ export function projectNextAction(facts: NextActionFacts): NextAction {
   const finalReviewRequired = taskFinalReviewRequired(facts);
   const finalReviewContract = taskFinalReviewContract(facts);
   const failedFinal = latestTaskFinalReview(facts.reviewRounds, finalReviewContract);
-  const failedFinalOutcome = failedFinal === undefined
-    ? null
-    : classifyReviewRoundOutcome(failedFinal, nextActionReviewOutcomeEvidence(facts));
   if (finalReviewRequired
-    && failedFinal !== undefined && failedFinalOutcome?.kind === "non-semantic") {
+    && failedFinal?.status === "failed") {
     const reviewerTurn = failedFinal.reviewerTurnId === undefined
       ? undefined
       : facts.reviewOutcomeEvidence?.turns.find(
@@ -568,93 +548,46 @@ export function projectNextAction(facts: NextActionFacts): NextAction {
       : reviewerTurn?.status === "failed"
         ? `yui task turn retry ${task.id}/${reviewerTurn.id}`
         : undefined;
-    const directForceFresh = failedFinal.executionGroup === undefined
-      ? {
-          kind: "force-fresh-review",
-          reason:
-            "Create a distinct full Round only when preserving this direct non-semantic attempt as immutable history is preferable.",
-          recommendedCommand:
-            `yui task review force-fresh ${task.id}/${failedFinal.id}`,
-          refs: [ref("review-round", failedFinal.id)]
-        }
-      : undefined;
     return buildAction(facts, {
       kind: "resume-review",
-      reason: `Task-final Review ${failedFinal.id} ended before a semantic review was proven.`,
+      reason: `Task-final Review ${failedFinal.id} failed during execution: ${
+        failedFinal.failure?.message ?? "unknown Core failure"
+      }.`,
       refs: [
         ref("review-round", failedFinal.id),
         ...(reviewerTurn?.status === "failed" ? [ref("turn", reviewerTurn.id)] : [])
       ],
       preconditions: [
-        { fact: "Task-final Review has semantic evidence", satisfied: false, ref: ref("review-round", failedFinal.id) }
+        {
+          fact: "Task-final Review has one exact completed Reviewer Turn",
+          satisfied: false,
+          ref: ref("review-round", failedFinal.id)
+        }
       ],
-      ...(sameRoundCommand !== undefined
-        ? { recommendedCommand: sameRoundCommand }
-        : directForceFresh === undefined
-          ? {}
-          : { recommendedCommand: directForceFresh.recommendedCommand }),
-      ...(sameRoundCommand === undefined || directForceFresh === undefined
-        ? {}
-        : { alternatives: [directForceFresh] })
+      ...(sameRoundCommand === undefined ? {} : { recommendedCommand: sameRoundCommand })
     });
   }
   if (finalReviewRequired
-    && failedFinal !== undefined && failedFinalOutcome?.kind === "ambiguous") {
+    && failedFinal?.status === "completed"
+    && !isCompletedTaskReviewEvidenceFromTurns(
+      failedFinal,
+      facts.reviewOutcomeEvidence?.turns ?? []
+    )) {
     return buildAction(facts, {
       kind: "repair-protocol-inconsistency",
-      reason: `Task-final Review ${failedFinal.id} has ambiguous semantic and infrastructure evidence: ${failedFinalOutcome.reason}`,
+      reason:
+        `Task-final Review ${failedFinal.id} is completed without one exact completed main Reviewer Turn.`,
       refs: [ref("review-round", failedFinal.id)],
       conflicts: [ref("review-round", failedFinal.id)],
       preconditions: [
-        { fact: "Review outcome is unambiguously semantic or non-semantic", satisfied: false, ref: ref("review-round", failedFinal.id) }
+        {
+          fact: "ReviewRound and exact main Reviewer Turn agree",
+          satisfied: false,
+          ref: ref("review-round", failedFinal.id)
+        }
       ]
     });
   }
-  if (finalReviewRequired
-    && failedFinal !== undefined
-    && failedFinalOutcome?.kind === "semantic"
-    && failedFinal.deltaRecheck?.disposition === "requires-full-review") {
-    return buildAction(facts, {
-      kind: "request-final-review",
-      reason: `Delta Recheck ${failedFinal.id} could not establish equivalence; Yui recorded the result and left the next Review action to the Leader.`,
-      refs: [ref("review-round", failedFinal.id)],
-      preconditions: [
-        { fact: "Current frozen head has accepting final Review evidence", satisfied: false }
-      ],
-      alternatives: [
-        {
-          kind: "request-full-review",
-          reason: "Request a full Review when independent evidence is still required.",
-          recommendedCommand:
-            `yui task review request ${task.id} --role ${failedFinal.reviewerRoleName}`,
-          refs: [ref("review-round", failedFinal.id)]
-        },
-        {
-          kind: "continue-leader-work",
-          reason: "Inspect directly, change the candidate, or choose another Reviewer as Task risk requires.",
-          refs: [ref("review-round", failedFinal.id)]
-        }
-      ],
-      judgmentRequired:
-        "Leader must choose full Review, another Reviewer, direct inspection, or more development; Core will not auto-escalate."
-    });
-  }
-  if (finalReviewRequired
-    && failedFinal !== undefined
-    && failedFinalOutcome?.kind === "semantic"
-    && ((failedFinal.checks ?? []).some(({ outcome }) => outcome === "failed")
-      || failedFinal.deltaRecheck?.disposition === "finding")) {
-    return buildAction(facts, {
-      kind: "route-review-findings",
-      reason: `Task-final Review ${failedFinal.id} delivered semantic negative evidence; route its open findings into a repair wave on one frozen head.`,
-      refs: [ref("review-round", failedFinal.id)],
-      preconditions: [
-        { fact: "Task-final Review is failed", satisfied: true, ref: ref("review-round", failedFinal.id) }
-      ],
-      recommendedCommand: `yui task review finding repair-wave ${task.id} --create`
-    });
-  }
-
   const activeFinal = latestTaskFinalReview(facts.reviewRounds, finalReviewContract);
   if (activeFinal !== undefined
     && (activeFinal.status === "pending" || activeFinal.status === "running")) {
@@ -776,15 +709,12 @@ export function projectNextAction(facts: NextActionFacts): NextAction {
 
   const finalReviewOptional = !finalReviewRequired
     && !hasValidFinalReview(facts);
-  const unresolvedDelta = failedFinal?.deltaRecheck?.disposition === "requires-full-review";
   const optionalReviewer = facts.reviewConfig?.roleName
-    ?? (unresolvedDelta ? failedFinal?.reviewerRoleName : undefined);
+    ?? failedFinal?.reviewerRoleName;
   const finalReviewAlternative = finalReviewOptional && optionalReviewer !== undefined
     ? [{
         kind: "request-final-review",
-        reason: unresolvedDelta
-          ? `Delta Recheck ${failedFinal!.id} returned requires-full-review; request full independent evidence when the Leader judges it necessary.`
-          : "Request an independent Task-final Review when the Leader wants extra assurance before completion.",
+        reason: "Request an independent Task-final Review when the Leader wants extra assurance before completion.",
         recommendedCommand: `yui task review request ${task.id} --role ${optionalReviewer}`,
         refs: [ref("task", task.id)]
       }]
@@ -816,9 +746,7 @@ export function projectNextAction(facts: NextActionFacts): NextAction {
       ? {}
       : {
           judgmentRequired:
-            unresolvedDelta
-              ? "Leader must route the non-accepting Delta result: full Review, another Reviewer, direct inspection, more development, or completion when policy permits."
-              : "Leader must decide whether the frozen Task result is safe to complete or needs one optional Task-final Review."
+            "Leader must decide whether the frozen Task result is safe to complete or needs one optional Task-final Review."
         }),
     recommendedCommand: `yui task complete ${task.id} --summary-file -`
   });
@@ -1099,24 +1027,11 @@ function hasValidFinalReview(facts: NextActionFacts): boolean {
         contract
       ))
     ));
-  if (final === undefined || !isAcceptedTaskReviewBaselineFromEvidence(
+  if (final === undefined || !isCompletedTaskReviewEvidenceFromTurns(
     final,
-    nextActionReviewOutcomeEvidence(facts)
+    facts.reviewOutcomeEvidence?.turns ?? []
   )) return false;
   return final.taskCandidate !== undefined;
-}
-
-/** Adapts the serializable next-action evidence bundle to the shared classifier. */
-export function nextActionReviewOutcomeEvidence(
-  facts: NextActionFacts
-): ReviewOutcomeEvidenceStore | undefined {
-  const evidence = facts.reviewOutcomeEvidence;
-  if (evidence === undefined) return undefined;
-  return {
-    listTurns: () => evidence.turns,
-    listReviewFindings: () => evidence.reviewFindings,
-    listEvents: () => evidence.events
-  };
 }
 
 type Inconsistency = Readonly<{

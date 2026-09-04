@@ -11,11 +11,7 @@ import { roleAgentSessionResumeMode } from "../executor/agentExecutor.js";
 import { resolveEffectiveLaunch } from "../executor/effectiveLaunch.js";
 import { createTaskEvent } from "../event/taskEvent.js";
 import type { TaskStore } from "../storage/taskStore.js";
-import {
-  createTurn,
-  type ProducerTurnResult,
-  type Turn
-} from "../turn/turn.js";
+import { createTurn, type Turn } from "../turn/turn.js";
 import {
   currentWorkItemExecutionGroup,
   updateWorkItemStatus,
@@ -31,7 +27,6 @@ export type WorkItemSynthesisProducer = Readonly<{
   laneId: string;
   roleName: string;
   turnId: string;
-  result: ProducerTurnResult;
 }>;
 
 export type WorkItemMainTurnReconciliation = Readonly<{
@@ -59,7 +54,7 @@ export function successfulWorkItemSynthesisProducers(
         || turn.workItemId !== item.id
         || turn.executionGroupId !== group.id
         || turn.executionLaneId !== lane.id
-        || turn.result?.producer === undefined) {
+        || turn.result === undefined) {
         throw new Error(
           `Successful ExecutionLane has no exact Producer Turn result: ${group.id}/${lane.id}.`
         );
@@ -67,8 +62,7 @@ export function successfulWorkItemSynthesisProducers(
       return [{
         laneId: lane.id,
         roleName: lane.roleName,
-        turnId: turn.id,
-        result: turn.result.producer
+        turnId: turn.id
       }];
     });
 }
@@ -156,6 +150,7 @@ export function reconcileWorkItemMainTurns(
       roleName: role.name,
       purpose: "execution",
       workItemId: item.id,
+      sourceExecutionGroupId: group.id,
       workspace
     }, now, "controller", group.assignment.contextSnapshotRef);
     const turn = createTurn(
@@ -219,12 +214,12 @@ function synthesisDirective(
   producers: readonly WorkItemSynthesisProducer[]
 ): string {
   return [
-    "Synthesize the frozen successful Producer results below in the WorkItem main workspace.",
+    "Synthesize every frozen successful Producer result in stable Lane order.",
+    "Expand each exact source Turn from the frozen Context Snapshot and consume its original result text plus Core-authored system evidence.",
     "Do not rerun, retry, append, or abandon any Lane. Form the final WorkItem result from these records.",
     JSON.stringify({
       schemaVersion: 1,
       sourceExecutionGroupId: group.id,
-      assignment: group.assignment,
       producers
     }, null, 2)
   ].join("\n\n");

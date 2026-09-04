@@ -102,6 +102,8 @@ export type RuntimeObservationPayload = Readonly<{
   failure?: RuntimeTurnFailure;
   /** Provider-visible input only; never reasoning or tool activity. */
   input?: string;
+  /** Exact final Agent result text; Core treats it as opaque transport. */
+  output?: string;
   summary?: string;
   execution?: "active" | "quiescent" | "unknown";
   outcome?: "pending" | "succeeded" | "failed" | "cancelled" | "unknown";
@@ -121,7 +123,7 @@ export type RuntimeObservationPayload = Readonly<{
 }>;
 
 export type RuntimeObservation = Readonly<{
-  schemaVersion: 3;
+  schemaVersion: 4;
   eventId: string;
   semanticKey: string;
   kind: RuntimeObservationKind;
@@ -227,7 +229,7 @@ const PROVIDER_STATE: ReadonlySet<RuntimeObservationKind> = new Set([
 ]);
 
 export function createRuntimeObservation(input: RuntimeObservation): RuntimeObservation {
-  if (input.schemaVersion !== 3) throw new Error("Runtime observation schemaVersion must be 3.");
+  if (input.schemaVersion !== 4) throw new Error("Runtime observation schemaVersion must be 4.");
   if (!KINDS.includes(input.kind)) throw new Error("Runtime observation kind is invalid.");
   if (!AUTHORITIES.includes(input.authority)) throw new Error("Runtime observation authority is invalid.");
   if (input.kind === "host.observed" && input.authority !== "host" && input.authority !== "controller") {
@@ -271,7 +273,7 @@ export function createRuntimeObservation(input: RuntimeObservation): RuntimeObse
     throw new Error("Runtime observation ordinal must be a non-negative safe integer.");
   }
   return Object.freeze({
-    schemaVersion: 3,
+    schemaVersion: 4,
     eventId: requireIdentity(input.eventId, "Runtime observation event id"),
     semanticKey: requireIdentity(input.semanticKey, "Runtime observation semantic key"),
     kind: input.kind,
@@ -570,6 +572,9 @@ function normalizePayload(
       : { observerDetail: requireText(input.observerDetail, "Runtime observer detail") }),
     ...(failure === undefined ? {} : { failure }),
     ...(input.input === undefined ? {} : { input: requireText(input.input, "Provider-visible input") }),
+    ...(input.output === undefined
+      ? {}
+      : { output: requireResultText(input.output, "Runtime Turn output") }),
     ...(input.summary === undefined ? {} : { summary: requireText(input.summary, "Runtime summary") }),
     ...(input.execution === undefined ? {} : { execution: input.execution }),
     ...(input.outcome === undefined ? {} : { outcome: input.outcome }),
@@ -769,4 +774,11 @@ function requireText(value: unknown, label: string): string {
     throw new Error(`${label} is invalid.`);
   }
   return normalized;
+}
+
+function requireResultText(value: unknown, label: string): string {
+  if (typeof value !== "string" || value.includes("\0") || value.trim().length === 0) {
+    throw new Error(`${label} is invalid.`);
+  }
+  return value;
 }

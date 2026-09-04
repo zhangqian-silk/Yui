@@ -899,7 +899,7 @@ function collectBlockers(
       kind: "review",
       id: round.id,
       owner: "leader",
-      summary: round.summary ?? `ReviewRound ${round.id} failed.`
+      summary: round.failure?.message ?? `ReviewRound ${round.id} failed.`
     });
   }
   for (const attempt of integrations.filter(({ status }) => status === "blocked" || status === "failed")) {

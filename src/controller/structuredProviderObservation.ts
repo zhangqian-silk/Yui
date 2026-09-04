@@ -312,7 +312,7 @@ export async function publishStructuredProviderTerminal(input: Readonly<{
   const payload: RuntimeObservationPayload = kind === "turn.completed"
     ? {
         ...(input.terminal.input === undefined ? {} : { input: input.terminal.input }),
-        ...(input.terminal.summary === undefined ? {} : { summary: input.terminal.summary })
+        ...(input.terminal.output === undefined ? {} : { output: input.terminal.output })
       }
     : kind === "turn.failed"
       ? {
@@ -421,7 +421,7 @@ function observation(input: Readonly<{
     payload: input.payload ?? {}
   };
   return createRuntimeObservation({
-    schemaVersion: 3,
+    schemaVersion: 4,
     eventId,
     semanticKey: runtimeObservationSemanticKey(partial),
     kind: input.kind,

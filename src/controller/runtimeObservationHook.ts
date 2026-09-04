@@ -126,7 +126,7 @@ async function runGlobalRuntimeTurnHook(
     ...(environment.YUI_SESSION_TITLE === undefined
       ? {}
       : { title: requireIdentity(environment.YUI_SESSION_TITLE, "Session title") }),
-    summary: globalHookSummary(payload, hookEventName)
+    output: globalHookOutput(payload, hookEventName)
   });
   await call(
     home,
@@ -136,13 +136,13 @@ async function runGlobalRuntimeTurnHook(
   ).catch(() => {});
 }
 
-function globalHookSummary(
+function globalHookOutput(
   payload: Readonly<Record<string, unknown>>,
   hookEventName: "Stop" | "StopFailure"
 ): string {
   for (const field of ["last_assistant_message", "summary", "message", "error"]) {
     const value = payload[field];
-    if (typeof value === "string" && value.trim().length > 0) return value.trim();
+    if (typeof value === "string" && value.trim().length > 0) return value;
   }
   return hookEventName === "Stop" ? "Native Turn completed." : "Native Turn failed.";
 }

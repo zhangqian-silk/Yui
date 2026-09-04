@@ -11,7 +11,6 @@ import {
   sameTaskFinalReviewContract,
   type TaskFinalReviewContract
 } from "../review/taskFinalReviewContract.js";
-import type { ReviewCheck } from "../review/reviewRound.js";
 import type { TaskStore } from "../storage/taskStore.js";
 import {
   governingWorkItemCandidate,
@@ -375,46 +374,13 @@ export class WorkItemChangeSetManager {
     });
   }
 
-  /**
-   * Verified evidence for the exact reviewed candidate.  A completed
-   * ReviewRound freezes the candidate it reviewed at `reviewBaseCommit`; when
-   * the captured ChangeSet head is that commit, the round's checks are
-   * durable evidence for it.  "completed" alone is not a verdict: the
-   * reviewer may have completed with failed checks (requires-repair), so only a
-   * round with an explicit positive verdict — at least one passed check and
-   * no failed one — may feed `evidenceRefs`.  The link is by
-   * `reviewBaseCommit`, not by `evidenceCommit`: the latter records the exact
-   * tree the checks ran on (the frozen base for a clean review, a diagnostic
-   * commit for a committed-diagnostic review, absent for a dirty review), and
-   * the queue separately re-checks that tree binding before waiving a gate.
-   */
   #captureEvidenceRefs(
-    taskId: string,
-    workItemId: string,
-    headCommit: string
+    _taskId: string,
+    _workItemId: string,
+    _headCommit: string
   ): readonly string[] {
-    return this.store.listReviewRounds(taskId)
-      .filter((round) => round.status === "completed"
-        && round.workItemId === workItemId
-        && round.reviewBaseCommit === headCommit
-        && hasPositiveReviewVerdict(round.checks))
-      .map(({ id }) => `review-round:${id}`);
+    return [];
   }
-}
-
-/**
- * A ReviewRound carries reusable verification evidence only when its checks
- * state an explicit positive verdict: at least one check passed and none
- * failed.  A round without checks, or with only skipped checks, has no
- * positive conclusion; a round with a failed check rejects the candidate.
- * Neither may skip a later gate.
- */
-function hasPositiveReviewVerdict(
-  checks: readonly ReviewCheck[] | undefined
-): boolean {
-  return checks !== undefined
-    && checks.some((check) => check.outcome === "passed")
-    && checks.every((check) => check.outcome !== "failed");
 }
 
 type CapturableContext = Readonly<{

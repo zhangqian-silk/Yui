@@ -108,8 +108,8 @@ export type WorkItemCandidate = Readonly<{
 }>;
 
 export type WorkItem = {
-  /** v14 replaces configurable WorkItem panels with fixed replicated Groups. */
-  schemaVersion: 14;
+  /** v15 removes retired pre-unified execution history from the current contract. */
+  schemaVersion: 15;
   id: string;
   taskId: string;
   title: string;
@@ -119,11 +119,6 @@ export type WorkItem = {
   writeProjectIds: readonly string[];
   /** Immutable execution history for this WorkItem. */
   executionGroups: readonly WorkItemExecutionGroup[];
-  /**
-   * Immutable pre-v14 execution history retained only for audit after the
-   * execution-model migration. It is never dispatch or recovery authority.
-   */
-  legacyExecutionGroups?: readonly Readonly<Record<string, unknown>>[];
   /** Current iteration Group; historical Groups remain addressable by id. */
   currentExecutionGroupId?: string;
   /** Explicit Git refs for the initial writable WorkItem worktree. */
@@ -174,7 +169,7 @@ export function createWorkItem(
 ): WorkItem {
   const timestamp = now.toISOString();
   return validateWorkItem({
-    schemaVersion: 14,
+    schemaVersion: 15,
     id: requireIdentity(id, "Work Item id"),
     taskId: requireIdentity(taskId, "Task id"),
     title: requireText(input.title, "Work item title"),
@@ -522,7 +517,30 @@ export function recordWorkItemWorkspaceDisposition(
 }
 
 export function validateWorkItem(workItem: WorkItem): WorkItem {
-  if (workItem.schemaVersion !== 14) throw new Error("WorkItem must use schemaVersion 14.");
+  rejectUnknownFields(workItem as unknown as Record<string, unknown>, [
+    "schemaVersion",
+    "id",
+    "taskId",
+    "title",
+    "objective",
+    "acceptance",
+    "dependsOn",
+    "writeProjectIds",
+    "executionGroups",
+    "currentExecutionGroupId",
+    "baseRefs",
+    "revision",
+    "assignee",
+    "status",
+    "candidates",
+    "outcome",
+    "disposition",
+    "workspaceDisposition",
+    "createdAt",
+    "updatedAt",
+    "endedAt"
+  ], "WorkItem");
+  if (workItem.schemaVersion !== 15) throw new Error("WorkItem must use schemaVersion 15.");
   validateTaskRecordReference({ taskId: workItem.taskId, localId: workItem.id }, "workItem");
   requireIdentity(workItem.taskId, "Task id");
   requireText(workItem.title, "Work item title");
@@ -548,13 +566,6 @@ export function validateWorkItem(workItem: WorkItem): WorkItem {
   }
   if (!Array.isArray(workItem.executionGroups)) {
     throw new Error("Work Item executionGroups are invalid.");
-  }
-  if (workItem.legacyExecutionGroups !== undefined
-    && (!Array.isArray(workItem.legacyExecutionGroups)
-      || workItem.legacyExecutionGroups.some((group) => (
-        typeof group !== "object" || group === null || Array.isArray(group)
-      )))) {
-    throw new Error("Work Item legacy execution history is invalid.");
   }
   const groupIds = new Set<string>();
   for (const group of workItem.executionGroups) {
@@ -1045,4 +1056,14 @@ function sameDisposition(
   return left.by === right.by
     && left.summary === right.summary
     && left.replacementWorkItemId === right.replacementWorkItemId;
+}
+
+function rejectUnknownFields(
+  value: Record<string, unknown>,
+  fields: readonly string[],
+  label: string
+): void {
+  const allowed = new Set(fields);
+  const unknown = Object.keys(value).find((field) => !allowed.has(field));
+  if (unknown !== undefined) throw new Error(`${label} has unknown field: ${unknown}.`);
 }

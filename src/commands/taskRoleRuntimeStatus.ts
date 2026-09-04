@@ -565,7 +565,7 @@ function projectTaskRoleRuntime(
   };
   let projection = projectRuntimeTaskEvents(fence, run.createdAt, events);
   projection = projectRuntimeObservation(projection, createRuntimeObservation({
-    schemaVersion: 3,
+    schemaVersion: 4,
     eventId: `runtime-host-${run.id}`,
     semanticKey: `runtime-host-${run.id}`,
     kind: "host.observed",

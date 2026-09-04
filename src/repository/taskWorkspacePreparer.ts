@@ -55,10 +55,6 @@ import {
   type ManagedWorkspace,
   type WorkspaceProjectEntry
 } from "../worktree/managedWorkspace.js";
-import {
-  validateExecutionGroup,
-  type ExecutionGroup
-} from "../execution/legacyExecutionGroup.js";
 import type { ExecutionLaneGitSnapshot } from "./executionLaneGitSnapshot.js";
 import type { Turn } from "../turn/turn.js";
 import { formatTurnReceiptId } from "../task/taskRecordReference.js";
@@ -1263,27 +1259,20 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
     executionLaneId: string
   ): Promise<GitWorkspaceRemoval> {
     const task = requireTask(this.store, taskId);
-    const located = cleanupExecutionLaneLineage(
+    const lineage = executionLaneLineage(
       this.store,
       task,
       executionGroupId,
       executionLaneId
     );
-    const { lineage, legacyGroup } = located;
     const item = lineage.purpose === "execution"
       ? this.store.getWorkItem(taskId, lineage.workItemId)
       : null;
-    const group = legacyGroup ?? (lineage.purpose === "execution"
+    const group = lineage.purpose === "execution"
       ? (item === null ? undefined : workItemExecutionGroupById(item, executionGroupId))
-      : this.store.getReviewRound(taskId, lineage.reviewRoundId)?.executionGroup);
+      : this.store.getReviewRound(taskId, lineage.reviewRoundId)?.executionGroup;
     const lane = group?.lanes.find(({ id }) => id === executionLaneId);
-    const terminal = legacyGroup !== undefined
-      ? lane !== undefined
-      : lane === undefined
-      ? false
-      : "disposition" in lane
-        ? lane.disposition !== "open"
-        : ["completed", "failed", "skipped"].includes(lane.status);
+    const terminal = lane !== undefined && lane.disposition !== "open";
     if (group === undefined
       || lane === undefined || !terminal) {
       throw new Error(`Execution Lane is not terminally resolved: ${taskId}/${executionLaneId}.`);
@@ -1375,9 +1364,7 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
   async cleanupExecutionLaneWorkspacesForWorkItem(taskId: string, workItemId: string): Promise<GitWorkspaceRemoval> {
     let result: GitWorkspaceRemoval = "missing";
     const item = this.store.getWorkItem(taskId, workItemId);
-    const groups = item === null
-      ? []
-      : [...item.executionGroups, ...legacyExecutionGroups(item)];
+    const groups = item?.executionGroups ?? [];
     for (const group of groups) for (const lane of group.lanes) {
       const owner = this.store.listManagedWorkspaces(taskId).find(({ owner }) => (
         owner.type === "execution-lane" && owner.purpose === "execution"
@@ -1402,7 +1389,7 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
       ? []
       : [
           ...(round.executionGroup?.lanes ?? []),
-          ...(legacyReviewExecutionGroup(round)?.lanes ?? [])
+          ...(round.executionGroup?.lanes ?? [])
         ];
     for (const lane of lanes) {
       const owner = this.store.listManagedWorkspaces(taskId).find(({ owner }) => (
@@ -1997,83 +1984,6 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
     );
   }
 
-  async snapshotReviewRoundResult(
-    taskId: string,
-    reviewRoundId: string
-  ): Promise<Readonly<{ evidenceCommit?: string }>> {
-    const round = this.store.getReviewRound(taskId, reviewRoundId);
-    if (round === null) throw new Error(`ReviewRound not found: ${taskId}/${reviewRoundId}.`);
-    const workspace = this.store.getReviewRoundWorkspace(taskId, reviewRoundId);
-    if (round.status !== "running" || workspace === null) {
-      throw new Error(`ReviewRound is not running in a managed workspace: ${reviewRoundId}.`);
-    }
-    assertReviewRoundOwnsWorkspace(round.id, workspace);
-    if (round.workspace === undefined || !isDeepStrictEqual(round.workspace, workspace)) {
-      throw new Error(`ReviewRound workspace record diverged: ${round.id}.`);
-    }
-    return this.#snapshotReviewWorkspaceEntries(round.id, workspace, round.reviewBaseCommit);
-  }
-
-  /**
-   * Snapshot the exact workspace recorded on one Reviewer Turn. Panel Lanes
-   * own separate durable workspaces; the ReviewRound's shared workspace is
-   * not a valid substitute for a Lane's branch/head evidence.
-   */
-  async snapshotReviewRunResult(
-    taskId: string,
-    run: Turn
-  ): Promise<Readonly<{ evidenceCommit?: string }>> {
-    if (run.taskId !== taskId || run.purpose !== "review" || run.reviewRoundId === undefined) {
-      throw new Error(`Turn is not an exact ReviewRound Turn: ${run.id}.`);
-    }
-    if (run.workspace === undefined) {
-      throw new Error(`Review Turn has no managed workspace: ${run.id}.`);
-    }
-    const round = this.store.getReviewRound(taskId, run.reviewRoundId);
-    if (round === null || round.status !== "running") {
-      throw new Error(`ReviewRound is not running for Review Turn: ${run.id}.`);
-    }
-    const stored = this.store.getManagedWorkspace(run.workspace.owner);
-    if (stored === null || !isDeepStrictEqual(stored, run.workspace)) {
-      throw new Error(`Review Turn workspace is not the durable owner: ${run.id}.`);
-    }
-    if (run.workspace.owner.type === "review-round") {
-      if (run.workspace.owner.taskId !== taskId
-        || run.workspace.owner.reviewRoundId !== round.id
-        || round.workspace === undefined
-        || !isDeepStrictEqual(round.workspace, run.workspace)) {
-        throw new Error(`Review Turn workspace owner does not match its ReviewRound: ${run.id}.`);
-      }
-      return this.#snapshotReviewWorkspaceEntries(round.id, run.workspace, round.reviewBaseCommit);
-    }
-    if (run.workspace.owner.type !== "execution-lane"
-      || run.workspace.owner.taskId !== taskId
-      || run.workspace.owner.purpose !== "review"
-      || run.workspace.owner.reviewRoundId !== round.id
-      || run.workspace.owner.executionGroupId !== run.executionGroupId
-      || run.workspace.owner.executionLaneId !== run.executionLaneId) {
-      throw new Error(`Review Turn workspace owner does not match its Lane lineage: ${run.id}.`);
-    }
-    const lane = round.executionGroup?.lanes.find(({ id }) => id === run.executionLaneId);
-    const writableProjectIds = run.workspace.entries
-      .filter(({ access }) => access === "write")
-      .map(({ projectId }) => projectId)
-      .sort();
-    if (lane === undefined
-      || lane.currentTurnId !== run.id
-      || lane.roleName !== run.roleName
-      || lane.workspace?.root !== run.workspace.root
-      || !isDeepStrictEqual(
-        [...lane.workspace.writableProjectIds].sort(),
-        writableProjectIds
-      )
-      || run.workspace.entries.length === 0
-      || run.workspace.entries.some(({ access }) => access !== "write")) {
-      throw new Error(`Review Turn Lane workspace lineage is not exact: ${run.id}.`);
-    }
-    return this.#snapshotReviewWorkspaceEntries(round.id, run.workspace, round.reviewBaseCommit);
-  }
-
   async inspectExecutionLaneWorkspace(
     taskId: string,
     executionGroupId: string,
@@ -2123,7 +2033,7 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
     for (const lane of round.executionGroup?.lanes ?? []) {
       assertWorkspaceSessionsRetirable(this.store, task.id, lane.roleName, this.now());
     }
-    for (const lane of legacyReviewExecutionGroup(round)?.lanes ?? []) {
+    for (const lane of round.executionGroup?.lanes ?? []) {
       assertWorkspaceSessionsRetirable(this.store, task.id, lane.roleName, this.now());
     }
     if (await this.#inspectEntries(
@@ -2383,51 +2293,6 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
       found ||= state === "clean";
     }
     return found ? "clean" : "missing";
-  }
-
-  async #snapshotReviewWorkspaceEntries(
-    reviewRoundId: string,
-    workspace: ManagedWorkspace,
-    reviewBaseCommit: string
-  ): Promise<Readonly<{ evidenceCommit?: string }>> {
-    const changed: string[] = [];
-    let dirty = false;
-    for (const entry of workspace.entries) {
-      if (await this.git.headRef(entry.path) !== entry.branch) {
-        throw new Error(
-          `Review Project workspace left its managed branch: ${reviewRoundId}/${entry.projectId}.`
-        );
-      }
-      const head = (await this.git.inspect(entry.path, "HEAD")).baseCommit;
-      const taskId = workspace.owner.taskId;
-      if (!await this.git.isAncestor(
-        this.#taskRepositoryPath(taskId, entry.projectId),
-        entry.baseCommit,
-        head
-      )) {
-        throw new Error(
-          `Review workspace HEAD does not descend from its frozen base for `
-          + `${reviewRoundId}/${entry.projectId}: expected ancestor ${entry.baseCommit}, `
-          + `physical HEAD ${head}.`
-        );
-      }
-      if (head !== entry.baseCommit) changed.push(head);
-      if (!await this.git.isClean(entry.path)) dirty = true;
-    }
-    if (changed.length > 1) {
-      throw new Error(
-        `Review workspace has diagnostic commits in multiple Projects; preserve it for Leader routing: ${reviewRoundId}.`
-      );
-    }
-    // A dirty worktree has uncommitted diagnostics: no single commit captures
-    // the tree the checks ran on, so no evidenceCommit can attest it and the
-    // queue must re-run the gate.  A clean worktree attests that checks ran on
-    // the recorded tree: the frozen base when the reviewer made no commits, or
-    // the reviewer's single diagnostic commit otherwise.
-    if (dirty) return {};
-    return changed.length === 0
-      ? { evidenceCommit: reviewBaseCommit }
-      : { evidenceCommit: changed[0]! };
   }
 
   #projectContainer(projectName: string): string {
@@ -2707,61 +2572,6 @@ function executionLaneLineage(
     }
   }
   throw new Error(`Execution Lane lineage not found: ${task.id}/${executionGroupId}/${executionLaneId}.`);
-}
-
-type CleanupExecutionLaneLineage = Readonly<{
-  lineage: ExecutionLaneLineage;
-  /** Pre-v14 history is retired authority and is reachable here only for cleanup. */
-  legacyGroup?: ExecutionGroup;
-}>;
-
-function cleanupExecutionLaneLineage(
-  store: TaskStore,
-  task: Task,
-  executionGroupId: string,
-  executionLaneId: string
-): CleanupExecutionLaneLineage {
-  try {
-    return {
-      lineage: executionLaneLineage(store, task, executionGroupId, executionLaneId)
-    };
-  } catch (error) {
-    for (const item of store.listWorkItems(task.id)) {
-      const group = legacyExecutionGroups(item).find((candidate) => (
-        candidate.id === executionGroupId
-          && candidate.lanes.some(({ id }) => id === executionLaneId)
-      ));
-      if (group !== undefined) {
-        return {
-          lineage: { purpose: "execution", workItemId: item.id, reviewRoundId: "" },
-          legacyGroup: group
-        };
-      }
-    }
-    for (const round of store.listReviewRounds(task.id)) {
-      const group = legacyReviewExecutionGroup(round);
-      if (group?.id === executionGroupId
-        && group.lanes.some(({ id }) => id === executionLaneId)) {
-        return {
-          lineage: { purpose: "review", reviewRoundId: round.id },
-          legacyGroup: group
-        };
-      }
-    }
-    throw error;
-  }
-}
-
-function legacyExecutionGroups(item: WorkItem): readonly ExecutionGroup[] {
-  return (item.legacyExecutionGroups ?? []).map((group) => (
-    validateExecutionGroup(group as ExecutionGroup)
-  ));
-}
-
-function legacyReviewExecutionGroup(round: ReviewRound): ExecutionGroup | undefined {
-  return round.legacyExecutionGroup === undefined
-    ? undefined
-    : validateExecutionGroup(round.legacyExecutionGroup as ExecutionGroup);
 }
 
 function assertWorkItemWorkspaceEligible(

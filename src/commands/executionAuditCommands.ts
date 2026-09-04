@@ -221,15 +221,10 @@ export function renderExecutionAudit(
     lines.push(
       "",
       `Review rounds: ${reviews.total} total · ${reviews.completed} completed · ${reviews.failed} failed`,
-      `Execution failures: ${reviews.infraFailed} · semantic negatives: ${reviews.semanticNegative}`,
-      ...(reviews.deltaRechecks.total === 0
+      `Execution failures: ${reviews.infraFailed}`,
+      ...(reviews.deltaRechecks === 0
         ? []
-        : [
-            `Delta-rechecks: ${reviews.deltaRechecks.total} total · `
-              + `${reviews.deltaRechecks.equivalentAndAccepted} accepted · `
-              + `${reviews.deltaRechecks.finding} finding · `
-              + `${reviews.deltaRechecks.requiresFullReview} requiring Task Agent decision`
-          ])
+        : [`Delta-rechecks: ${reviews.deltaRechecks} total`])
     );
   } else {
     lines.push("", ...sectionError("reviews", report));
@@ -327,7 +322,7 @@ export function renderExecutionAudit(
           { header: "Type", minWidth: 8, maxWidth: 12 },
           { header: "Turns", minWidth: 4, maxWidth: 6 },
           { header: "WIs", minWidth: 3, maxWidth: 5 },
-          { header: "Review F/D/N", minWidth: 12, maxWidth: 16 },
+          { header: "Review F/D/X", minWidth: 12, maxWidth: 16 },
           { header: "Integration A/F/R", minWidth: 17, maxWidth: 20 },
           { header: "Pre-progress gen", minWidth: 12, maxWidth: 16 },
           { header: "Terminal ws", minWidth: 10, maxWidth: 12 },
@@ -338,7 +333,7 @@ export function renderExecutionAudit(
           task.taskType ?? "unspecified",
           String(task.turns.total),
           String(task.workItems),
-          `${task.reviews.full}/${task.reviews.delta}/${task.reviews.nonSemantic}`,
+          `${task.reviews.full}/${task.reviews.delta}/${task.reviews.failed}`,
           `${task.integrations.attempts}/${task.integrations.failed}/${task.integrations.repeatedIdentities}`,
           String(task.providerGenerationsBeforeFirstProgress),
           String(task.terminalWorkspaceCount),

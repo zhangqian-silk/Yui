@@ -1,19 +1,7 @@
-/**
- * Stable fault classification for execution audit (Issue 11 §2).
- *
- * Classification comes from structured outcomes wherever the current build
- * exposes them. Free-text regex matching exists ONLY for importing historical
- * records (Turn summaries written before this taxonomy existed) and is
- * never the basis of a new state machine: every text-derived result carries
- * `basis: "text-historical"` so consumers can tell the two apart.
- */
+/** Stable fault classification from Core-owned execution facts only. */
 import type { Turn } from "../turn/turn.js";
 import type { ReviewRound } from "../review/reviewRound.js";
 import type { IntegrationAttempt } from "../integration/integrationAttempt.js";
-import {
-  classifyReviewRoundOutcome,
-  type ReviewOutcomeEvidenceStore
-} from "../review/reviewOutcomeClassifier.js";
 
 export const FAULT_CLASSES = [
   "provider-transient",
@@ -22,7 +10,6 @@ export const FAULT_CLASSES = [
   "delivery-uncertain",
   "storage-backend-lock",
   "review-infra",
-  "review-semantic-negative",
   "integration-environment",
   "integration-candidate-failure",
   "stale-base-target-cas",
@@ -34,7 +21,7 @@ export type FaultClass = (typeof FAULT_CLASSES)[number];
 
 export type FaultClassification = Readonly<{
   faultClass: FaultClass;
-  basis: "structured" | "text-historical" | "none";
+  basis: "structured" | "none";
   /** Short excerpt or field name that justifies the class. */
   evidence: string;
 }>;
@@ -51,19 +38,6 @@ export type StructuredFaultHint = Readonly<{
   evidence: string;
 }>;
 
-const PROVIDER_TRANSIENT_PATTERN =
-  /\b5\d{2}\b|gateway time|connection lost|server error|overloaded|rate.?limit|ECONNRESET|socket hang up|API Error|nonstream call error|mid-response/iu;
-const POLICY_DENIED_PATTERN =
-  /policy|permission denied|forbidden|not authorized|\b403\b/iu;
-const SESSION_DEAD_PATTERN =
-  /tmux session exited|session cannot be replaced|could not start|pane[^\n]*(dead|exited)|session[^\n]*(dead|exited|broken)|native session|launch reservation/iu;
-const STORAGE_LOCK_PATTERN =
-  /storage lock|database is locked|SQLITE_BUSY|lock timeout|COMMAND_TIMED_OUT|storage conflict|timed out waiting/iu;
-const DELIVERY_UNCERTAIN_PATTERN =
-  /delivery[^\n]*(uncertain|unknown)|uncertain[^\n]*delivery|push[^\n]*uncertain/iu;
-const STALE_BASE_PATTERN =
-  /stale (role|agent|base|target|state)|expected head|base[^\n]*(changed|moved)|conflict|CAS/iu;
-
 const INTEGRATION_ENVIRONMENT_PATTERN =
   /tsc: not found|command not found|ENOENT|runner disappeared|runner vanished|dirty target|wrong argument|not a git repository|npm error|node: not found/iu;
 
@@ -72,11 +46,7 @@ function excerpt(text: string, max = 160): string {
   return normalized.length <= max ? normalized : `${normalized.slice(0, max)}…`;
 }
 
-/**
- * Classify a failed Turn. A structured hint (from a future capability
- * provider) always wins; otherwise the summary is matched as historical
- * import text. Non-failed Turns return {@link NO_FAULT}.
- */
+/** Classify a failed Turn without inspecting Agent-authored output. */
 export function classifyTurnFailure(
   run: Pick<Turn, "status" | "result">,
   structured?: StructuredFaultHint
@@ -89,57 +59,35 @@ export function classifyTurnFailure(
       evidence: structured.evidence
     };
   }
-  const summary = run.result?.output ?? "";
-  if (summary.length === 0) {
-    return { faultClass: "other", basis: "text-historical", evidence: "" };
+  const failureReason = run.result?.failureReason;
+  if (failureReason === "delivery-unknown") {
+    return {
+      faultClass: "delivery-uncertain",
+      basis: "structured",
+      evidence: failureReason
+    };
   }
-  const text = excerpt(summary);
-  if (POLICY_DENIED_PATTERN.test(summary)) {
-    return { faultClass: "policy-denied", basis: "text-historical", evidence: text };
+  if (failureReason === "startup-failed") {
+    return {
+      faultClass: "session-dead",
+      basis: "structured",
+      evidence: failureReason
+    };
   }
-  if (PROVIDER_TRANSIENT_PATTERN.test(summary)) {
-    return { faultClass: "provider-transient", basis: "text-historical", evidence: text };
-  }
-  if (STORAGE_LOCK_PATTERN.test(summary)) {
-    return { faultClass: "storage-backend-lock", basis: "text-historical", evidence: text };
-  }
-  if (DELIVERY_UNCERTAIN_PATTERN.test(summary)) {
-    return { faultClass: "delivery-uncertain", basis: "text-historical", evidence: text };
-  }
-  if (STALE_BASE_PATTERN.test(summary)) {
-    return { faultClass: "stale-base-target-cas", basis: "text-historical", evidence: text };
-  }
-  if (SESSION_DEAD_PATTERN.test(summary)) {
-    return { faultClass: "session-dead", basis: "text-historical", evidence: text };
-  }
-  return { faultClass: "other", basis: "text-historical", evidence: text };
+  return {
+    faultClass: "other",
+    basis: "structured",
+    evidence: failureReason ?? "failed without Core failure reason"
+  };
 }
 
-/**
- * Review execution failure (the Round itself failed to execute/deliver) is
- * `review-infra`; a completed Round with failed checks is a semantic negative.
- */
-export function classifyReviewRound(
-  round: ReviewRound,
-  evidence?: ReviewOutcomeEvidenceStore
-): FaultClassification {
-  const outcome = classifyReviewRoundOutcome(round, evidence);
-  if (outcome?.kind === "non-semantic") {
+/** ReviewRound failure is an execution fault; completed prose is not classified. */
+export function classifyReviewRound(round: ReviewRound): FaultClassification {
+  if (round.status === "failed") {
     return {
       faultClass: "review-infra",
       basis: "structured",
-      evidence: outcome.reason
-    };
-  }
-  if (outcome?.kind === "semantic" && (round.checks ?? []).some((c) => c.outcome === "failed")) {
-    const failed = (round.checks ?? [])
-      .filter((c) => c.outcome === "failed")
-      .map((c) => c.name)
-      .join(",");
-    return {
-      faultClass: "review-semantic-negative",
-      basis: "structured",
-      evidence: `failed checks: ${failed}`
+      evidence: round.failure?.message ?? "Review execution failed without Core failure detail."
     };
   }
   return NO_FAULT;
@@ -167,7 +115,7 @@ export function classifyIntegrationAttempt(
   if (INTEGRATION_ENVIRONMENT_PATTERN.test(checkText)) {
     return {
       faultClass: "integration-environment",
-      basis: "text-historical",
+      basis: "structured",
       evidence: excerpt(checkText)
     };
   }

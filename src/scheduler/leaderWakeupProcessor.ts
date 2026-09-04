@@ -114,15 +114,18 @@ export async function processLeaderWakeups(
             : "new" as const
           : roleAgentSessionResumeMode(sessionSet, role.effective.agentId, role.effective);
       const turnId = store.peekNextTurnId(task.id);
+      const envelope = store.getTaskWakeEnvelope?.(task.id) ?? null;
       const contextSnapshot = store.freezeLeaderContextSnapshot?.(task.id, role.name, now);
       const input = createTurnInput({
         source: leaderWakeInputSource(wakeup.reasons),
         directive: [
           `Wake reasons: ${wakeup.reasons.join(", ")}.`,
+          ...(envelope === null ? [] : [envelope.text.trim()]),
           `Load exact context for ${task.id}/${turnId}.`,
+          "Read every referenced completed Worker or Reviewer Turn in full before deciding its disposition.",
           "Before ending this Turn, judge the affected WorkItems and Task; persist any lifecycle or result changes you establish.",
           "The final Turn response is evidence only and never updates WorkItem or Task state by itself."
-        ].join(" "),
+        ].join("\n"),
         ...(contextSnapshot === undefined ? {} : { contextSnapshotRef: contextSnapshot.ref }),
         deltaRefIds: contextSnapshot?.deltaRefIds ?? []
       });
@@ -130,7 +133,6 @@ export async function processLeaderWakeups(
         ...(role.managedWorkspace === undefined ? {} : { workspace: role.managedWorkspace }),
         effective: role.effective
       });
-      const envelope = store.getTaskWakeEnvelope?.(task.id) ?? null;
       const claim = store.saveLeaderDispatch({
         task,
         role,
@@ -210,13 +212,17 @@ async function forceLeaderSteer(
     return { taskId, status: "failed", reason: "not-ready", error: "Active Leader Turn has no steerable Provider fence." };
   }
   const batch = processing.batch;
+  const envelope = store.getTaskWakeEnvelope?.(taskId) ?? null;
   const directive = [
     `Aggregated Leader events: ${batch.reasons.join(", ")}.`,
     `The first event arrived at ${batch.firstQueuedAt} and has waited at least 10 minutes while this Leader Turn remained active.`,
+    ...(envelope?.referencedTurnIds.map(
+      (turnId) => `Read the complete result: yui task turn show ${taskId}/${turnId}.`
+    ) ?? []),
     "Process these events now and update durable Task or WorkItem facts when needed.",
     "After the events are handled, continue the work you were doing before this interruption.",
     `Load the current exact context for ${taskId}/${active.id}; the event batch may have grown while this input was delivered.`
-  ].join(" ");
+  ].join("\n");
   const input = createTurnInput({
     source: { type: "yui", channel: "leader-forced-wakeup" },
     directive,

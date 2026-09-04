@@ -51,7 +51,7 @@ export type CodexThreadSnapshot = Readonly<{
 export type CodexThreadTurnSnapshot = Readonly<{
   turnId: string;
   status?: "completed" | "interrupted" | "failed" | "inProgress";
-  summary?: string;
+  output?: string;
   error?: string;
 }>;
 
@@ -392,12 +392,12 @@ function parseThreadSnapshot(
     const turnId = optionalId(turn.id);
     if (turnId === undefined) return [];
     const status = optionalTurnStatus(turn.status);
-    const summary = codexTurnSummary(turn);
+    const output = codexTurnOutput(turn);
     const error = providerError(turn.error);
     return [{
       turnId,
       ...(status === undefined ? {} : { status }),
-      ...(summary === undefined ? {} : { summary }),
+      ...(output === undefined ? {} : { output }),
       ...(error === undefined ? {} : { error })
     }];
   });
@@ -418,8 +418,8 @@ function parseThreadSnapshot(
   };
 }
 
-/** Extract the last assistant message from one native Codex Turn. */
-export function codexTurnSummary(turn: JsonRpcObject): string | undefined {
+/** Extract the last assistant message from one native Codex Turn without rewriting it. */
+export function codexTurnOutput(turn: JsonRpcObject): string | undefined {
   for (const value of [...arrayMember(turn, "items")].reverse()) {
     const item = object(value);
     if (item === null) continue;
@@ -429,8 +429,23 @@ export function codexTurnSummary(turn: JsonRpcObject): string | undefined {
       || type === "agent_message"
       || (type === "message" && (item.role === "assistant" || message?.role === "assistant"));
     if (!agentMessage) continue;
-    const text = messageText(item) ?? (message === null ? undefined : messageText(message));
+    const text = messageOutput(item) ?? (message === null ? undefined : messageOutput(message));
     if (text !== undefined) return text;
+  }
+  return undefined;
+}
+
+function messageOutput(message: JsonRpcObject): string | undefined {
+  for (const value of [message.text, message.content]) {
+    if (typeof value === "string" && value.trim().length > 0) return value;
+    if (!Array.isArray(value)) continue;
+    const parts = value.flatMap((part) => {
+      if (typeof part === "string" && part.trim().length > 0) return [part];
+      const record = object(part);
+      const text = record?.text ?? record?.content;
+      return typeof text === "string" && text.trim().length > 0 ? [text] : [];
+    });
+    if (parts.length > 0) return parts.join("\n");
   }
   return undefined;
 }

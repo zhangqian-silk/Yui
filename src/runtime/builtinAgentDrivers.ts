@@ -293,7 +293,7 @@ function mapClaudeLifecycleHook(
       ];
     case "Stop":
       return [
-        mapped("turn.completed", optionalSummary(payload)),
+        mapped("turn.completed", optionalResultOutput(payload)),
         mapped("native-work.snapshot", {
           snapshotComplete: payload.background_tasks_complete === true,
           observationQuality: payload.background_tasks_complete === true ? "exact" : "partial"
@@ -435,7 +435,7 @@ function mapCodexHook(
         })
       ];
     case "Stop":
-      return mapped("turn.completed", optionalSummary(payload));
+      return mapped("turn.completed", optionalResultOutput(payload));
     case "SessionEnd":
       return mapped("activation.ended");
     default:
@@ -550,6 +550,19 @@ function optionalSummary(
     const value = payload[field];
     if (typeof value === "string" && value.trim().length > 0) {
       return { summary: value.trim() };
+    }
+  }
+  return {};
+}
+
+function optionalResultOutput(
+  payload: Readonly<Record<string, unknown>>,
+  preferred = "last_assistant_message"
+): RuntimeObservationPayload {
+  for (const field of [preferred, "summary", "message"]) {
+    const value = payload[field];
+    if (typeof value === "string" && value.trim().length > 0 && !value.includes("\0")) {
+      return { output: value };
     }
   }
   return {};

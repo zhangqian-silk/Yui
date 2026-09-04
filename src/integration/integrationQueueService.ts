@@ -560,19 +560,8 @@ async function canReuseEvidenceAtHead(
 }
 
 /**
- * Resolve each reusable evidence reference to its ReviewRound and collect the
- * names of checks that passed.  A requested gate command is covered only when
- * a resolved round recorded that exact command as passed.  A review that ran
- * `true` (or any other unrelated check) never waives a different gate.
- *
- * A check is reusable only when it ran on the frozen candidate tree.  A
- * ReviewRound must attest to this by recording its `evidenceCommit` as the
- * exact `reviewBaseCommit`.  A missing `evidenceCommit` is ambiguous: the
- * reviewer may have run checks with uncommitted dirty diagnostics, so the
- * absence cannot be treated as frozen-tree proof.  A round whose
- * `evidenceCommit` differs from its `reviewBaseCommit` ran its checks on a
- * diagnostic tree (the reviewer's own commit with review-only changes); those
- * checks proved a different tree and cannot waive the candidate gate.
+ * Resolve reusable Core-owned gate artifacts. Agent-authored review text is
+ * never interpreted as check evidence and therefore cannot waive a gate.
  */
 async function evidenceCoversCheckCommands(
   store: TaskStore,
@@ -600,21 +589,8 @@ async function evidenceCoversCheckCommands(
       }
       continue;
     }
-    const roundId = parseReviewRoundRef(ref);
-    if (roundId === undefined) continue;
-    const round = store.getReviewRound(taskId, roundId);
-    if (round === null || round.status !== "completed") continue;
-    if (round.evidenceCommit !== round.reviewBaseCommit) continue;
-    for (const check of round.checks ?? []) {
-      if (check.outcome === "passed") covered.add(check.name);
-    }
   }
   return checkCommands.every((cmd) => covered.has(cmd));
-}
-
-function parseReviewRoundRef(ref: string): string | undefined {
-  const prefix = "review-round:";
-  return ref.startsWith(prefix) ? ref.slice(prefix.length) : undefined;
 }
 
 export type ProcessIntegrationQueueOptions = Readonly<{

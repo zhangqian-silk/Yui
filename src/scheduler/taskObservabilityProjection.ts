@@ -91,8 +91,7 @@ export type WorkItemObservabilityProjection = Readonly<{
   groupIds: readonly string[];
   cost: TaskCostProjection;
   context: TaskContextProjection;
-  evidenceCount: number | null;
-  openFindingCount: number | null;
+  resultCount: number | null;
 }>;
 
 export type TaskObservabilityProjection = Readonly<{
@@ -136,8 +135,7 @@ export function buildTaskObservabilityProjection(
       groupIds: groups.map(({ id }) => id),
       cost: itemCost,
       context: itemContext,
-      evidenceCount: producerObservability?.evidenceCount ?? null,
-      openFindingCount: producerObservability?.openFindingCount ?? null
+      resultCount: producerObservability?.resultCount ?? null
     });
   });
   const cost = projectCost(input.executionGroups, input.turns, input.events, now);
@@ -154,29 +152,26 @@ export function buildTaskObservabilityProjection(
 function projectWorkItemProducerObservability(
   item: WorkItem,
   turns: readonly Turn[]
-): Readonly<{ evidenceCount: number; openFindingCount: number }> | null {
+): Readonly<{ resultCount: number }> | null {
   const successfulLanes = item.executionGroups.flatMap((group) => group.lanes.flatMap((lane) => (
     lane.disposition === "succeeded" ? [{ group, lane }] : []
   )));
-  let evidenceCount = 0;
-  let openFindingCount = 0;
+  let resultCount = 0;
   for (const { group, lane } of successfulLanes) {
     const turn = lane.successfulTurnId === undefined
       ? undefined
       : turns.find(({ id }) => id === lane.successfulTurnId);
-    const producer = turn?.result?.producer;
     if (turn === undefined
-      || producer === undefined
+      || turn.result === undefined
       || turn.status !== "completed"
       || turn.taskId !== item.taskId
       || turn.workItemId !== item.id
       || turn.executionGroupId !== group.id
       || turn.executionLaneId !== lane.id
       || turn.roleName !== lane.roleName) return null;
-    evidenceCount += producer.evidence.length;
-    openFindingCount += producer.findings.filter(({ status }) => status === "open").length;
+    resultCount += 1;
   }
-  return { evidenceCount, openFindingCount };
+  return { resultCount };
 }
 
 function projectDag(workItems: readonly WorkItem[]): TaskDagProjection {

@@ -104,5 +104,10 @@ accept, capture, integrate, or complete the WorkItem; the Leader decides its
 disposition. If context or scope is stale or mismatched, report that blocker
 once and stop without wrappers, permission broadening, or another Turn target.
 
+Use clear prose. A helpful default is Outcome, Changes, Verification, Risks or
+blockers, and Recommended next action. This is a communication convention, not
+a protocol: Yui preserves the original text and does not parse, normalize, or
+reject it for missing headings or invalid JSON.
+
 Leave managed workspaces intact after handoff. Their owner lifecycle and
 cleanup belong to the Leader and Yui Core.

@@ -181,7 +181,7 @@ function projectLane(
     const producerObserved = exact
       && lane.successfulTurnId === current.id
       && current.status === "completed"
-      && current.result?.producer !== undefined;
+      && current.result !== undefined;
     return Object.freeze({
       laneId: lane.id,
       ordinal: lane.ordinal,

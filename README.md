@@ -90,24 +90,25 @@ Candidate IDs are local to their WorkItem and carry both Task and WorkItem
 provenance.
 
 Yui records layout, aggregate, and per-record-family versions in `schema.json`.
-Runtime admission still has only two outcomes: exact current, or rejected; a
+Runtime admission has only two outcomes: exact current, or rejected; a
 Controller never migrates storage while serving work. `yui upgrade --dry-run`
-is read-only, while `yui upgrade` applies only the release's explicit adjacent
-migration graph. Missing steps, newer layouts, and malformed Homes fail closed.
+is read-only, while `yui upgrade` validates only the release's exact current
+contract. Older, newer, incomplete, and malformed Homes fail closed.
 
 `yui update` stages and pins one exact package, runs that staged binary's
 storage preflight, stops the exact old Controller, activates the same artifact,
-applies any complete adjacent migration path, verifies the installed binary and
-current Home, and starts the replacement Controller. If no complete path exists,
+verifies the installed binary and current Home, and starts the replacement
+Controller. If the staged binary does not support the current Home exactly,
 the update stops before activation and leaves both the Home and current
 installation unchanged.
 
 To retain an old Home, keep it byte-for-byte and open it only with its original
 Yui version for read-only inspection. For unfinished work, initialize a new
 Home and let the Operator create a new Task from the old Task's objective,
-relevant WorkItems, current repository state, and available result summaries.
-The Operator creates new identities; it does not import old runtime/session
-state or pretend that the old Task continued.
+relevant WorkItems, current repository state, and available exact Turn results.
+The Operator creates new identities and may consult available exact Turn
+results; it does not import old runtime/session state or pretend that the old
+Task continued.
 
 See [Task-local identity](docs/task-local-identity.md) for the current reference
 contract.
@@ -122,9 +123,9 @@ re-running the isolated E2E and docs. This is a deliberate scheduling trade-off
 that avoids cross-Task blocking, not an accident to repair ad hoc. The
 current manifest descriptor map is re-derived against the newest head, while the
 post-baseline descriptor snapshot remains frozen. If another Task later lands a
-record-schema change, the integrating branch must supply the complete adjacent
-path (including an explicit `0->1` introduction for a new family) and re-test to
-convergence.
+record-schema change, the integrating branch must rebase, allocate the next
+current contract without collision, and re-test to convergence. It does not
+preserve an upgrade path for the displaced intermediate contract.
 
 Yui provides four reusable Worker Profile definitions through
 `yui config profile reset`; minimum setup makes each one inherit the current
@@ -362,8 +363,9 @@ the identical frozen Assignment in isolated Lane workspaces. Yui waits for
 every Lane to settle and requires at least two successful Producer results
 before creating one idempotent main Reviewer synthesis Turn. Successful
 Producers are never rerun during Lane or main retry. Producer output is durable
-non-authoritative evidence; only the main Reviewer result completes the Round,
-updates the finding ledger, and supplies the semantic Review outcome.
+non-authoritative evidence; only the exact completed main Reviewer Turn
+completes the Round. The Leader reads that Turn's original result and decides
+what it means.
 
 Task context and next-action expose the Review shape, every frozen Project
 commit, its relation to the current candidate, Producer and main Turns, and
@@ -588,12 +590,11 @@ every mismatch fails closed. Its diagnostic commit
 is visible history but is
 explicitly rejected by capture, ChangeSet, Integration, and acceptance paths.
 The Reviewer's final Provider response is its complete free-form Markdown or
-JSON report. If a JSON report
-includes known `checks` or `evidenceCommit` fields, Yui records them as
-structured evidence and verifies the reported commit against the managed
-Review branch HEAD; unknown fields remain part of the report. Dirty uncommitted
-diagnosis may end without a commit; the worktree is retained and cleanup
-refuses it until it is clean.
+JSON result. Yui stores that text unchanged and does not parse headings, field
+names, checks, severities, findings, or verdicts. Core-owned workspace and Git
+evidence remains separate from Agent prose. Dirty uncommitted diagnosis may end
+without a commit; the worktree is retained and cleanup refuses it until it is
+clean.
 
 Every Role desired launch change increments its revision and applies only to a
 future launch. Each Turn and native Role Session stores the complete actual
@@ -916,10 +917,10 @@ Global Context entry:
 yui session enter <global-role>
 ```
 
-`yui update` accepts the current Home contract or a complete centralized
-migration path. Unsupported older Homes remain untouched; inspect those with a
-compatible Yui version and let the current Operator recreate unfinished intent
-as new Tasks in a newly initialized Home.
+`yui update` accepts only the current Home contract. Unsupported older Homes
+remain untouched; inspect those with a compatible Yui version and let the
+current Operator recreate unfinished intent as new Tasks in a newly initialized
+Home.
 
 tmux fixes a pane's history capacity when that pane is created. Existing panes
 retain their configured capacity; managed runtime output remains observable in
@@ -1001,11 +1002,10 @@ hiding the resources that remain. Use `--all` to include discovered Yui homes.
 
 `controller restart` replaces the Controller process and its scheduler/socket services with the currently installed Yui version. It can recover a lost discovery record only when the old process still matches the current UID, Controller entrypoint, physical Home, PID, and process-start identity. It does not stop or restart managed tmux/Agent sessions.
 
-Successful `setup`, `upgrade`, and `update` commands ensure that the current
-Home has a running Controller, starting one when the Home was previously idle.
-Read-only commands and `upgrade --dry-run` do not start a Controller. `update`
-also replaces an already-running Controller only after the new binary passes its
-health checks.
+Successful `setup` and `update` commands ensure that the current Home has a
+running Controller, starting one when the Home was previously idle. `upgrade`
+is read-only and does not start a Controller. `update` replaces an
+already-running Controller only after the new binary passes its health checks.
 
 Its recovery reconciliation runs every 120 seconds by default. Normal durable state changes enqueue a Task, Role, or Operator key and return immediately; keys received in the same fixed 100 ms window trigger one non-overlapping targeted pass. Operator presentation has an independent lane, so a blocked Task workspace operation cannot delay a user question. Periodic Git/worktree work is limited to Tasks with durable Task-mailbox work, while active Role liveness uses one tmux inventory. Structured Agent Driver observations, whether received from native provider events or supported Hooks, are exact-fenced before they reach the durable runtime inbox. A terminal Turn observation atomically records the exact Turn result. Durable mailboxes freeze the current batch while new signals merge into the next batch. Task-orchestration failures retain the exact Controller-owned processing batch for two bounded fast retries and later periodic recovery; a successful retry completes that batch before newer pending work is claimed. Recommended InputRequest and pending Turn deadlines share one nearest-deadline selector and therefore do not wait for the recovery interval. Explicit `task reconcile` still requests an immediate recovery pass. The retained loop is:
 
@@ -1097,16 +1097,15 @@ yui project reset|replace|retire|delete
 ```
 
 `yui update` stages the newly published package side by side and asks that exact
-binary to verify either a current Home or a complete adjacent migration path.
-Only then does it stop the exact old Controller, activate the same concrete
-package version, apply that path, validate the actually installed binary and
-Home, and start the replacement Controller. Unsupported Homes block preflight
-and remain untouched.
+binary to verify the current Home. Only then does it stop the exact old
+Controller, activate the same concrete package version, validate the actually
+installed binary and Home, and start the replacement Controller. Unsupported
+Homes block preflight and remain untouched.
 
-`yui upgrade --dry-run` reports the exact adjacent steps without writing.
-`yui upgrade` applies those steps transactionally to SQLite record payloads and
-then advances the atomic manifest; rerunning completes an interrupted manifest
-advance without inventing repair behavior.
+`yui upgrade --dry-run` validates an exact current Home without writing.
+`yui upgrade` performs the same validation. This release provides no migration
+from older aggregate contracts; use their matching Yui version or initialize a
+new Home.
 
 Agent environment bindings store process-environment variable names, never secret values. Adapter-owned lifecycle arguments cannot be overridden through raw arguments.
 
@@ -1127,7 +1126,7 @@ npm test
 ```
 
 The permanent suite is intentionally one seconds-scale core smoke. It checks
-CLI startup, a normal SQLite Task path, the supported migration graph, and the
+CLI startup, a normal SQLite Task path, exact-current storage admission, and the
 built-in Agent Drivers. Change-specific TDD fixtures and abnormal-data repros
 are temporary development evidence and are removed when the change is complete;
 they do not accumulate as permanent regression tests. See

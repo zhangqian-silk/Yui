@@ -1,43 +1,54 @@
-import type { TaskEvent } from "../event/taskEvent.js";
 import type { Turn } from "../turn/turn.js";
-import type { ReviewFinding } from "./reviewFinding.js";
 import type { ReviewRound } from "./reviewRound.js";
-import { isSemanticReviewRound } from "./reviewOutcomeClassifier.js";
 
-export type ReviewAcceptanceEvidenceStore = Readonly<{
+export type ReviewCompletionEvidenceStore = Readonly<{
   listTurns(taskId: string): readonly Turn[];
-  listReviewFindings(taskId: string): readonly ReviewFinding[];
-  listEvents(taskId: string): readonly TaskEvent[];
 }>;
 
-/**
- * Whether a completed Task-final Round is a trustworthy accepted baseline.
- * Semantic completion alone is insufficient when it returned a non-accepting
- * delta disposition or still owns an open material finding.
- */
-export function isAcceptedTaskReviewBaseline(
-  store: ReviewAcceptanceEvidenceStore,
+/** Whether a ReviewRound has one exact completed main Reviewer Turn. */
+export function isCompletedReviewExecution(
+  store: ReviewCompletionEvidenceStore,
   round: ReviewRound
 ): boolean {
-  return isAcceptedTaskReviewBaselineFromEvidence(round, store);
+  return isCompletedReviewExecutionFromTurns(round, store.listTurns(round.taskId));
 }
 
-/** Pure evidence form shared by read-only projections and mutation paths. */
-export function isAcceptedTaskReviewBaselineFromEvidence(
+export function isCompletedReviewExecutionFromTurns(
   round: ReviewRound,
-  evidence?: ReviewAcceptanceEvidenceStore
+  turns: readonly Turn[]
+): boolean {
+  if (round.status !== "completed" || round.reviewerTurnId === undefined) return false;
+  const turn = turns.find(({ id }) => id === round.reviewerTurnId);
+  return turn !== undefined
+    && turn.status === "completed"
+    && turn.result !== undefined
+    && turn.purpose === "review"
+    && turn.taskId === round.taskId
+    && turn.reviewRoundId === round.id
+    && turn.roleName === round.reviewerRoleName
+    && turn.executionGroupId === undefined
+    && turn.effective.reviewBaseCommit === round.reviewBaseCommit;
+}
+
+/**
+ * Whether a Task-final ReviewRound has one exact completed main Reviewer Turn.
+ * This is structural evidence only and never means the Leader accepted it.
+ */
+export function isCompletedTaskReviewEvidence(
+  store: ReviewCompletionEvidenceStore,
+  round: ReviewRound
+): boolean {
+  return isCompletedTaskReviewEvidenceFromTurns(round, store.listTurns(round.taskId));
+}
+
+export function isCompletedTaskReviewEvidenceFromTurns(
+  round: ReviewRound,
+  turns: readonly Turn[]
 ): boolean {
   if ((round.scope ?? "work-item") !== "task"
-    || round.status !== "completed"
     || round.taskCandidate === undefined
-    || round.taskCandidate.projects.length === 0
-    || !isSemanticReviewRound(round, evidence)) return false;
-  if ((round.checks ?? []).some(({ outcome }) => outcome === "failed")) return false;
-  if (round.deltaRecheck !== undefined
-    && round.deltaRecheck.disposition !== "equivalent-and-accepted") return false;
-  return !(evidence?.listReviewFindings(round.taskId) ?? []).some((finding) => (
-    finding.lastReviewRoundId === round.id
-    && (finding.severity === "p1" || finding.severity === "p2")
-    && (finding.disposition === "open" || finding.disposition === "fixed-pending-review")
-  ));
+    || round.taskCandidate.projects.length === 0) {
+    return false;
+  }
+  return isCompletedReviewExecutionFromTurns(round, turns);
 }

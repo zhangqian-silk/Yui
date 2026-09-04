@@ -43,6 +43,8 @@ export type WakeEnvelope = Readonly<{
   taskId: string;
   wakeId: string;
   fromCursor: string;
+  /** Existing Turns named by terminal events in the wake delta, in event order. */
+  referencedTurnIds: readonly string[];
   totalBytes: number;
   text: string;
 }>;
@@ -68,13 +70,25 @@ export function buildTaskWakeEnvelope(
 
   const fromTime = Date.parse(request.fromCursor);
   const events = reader.listEvents(request.taskId);
+  const deltaEvents = events.filter((record) => Date.parse(record.createdAt) > fromTime);
+  const turns = operationalTaskRecords(reader.listTurns(request.taskId), events, "turn");
+  const turnsById = new Map(turns.map((turn) => [turn.id, turn]));
+  const referencedTurnIds = [...new Set(deltaEvents.flatMap((event) => {
+    if (!["turn.completed", "turn.failed", "turn.cancelled"].includes(event.type)) return [];
+    const turnId = event.payload.turnId;
+    return turnId !== undefined && turnsById.has(turnId) ? [turnId] : [];
+  }))];
+  const changedTurnIds = new Set([
+    ...turns
+      .filter((record) => Date.parse(record.createdAt) > fromTime)
+      .map(({ id }) => id),
+    ...referencedTurnIds
+  ]);
   const counts = {
-    events: events
-      .filter((record) => Date.parse(record.createdAt) > fromTime).length,
+    events: deltaEvents.length,
     messages: operationalTaskRecords(reader.listMessages(request.taskId), events, "message")
       .filter((record) => Date.parse(record.createdAt) > fromTime).length,
-    turns: operationalTaskRecords(reader.listTurns(request.taskId), events, "turn")
-      .filter((record) => Date.parse(record.createdAt) > fromTime).length
+    turns: changedTurnIds.size
   };
   const activeReviews = reader.listReviewRounds(request.taskId).filter((round) => (
     (round.scope ?? "work-item") === "task"
@@ -97,6 +111,13 @@ export function buildTaskWakeEnvelope(
     `  Reasons: ${renderReasons(request.reasons)}`,
     `  Changed: ${counts.events} events, ${counts.messages} messages, ${counts.turns} Turns`
       + ` → yui task wake show ${request.taskId} ${request.wakeId}`,
+    `  Result Turns: ${referencedTurnIds.length === 0
+      ? "none"
+      : referencedTurnIds.slice(0, 4)
+        .map((turnId) => `${turnId} → yui task turn show ${request.taskId}/${turnId}`)
+        .join(", ")}${referencedTurnIds.length > 4
+        ? `, … (+${referencedTurnIds.length - 4})`
+        : ""}`,
     `  Active Task Reviews: ${activeReviews.length === 0
       ? "none"
       : `${reviewOrientation}${activeReviews.length > 3 ? `, … (+${activeReviews.length - 3})` : ""}`}`,
@@ -116,6 +137,7 @@ export function buildTaskWakeEnvelope(
     taskId: request.taskId,
     wakeId: request.wakeId,
     fromCursor: request.fromCursor,
+    referencedTurnIds: Object.freeze(referencedTurnIds),
     totalBytes,
     text: `${body}\n`
   });

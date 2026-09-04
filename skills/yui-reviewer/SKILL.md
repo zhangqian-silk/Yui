@@ -33,13 +33,13 @@ widen, or silently update the assigned Review scope.
 The Turn also identifies the execution shape. A direct Review Turn is the main
 Reviewer and produces the authoritative Review result. In replicated Review,
 a Producer Lane independently inspects the same frozen Assignment in its own
-Lane workspace and returns durable summary, checks, findings, evidence, and
-exact code references. A Producer result is non-authoritative: do not create a
-Candidate, ChangeSet, integration, ReviewResult, finding-ledger entry, semantic
-outcome, or completion decision.
+Lane workspace and returns one complete original result. A Producer result is
+non-authoritative: do not create a Candidate, ChangeSet, integration, or
+completion decision.
 
 Only the main Reviewer synthesis Turn may interpret all stable successful
-Producer results and complete the ReviewRound. Inspect every supplied result,
+Producer results and complete the ReviewRound. Read every exact source Turn's
+original result, inspect every supplied result,
 resolve disagreement through judgment against the frozen sources, and return
 one complete authoritative report. Do not select a winning Lane, mutate
 Producer results, rerun successful Producers, or omit a successful result from
@@ -53,21 +53,13 @@ binding fails before review begins:
 
 - do not inspect the candidate, run candidate checks, invent findings, accept
   risk, or claim the frozen result was reviewed;
-- return only the exact infrastructure diagnosis, with no semantic findings or
-  checks, through the assigned Review Turn;
+- return the exact infrastructure diagnosis through the assigned Review Turn;
 - do not recommend a Repair WorkItem—the Leader must recover the same frozen
   review boundary with Yui's projected same-Round `task review retry` or exact
-  `task turn retry`; `task review force-fresh` is reserved for an eligible
-  direct Round when the Leader deliberately chooses a distinct attempt;
+  `task turn retry`;
 - if any candidate inspection or Reviewer output did occur, report it
-  explicitly. Mixed infrastructure and semantic evidence is ambiguous and must
-  fail closed, never be relabeled as a clean transport failure.
-
-Yui derives `semantic`, `non-semantic`, or `ambiguous` from the immutable
-Round, Turn receipt, completion Event, and finding evidence. Never write or
-simulate a classification field. A non-semantic attempt cannot satisfy
-acceptance; an ambiguous attempt requires
-Leader diagnosis before another review or repair decision.
+  explicitly so the Leader can judge what remains useful. Core records only
+  the execution boundary and never classifies the meaning of this prose.
 
 The Review scope remains the current Turn's frozen candidate even if the Leader
 handles new user input or advances Task main while this Review is running. Do
@@ -75,15 +67,10 @@ not switch to the newer head, cancel the current inspection, or claim the
 result covers anything beyond the frozen candidate.
 
 For a Delta Recheck, judge only the verified baseline plus the exact supplied
-diff. Return exactly one explicit disposition with reasoning:
-
-- `equivalent-and-accepted` when the new candidate preserves the accepted
-  semantics and evidence;
-- `finding` for a reachable material defect;
-- `requires-full-review` when equivalence cannot be established.
-
-Never create or request a follow-up Round yourself: `requires-full-review`, a
-finding, and every uncertainty return to the Leader for routing.
+diff. State clearly whether the new candidate remains equivalent, has a
+material defect, or needs a full Review, and explain why. These are recommended
+conclusions for the Leader, not machine-readable dispositions. Never create or
+request a follow-up Round yourself.
 
 Keep the context layers distinct. Yui Core owns ReviewRound identity,
 lifecycle, access, workspace, and exact Turn-result correlation; this generic Skill owns
@@ -110,6 +97,11 @@ soon as the first finding is discovered. A review result is evidence for Leader
 judgment; it does not accept the WorkItem or complete the Task. Preserve the
 ReviewRound record and explicitly clean its workspace after the round is
 terminal.
+
+A helpful default result layout is Conclusion, Material findings, Verification,
+Uncertainty, and Recommended next action. Markdown or JSON are both acceptable.
+Yui preserves the original text and does not parse, normalize, or reject it for
+missing headings, field names, or formatting.
 
 For normal software delivery, follow the applicable Project Policy. The
 Leader decides whether risk warrants one independent Task-final Review of the

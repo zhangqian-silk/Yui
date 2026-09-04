@@ -14,7 +14,7 @@ import {
   codexGoalNotification,
   codexAppServerErrorIsMissing,
   codexTurnInput,
-  codexTurnSummary
+  codexTurnOutput
 } from "./codexAppServerRuntime.js";
 import type {
   AgentHostLaunchPayload,
@@ -60,7 +60,7 @@ export type StructuredProviderTurnTerminal = Readonly<{
   observedAt: string;
   /** Provider-visible input only; internal reasoning and tool items are excluded. */
   input?: string;
-  summary?: string;
+  output?: string;
   /** Human-readable Provider error message. */
   error?: string;
   /** Complete serialized Provider exception as received by this Driver. */
@@ -598,7 +598,7 @@ class CodexStructuredProviderSession implements StructuredProviderSession {
             ? "failed"
             : recovered.status === "interrupted" ? "cancelled" : "completed",
           observedAt: new Date().toISOString(),
-          ...(recovered.summary === undefined ? {} : { summary: recovered.summary }),
+          ...(recovered.output === undefined ? {} : { output: recovered.output }),
           ...(recovered.status !== "failed"
             ? {}
             : {
@@ -662,7 +662,7 @@ class CodexStructuredProviderSession implements StructuredProviderSession {
       const failure = status === "failed"
         ? providerErrorEvidence(turn.error)
         : undefined;
-      const summary = codexTurnSummary(turn);
+      const output = codexTurnOutput(turn);
       const input = codexTurnInput(turn);
       const terminal = {
         conversationId: this.conversationId,
@@ -671,7 +671,7 @@ class CodexStructuredProviderSession implements StructuredProviderSession {
         status,
         observedAt: new Date().toISOString(),
         ...(input === undefined ? {} : { input }),
-        ...(summary === undefined ? {} : { summary }),
+        ...(output === undefined ? {} : { output }),
         ...(failure === undefined ? {} : failure)
       } as const;
       if (this.#submissionPending && emit) {
@@ -956,7 +956,7 @@ class ClaudeStructuredProviderSession implements StructuredProviderSession {
       ...(failed
         ? { error: result, rawError: providerErrorEvidence(message).rawError }
         : typeof message.result === "string" && message.result.length > 0
-          ? { summary: message.result }
+          ? { output: message.result }
           : {})
     });
   }

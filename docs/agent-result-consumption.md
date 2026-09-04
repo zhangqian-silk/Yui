@@ -1,90 +1,67 @@
 # Agent Result Consumption
 
-Status: proposed design  
-Date: 2026-09-04  
+Status: implemented contract
+Date: 2026-09-04
 Baseline: `8a29c294d66107c697a74f803b3190ab9c00e333`
 
-## Product decision
+## Decision
 
 Every managed Agent Turn produces one durable original result. The next Agent
-in the ownership chain reads that result and decides what it means.
+in the ownership chain reads that exact result and decides what it means.
 
-Yui Core owns the structured execution envelope:
+`TurnResult.output` is the sole Agent-authored durable truth. Yui Core stores
+it unchanged and does not parse, classify, normalize, or validate its semantic
+content.
+
+Skills and dispatch instructions may recommend a Markdown or JSON layout to
+make handoffs easier to read. That layout is not a protocol. Missing headings,
+invalid JSON, omitted checks, or an imprecise conclusion are quality evidence
+for the consuming Agent; they are not Core execution failures.
+
+## Authority boundary
+
+Yui Core owns only facts it can establish independently:
 
 - Task, Role, Turn, WorkItem, ReviewRound, and ExecutionGroup identity;
 - Provider and runtime lifecycle;
+- exact frozen Context and Git boundaries;
 - workspace ownership and write scope;
-- exact frozen commits and Core-observed Git state;
-- mailbox delivery, retry fences, and terminal status.
+- mailbox delivery, retry fences, and terminal status;
+- Core-run validation and Integration evidence.
 
-The Agent owns the result text. Core stores it unchanged and does not parse,
-classify, normalize, or validate its semantic sections.
+Agents own the meaning of their prose:
 
-Skills and dispatch instructions may request a consistent Markdown or JSON
-shape so another Agent can read results efficiently. Missing headings, invalid
-JSON, an omitted finding, or an imprecise conclusion are not protocol errors.
-They are result-quality evidence for the consuming Agent to accept, reject,
-retry, or clarify.
+- outcome and implementation sufficiency;
+- review conclusion and findings;
+- reported checks and residual risk;
+- whether more work, another review, or acceptance is appropriate.
 
-## Why the current design is too complex
+Core never converts Agent prose into checks, findings, severity, verdict,
+delta disposition, repair topology, or acceptance.
 
-The current runtime has two result paths:
+## Turn result
 
-1. ordinary Turns preserve `TurnResult.output`;
-2. Review Turns and replicated Producer Lanes additionally parse the same text
-   into checks, findings, evidence, commits, delta dispositions, and finding
-   ledger records.
+The current contract is:
 
-Those derived fields then influence Lane success, Review acceptance, repair
-planning, and Task completion. This creates several problems:
+```ts
+type TurnResult = Readonly<{
+  schemaVersion: 2;
+  output: string;
+  completedAt: string;
+  provider?: TurnProviderResult;
+  systemEvidence?: TurnSystemEvidence;
+  failureReason?: TurnFailureReason;
+}>;
 
-- the raw result and parsed projection can disagree;
-- valid free-form results may be interpreted as empty structured results;
-- malformed formatting can turn successful Agent work into
-  `missing-result`;
-- Review and execution need separate parsers and semantic state;
-- Core starts making judgments that belong to the main Agent or Leader;
-- each new result concept expands persistence, migration, UI, retry, and
-  completion logic.
+type TurnSystemEvidence = Readonly<{
+  workspaceSnapshot?: ExecutionLaneGitSnapshot;
+}>;
+```
 
-The root correction is not a more permissive parser. It is removing
-Agent-authored semantics from Core decisions.
+`output` preserves the Provider's complete non-empty text, including its outer
+whitespace. `systemEvidence` is authored and validated by Core.
 
-## Alternatives considered
-
-### Require and validate one JSON schema
-
-This makes automation straightforward but turns a formatting mistake into an
-execution failure and gives Core a growing semantic contract for every Agent
-role. It also duplicates the original result with a parsed representation.
-
-Rejected because result quality belongs to the consuming Agent.
-
-### Parse JSON or Markdown on a best-effort basis
-
-This appears compatible with free-form output, but absence and parse failure
-become indistinguishable from a genuine empty result. That is the current
-source of false clean Reviews and incomplete repair projections.
-
-Rejected because a non-authoritative parser must not influence lifecycle or
-acceptance, and a parser with no influence has no product value.
-
-### Preserve opaque output and objective Core evidence
-
-This keeps one Agent-authored source of truth while retaining strong guarantees
-for identity, workspace, commits, runtime, and delivery.
-
-Selected because it has the smallest durable concept set and the same
-Agent-to-Agent behavior for Worker, Producer, Reviewer, and Leader.
-
-## Target result contract
-
-### Agent-authored result
-
-`TurnResult.output` is the only authoritative Agent-authored result. It remains
-an opaque, non-empty string and is never interpreted by Core.
-
-The result may use a recommended structure such as:
+A useful, optional Agent layout is:
 
 ```markdown
 ## Outcome
@@ -98,75 +75,44 @@ The result may use a recommended structure such as:
 ## Recommended next action
 ```
 
-Reviewer instructions may use review-oriented labels, and an Agent may choose
-JSON when that improves communication. Core does not require either format.
+Markdown, JSON, or ordinary prose are all legal.
 
-### Core-authored evidence
+## Terminal meaning
 
-Core may attach facts it observed independently of the Agent text:
-
-```ts
-type TurnSystemEvidence = Readonly<{
-  workspaceSnapshot?: ExecutionLaneGitSnapshot;
-}>;
-```
-
-These facts are strongly validated because Core owns their production. They do
-not assert that the implementation is correct or that a Review passed.
-
-For a writable replicated Lane, a clean exact workspace snapshot remains
-required. A dirty workspace, wrong managed branch, missing durable workspace,
-or mismatched Project set remains a Core failure. An Agent failing to mention
-a check or commit in its prose does not.
-
-### Terminal meaning
-
-- `Turn.completed`: the Provider completed and every required Core-observed
+- `Turn.completed` means the Provider completed and every required Core-owned
   artifact boundary is valid.
-- `Turn.failed`: Provider, runtime, authority, workspace, or another
+- `Turn.failed` means Provider, runtime, authority, workspace, or another
   Core-owned execution boundary failed.
-- Neither status means that the Agent result is sufficient or accepted.
+- Neither state means that the result is sufficient, correct, reviewed, or
+  accepted.
 
-Acceptance remains an explicit action by the main Agent or Leader.
+For a writable replicated Lane, Core still requires a clean exact workspace
+snapshot. A dirty workspace, wrong branch, missing durable owner, mismatched
+Project set, or wrong commit fails the Lane. The Agent does not need to repeat
+those facts in its output.
 
 ## Direct execution
 
-Direct Worker and direct Reviewer behavior is already close to the target:
+A direct Worker or Reviewer Turn:
 
-1. dispatch one exact Turn with a frozen Context Snapshot;
-2. preserve the Provider's final result as `TurnResult.output`;
-3. record the Provider and workspace facts Core directly observed;
-4. route a terminal event containing the exact `turnId`;
-5. let the Leader read the complete Turn result and decide.
+1. receives one exact frozen Context Snapshot;
+2. returns one original result;
+3. has Provider and Core workspace facts recorded separately;
+4. emits a terminal Event containing the exact `turnId`;
+5. is consumed by the Leader through the exact Turn record.
 
-No checks, findings, evidence, verdict, or infrastructure diagnosis is
-extracted from the output.
-
-For Review, `ReviewRound.completed` means that its exact main Reviewer Turn
-completed and delivered a result. It does not mean that the candidate passed.
-`ReviewRound.failed` is reserved for execution failure.
+For Review, `ReviewRound.completed` means its exact main Reviewer Turn
+completed. It is not a machine-derived pass verdict. The Leader's later accept
+or complete action is the semantic decision.
 
 ## Replicated execution
 
-Replicated execution keeps its Assignment, isolated Lanes, all-Lanes-settled
-rule, minimum successful Producer count, and one main synthesis Turn. It no
-longer gives Producer prose a machine-readable semantic role.
+Replicated execution retains immutable Assignment, isolated Lanes, all-Lanes
+settlement, minimum successful Producer count, and one main synthesis Turn.
 
-### Producer Lane
-
-Each Producer:
-
-1. receives the same immutable Assignment;
-2. works in its exact isolated Lane workspace;
-3. returns one original result;
-4. is marked successful when its Provider completes and its required
-   Core-observed workspace snapshot is valid.
-
-The Producer may be instructed to report outcome, changes, checks, findings,
-uncertainty, and next action. Core does not parse those sections and does not
-derive severity or check outcomes from them.
-
-### Main synthesis
+Each Producer returns one opaque original result. A Producer succeeds when its
+Provider completes and its required Core workspace snapshot is valid. Core
+does not interpret any reported outcome, check, finding, or recommendation.
 
 The main synthesis Turn receives stable source references in Lane order:
 
@@ -178,226 +124,96 @@ type SynthesisSource = Readonly<{
 }>;
 ```
 
-Its frozen Context Snapshot authorizes the exact successful Producer Turns.
-The main Agent expands each source Turn and reads:
+Its frozen Context Snapshot materializes every successful source Turn,
+including the exact `TurnResult.output` and Core system evidence. The dispatch
+input contains references rather than copied or parsed Producer objects.
 
-- the complete original `TurnResult.output`;
-- the Core-observed workspace snapshot, when present;
-- the immutable Assignment and Lane identity.
+The main Agent reads every source result, resolves disagreement against the
+frozen source, and returns one new original result. For WorkItem execution the
+Leader consumes the main Worker result. For replicated Review the Leader
+consumes the main Reviewer result.
 
-The dispatch input lists source references instead of embedding parsed Producer
-objects. This avoids the 4 KiB Turn-input limit and keeps the existing Context
-API as the only durable expansion path.
+## Leader delivery
 
-The main Agent synthesizes one new original result. For replicated WorkItem
-execution, the Leader consumes that main result. For replicated Review, the
-main Reviewer result completes the ReviewRound and the Leader consumes it.
+Role completion Events contain the exact `turnId`, not a copied summary.
 
-Producer disagreements, reported findings, and claimed checks are resolved by
-the main Agent, not by ExecutionGroup code.
+A normal Leader wake records a cursor window. `yui task wake show` resolves
+terminal Events in that window to the referenced Turn even when the Turn was
+created before the window and completed much later. The wake points the Leader
+to:
 
-## Leader result delivery
-
-A Role completion event continues to carry the exact `turnId`; it does not
-copy or summarize the result as a second authority.
-
-Leader result consumption follows:
-
-1. the Leader wake identifies the exact delta events;
-2. `task wake show` resolves terminal events to their referenced Turn IDs,
-   using event completion time rather than Turn creation time;
-3. the Leader reads each exact result with `task turn show`;
-4. the Leader records the lifecycle decision.
-
-This must work for both a newly dispatched Leader Turn and a force-steer into
-an active Leader Turn. A force-steer therefore includes the claimed event
-references or an equivalent wake cursor, rather than only reason tags.
-
-`task context` may keep bounded summaries for orientation, but summaries never
-replace exact result consumption.
-
-## Review and acceptance
-
-Review keeps the boundaries that Core can prove:
-
-- the ReviewRound and Reviewer identity;
-- the exact frozen Candidate or Task heads;
-- the exact Reviewer Turn and workspace;
-- Provider completion or execution failure;
-- whether the current Candidate still matches the reviewed heads.
-
-Core does not derive from Reviewer text:
-
-- Review pass or failure;
-- semantic versus non-semantic output;
-- findings or severity;
-- check outcomes;
-- accepted risk;
-- delta-recheck disposition;
-- repair topology.
-
-When final Review is required, Task completion requires a completed
-ReviewRound over the current exact Task heads and the required Reviewer
-contract. The Leader's explicit `task complete` action is the semantic
-acceptance decision.
-
-A delta recheck may continue to freeze the previous Review, exact diff, and new
-heads as objective context. Its requested disposition remains an Agent output
-convention. The Leader reads the original result and decides whether to
-complete, repair, or request a full Review; Core does not parse the disposition.
-
-## Finding ledger and repair waves
-
-Automatic finding extraction, severity normalization, cross-Round matching,
-finding-ledger completion gates, and result-driven repair-wave planning leave
-the active execution path.
-
-The Leader already has the durable primitives needed to act:
-
-- exact Worker and Reviewer Turn results;
-- WorkItem accept or reject;
-- same-WorkItem retry;
-- Task Decision and Milestone records;
-- new WorkItems only for independently owned requirements;
-- explicit Review requests.
-
-Existing valid finding-ledger records remain readable as historical audit
-evidence after migration, but they do not block completion or drive
-`next-action`. New Review results do not create ledger records.
-
-## Tradeoffs
-
-The design intentionally gives up:
-
-- machine-readable finding and check counts derived from Agent prose;
-- automatic repair-wave planning from Reviewer text;
-- completion blocking based on extracted severity;
-- automatic interpretation of delta-review wording.
-
-In return, Yui has one result authority, fewer persistent concepts, and no
-false semantic decision caused by formatting. Token, tool, duration, Provider,
-workspace, Git, Integration, and Core-run check observability remain
-structured.
-
-When a check must be an engineering gate, Yui must run it through an existing
-Core-owned check or DurableJob boundary. Parsing an Agent's claim that a check
-passed is not equivalent evidence.
-
-## Persistence transition
-
-Use one adjacent aggregate migration.
-
-### Turn
-
-Advance `Turn` to v5 and `TurnResult` to v2:
-
-```ts
-type TurnResult = Readonly<{
-  schemaVersion: 2;
-  output: string;
-  completedAt: string;
-  provider?: TurnProviderResult;
-  systemEvidence?: TurnSystemEvidence;
-  failureReason?: TurnFailureReason;
-  legacyProducer?: ProducerTurnResult;
-}>;
+```sh
+yui task turn show <task>/<turn>
 ```
 
-`legacyProducer` is migration-only audit evidence. New Turns never write it,
-and active execution, synthesis, acceptance, and observability never read it.
+A forced steer into an already active Leader Turn includes the exact
+referenced result Turn commands directly. In both paths the Leader reads the
+complete original result before accepting, retrying, repairing, reviewing
+again, or waiting.
 
-Where an earlier Producer payload and Turn workspace contain sufficient exact
-Project information, migration also derives the Core-owned workspace snapshot.
-Failure to derive it preserves the legacy payload without inventing a
-snapshot.
+## Review and completion
 
-### ReviewRound
+ReviewRound persistence contains Core-owned identity, frozen candidate,
+workspace, execution Group, exact main Reviewer Turn, lifecycle status, and
+optional Core failure. It does not copy Agent summary, report, checks, findings,
+or evidence commits.
 
-Advance `ReviewRound` to v8. A current terminal Round contains:
+Task-final Review completion requires:
 
-- `reviewerTurnId` pointing to the exact main Reviewer Turn when one ran;
-- `status` and `endedAt`;
-- an optional Core-authored terminal failure for a Round that could not create
-  or complete its main Turn;
-- its existing frozen Candidate, workspace, execution Group, and request
-  provenance.
+- the required Review contract;
+- a completed ReviewRound over the current exact Task heads; and
+- one exact completed main Reviewer Turn bound to that Round.
 
-It does not copy the Agent result into `summary`, `report`, or `checks`.
+Core does not inspect the Reviewer output to decide whether it passed. The
+Leader reads the original result and explicitly completes the Task when the
+outcome is acceptable.
 
-Migration moves existing reports, checks, evidence commits, findings, and
-delta dispositions into one opaque `legacyResult` audit payload. Active
-acceptance and completion code never reads that payload.
+A delta recheck stores only objective lineage and diff facts. The Reviewer may
+state that the change is equivalent, defective, or requires a full review, but
+Core does not parse that conclusion.
 
-The current delta-recheck record keeps only objective lineage: previous Round,
-previous head, exact diff digest, changed files, and line counts. Any requested
-disposition and reasoning live only in the Reviewer Turn output.
+## Removed concepts
 
-### Finding ledger
+The current execution path has no:
 
-Existing rows remain audit-only. The migration removes their operational
-authority and removes the active `findingLedger=enforce` completion behavior.
-No malformed or historical record is automatically repaired.
+- Producer-result semantic parser;
+- Review-result parser or semantic classifier;
+- machine-derived check or finding projection;
+- finding ledger or finding-based completion gate;
+- result-driven repair wave;
+- `force-fresh` Review replacement path;
+- Review evidence reuse based on Agent claims.
 
-## Implementation boundaries
+Core-owned GateArtifacts remain reusable because Yui ran and recorded those
+checks itself.
 
-This is one coupled feature, not a set of parallel WorkItems. Result
-terminalization, replicated synthesis, Review acceptance, and migration share
-the same authority boundary and should change together.
+## Storage boundary
 
-The implementation order is:
+This contract uses aggregate schema 31:
 
-1. make `TurnResult.output` plus Core-owned evidence the common result model;
-2. make direct and replicated terminalization stop parsing Agent text;
-3. make main synthesis consume exact source Turn refs and raw outputs;
-4. make ReviewRound and completion depend only on objective execution and
-   frozen-head facts;
-5. remove finding-ledger and repair-wave authority;
-6. update Leader, Worker, Reviewer, built-in Profile, CLI, Web, and
-   observability wording;
-7. add the adjacent migration and remove change-specific scaffolding after
-   validation.
+- WorkItem v15;
+- Turn v5 with TurnResult v2;
+- ReviewRound v8.
+
+There is intentionally no compatibility migration from earlier aggregate
+contracts. An older Home is unsupported by this release and must be opened
+with its matching Yui version or replaced with a newly initialized Home.
+Current validators reject retired semantic result fields instead of preserving
+or adapting them.
 
 ## Verification
 
-Use deterministic local evidence only:
+The required deterministic evidence is:
 
-- a direct Worker may return normal Markdown and completes its Turn unchanged;
-- a writable Producer with arbitrary non-empty text and a clean exact
-  workspace snapshot succeeds;
-- missing headings, invalid JSON, or no reported checks do not create
-  `missing-result`;
+- arbitrary non-empty Worker or Reviewer prose is preserved unchanged;
+- missing headings, invalid JSON, or omitted reported checks do not fail a
+  Turn;
 - dirty or mismatched writable Lane state still fails;
-- main synthesis receives every successful Producer's exact original output in
-  stable Lane order;
-- a direct or replicated Reviewer result remains unchanged and wakes the
-  Leader;
-- final-review gating checks the completed exact-head Round, not parsed
-  findings or checks;
-- existing structured Producer and finding-ledger history remains readable but
-  has no active authority after migration;
-- build and the seconds-scale core smoke pass.
+- main synthesis receives every successful source Turn in stable Lane order;
+- Review completion depends on the exact completed main Turn, not its wording;
+- wake inspection includes a long-running Turn referenced by a terminal Event;
+- old parsed-result and finding commands are absent;
+- build, focused tests, and the complete Core test suite pass.
 
-No real Provider, paid model, shared Home, or production resource is required.
-
-## Rollout and rollback
-
-The change should ship as one adjacent aggregate version without a dual-mode
-feature flag. Running both parsed and opaque authority would preserve the
-ambiguity this design removes.
-
-Before migration, rollback is an ordinary code rollback. After migration,
-standard Yui storage-version rules apply: the previous binary must not open the
-newer Home. Legacy Producer and finding data remains preserved so a later
-forward fix can inspect it without reconstructing Agent semantics.
-
-## Explicit non-goals
-
-- No natural-language, Markdown, JSON, regex, or model-based result parser.
-- No proof that an Agent result is complete or correct.
-- No automatic acceptance, repair, retry, WorkItem creation, or Review
-  escalation based on result text.
-- No removal of replicated execution.
-- No weakening of identity, authorization, workspace, Git, Provider, or
-  lifecycle validation.
-- No duplicate summary or finding store that competes with the original Turn
-  result.
+No real Provider, paid model, shared Home, or production resource is required
+for runtime verification.
