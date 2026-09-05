@@ -1,0 +1,32 @@
+{
+  "status": "passed",
+  "scope": "documents-contracts-and-package-only",
+  "yui_runtime_tests": "not-run",
+  "checks": {
+    "markdown_documents": 45,
+    "relative_links": 98,
+    "standalone_prose": "checked",
+    "code_fences": "checked",
+    "offline_html": {
+      "articles": 45,
+      "anchors": 464,
+      "remote_assets": 0
+    },
+    "complete_architecture_diagram": {
+      "layers": 6,
+      "standalone": true,
+      "reader_entry": "full-architecture",
+      "remote_assets": 0
+    },
+    "task_dependency_dag": "checked",
+    "tasks": 12,
+    "acceptance_scenarios": {
+      "count": 46,
+      "status": "planned"
+    },
+    "capability_descriptors": 38,
+    "manifest": "checked",
+    "typescript": "passed"
+  },
+  "errors": []
+}
