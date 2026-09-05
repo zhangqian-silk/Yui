@@ -17,11 +17,12 @@
  *                                    on the durable outbox.
  *   - Crash recovery .............. WAL rollback of uncommitted transactions;
  *                                    outbox replay of committed-but-unacked effects.
- *   - Record family versioning .... full record (incl. schemaVersion) in payload.
+ *   - Record validation ........... current record (incl. local schemaVersion)
+ *                                    in payload.
  *   - Evidence retention .......... events/review_rounds/change_sets/
  *                                    integration_attempts are never pruned.
  *
- * Records are stored as full versioned JSON in `payload` columns, with typed
+ * Records are stored as full current JSON in `payload` columns, with typed
  * columns for the fields that are queried/filtered/used-for-CAS (§4). A
  * high-frequency runtime telemetry observation is a single-row upsert into
  * `telemetry` scoped by its primary key — it never rewrites global
@@ -136,12 +137,10 @@ import {
   inspectSqliteSchemaMigrations,
   migrateSqliteSchema,
   SqliteSchemaMigrationError,
-  SQLITE_AGGREGATE_VERSION,
-  SQLITE_LAYOUT_VERSION,
   TELEMETRY_KEEP_PER_GENERATION,
   TELEMETRY_TURN_CAP
 } from "./sqliteSchema.js";
-import { inspectStorageSchema, StorageSchemaError } from "./storageSchema.js";
+import { StorageSchemaError } from "./storageSchema.js";
 
 /** Options for {@link SqliteTaskStore}. */
 export type SqliteTaskStoreOptions = Readonly<{
@@ -333,9 +332,10 @@ export class SqliteTaskStore implements TaskStore {
     const now = new Date().toISOString();
     const identity = generateHomeIdentity(new Date());
     this.#db.prepare(
-      `INSERT OR IGNORE INTO home_meta (id, home_identity, revision, layout_version, aggregate_version, created_at, updated_at)
-       VALUES (1, ?, 0, ?, ?, ?, ?)`
-    ).run(JSON.stringify(identity), SQLITE_LAYOUT_VERSION, SQLITE_AGGREGATE_VERSION, now, now);
+      `INSERT OR IGNORE INTO home_meta
+       (id, home_identity, revision, created_at, updated_at)
+       VALUES (1, ?, 0, ?, ?)`
+    ).run(JSON.stringify(identity), now, now);
   }
 
   #seedConfig(): void {

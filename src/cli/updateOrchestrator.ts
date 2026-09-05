@@ -1,8 +1,10 @@
 /**
- * Side-by-side `yui update` orchestration for the current storage contract.
+ * Side-by-side `yui update` orchestration for the supported storage range.
  *
- * The staged binary proves an exact-current Home before the exact Controller
- * is stopped and the replacement is activated, verified, and restarted.
+ * The staged binary proves either an exact-current Home or a complete
+ * migration path before the exact Controller is stopped. The replacement is
+ * then activated, any required storage migration is applied, and the result is
+ * verified before the Controller is restarted.
  */
 
 /** A side-by-side staged package, isolated from the live global install. */
@@ -15,6 +17,7 @@ export type StagedPackage = Readonly<{
 /** Read-only verdict produced by the staged binary. */
 export type UpdatePreflight = Readonly<
   | { status: "already-current"; stepCount?: 0 }
+  | { status: "migration-ready"; stepCount: number }
   | {
       status: "blocked";
       stage: string;
@@ -54,11 +57,19 @@ export type UpdateControllerStopResult = Readonly<{
   pid?: number;
 }>;
 
-/** Injected update effects for a current-contract binary replacement. */
+export type UpdateStorageMigrationResult = Readonly<{
+  backupPath?: string;
+}>;
+
+/** Injected update effects for a binary replacement and optional Home migration. */
 export type UpdatePorts = Readonly<{
   stage: (version?: string) => StagedPackage;
   preflight: (staged: StagedPackage, home: string) => UpdatePreflight;
   activateBinary: (staged: StagedPackage) => void;
+  migrateStorage?: (
+    staged: StagedPackage,
+    home: string
+  ) => UpdateStorageMigrationResult;
   verify: (staged: StagedPackage, home: string) => void;
   cleanup: (staged: StagedPackage) => void;
   beginControllerHandover?: (home: string) => () => void;
@@ -71,7 +82,7 @@ export type UpdatePorts = Readonly<{
 export type UpdateResult = Readonly<
   (
     | { outcome: "already-current"; version: string }
-    | { outcome: "updated"; version: string }
+    | { outcome: "updated"; version: string; backupPath?: string }
     | {
         outcome: "aborted";
         phase: UpdatePhase;
@@ -83,6 +94,7 @@ export type UpdateResult = Readonly<
         retryCommand?: string;
         sceneUnchanged?: true;
         controllerOwnershipUnknown?: true;
+        backupPath?: string;
       }
   ) & { cleanupWarning?: string }
 >;
@@ -92,6 +104,7 @@ export type UpdatePhase =
   | "preflight"
   | "coordination"
   | "activate-binary"
+  | "migrate-storage"
   | "post-verify";
 
 type ControllerLifecycle = Readonly<{
@@ -162,6 +175,26 @@ function runStagedUpdate(
       ...(preflight.sceneUnchanged === true ? { sceneUnchanged: true } : {})
     };
   }
+  if (preflight.status === "migration-ready" && ports.migrateStorage === undefined) {
+    return {
+      outcome: "aborted",
+      phase: "preflight",
+      message: "The staged binary requires a storage migration, but no migration operation is available.",
+      action: "Use the complete Yui updater or run the staged release's `yui upgrade` explicitly.",
+      recoverable: true,
+      version: staged.version
+    };
+  }
+  if (preflight.status === "migration-ready" && !hasCompleteControllerLifecycle(ports)) {
+    return {
+      outcome: "aborted",
+      phase: "preflight",
+      message: "Storage migration requires a complete, fenced Controller handoff.",
+      action: "Provide status, exact stop, replacement start, and exact restore operations.",
+      recoverable: true,
+      version: staged.version
+    };
+  }
 
   let releaseHandover: (() => void) | undefined;
   try {
@@ -180,7 +213,7 @@ function runStagedUpdate(
   try {
     const captured = captureControllerLifecycle(ports, staged.version, home);
     if ("outcome" in captured) return captured;
-    return activateAndVerify(ports, staged, home, captured.lifecycle);
+    return activateAndVerify(ports, staged, home, captured.lifecycle, preflight);
   } finally {
     releaseHandover?.();
   }
@@ -190,7 +223,8 @@ function activateAndVerify(
   ports: UpdatePorts,
   staged: StagedPackage,
   home: string,
-  lifecycle: ControllerLifecycle
+  lifecycle: ControllerLifecycle,
+  preflight: Exclude<UpdatePreflight, { status: "blocked" }>
 ): UpdateResult {
   try {
     ports.activateBinary(staged);
@@ -205,18 +239,46 @@ function activateAndVerify(
     });
   }
 
+  let migration: UpdateStorageMigrationResult | undefined;
+  if (preflight.status === "migration-ready") {
+    try {
+      migration = ports.migrateStorage!(staged, home);
+      if (!isStorageMigrationResult(migration)) {
+        throw new Error("Storage migration returned a malformed result.");
+      }
+    } catch (error) {
+      return {
+        outcome: "aborted",
+        phase: "migrate-storage",
+        message: `Storage migration failed: ${messageOf(error)}`,
+        action:
+          "The target Yui binary is installed and the Home remains quiesced. "
+          + "Resolve the reported problem, rerun `yui upgrade`, then verify "
+          + "`yui doctor` before starting the Controller.",
+        recoverable: true,
+        version: staged.version
+      };
+    }
+  }
+
   try {
     ports.verify(staged, home);
   } catch (error) {
+    const storageMigrated = preflight.status === "migration-ready";
     const failure: Extract<UpdateResult, { outcome: "aborted" }> = {
       outcome: "aborted",
       phase: "post-verify",
       message: `Post-update health check failed: ${messageOf(error)}`,
       action: binaryHealthUncertainAction(),
-      recoverable: false,
-      version: staged.version
+      recoverable: storageMigrated,
+      version: staged.version,
+      ...(migration?.backupPath === undefined
+        ? {}
+        : { backupPath: migration.backupPath })
     };
-    return restoreControllerOrReport(ports, home, lifecycle, failure);
+    return storageMigrated
+      ? failure
+      : restoreControllerOrReport(ports, home, lifecycle, failure);
   }
 
   if (lifecycle.ensureRunning) {
@@ -224,6 +286,7 @@ function activateAndVerify(
       ports.startController!(home);
     } catch (error) {
       const unknownActive = isUnknownActiveControllerFailure(error);
+      const storageMigrated = preflight.status === "migration-ready";
       const failure: Extract<UpdateResult, { outcome: "aborted" }> = {
         outcome: "aborted",
         phase: "post-verify",
@@ -232,14 +295,19 @@ function activateAndVerify(
           : "The replacement Controller could not start after activation and verification"}: ${messageOf(error)}.`,
         action: unknownActive
           ? unknownActiveControllerAction(home)
-          : lifecycle.wasRunning
+          : storageMigrated
+            ? "Keep the Home quiesced, verify the activated binary, then start the current Controller explicitly."
+            : lifecycle.wasRunning
             ? "Keep the Home quiesced and restore the captured Controller identity before retrying."
             : "Verify the activated binary, then start the Controller explicitly.",
-        recoverable: false,
+        recoverable: storageMigrated && !unknownActive,
         version: staged.version,
-        controllerOwnershipUnknown: true
+        ...(migration?.backupPath === undefined
+          ? {}
+          : { backupPath: migration.backupPath }),
+        ...(unknownActive ? { controllerOwnershipUnknown: true } : {})
       };
-      return unknownActive
+      return unknownActive || storageMigrated
         ? failure
         : restoreControllerOrReport(ports, home, lifecycle, failure);
     }
@@ -247,7 +315,8 @@ function activateAndVerify(
 
   return {
     outcome: "updated",
-    version: staged.version
+    version: staged.version,
+    ...(migration?.backupPath === undefined ? {} : { backupPath: migration.backupPath })
   };
 }
 
@@ -391,6 +460,18 @@ function isControllerLifecycleStatus(value: unknown): value is UpdateControllerL
 
 function isControllerStopResult(value: unknown): value is UpdateControllerStopResult {
   return isRecord(value) && typeof value.stopped === "boolean";
+}
+
+function hasCompleteControllerLifecycle(ports: UpdatePorts): boolean {
+  return ports.controllerStatus !== undefined
+    && ports.stopController !== undefined
+    && ports.startController !== undefined
+    && ports.restoreController !== undefined;
+}
+
+function isStorageMigrationResult(value: unknown): value is UpdateStorageMigrationResult {
+  return isRecord(value)
+    && (value.backupPath === undefined || typeof value.backupPath === "string");
 }
 
 function isPositivePid(value: unknown): value is number {

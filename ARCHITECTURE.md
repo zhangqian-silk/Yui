@@ -366,18 +366,33 @@ cleanup revalidates ownership and fails safely when concurrent state changes;
 manual retry is the recovery boundary rather than another durable state
 machine.
 
-Storage still records layout, aggregate, and record-family versions, but this
-release deliberately re-baselines all three axes at the current contract. The
-production migration registry is empty. Ordinary opening, Controller startup,
-doctor, update preflight, and the storage upgrade entry point therefore accept
-only an exact current manifest and current record shapes. An older Home is
-unsupported and must not be normalized, rewritten, or switched in place.
+Storage has one compatibility authority: the highest contiguous, checksummed
+version in SQLite's append-only migration ledger. The CLI exposes that release's
+current version and minimum supported migration version. Ordinary opening and
+Controller startup accept only the exact current version; historical decoding
+and rewriting exist only inside `yui upgrade` and the migration phase of
+`yui update`.
 
-SQLite bootstrap DDL is an implementation detail for initializing a fresh Home.
-Its ledger must be complete on every later open; a partial or older ledger is
-rejected rather than advanced. This keeps one durable model for Turn,
-TaskRoleSessionSet, WorkMailbox, and Provider Runtime Binding and prevents an
-old writer or migration transform from recreating removed delivery state.
+Yui 0.15.0 establishes storage version 1 as the clean single-version baseline:
+`schema.json` has no authority, and layout/aggregate/record-version axes are
+absent from Home metadata. Pre-0.15.0 Homes are outside the migration floor.
+Future releases append one immutable migration per storage version and retain
+the complete chain from version 1. A fresh Home replays that same chain, so
+fresh and upgraded Homes converge on one current schema.
+
+The staged `upgrade --update-preflight` / `--update-apply` machine handshake is
+also a compatibility contract: target releases keep its established outcomes
+and required fields, plus the parent-owned handover-lock proof, readable by
+every updater released since version 1. Additive detail is allowed; renaming or
+removing consumed fields would strand an otherwise valid cross-version
+migration path.
+
+An upgrade runs only while the Controller is quiesced, creates a consistent
+database backup, applies all missing migrations in one transaction, and
+validates the current record model before writes resume. A missing or changed
+ledger row, a migration gap, a Home below the migration floor, a future Home,
+or malformed data fails closed. Runtime code contains no dual readers,
+historical normalizers, or independently writable compatibility state.
 
 The Web control room is loopback-only and never receives Controller socket
 credentials. It presents durable records and native terminal access without

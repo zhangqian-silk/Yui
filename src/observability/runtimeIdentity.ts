@@ -16,9 +16,13 @@ import { join } from "node:path";
 import Database from "better-sqlite3";
 
 import {
-  CURRENT_AGGREGATE_SCHEMA_VERSION,
-  CURRENT_STORAGE_LAYOUT_VERSION
+  CURRENT_STORAGE_VERSION,
+  MIN_SUPPORTED_STORAGE_VERSION
 } from "../storage/storageVersions.js";
+import {
+  inspectStorageSchema,
+  type StorageSchemaState
+} from "../storage/storageSchema.js";
 import { resolveStoreWorkerEnabledForHome } from "../storage/storeRpc.js";
 
 export const UNSUPPORTED = "unsupported" as const;
@@ -67,9 +71,9 @@ export type StorageIdentityFinding = Readonly<{
 
 export type StorageIdentity = Readonly<{
   home: string;
-  manifestStatus: "current" | "uninitialized" | "invalid" | "unsupported";
-  logicalLayout: number | Unsupported;
-  aggregateSchemaVersion: number | Unsupported;
+  storageStatus: StorageSchemaState["status"];
+  storageVersion: number | Unsupported;
+  minimumStorageVersion: number;
   /** The one backend ordinary startup opens. */
   configuredBackend: "sqlite";
   /** Worker selected by THIS process environment (YUI_STORE_WORKER). */
@@ -238,7 +242,7 @@ export function collectRuntimeBuildIdentity(
 
 export type StorageIdentityPorts = Readonly<{
   env: NodeJS.ProcessEnv;
-  readText(path: string): string | null;
+  inspectStorage(home: string): StorageSchemaState;
   fileSize(path: string): number | null;
   exists(path: string): boolean;
   /** Open yui.db read-only and run PRAGMA quick_check. Null when absent. */
@@ -250,13 +254,7 @@ export function createProductionStorageIdentityPorts(
 ): StorageIdentityPorts {
   return {
     env,
-    readText: (path) => {
-      try {
-        return readFileSync(path, "utf8");
-      } catch {
-        return null;
-      }
-    },
+    inspectStorage: (home) => inspectStorageSchema(home),
     fileSize: (path) => {
       try {
         return statSync(path).size;
@@ -290,42 +288,12 @@ export function collectStorageIdentity(
   home: string,
   ports: StorageIdentityPorts = createProductionStorageIdentityPorts()
 ): StorageIdentity {
-  const manifestPath = join(home, "schema.json");
-  const manifestText = ports.readText(manifestPath);
-  let manifestStatus: StorageIdentity["manifestStatus"] = "uninitialized";
-  let logicalLayout: number | Unsupported = UNSUPPORTED;
-  let aggregateSchemaVersion: number | Unsupported = UNSUPPORTED;
-  if (manifestText !== null) {
-    manifestStatus = "current";
-    try {
-      const manifest = JSON.parse(manifestText) as {
-        storageVersion?: unknown;
-        aggregateSchemaVersion?: unknown;
-      };
-      if (
-        typeof manifest.storageVersion === "number"
-        && Number.isFinite(manifest.storageVersion)
-      ) {
-        logicalLayout = manifest.storageVersion;
-      }
-      if (
-        typeof manifest.aggregateSchemaVersion === "number"
-        && Number.isFinite(manifest.aggregateSchemaVersion)
-      ) {
-        aggregateSchemaVersion = manifest.aggregateSchemaVersion;
-      }
-      if (typeof logicalLayout !== "number"
-        || typeof aggregateSchemaVersion !== "number"
-        || logicalLayout !== CURRENT_STORAGE_LAYOUT_VERSION
-        || aggregateSchemaVersion !== CURRENT_AGGREGATE_SCHEMA_VERSION) {
-        manifestStatus = "unsupported";
-      }
-    } catch {
-      manifestStatus = "invalid";
-      logicalLayout = UNSUPPORTED;
-      aggregateSchemaVersion = UNSUPPORTED;
-    }
-  }
+  const storage = ports.inspectStorage(home);
+  const storageVersion = storage.status === "current"
+    || storage.status === "upgradeable"
+    || storage.status === "unsupported"
+    ? storage.currentVersion
+    : UNSUPPORTED;
 
   const statePath = join(home, "state.json");
   const statePresent = ports.exists(statePath);
@@ -340,7 +308,7 @@ export function collectStorageIdentity(
   const workerEnabled = resolveStoreWorkerEnabledForHome(home, ports.env);
   const dbHealth = dbPresent ? ports.probeDatabaseHealth(dbPath) : null;
   const findings: StorageIdentityFinding[] = [];
-  if (manifestStatus === "current" && !dbPresent) {
+  if (storage.status === "current" && !dbPresent) {
     findings.push({
       code: "current-database-missing",
       severity: "contradiction",
@@ -348,20 +316,50 @@ export function collectStorageIdentity(
       remediation: "Preserve this Home for diagnosis and initialize a new Home."
     });
   }
-  if (manifestStatus === "unsupported") {
+  if (storage.status === "uninitialized") {
+    findings.push({
+      code: "storage-uninitialized",
+      severity: "needs-repair",
+      message: "Yui storage has not been initialized for this Home.",
+      remediation: "Run `yui setup` for a new, empty Home."
+    });
+  }
+  if (storage.status === "upgradeable") {
+    findings.push({
+      code: "storage-upgrade-required",
+      severity: "needs-repair",
+      message:
+        `Storage version ${storage.currentVersion} requires migration to `
+        + `${CURRENT_STORAGE_VERSION}.`,
+      remediation: "Run `yui upgrade` or `yui update` before resuming writes."
+    });
+  }
+  if (storage.status === "unsupported") {
     findings.push({
       code: "unsupported-storage-contract",
       severity: "contradiction",
-      message: "The Home does not match this release's exact storage contract.",
-      remediation: "Open it read-only with its original Yui version, then let the Operator recreate unfinished work in a new Home."
+      message:
+        `Storage version ${storage.currentVersion} is outside the supported migration range `
+        + `${MIN_SUPPORTED_STORAGE_VERSION}..${CURRENT_STORAGE_VERSION}.`,
+      remediation: storage.direction === "newer"
+        ? "Use a newer Yui release."
+        : "Use a Yui release whose migration floor includes this Home."
     });
   }
-  if (manifestStatus === "invalid") {
+  if (storage.status === "invalid") {
     findings.push({
-      code: "invalid-storage-manifest",
+      code: "invalid-storage",
       severity: "contradiction",
-      message: "schema.json is invalid.",
-      remediation: "Preserve this Home for diagnosis and initialize a new Home."
+      message: storage.detail,
+      remediation: "Preserve this Home for diagnosis and restore a known-good backup."
+    });
+  }
+  if (ports.exists(join(home, "schema.json"))) {
+    findings.push({
+      code: "ignored-legacy-storage-manifest",
+      severity: "warning",
+      message: "schema.json is legacy metadata and is not a storage authority.",
+      remediation: "A successful storage upgrade removes it automatically."
     });
   }
   if (dbPresent && dbHealth !== null && dbHealth !== "ok") {
@@ -392,9 +390,9 @@ export function collectStorageIdentity(
 
   return {
     home,
-    manifestStatus,
-    logicalLayout,
-    aggregateSchemaVersion,
+    storageStatus: storage.status,
+    storageVersion,
+    minimumStorageVersion: MIN_SUPPORTED_STORAGE_VERSION,
     configuredBackend,
     workerEnabled,
     physicalStateJson: {
@@ -405,8 +403,7 @@ export function collectStorageIdentity(
       present: dbPresent,
       bytes: dbBytes ?? UNSUPPORTED,
       wal: walPresent,
-      shm: shmPresent
-      ,
+      shm: shmPresent,
       health: dbHealth ?? UNSUPPORTED
     },
     findings

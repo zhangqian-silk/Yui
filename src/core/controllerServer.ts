@@ -588,8 +588,8 @@ async function routeRequest(
         homeFilesystemId,
         controllerInstanceId,
         version: YUI_VERSION,
-        storageLayoutVersion: yuiVersionIdentity().storageLayoutVersion,
-        aggregateSchemaVersion: yuiVersionIdentity().aggregateSchemaVersion,
+        storageVersion: yuiVersionIdentity().storageVersion,
+        minimumStorageVersion: yuiVersionIdentity().minimumStorageVersion,
         ...(status === undefined ? {} : { runtime: status(telemetry) })
       }
     });
@@ -955,7 +955,7 @@ export function buildRuntimeIdentityReceipt(input: RuntimeIdentityInput): Runtim
     }
   })();
   return Object.freeze({
-    schemaVersion: 1,
+    schemaVersion: 2,
     version: YUI_VERSION,
     executablePath: process.execPath,
     args: process.argv.slice(1),
@@ -965,8 +965,8 @@ export function buildRuntimeIdentityReceipt(input: RuntimeIdentityInput): Runtim
     cliRealpath: controllerCliRealpath(),
     controllerRealpath: realpathSync(fileURLToPath(import.meta.url)),
     controllerProtocolVersion: FILE_TASK_CONTROLLER_PROTOCOL_VERSION,
-    storageLayoutVersion: yuiVersionIdentity().storageLayoutVersion,
-    aggregateSchemaVersion: yuiVersionIdentity().aggregateSchemaVersion,
+    storageVersion: yuiVersionIdentity().storageVersion,
+    minimumStorageVersion: yuiVersionIdentity().minimumStorageVersion,
     storageBackend: input.storageBackend,
     workerEnabled: input.workerEnabled,
     pid: process.pid,

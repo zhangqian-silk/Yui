@@ -51,12 +51,12 @@ There is no compatibility lookup, cross-Task guess, or bare-ID fallback.
 
 ## Current-schema boundary
 
-Runtime opens only aggregate v31 / Task v7. It does not convert,
-dual-read, or infer records from an older schema. If an existing `YUI_HOME`
-does not match the current schema, keep it untouched for external archival
-and initialize a fresh home for this runtime.
+Runtime opens only the current Home storage version and current record shapes.
+It does not dual-read or infer historical records during ordinary work.
+Historical decoding and rewriting are confined to the explicit `yui upgrade`
+boundary and the migration phase of `yui update`; every valid Home at or above
+the CLI's minimum supported storage version can advance directly to current.
 
-This hard cut keeps Task-local references, Role desired configuration, and
-immutable Turn/RoleSession effective snapshots under one unambiguous
-contract. There is no compatibility lookup, conversion command, or
-intermediate storage format.
+This boundary keeps Task-local references, Role desired configuration, and
+immutable Turn/RoleSession effective snapshots under one unambiguous runtime
+contract while the append-only migration chain preserves supported history.

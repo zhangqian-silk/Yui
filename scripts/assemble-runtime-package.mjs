@@ -218,11 +218,22 @@ function copyProductionDependencies(root, output) {
       `Runtime assembly could not list production dependencies: ${error.message}`
     );
   }
-  const packages = listed
+  const entries = listed
     .split("\n")
     .map((line) => line.trim())
-    .filter((line) => line.length > 0 && resolve(line) !== resolve(root))
-    .map((line) => resolve(line));
+    .filter((line) => line.length > 0);
+  // `npm ls --parseable` always emits the project root first. npm 11 may
+  // redact UUID-shaped path segments in every emitted path, so resolve each
+  // dependency from its relative path below that first entry rather than
+  // trusting the printed absolute prefix. External linked dependencies still
+  // resolve outside node_modules and fail the boundary check below.
+  const listedRoot = entries[0];
+  if (listedRoot === undefined) {
+    throw new Error("Runtime assembly found no npm project root.");
+  }
+  const packages = entries
+    .slice(1)
+    .map((line) => resolve(root, relative(listedRoot, line)));
   if (packages.length === 0) {
     throw new Error("Runtime assembly found no production dependencies to copy.");
   }

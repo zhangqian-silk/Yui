@@ -1,5 +1,16 @@
-import { existsSync } from "node:fs";
-import { join } from "node:path";
+import {
+  basename,
+  dirname,
+  join
+} from "node:path";
+import {
+  copyFileSync,
+  existsSync,
+  mkdirSync,
+  rmSync
+} from "node:fs";
+
+import Database from "better-sqlite3";
 
 import {
   RUNTIME_OBSERVATION_TASK_EVENT,
@@ -18,56 +29,76 @@ import { validateTurn } from "../../turn/turn.js";
 import { validateWorkItem } from "../../workItem/workItem.js";
 import { SqliteTaskStore } from "../sqliteStore.js";
 import {
+  inspectSqliteSchemaMigrations,
+  migrateSqliteSchema,
+  storageMigrationPlan,
+  type StorageMigrationStep
+} from "../sqliteSchema.js";
+import {
+  CURRENT_DATABASE_FILENAME,
   inspectStorageSchema,
   type StorageSchemaState
 } from "../storageSchema.js";
-import type { StorageVersionState } from "./recordVersions.js";
-
-const CURRENT_DATABASE_FILENAME = "yui.db";
-
-type CurrentStorageReport = Readonly<{
-  outcome: "already-current";
-  mode: "dry-run" | "execute";
-  source: StorageVersionState;
-  target: StorageVersionState;
-}>;
+import {
+  CURRENT_STORAGE_VERSION,
+  MIN_SUPPORTED_STORAGE_VERSION
+} from "../storageVersions.js";
 
 export type HomeClassification = Readonly<{
   classification:
     | Readonly<{ verdict: "USABLE"; status: "current" }>
+    | Readonly<{ verdict: "MIGRATABLE"; status: "migration-ready" }>
     | Readonly<{
         verdict: "NEEDS_NEW_VERSION";
         status: "unsupported";
         blocker: Readonly<{
-          reason: "future-version" | "missing-step";
-          axis: "layout" | "aggregate" | "record";
-          recordKind?: string;
-          found?: number;
-          supported?: number;
-          from?: number;
-          to?: number;
+          reason: "future-version" | "below-minimum";
+          found: number;
+          current: number;
+          minimum: number;
           message: string;
           action: string;
         }>;
       }>
     | Readonly<{ verdict: "CORRUPTED"; status: "unsupported"; detail: string }>;
-  layoutVersion?: number;
-  aggregateVersion?: number;
-  latestLayoutVersion: number;
-  latestAggregateVersion: number;
-  incompatibleComponent?: "layout" | "aggregate" | "record";
+  storageVersion?: number;
+  currentStorageVersion: number;
+  minimumSupportedStorageVersion: number;
   uninitialized?: true;
+}>;
+
+export type StorageUpgradeReport = Readonly<{
+  outcome: "already-current" | "upgrade-plan" | "upgraded";
+  mode: "dry-run" | "execute";
+  sourceVersion: number;
+  targetVersion: number;
+  steps: readonly StorageMigrationStep[];
+  backupPath?: string;
 }>;
 
 export type UpgradeBlockerStage = "uninitialized" | "unsupported" | "corruption";
 
 export type UpgradeResult = Readonly<
-  | { outcome: "already-current"; classification: HomeClassification; report: CurrentStorageReport }
+  | {
+      outcome: "already-current";
+      classification: HomeClassification;
+      report: StorageUpgradeReport;
+    }
+  | {
+      outcome: "upgrade-plan";
+      classification: HomeClassification;
+      report: StorageUpgradeReport;
+    }
+  | {
+      outcome: "upgraded";
+      classification: HomeClassification;
+      report: StorageUpgradeReport;
+    }
   | {
       outcome: "update-preflight";
-      status: "already-current";
-      stepCount: 0;
-      steps: readonly [];
+      status: "already-current" | "migration-ready";
+      stepCount: number;
+      steps: readonly StorageMigrationStep[];
       classification: HomeClassification;
     }
   | {
@@ -78,89 +109,214 @@ export type UpgradeResult = Readonly<
       classification: HomeClassification;
       sceneUnchanged: true;
     }
+  | {
+      outcome: "failed";
+      stage: "backup" | "migration";
+      message: string;
+      action: string;
+      backupPath?: string;
+      classification: HomeClassification;
+      sceneUnchanged: boolean;
+    }
 >;
 
 export type RunStorageUpgradeOptions = Readonly<{
   home: string;
-  latest: StorageVersionState;
   mode: "dry-run" | "execute" | "update-preflight";
   now?: Date;
 }>;
 
 /**
- * Validate the one supported storage contract.
+ * Upgrade one valid Home through the complete linear migration chain.
  *
- * Aggregate 31 deliberately has no historical migration path. `upgrade`
- * remains as a read-only compatibility/preflight surface for current Homes;
- * every non-current contract is rejected without touching the Home.
+ * Supported earlier versions are readable only here. Ordinary stores still
+ * admit exactly {@link CURRENT_STORAGE_VERSION}; no old-shape normalizer or
+ * dual read path enters runtime code. Execute mode is an offline primitive:
+ * its caller must own the maintenance fence and keep the Controller quiesced
+ * for the whole backup, migration, and validation interval.
  */
 export async function runStorageUpgrade(options: RunStorageUpgradeOptions): Promise<UpgradeResult> {
-  const schema = inspectStorageSchema(options.home);
-  if (schema.status === "uninitialized") {
+  const state = inspectStorageSchema(options.home);
+  if (state.status === "uninitialized") {
     return blocked(
-      { ...currentClassification(options.latest), uninitialized: true },
+      { ...corruptedClassification("Storage is not initialized."), uninitialized: true },
       "uninitialized",
       "Yui storage is not initialized for this Home.",
       "Run `yui setup` with a new Home."
     );
   }
-  if (schema.status === "invalid") {
+  if (state.status === "invalid") {
     return blocked(
-      corruptedClassification(options.latest, schema.detail),
+      corruptedClassification(state.detail),
       "corruption",
-      `Storage schema is invalid: ${schema.detail}`,
+      `Storage is invalid: ${state.detail}`,
       "Preserve this Home for diagnosis and restore it from a known-good backup."
     );
   }
-  if (!existsSync(join(options.home, CURRENT_DATABASE_FILENAME))) {
-    return blocked(
-      corruptedClassification(options.latest, "The SQLite database is missing."),
-      "corruption",
-      "The SQLite Home is incomplete: yui.db is missing.",
-      "Preserve this Home for diagnosis and restore it from a known-good backup."
-    );
-  }
-  if (schema.status === "unsupported") {
-    const classification = unsupportedClassification(schema, options.latest);
+  if (state.status === "unsupported") {
+    const classification = unsupportedClassification(state);
     return blocked(
       classification,
       "unsupported",
-      "This Home does not exactly match the current storage contract; this release provides no migration path.",
-      schema.direction === "newer"
-        ? "Use a newer Yui release that supports this exact Home."
-        : "Open it with its matching Yui version, or initialize a new Home."
+      classification.classification.verdict === "NEEDS_NEW_VERSION"
+        ? classification.classification.blocker.message
+        : "Storage is unsupported.",
+      classification.classification.verdict === "NEEDS_NEW_VERSION"
+        ? classification.classification.blocker.action
+        : "Use a compatible Yui release."
     );
   }
 
-  try {
-    validateCurrentStore(options.home);
-  } catch (error) {
+  if (state.status === "current") {
+    try {
+      validateCurrentStore(options.home);
+    } catch (error) {
+      return blocked(
+        corruptedClassification(messageOf(error)),
+        "corruption",
+        `Current storage validation failed: ${messageOf(error)}`,
+        "Preserve this Home for diagnosis and restore it from a known-good backup."
+      );
+    }
+    const classification = currentClassification();
+    if (options.mode === "update-preflight") {
+      return {
+        outcome: "update-preflight",
+        status: "already-current",
+        stepCount: 0,
+        steps: [],
+        classification
+      };
+    }
+    return {
+      outcome: "already-current",
+      classification,
+      report: {
+        outcome: "already-current",
+        mode: options.mode,
+        sourceVersion: CURRENT_STORAGE_VERSION,
+        targetVersion: CURRENT_STORAGE_VERSION,
+        steps: []
+      }
+    };
+  }
+
+  const plan = storageMigrationPlan(state.currentVersion);
+  if (plan === null) {
     return blocked(
-      corruptedClassification(options.latest, messageOf(error)),
+      corruptedClassification(
+        `No complete migration path exists from ${state.currentVersion} `
+          + `to ${CURRENT_STORAGE_VERSION}.`
+      ),
       "corruption",
-      `Current storage validation failed: ${messageOf(error)}`,
-      "Preserve this Home for diagnosis and restore it from a known-good backup."
+      "The storage migration registry is incomplete.",
+      "Install a Yui release that carries the complete migration chain."
     );
   }
-
-  const classification = currentClassification(options.latest);
+  const classification = migratableClassification(state.currentVersion);
   if (options.mode === "update-preflight") {
     return {
       outcome: "update-preflight",
-      status: "already-current",
-      stepCount: 0,
-      steps: [],
+      status: "migration-ready",
+      stepCount: plan.length,
+      steps: plan,
       classification
     };
   }
+  if (options.mode === "dry-run") {
+    return {
+      outcome: "upgrade-plan",
+      classification,
+      report: {
+        outcome: "upgrade-plan",
+        mode: "dry-run",
+        sourceVersion: state.currentVersion,
+        targetVersion: CURRENT_STORAGE_VERSION,
+        steps: plan
+      }
+    };
+  }
+
+  let backupPath: string;
+  try {
+    backupPath = await createDatabaseBackup(
+      options.home,
+      state.currentVersion,
+      options.now ?? new Date()
+    );
+  } catch (error) {
+    return {
+      outcome: "failed",
+      stage: "backup",
+      message: `Storage backup failed: ${messageOf(error)}`,
+      action:
+        "Storage was not modified. Resolve the backup path, permissions, or free-space problem "
+        + "and rerun `yui upgrade`.",
+      classification,
+      sceneUnchanged: true
+    };
+  }
+  let migrationCommitted = false;
+  try {
+    const database = new Database(join(options.home, CURRENT_DATABASE_FILENAME));
+    try {
+      database.pragma("journal_mode = WAL");
+      database.pragma("synchronous = FULL");
+      database.pragma("foreign_keys = ON");
+      database.pragma("busy_timeout = 5000");
+      migrateSqliteSchema(database, { mode: "apply" });
+      migrationCommitted = true;
+    } finally {
+      database.close();
+    }
+    validateCurrentStore(options.home);
+    rmSync(join(options.home, "schema.json"), { force: true });
+  } catch (error) {
+    const restoration = migrationCommitted
+      ? tryRestoreDatabaseBackup(options.home, backupPath)
+      : { restored: true as const };
+    return {
+      outcome: "failed",
+      stage: "migration",
+      message: `Storage migration failed: ${messageOf(error)}`,
+      action: restoration.restored
+        ? "The original database was restored from the timestamped backup. "
+          + "Resolve the reported problem and rerun `yui upgrade`."
+        : "Automatic restore also failed. Keep the Home quiesced and restore "
+          + `${backupPath} manually before retrying. Restore error: ${restoration.error}`,
+      backupPath,
+      classification,
+      sceneUnchanged: restoration.restored
+    };
+  }
+
+  const finalState = inspectStorageSchema(options.home);
+  if (finalState.status !== "current") {
+    const restoration = tryRestoreDatabaseBackup(options.home, backupPath);
+    return {
+      outcome: "failed",
+      stage: "migration",
+      message: `Storage migration did not reach version ${CURRENT_STORAGE_VERSION}.`,
+      action: restoration.restored
+        ? "The original database was restored from the timestamped backup. "
+          + "Inspect the migration registry before retrying."
+        : "Automatic restore also failed. Keep the Home quiesced and restore "
+          + `${backupPath} manually before retrying. Restore error: ${restoration.error}`,
+      backupPath,
+      classification,
+      sceneUnchanged: restoration.restored
+    };
+  }
   return {
-    outcome: "already-current",
-    classification,
+    outcome: "upgraded",
+    classification: currentClassification(),
     report: {
-      outcome: "already-current",
-      mode: options.mode,
-      source: options.latest,
-      target: options.latest
+      outcome: "upgraded",
+      mode: "execute",
+      sourceVersion: state.currentVersion,
+      targetVersion: CURRENT_STORAGE_VERSION,
+      steps: plan,
+      backupPath
     }
   };
 }
@@ -199,63 +355,112 @@ function validateCurrentStore(home: string): void {
         }
       }
     }
+    const quickCheck = store.databaseHandle().pragma("quick_check", { simple: true });
+    if (quickCheck !== "ok") {
+      throw new Error(`SQLite quick_check failed: ${String(quickCheck)}.`);
+    }
   } finally {
     store.close();
   }
 }
 
-function currentClassification(latest: StorageVersionState): HomeClassification {
+async function createDatabaseBackup(
+  home: string,
+  sourceVersion: number,
+  now: Date
+): Promise<string> {
+  const source = join(home, CURRENT_DATABASE_FILENAME);
+  if (!existsSync(source)) throw new Error("The authoritative yui.db is missing.");
+  const backupDirectory = join(dirname(home), `${basename(home)}-backups`);
+  mkdirSync(backupDirectory, { recursive: true, mode: 0o700 });
+  const timestamp = now.toISOString().replaceAll(":", "-");
+  const backupPath = join(
+    backupDirectory,
+    `pre-storage-v${sourceVersion}-${timestamp}.db`
+  );
+  const database = new Database(source, { readonly: true, fileMustExist: true });
+  try {
+    await database.backup(backupPath);
+  } finally {
+    database.close();
+  }
+  return backupPath;
+}
+
+function restoreDatabaseBackup(home: string, backupPath: string): void {
+  const databasePath = join(home, CURRENT_DATABASE_FILENAME);
+  rmSync(`${databasePath}-wal`, { force: true });
+  rmSync(`${databasePath}-shm`, { force: true });
+  copyFileSync(backupPath, databasePath);
+}
+
+function tryRestoreDatabaseBackup(
+  home: string,
+  backupPath: string
+): Readonly<{ restored: true } | { restored: false; error: string }> {
+  try {
+    restoreDatabaseBackup(home, backupPath);
+    return { restored: true };
+  } catch (error) {
+    return { restored: false, error: messageOf(error) };
+  }
+}
+
+function currentClassification(): HomeClassification {
   return {
     classification: { verdict: "USABLE", status: "current" },
-    layoutVersion: latest.layout,
-    aggregateVersion: latest.aggregate,
-    latestLayoutVersion: latest.layout,
-    latestAggregateVersion: latest.aggregate
+    storageVersion: CURRENT_STORAGE_VERSION,
+    currentStorageVersion: CURRENT_STORAGE_VERSION,
+    minimumSupportedStorageVersion: MIN_SUPPORTED_STORAGE_VERSION
+  };
+}
+
+function migratableClassification(storageVersion: number): HomeClassification {
+  return {
+    classification: { verdict: "MIGRATABLE", status: "migration-ready" },
+    storageVersion,
+    currentStorageVersion: CURRENT_STORAGE_VERSION,
+    minimumSupportedStorageVersion: MIN_SUPPORTED_STORAGE_VERSION
   };
 }
 
 function unsupportedClassification(
-  schema: Extract<StorageSchemaState, { status: "unsupported" }>,
-  latest: StorageVersionState
+  state: Extract<StorageSchemaState, { status: "unsupported" }>
 ): HomeClassification {
-  const axis = schema.incompatibleComponent;
-  const found = schema.currentVersion;
-  const supported = schema.latestVersion;
-  const future = schema.direction === "newer";
+  const future = state.direction === "newer";
+  const message = future
+    ? `Storage version ${state.currentVersion} is newer than this CLI supports `
+      + `(${CURRENT_STORAGE_VERSION}).`
+    : `Storage version ${state.currentVersion} is older than the minimum supported `
+      + `migration version ${MIN_SUPPORTED_STORAGE_VERSION}.`;
   const action = future
-    ? "Use a newer Yui release that supports this exact Home."
-    : "Open it with its matching Yui version, or initialize a new Home.";
+    ? "Use a newer Yui release."
+    : "Preserve this Home for use with its matching historical Yui release, "
+      + "or initialize a new Home with Yui 0.15.0 or later.";
   return {
     classification: {
       verdict: "NEEDS_NEW_VERSION",
       status: "unsupported",
       blocker: {
-        reason: future ? "future-version" : "missing-step",
-        axis,
-        ...(schema.recordFamily === undefined ? {} : { recordKind: schema.recordFamily }),
-        ...(future ? { found, supported } : { from: found, to: supported }),
-        message: future
-          ? "The Home is newer than this Yui release."
-          : "This release provides no migration path for the older Home.",
+        reason: future ? "future-version" : "below-minimum",
+        found: state.currentVersion,
+        current: CURRENT_STORAGE_VERSION,
+        minimum: MIN_SUPPORTED_STORAGE_VERSION,
+        message,
         action
       }
     },
-    layoutVersion: schema.currentLayoutVersion,
-    aggregateVersion: schema.currentAggregateSchemaVersion,
-    latestLayoutVersion: latest.layout,
-    latestAggregateVersion: latest.aggregate,
-    incompatibleComponent: axis
+    storageVersion: state.currentVersion,
+    currentStorageVersion: CURRENT_STORAGE_VERSION,
+    minimumSupportedStorageVersion: MIN_SUPPORTED_STORAGE_VERSION
   };
 }
 
-function corruptedClassification(
-  latest: StorageVersionState,
-  detail: string
-): HomeClassification {
+function corruptedClassification(detail: string): HomeClassification {
   return {
     classification: { verdict: "CORRUPTED", status: "unsupported", detail },
-    latestLayoutVersion: latest.layout,
-    latestAggregateVersion: latest.aggregate
+    currentStorageVersion: CURRENT_STORAGE_VERSION,
+    minimumSupportedStorageVersion: MIN_SUPPORTED_STORAGE_VERSION
   };
 }
 
@@ -265,7 +470,14 @@ function blocked(
   message: string,
   action: string
 ): Extract<UpgradeResult, { outcome: "blocked" }> {
-  return { outcome: "blocked", stage, message, action, classification, sceneUnchanged: true };
+  return {
+    outcome: "blocked",
+    stage,
+    message,
+    action,
+    classification,
+    sceneUnchanged: true
+  };
 }
 
 function messageOf(error: unknown): string {

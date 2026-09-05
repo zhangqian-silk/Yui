@@ -7,9 +7,10 @@
  * `npm install --global --prefix <tmp>`, so the live global install is never
  * touched until the binary-activation step. Preflight invokes the STAGED binary's
  * internal `yui upgrade --update-preflight` contract so the target version
- * proves that the Home exactly matches its current storage contract. After the
- * parent stops the exact old Controller, the binary is promoted and the
- * activated binary verifies the unchanged Home.
+ * proves that the Home is current or has a complete supported migration path.
+ * After the parent stops the exact old Controller, the binary is promoted,
+ * required migrations run through that same staged artifact, and the activated
+ * binary verifies the resulting current Home.
  *
  * Two hardening guarantees this module enforces:
  *
@@ -41,7 +42,8 @@ import type {
   UpdateControllerStopResult,
   UpdateBlockerIdentity,
   UpdatePorts,
-  UpdatePreflight
+  UpdatePreflight,
+  UpdateStorageMigrationResult
 } from "./updateOrchestrator.js";
 
 const PACKAGE_NAME = "@zq-silk/yui";
@@ -186,6 +188,23 @@ export function createUpdatePorts(
       assertSpawnOk(result, "activate the new binary");
     },
 
+    migrateStorage(staged: StagedPackage, home: string): UpdateStorageMigrationResult {
+      const result = run(
+        staged.binaryPath,
+        ["--json", "upgrade", "--update-apply"],
+        {
+          cwd: process.cwd(),
+          env: {
+            ...environment,
+            YUI_HOME: home,
+            YUI_UPDATE_HANDOVER_OWNER_PID: String(process.pid)
+          },
+          shell: false
+        }
+      );
+      return interpretStorageMigration(result);
+    },
+
     verify(staged: StagedPackage, home: string): void {
       // Verify the ACTUALLY-ACTIVATED global binary, not the staging path (P1-3).
       const activeBinary = resolveGlobalBinary(environment, run);
@@ -194,7 +213,8 @@ export function createUpdatePorts(
           "Post-update health check failed: could not locate the activated global `yui` binary."
         );
       }
-      // 1) Health check the unchanged current Home through the activated binary.
+      // 1) Health check the current (possibly just migrated) Home through the
+      // activated binary.
       // POST-VERIFY PARSES THE MACHINE-READABLE RESULT FIRST, THEN THE EXIT STATUS
       // (R2-F2). `yui --json doctor` deliberately sets a non-zero exit when storage
       // is unhealthy, so interpreting the exit status before the envelope would
@@ -1054,18 +1074,74 @@ function interpretPreflight(result: SpawnSyncReturns<Buffer>): UpdatePreflight {
   };
 }
 
-/** Accept only an exact current Home. */
+/** Accept either an exact current Home or a complete supported migration path. */
 function parseUpdatePreflightResult(data: Record<string, unknown>): UpdatePreflight | null {
-  if (data.status !== "already-current"
+  if ((data.status !== "already-current" && data.status !== "migration-ready")
     || !Number.isSafeInteger(data.stepCount)
-    || data.stepCount !== 0
     || !Array.isArray(data.steps)
-    || data.steps.length !== 0) return null;
+    || data.steps.length !== data.stepCount) return null;
   const homeClassification = data.classification;
   if (!isRecord(homeClassification) || !isRecord(homeClassification.classification)) return null;
   const classification = homeClassification.classification;
-  if (classification.verdict !== "USABLE" || classification.status !== "current") return null;
-  return { status: "already-current", stepCount: 0 };
+  if (data.status === "already-current") {
+    if (data.stepCount !== 0
+      || classification.verdict !== "USABLE"
+      || classification.status !== "current") return null;
+    return { status: "already-current", stepCount: 0 };
+  }
+  if ((data.stepCount as number) <= 0
+    || classification.verdict !== "MIGRATABLE"
+    || classification.status !== "migration-ready"
+    || !data.steps.every(isStorageMigrationStep)) return null;
+  return { status: "migration-ready", stepCount: data.stepCount as number };
+}
+
+function interpretStorageMigration(
+  result: SpawnSyncReturns<Buffer>
+): UpdateStorageMigrationResult {
+  const data = parseSuccessEnvelopeData(result);
+  if (data === null) {
+    throw runtimeError(
+      "The staged binary did not return a successful storage migration result "
+        + `(exit ${result.status ?? "null"}${result.signal === null ? "" : `, signal ${result.signal}`}).`
+    );
+  }
+  if (data.outcome === "blocked" || data.outcome === "failed") {
+    const message = typeof data.message === "string"
+      ? data.message
+      : "The staged binary refused the storage migration.";
+    const action = typeof data.action === "string" ? ` Action: ${data.action}` : "";
+    const backup = typeof data.backupPath === "string"
+      ? ` Backup: ${data.backupPath}`
+      : "";
+    throw runtimeError(`${message}${action}${backup}`);
+  }
+  if (result.status !== 0) {
+    throw runtimeError(
+      `The staged binary returned outcome=${String(data.outcome)} but exited `
+        + `with status ${result.status ?? "null"}.`
+    );
+  }
+  if (data.outcome === "already-current") return {};
+  if (data.outcome !== "upgraded" || !isRecord(data.report)) {
+    throw runtimeError(
+      `The staged binary returned unexpected storage migration outcome=${String(data.outcome)}.`
+    );
+  }
+  const backupPath = data.report.backupPath;
+  if (typeof backupPath !== "string" || backupPath.length === 0) {
+    throw runtimeError("The staged binary did not report the required storage backup path.");
+  }
+  return { backupPath };
+}
+
+function isStorageMigrationStep(value: unknown): boolean {
+  return isRecord(value)
+    && Number.isSafeInteger(value.fromVersion)
+    && Number.isSafeInteger(value.toVersion)
+    && (value.toVersion as number) === (value.fromVersion as number) + 1
+    && typeof value.name === "string"
+    && value.name.length > 0;
 }
 
 function parseUpdateBlockers(value: unknown): readonly UpdateBlockerIdentity[] | undefined {

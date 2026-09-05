@@ -72,12 +72,12 @@ export YUI_HOME=/absolute/path/to/yui-home
 yui setup
 ```
 
-The home contains `schema.json`, the authoritative SQLite database `yui.db`,
-Project Catalog and knowledge, and Controller discovery files. Stable Project
-checkouts and managed worktrees live under the configured workspace, outside
-Yui home. Runtime storage accepts only the exact current contract; it never
-falls back to `state.json`, normalizes an older shape, or repairs a historical
-Home in place.
+The home contains the authoritative SQLite database `yui.db`, Project Catalog
+and knowledge, and Controller discovery files. Stable Project checkouts and
+managed worktrees live under the configured workspace, outside Yui home.
+Legacy `schema.json` and `state.json` files are evidence only. Runtime storage
+accepts only the exact current contract; supported earlier storage versions
+enter only through the explicit upgrade boundary.
 
 Every Task-owned record family allocates a monotonically increasing local ID
 inside its Task. Different Tasks may therefore both contain `work-item-1`,
@@ -89,43 +89,41 @@ and `task integration start`, keep their subordinate IDs local to that Task.
 Candidate IDs are local to their WorkItem and carry both Task and WorkItem
 provenance.
 
-Yui records layout, aggregate, and per-record-family versions in `schema.json`.
-Runtime admission has only two outcomes: exact current, or rejected; a
-Controller never migrates storage while serving work. `yui upgrade --dry-run`
-is read-only, while `yui upgrade` validates only the release's exact current
-contract. Older, newer, incomplete, and malformed Homes fail closed.
+Yui has one Home storage version, recorded by the append-only SQLite migration
+ledger. Every CLI reports both its current storage version and its minimum
+supported migration version. Runtime admission still has only two outcomes:
+exact current, or rejected; a Controller never migrates storage while serving
+work. `yui upgrade --dry-run` is read-only. `yui upgrade` quiesces a running
+Controller, creates a consistent backup, applies every missing migration in
+one transaction, validates the current contract, and then restarts the
+Controller when it was running before the upgrade.
 
 `yui update` stages and pins one exact package, runs that staged binary's
 storage preflight, stops the exact old Controller, activates the same artifact,
-verifies the installed binary and current Home, and starts the replacement
-Controller. If the staged binary does not support the current Home exactly,
-the update stops before activation and leaves both the Home and current
-installation unchanged.
+applies the staged release's migration chain when required, verifies the
+installed binary and current Home, and starts the replacement Controller. A
+Home inside the staged release's supported range can upgrade directly across
+multiple versions without installing intermediate releases. A newer Home, a
+Home below the migration floor, an incomplete migration ledger, or malformed
+data fails closed without a guessed repair.
 
-To retain an old Home, keep it byte-for-byte and open it only with its original
-Yui version for read-only inspection. For unfinished work, initialize a new
-Home and let the Operator create a new Task from the old Task's objective,
-relevant WorkItems, current repository state, and available exact Turn results.
-The Operator creates new identities and may consult available exact Turn
-results; it does not import old runtime/session state or pretend that the old
-Task continued.
+Yui 0.15.0 establishes storage version 1 and the migration floor. Homes created
+by earlier releases, including 0.14.2, are not on this compatibility line:
+preserve them for inspection with their matching Yui release or initialize a
+new Home. From 0.15.0 onward, each release retains the complete chain, so later
+`yui update` invocations can cross versions directly.
 
 See [Task-local identity](docs/task-local-identity.md) for the current reference
 contract.
 
-Schema work across Tasks is not serialized: any Task may advance a version axis
-(`layout`, `aggregate`, or a `record` family) on its own isolated branch without
-waiting for another Task's schema change to land. The later-integrating branch
-owns the reconciliation — rebasing onto the latest project head, resolving schema
-and code conflicts, re-advancing the schema versions and record-version-map
-entries the rebase requires, rebuilding and re-validating the wiring, and
-re-running the isolated E2E and docs. This is a deliberate scheduling trade-off
-that avoids cross-Task blocking, not an accident to repair ad hoc. The
-current manifest descriptor map is re-derived against the newest head, while the
-post-baseline descriptor snapshot remains frozen. If another Task later lands a
-record-schema change, the integrating branch must rebase, allocate the next
-current contract without collision, and re-test to convergence. It does not
-preserve an upgrade path for the displaced intermediate contract.
+Schema work across Tasks is not serialized: any Task may propose the next
+storage migration on its own isolated branch without waiting for another Task's
+schema change to land. The later-integrating branch owns the reconciliation:
+rebase onto the latest project head, preserve every already released migration
+unchanged, allocate the next contiguous storage version, resolve schema and code
+conflicts, and re-run the bounded validation. A migration may update physical
+tables and current record payloads together; it must not introduce another
+writable compatibility axis.
 
 Yui provides four reusable Worker Profile definitions through
 `yui config profile reset`; minimum setup makes each one inherit the current
@@ -917,10 +915,9 @@ Global Context entry:
 yui session enter <global-role>
 ```
 
-`yui update` accepts only the current Home contract. Unsupported older Homes
-remain untouched; inspect those with a compatible Yui version and let the
-current Operator recreate unfinished intent as new Tasks in a newly initialized
-Home.
+`yui update` accepts either the current Home contract or any valid historical
+contract at or above the staged CLI's minimum supported migration version.
+Unsupported newer Homes and Homes below that floor remain untouched.
 
 tmux fixes a pane's history capacity when that pane is created. Existing panes
 retain their configured capacity; managed runtime output remains observable in
@@ -1003,9 +1000,10 @@ hiding the resources that remain. Use `--all` to include discovered Yui homes.
 `controller restart` replaces the Controller process and its scheduler/socket services with the currently installed Yui version. It can recover a lost discovery record only when the old process still matches the current UID, Controller entrypoint, physical Home, PID, and process-start identity. It does not stop or restart managed tmux/Agent sessions.
 
 Successful `setup` and `update` commands ensure that the current Home has a
-running Controller, starting one when the Home was previously idle. `upgrade`
-is read-only and does not start a Controller. `update` replaces an
-already-running Controller only after the new binary passes its health checks.
+running Controller, starting one when the Home was previously idle. A
+successful `upgrade` restores a Controller only when it stopped one for the
+migration. `update` starts the replacement only after migration and health
+checks pass.
 
 Its recovery reconciliation runs every 120 seconds by default. Normal durable state changes enqueue a Task, Role, or Operator key and return immediately; keys received in the same fixed 100 ms window trigger one non-overlapping targeted pass. Operator presentation has an independent lane, so a blocked Task workspace operation cannot delay a user question. Periodic Git/worktree work is limited to Tasks with durable Task-mailbox work, while active Role liveness uses one tmux inventory. Structured Agent Driver observations, whether received from native provider events or supported Hooks, are exact-fenced before they reach the durable runtime inbox. A terminal Turn observation atomically records the exact Turn result. Durable mailboxes freeze the current batch while new signals merge into the next batch. Task-orchestration failures retain the exact Controller-owned processing batch for two bounded fast retries and later periodic recovery; a successful retry completes that batch before newer pending work is claimed. Recommended InputRequest and pending Turn deadlines share one nearest-deadline selector and therefore do not wait for the recovery interval. Explicit `task reconcile` still requests an immediate recovery pass. The retained loop is:
 
@@ -1097,15 +1095,17 @@ yui project reset|replace|retire|delete
 ```
 
 `yui update` stages the newly published package side by side and asks that exact
-binary to verify the current Home. Only then does it stop the exact old
-Controller, activate the same concrete package version, validate the actually
-installed binary and Home, and start the replacement Controller. Unsupported
-Homes block preflight and remain untouched.
+binary to classify the Home. Only then does it stop the exact old Controller,
+activate the same concrete package version, apply the complete missing
+migration chain when needed, validate the actually installed binary and Home,
+and start the replacement Controller. Unsupported Homes block preflight and
+remain untouched.
 
-`yui upgrade --dry-run` validates an exact current Home without writing.
-`yui upgrade` performs the same validation. This release provides no migration
-from older aggregate contracts; use their matching Yui version or initialize a
-new Home.
+`yui upgrade --dry-run` prints the ordered migration plan without writing.
+`yui upgrade` creates a timestamped SQLite backup and upgrades any valid Home
+from the CLI's minimum supported storage version to its current version. Yui
+0.15.0 is storage version 1; pre-0.15.0 Homes remain outside that migration
+line and are never rewritten.
 
 Agent environment bindings store process-environment variable names, never secret values. Adapter-owned lifecycle arguments cannot be overridden through raw arguments.
 

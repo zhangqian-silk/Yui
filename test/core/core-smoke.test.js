@@ -123,11 +123,15 @@ import { projectNextAction } from "../../dist/task/nextAction.js";
 import { projectTaskRemoteDelivery } from "../../dist/task/remoteDelivery.js";
 import { listPublicCommandPaths } from "../../dist/cli/commandCatalog.js";
 import { runUpdate } from "../../dist/cli/updateOrchestrator.js";
+import { createUpdatePorts } from "../../dist/cli/updatePorts.js";
 import { acquireHandoverLock, readHandoverFence } from "../../dist/release/runtimeRelease.js";
 import { SqliteTaskStore } from "../../dist/storage/sqliteStore.js";
 import * as taskStoreContract from "../../dist/storage/taskStore.js";
-import { ensureStorageSchema, StorageSchemaError } from "../../dist/storage/storageSchema.js";
-import { latestStorageVersionState } from "../../dist/storage/upgrade/recordVersions.js";
+import { inspectStorageSchema, StorageSchemaError } from "../../dist/storage/storageSchema.js";
+import {
+  CURRENT_STORAGE_VERSION,
+  MIN_SUPPORTED_STORAGE_VERSION
+} from "../../dist/storage/storageVersions.js";
 import { runStorageUpgrade } from "../../dist/storage/upgrade/upgradeOrchestrator.js";
 import { initializeCurrentTaskStore } from "../../dist/storage/currentTaskStore.js";
 import { createProject } from "../../dist/repository/project.js";
@@ -179,6 +183,16 @@ test("the packaged CLI starts and exposes the core workflow", () => {
     env: bareEnv
   });
   assert.match(help, /Yui/u);
+  const version = JSON.parse(execFileSync(
+    process.execPath,
+    [join(root, "dist", "cli.js"), "--json", "version"],
+    { cwd: root, encoding: "utf8", env: bareEnv }
+  ));
+  assert.equal(version.ok, true);
+  assert.equal(version.data.storageVersion, CURRENT_STORAGE_VERSION);
+  assert.equal(version.data.minimumStorageVersion, MIN_SUPPORTED_STORAGE_VERSION);
+  assert.equal(Object.hasOwn(version.data, "storageLayoutVersion"), false);
+  assert.equal(Object.hasOwn(version.data, "aggregateSchemaVersion"), false);
   const commands = listPublicCommandPaths();
   for (const command of [
     "setup",
@@ -390,6 +404,118 @@ test("update quiesces the exact Controller before replacing a current-contract b
   ]);
 });
 
+test("update applies a supported storage migration before post-verification", () => {
+  const calls = [];
+  const result = runUpdate({
+    stage: () => {
+      calls.push("stage");
+      return { binaryPath: "/tmp/staged-yui", version: "0.15.0" };
+    },
+    preflight: () => {
+      calls.push("preflight");
+      return { status: "migration-ready", stepCount: 1 };
+    },
+    beginControllerHandover: () => {
+      calls.push("handover");
+      return () => calls.push("release");
+    },
+    controllerStatus: () => {
+      calls.push("status");
+      return { running: false };
+    },
+    stopController: () => {
+      calls.push("stop");
+      return { stopped: true };
+    },
+    activateBinary: () => calls.push("activate"),
+    migrateStorage: () => {
+      calls.push("migrate");
+      return { backupPath: "/tmp/yui-backup.db" };
+    },
+    verify: () => calls.push("verify"),
+    startController: () => calls.push("start"),
+    restoreController: () => calls.push("restore"),
+    cleanup: () => calls.push("cleanup")
+  }, { home: "/tmp/yui-update-home" });
+  assert.deepEqual(result, {
+    outcome: "updated",
+    version: "0.15.0",
+    backupPath: "/tmp/yui-backup.db"
+  });
+  assert.deepEqual(calls, [
+    "stage",
+    "preflight",
+    "handover",
+    "status",
+    "activate",
+    "migrate",
+    "verify",
+    "start",
+    "release",
+    "cleanup"
+  ]);
+});
+
+test("update ports delegate the planned migration to the exact staged binary", () => {
+  const invocations = [];
+  const response = (data) => {
+    const stdout = Buffer.from(JSON.stringify({ ok: true, data }));
+    return {
+      pid: 1,
+      output: [null, stdout, Buffer.alloc(0)],
+      stdout,
+      stderr: Buffer.alloc(0),
+      status: 0,
+      signal: null
+    };
+  };
+  const ports = createUpdatePorts({}, (command, args, options) => {
+    invocations.push({ command, args: [...args], env: options.env });
+    if (args.includes("--update-preflight")) {
+      return response({
+        outcome: "update-preflight",
+        status: "migration-ready",
+        stepCount: 1,
+        steps: [{
+          fromVersion: 1,
+          toVersion: 2,
+          name: "future-storage-change",
+          introducedIn: "0.16.0"
+        }],
+        classification: {
+          classification: { verdict: "MIGRATABLE", status: "migration-ready" }
+        }
+      });
+    }
+    return response({
+      outcome: "upgraded",
+      report: { backupPath: "/tmp/yui-backup.db" }
+    });
+  });
+  const staged = { binaryPath: "/tmp/staged-yui", version: "0.15.0" };
+  assert.deepEqual(ports.preflight(staged, "/tmp/yui-home"), {
+    status: "migration-ready",
+    stepCount: 1
+  });
+  assert.deepEqual(ports.migrateStorage(staged, "/tmp/yui-home"), {
+    backupPath: "/tmp/yui-backup.db"
+  });
+  assert.deepEqual(invocations.map(({ command, args }) => ({ command, args })), [
+    {
+      command: "/tmp/staged-yui",
+      args: ["--json", "upgrade", "--update-preflight"]
+    },
+    {
+      command: "/tmp/staged-yui",
+      args: ["--json", "upgrade", "--update-apply"]
+    }
+  ]);
+  assert.equal(
+    invocations[1].env.YUI_UPDATE_HANDOVER_OWNER_PID,
+    String(process.pid)
+  );
+});
+
 test("Managed Codex shares the native App Server used by interactive clients", () => {
   const adapter = resolveAgentAdapter("codex");
   const launch = adapter.compileManagedControl({
@@ -444,7 +570,6 @@ test("Global Codex Sessions use the shared daemon and retain a process-independe
     () => createConfiguredAgent("custom", "codex", "codex", ["--remote", "unix://"], [], now),
     /Agent base argument is reserved by adapter codex: --remote/u
   );
-  ensureStorageSchema(home);
   const store = new SqliteTaskStore(home);
   t.after(() => store.close());
   const agent = createConfiguredAgent("codex", "codex", "codex", [], [], now);
@@ -599,7 +724,6 @@ test("Task execution can be fenced without changing semantic progress", () => {
 test("SQLite projects an active native Session and its Host activation", (t) => {
   const home = mkdtempSync(join(tmpdir(), "yui-active-session-smoke-"));
   t.after(() => rmSync(home, { recursive: true, force: true }));
-  ensureStorageSchema(home);
   const store = new SqliteTaskStore(home);
   t.after(() => store.close());
   const now = new Date("2026-08-31T00:00:00.000Z");
@@ -721,7 +845,6 @@ test("a reused Host generation mismatch is terminal and settles the stale reserv
 test("native continuation results wake the supervisor only after the parent Turn is terminal", (t) => {
   const home = mkdtempSync(join(tmpdir(), "yui-continuation-owner-smoke-"));
   t.after(() => rmSync(home, { recursive: true, force: true }));
-  ensureStorageSchema(home);
   const store = new SqliteTaskStore(home);
   t.after(() => store.close());
   const now = new Date("2026-09-03T09:15:00.000Z");
@@ -837,7 +960,6 @@ test("native continuation results wake the supervisor only after the parent Turn
 test("runtime pre-start persists the empty Session binding before Provider discovery", (t) => {
   const home = mkdtempSync(join(tmpdir(), "yui-prestart-session-smoke-"));
   t.after(() => rmSync(home, { recursive: true, force: true }));
-  ensureStorageSchema(home);
   const store = new SqliteTaskStore(home);
   t.after(() => store.close());
   const now = new Date("2026-08-31T00:00:00.000Z");
@@ -965,7 +1087,6 @@ test("Turns record provider-visible input without delivery handshake state", () 
 test("Task-scoped Turn listing includes Leader Turns without a WorkItem", (t) => {
   const home = mkdtempSync(join(tmpdir(), "yui-task-turn-list-smoke-"));
   t.after(() => rmSync(home, { recursive: true, force: true }));
-  ensureStorageSchema(home);
   const store = new SqliteTaskStore(home);
   t.after(() => store.close());
   const now = new Date("2026-08-31T00:00:00.000Z");
@@ -1194,7 +1315,6 @@ test("Yui and direct Turns share one Provider conversation", () => {
 test("a direct Provider Turn records visible input and output without workflow state", (t) => {
   const home = mkdtempSync(join(tmpdir(), "yui-direct-provider-turn-smoke-"));
   t.after(() => rmSync(home, { recursive: true, force: true }));
-  ensureStorageSchema(home);
   const store = new SqliteTaskStore(home);
   t.after(() => store.close());
   const startedAt = new Date("2026-08-31T00:30:00.000Z");
@@ -1378,7 +1498,6 @@ test("a direct Provider Turn records visible input and output without workflow s
 test("a wake names a completed Turn even when that Turn predates the delta cursor", (t) => {
   const home = mkdtempSync(join(tmpdir(), "yui-wake-result-turn-smoke-"));
   t.after(() => rmSync(home, { recursive: true, force: true }));
-  ensureStorageSchema(home);
   const store = new SqliteTaskStore(home);
   t.after(() => store.close());
   const createdAt = new Date("2026-09-04T01:00:00.000Z");
@@ -1460,7 +1579,6 @@ test("a wake names a completed Turn even when that Turn predates the delta curso
 test("Leader wakeups aggregate for one minute and force-steer after ten", async (t) => {
   const home = mkdtempSync(join(tmpdir(), "yui-leader-wake-window-smoke-"));
   t.after(() => rmSync(home, { recursive: true, force: true }));
-  ensureStorageSchema(home);
   const store = new SqliteTaskStore(home);
   t.after(() => store.close());
   const firstEventAt = new Date("2026-08-31T01:00:00.000Z");
@@ -1619,7 +1737,6 @@ test("Leader wakeups aggregate for one minute and force-steer after ten", async 
 test("an active Task without a durable event remains quiet", async (t) => {
   const home = mkdtempSync(join(tmpdir(), "yui-active-task-quiet-smoke-"));
   t.after(() => rmSync(home, { recursive: true, force: true }));
-  ensureStorageSchema(home);
   const store = new SqliteTaskStore(home);
   t.after(() => store.close());
   const now = new Date("2026-08-31T00:30:00.000Z");
@@ -1669,7 +1786,6 @@ test("an active Task without a durable event remains quiet", async (t) => {
 test("active Role Turns deliver from durable state and Worker hints settle at acceptance", async (t) => {
   const home = mkdtempSync(join(tmpdir(), "yui-unowned-provider-smoke-"));
   t.after(() => rmSync(home, { recursive: true, force: true }));
-  ensureStorageSchema(home);
   const store = new SqliteTaskStore(home);
   t.after(() => store.close());
   const startedAt = new Date("2026-08-31T01:00:00.000Z");
@@ -1947,7 +2063,6 @@ test("active Role Turns deliver from durable state and Worker hints settle at ac
 test("Task completion leaves its reusable Provider Session running", async (t) => {
   const home = mkdtempSync(join(tmpdir(), "yui-completed-task-session-smoke-"));
   t.after(() => rmSync(home, { recursive: true, force: true }));
-  ensureStorageSchema(home);
   const store = new SqliteTaskStore(home);
   t.after(() => store.close());
   const now = new Date("2026-08-31T00:45:00.000Z");
@@ -2011,7 +2126,6 @@ test("Task completion leaves its reusable Provider Session running", async (t) =
 test("the exact Provider Turn terminal atomically completes its Turn once", async (t) => {
   const home = mkdtempSync(join(tmpdir(), "yui-provider-terminal-smoke-"));
   t.after(() => rmSync(home, { recursive: true, force: true }));
-  ensureStorageSchema(home);
   const store = new SqliteTaskStore(home);
   t.after(() => store.close());
   const startedAt = new Date("2026-08-31T01:00:00.000Z");
@@ -2134,7 +2248,6 @@ test("the exact Provider Turn terminal atomically completes its Turn once", asyn
 test("Task execution stop/start atomically controls scheduler admission", (t) => {
   const home = mkdtempSync(join(tmpdir(), "yui-execution-gate-smoke-"));
   t.after(() => rmSync(home, { recursive: true, force: true }));
-  ensureStorageSchema(home);
   const store = new SqliteTaskStore(home);
   t.after(() => store.close());
   const now = new Date("2026-08-30T00:00:00.000Z");
@@ -2233,7 +2346,6 @@ test("Task execution stop/start atomically controls scheduler admission", (t) =>
 test("direct and replicated WorkItem execution converge through exact Lane retry", (t) => {
   const home = mkdtempSync(join(tmpdir(), "yui-work-item-execution-smoke-"));
   t.after(() => rmSync(home, { recursive: true, force: true }));
-  ensureStorageSchema(home);
   const store = new SqliteTaskStore(home);
   t.after(() => store.close());
   const startedAt = new Date("2026-09-02T00:00:00.000Z");
@@ -2412,7 +2524,6 @@ test("direct and replicated WorkItem execution converge through exact Lane retry
 test("direct and replicated Review keep Producer results non-authoritative", (t) => {
   const home = mkdtempSync(join(tmpdir(), "yui-review-execution-smoke-"));
   t.after(() => rmSync(home, { recursive: true, force: true }));
-  ensureStorageSchema(home);
   const store = new SqliteTaskStore(home);
   t.after(() => store.close());
   const now = new Date("2026-09-02T00:10:00.000Z");
@@ -2876,7 +2987,6 @@ test("Leader replicated Lanes derive from Task main without a WorkItem workspace
   const workspaceRoot = mkdtempSync(join(tmpdir(), "yui-leader-lane-worktrees-"));
   t.after(() => rmSync(home, { recursive: true, force: true }));
   t.after(() => rmSync(workspaceRoot, { recursive: true, force: true }));
-  ensureStorageSchema(home);
   const store = new SqliteTaskStore(home);
   t.after(() => store.close());
   store.saveConfig({ ...store.getConfig(), defaultWorkspace: workspaceRoot });
@@ -3000,7 +3110,6 @@ test("Leader replicated Lanes derive from Task main without a WorkItem workspace
 test("Core freezes writable Lane state without parsing the Producer output", (t) => {
   const home = mkdtempSync(join(tmpdir(), "yui-producer-evidence-smoke-"));
   t.after(() => rmSync(home, { recursive: true, force: true }));
-  ensureStorageSchema(home);
   const store = new SqliteTaskStore(home);
   t.after(() => store.close());
   const now = new Date("2026-09-02T00:20:00.000Z");
@@ -3243,7 +3352,6 @@ test("Core freezes writable Lane state without parsing the Producer output", (t)
 test("runtime terminalization preserves Agent output across dirty and wrong-branch Lane failures", (t) => {
   const home = mkdtempSync(join(tmpdir(), "yui-lane-result-preservation-"));
   t.after(() => rmSync(home, { recursive: true, force: true }));
-  ensureStorageSchema(home);
   const store = new SqliteTaskStore(home);
   t.after(() => store.close());
 
@@ -3497,7 +3605,6 @@ test("a packaged Controller restart inherits its direct parent's handover", (t) 
       rmSync(home, { recursive: true, force: true });
     }
   });
-  ensureStorageSchema(home);
   new SqliteTaskStore(home).close();
 
   const handover = acquireHandoverLock(home);
@@ -3519,7 +3626,6 @@ test("a packaged Controller restart inherits its direct parent's handover", (t) 
 test("Controller begin-handover accepts a null fromReleaseId", async (t) => {
   const home = mkdtempSync(join(tmpdir(), "yui-controller-null-handover-smoke-"));
   t.after(() => rmSync(home, { recursive: true, force: true }));
-  ensureStorageSchema(home);
   new SqliteTaskStore(home).close();
   const controller = await startControllerServer(home, undefined, undefined, {
     release: null,
@@ -3528,7 +3634,7 @@ test("Controller begin-handover accepts a null fromReleaseId", async (t) => {
   });
   try {
     const handoverId = "handover-null-from-release";
-    const toReleaseId = `0.14.2-${"a".repeat(64)}`;
+    const toReleaseId = `0.15.0-${"a".repeat(64)}`;
     const result = await callFileTaskController(home, "controller.begin-handover", {
       handoverId,
       fromReleaseId: null,
@@ -3544,13 +3650,9 @@ test("Controller begin-handover accepts a null fromReleaseId", async (t) => {
   }
 });
 
-test("production storage exposes only the current contract", () => {
-  const latest = latestStorageVersionState();
-  assert.ok(Object.values(latest.record).every(({ path }) => path.startsWith("sqlite:")));
-  assert.equal(latest.record.turn.path, "sqlite:turn");
-  assert.equal(latest.record.workMailbox.path, "sqlite:workMailbox");
-  assert.equal(Object.hasOwn(latest.record, "storedTask"), false);
-  assert.equal(Object.hasOwn(latest.record, "activeTurnPointer"), false);
+test("production storage exposes one current version and one migration floor", () => {
+  assert.equal(MIN_SUPPORTED_STORAGE_VERSION, 1);
+  assert.equal(CURRENT_STORAGE_VERSION, 1);
   for (const retiredExport of [
     "FileTaskStore",
     "STORAGE_STATE_FILE",
@@ -3567,7 +3669,7 @@ test("a new current Home initializes its SQLite authority exactly once", (t) => 
   const store = initializeCurrentTaskStore(home);
   assert.equal(store.getRevision(), 0);
   store.close();
-  assert.ok(existsSync(join(home, "schema.json")));
+  assert.equal(existsSync(join(home, "schema.json")), false);
   assert.ok(existsSync(join(home, "yui.db")));
   const database = new Database(join(home, "yui.db"), { readonly: true });
   try {
@@ -3575,6 +3677,16 @@ test("a new current Home initializes its SQLite authority exactly once", (t) => 
       database.prepare("SELECT version FROM schema_migrations ORDER BY version").all(),
       [{ version: 1 }]
     );
+    assert.deepEqual(
+      database.prepare("PRAGMA table_info(schema_migrations)").all().map(({ name }) => name),
+      ["version", "name", "applied_at", "checksum"]
+    );
+    const homeMetaColumns = database
+      .prepare("PRAGMA table_info(home_meta)")
+      .all()
+      .map(({ name }) => name);
+    assert.equal(homeMetaColumns.includes("layout_version"), false);
+    assert.equal(homeMetaColumns.includes("aggregate_version"), false);
   } finally {
     database.close();
   }
@@ -3583,7 +3695,6 @@ test("a new current Home initializes its SQLite authority exactly once", (t) => 
 test("Task Role Profiles preserve runtime and portable behavior across add and update", (t) => {
   const home = mkdtempSync(join(tmpdir(), "yui-task-role-profile-update-smoke-"));
   t.after(() => rmSync(home, { recursive: true, force: true }));
-  ensureStorageSchema(home);
   const store = new SqliteTaskStore(home);
   t.after(() => store.close());
   const now = new Date("2026-09-03T06:10:00.000Z");
@@ -3820,38 +3931,76 @@ test("Task Role Profiles preserve runtime and portable behavior across add and u
   );
 });
 
-test("historical aggregate Homes are blocked without mutation", async (t) => {
-  const home = mkdtempSync(join(tmpdir(), "yui-unsupported-aggregate-smoke-"));
+test("a pre-0.15.0 Home stays outside the migration floor and remains untouched", async (t) => {
+  const home = mkdtempSync(join(tmpdir(), "yui-pre-baseline-storage-smoke-"));
   t.after(() => rmSync(home, { recursive: true, force: true }));
-  ensureStorageSchema(home);
-  new SqliteTaskStore(home).close();
-  const manifestPath = join(home, "schema.json");
-  const manifest = JSON.parse(readFileSync(manifestPath, "utf8"));
-  manifest.aggregateSchemaVersion = 30;
-  writeFileSync(manifestPath, `${JSON.stringify(manifest, null, 2)}\n`);
-  const beforeManifest = readFileSync(manifestPath, "utf8");
-  const beforeDatabase = readFileSync(join(home, "yui.db"));
-
-  for (const mode of ["dry-run", "execute", "update-preflight"]) {
-    const result = await runStorageUpgrade({
-      home,
-      latest: latestStorageVersionState(),
-      mode
-    });
-    assert.equal(result.outcome, "blocked");
-    assert.equal(result.stage, "unsupported");
-    assert.equal(result.sceneUnchanged, true);
-    assert.equal(result.classification.classification.verdict, "NEEDS_NEW_VERSION");
-    assert.equal(result.classification.aggregateVersion, 30);
-    assert.equal(readFileSync(manifestPath, "utf8"), beforeManifest);
-    assert.deepEqual(readFileSync(join(home, "yui.db")), beforeDatabase);
+  const databasePath = join(home, "yui.db");
+  const database = new Database(databasePath);
+  try {
+    database.exec(`
+      CREATE TABLE schema_migrations (
+        version     INTEGER PRIMARY KEY,
+        axis        TEXT NOT NULL CHECK (axis IN ('layout','aggregate','record')),
+        record_kind TEXT,
+        applied_at  TEXT NOT NULL,
+        checksum    TEXT NOT NULL
+      );
+      CREATE TABLE home_meta (
+        id                INTEGER PRIMARY KEY CHECK (id = 1),
+        home_identity     TEXT NOT NULL,
+        revision          INTEGER NOT NULL,
+        layout_version    INTEGER NOT NULL,
+        aggregate_version INTEGER NOT NULL,
+        created_at        TEXT NOT NULL,
+        updated_at        TEXT NOT NULL
+      );
+    `);
+    database.prepare(
+      `INSERT INTO schema_migrations
+       (version, axis, record_kind, applied_at, checksum)
+       VALUES (1, 'layout', NULL, ?, ?)`
+    ).run("2026-09-04T00:00:00.000Z", "pre-0.15.0-ledger");
+    database.prepare(
+      `INSERT INTO home_meta
+       (id, home_identity, revision, layout_version, aggregate_version, created_at, updated_at)
+       VALUES (1, ?, ?, 8, 2, ?, ?)`
+    ).run(
+      JSON.stringify({ schemaVersion: 1, id: "legacy-home" }),
+      0,
+      "2026-09-04T00:00:00.000Z",
+      "2026-09-04T00:00:00.000Z"
+    );
+  } finally {
+    database.close();
   }
+  const manifestPath = join(home, "schema.json");
+  writeFileSync(manifestPath, JSON.stringify({
+    schemaVersion: 1,
+    storageVersion: 8,
+    aggregateSchemaVersion: 31,
+    recordVersions: {},
+    updatedAt: "2026-09-04T00:00:00.000Z"
+  }));
+
+  const before = readFileSync(databasePath);
+  const inspected = inspectStorageSchema(home);
+  assert.equal(inspected.status, "unsupported");
+  assert.equal(inspected.direction, "older");
+  assert.equal(inspected.currentVersion, 0);
+  assert.equal(inspected.latestVersion, CURRENT_STORAGE_VERSION);
+
+  const dryRun = await runStorageUpgrade({ home, mode: "dry-run" });
+  assert.equal(dryRun.outcome, "blocked");
+  assert.equal(dryRun.stage, "unsupported");
+  assert.equal(dryRun.sceneUnchanged, true);
+  assert.match(dryRun.action, /initialize a new Home/u);
+  assert.deepEqual(readFileSync(databasePath), before);
+  assert.equal(existsSync(manifestPath), true);
 });
 
 test("an existing SQLite Home with missing singleton rows fails closed", (t) => {
   const home = mkdtempSync(join(tmpdir(), "yui-missing-sqlite-singletons-smoke-"));
   t.after(() => rmSync(home, { recursive: true, force: true }));
-  ensureStorageSchema(home);
   new SqliteTaskStore(home).close();
   const database = new Database(join(home, "yui.db"));
   try {
@@ -3872,7 +4021,6 @@ test("an existing SQLite Home with missing singleton rows fails closed", (t) => 
 test("fresh SQLite telemetry persists and aggregates by Turn", async (t) => {
   const home = mkdtempSync(join(tmpdir(), "yui-turn-telemetry-smoke-"));
   t.after(() => rmSync(home, { recursive: true, force: true }));
-  ensureStorageSchema(home);
   const business = new SqliteTaskStore(home);
   business.close();
   const telemetry = new SqliteTelemetryStore(home, { turnCap: 2 });
@@ -4191,7 +4339,6 @@ test("native terminal ingress preserves valid output and durably fails missing o
 test("managed Session authority follows durable state, not a frozen environment", (t) => {
   const home = mkdtempSync(join(tmpdir(), "yui-managed-caller-smoke-"));
   t.after(() => rmSync(home, { recursive: true, force: true }));
-  ensureStorageSchema(home);
   const store = new SqliteTaskStore(home);
   t.after(() => store.close());
   const now = new Date("2026-09-03T00:00:00.000Z");
@@ -4260,7 +4407,6 @@ test("managed Session authority follows durable state, not a frozen environment"
 test("a Turn Context Pack reports which of the Task's records are in flight", (t) => {
   const home = mkdtempSync(join(tmpdir(), "yui-live-task-state-smoke-"));
   t.after(() => rmSync(home, { recursive: true, force: true }));
-  ensureStorageSchema(home);
   const store = new SqliteTaskStore(home);
   t.after(() => store.close());
   const now = new Date("2026-09-03T00:00:00.000Z");

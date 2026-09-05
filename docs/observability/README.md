@@ -56,9 +56,9 @@ When enabled, `yui controller status` adds a read-only identity section:
 | `build.sourceCommit` | `git rev-parse HEAD` | `unsupported` if not a git repo |
 | `build.nodeVersion` | `process.version` | |
 | `build.platform` | `process.platform` | |
-| `storage.manifestStatus` | `schema.json` | `current`/`uninitialized`/`invalid`/`unsupported` |
-| `storage.logicalLayout` | `schema.json.storageVersion` | |
-| `storage.aggregateSchemaVersion` | `schema.json.aggregateSchemaVersion` | |
+| `storage.storageStatus` | SQLite migration ledger | `current`/`upgradeable`/`uninitialized`/`invalid`/`unsupported` |
+| `storage.storageVersion` | `schema_migrations` head | `unsupported` when unreadable |
+| `storage.minimumStorageVersion` | running CLI | Oldest version with a complete migration path |
 | `storage.configuredBackend` | Current product contract | Always `sqlite` |
 | `storage.workerEnabled` | `YUI_STORE_WORKER` override over the current SQLite default | |
 | `storage.physicalStateJson` | Old `state.json` existence/size | Evidence only; never authoritative |
@@ -84,21 +84,29 @@ Findings have three severities, rolled up into a health status:
 
 | Code | Meaning |
 | --- | --- |
-| `current-database-missing` | The current manifest exists but `yui.db` is missing |
+| `current-database-missing` | Current storage is reported but `yui.db` is missing |
 | `database-unhealthy` | `yui.db` exists but `PRAGMA quick_check` fails (corrupt or unopenable) |
-| `unsupported-storage-contract` | The manifest does not exactly match this release |
-| `invalid-storage-manifest` | `schema.json` is invalid |
+| `unsupported-storage-contract` | The ledger head is newer than current or below the migration floor |
+| `invalid-storage` | The migration ledger or SQLite schema is invalid |
+
+#### Needs repair (degraded)
+
+| Code | Meaning |
+| --- | --- |
+| `storage-uninitialized` | The empty Home has not been initialized; run `yui setup` |
+| `storage-upgrade-required` | A complete migration path exists; run `yui upgrade` or `yui update` |
 
 #### Warnings
 
 | Code | Meaning |
 | --- | --- |
 | `ignored-historical-store` | `state.json` is present but ignored by the current Store |
+| `ignored-legacy-storage-manifest` | `schema.json` is present but is no longer authoritative |
 | `invalid-worker-flag` | `YUI_STORE_WORKER` is not a recognized boolean |
 
-Only `fail` (contradictions) exits 5. Every finding prints with a precise action;
-unsupported Homes are preserved and must be inspected with their original Yui
-version or replaced by a new Home.
+`degraded` and `fail` are both unhealthy for machine-readable doctor/update
+verification. Every finding prints with a precise action. Upgradeable Homes are
+preserved until an explicit migration; unsupported Homes remain untouched.
 
 ## Fault classification taxonomy
 

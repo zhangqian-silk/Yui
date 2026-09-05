@@ -98,13 +98,15 @@ export type StorageHealthSummary = Readonly<{
 
 /**
  * The physical-backend facts `doctor --json` reports so an operator can prove
- * which backend is authoritative without inferring it from the manifest alone
- * (Issue 01). Every field is read-only evidence; `null` means "not applicable
- * or unreadable", never a guess.
+ * which backend is authoritative without inferring it from filesystem
+ * leftovers (Issue 01). Every field is read-only evidence; `null` means "not
+ * applicable or unreadable", never a guess.
  */
 export type StorageDetails = Readonly<{
-  /** The layout version the manifest declares (null when unreadable). */
-  logicalLayout: number | null;
+  /** The authoritative SQLite migration head (null when unreadable). */
+  storageVersion: number | null;
+  /** Oldest version for which this CLI carries a complete migration chain. */
+  minimumSupportedVersion: number;
   /** The backend ordinary startup opens for this Home. */
   authoritativeBackend: "sqlite";
   /** The absolute `yui.db` path when it exists, else null. */
@@ -130,7 +132,7 @@ export type DoctorReport = Readonly<{
  * healthy only when schema, compatibility, and state are all `ok`. Any
  * `unsupported` (version mismatch / needs-new-version), `invalid` (corrupted /
  * unreadable), or `missing` (uninitialized) storage check is blocking — even
- * though `yui doctor` itself exits 0.
+ * and the machine-readable command exits non-zero.
  */
 export function summarizeStorageHealth(
   checks: readonly DoctorCheck[]
@@ -161,17 +163,19 @@ export function buildDoctorReport(
 
 /**
  * Read the physical-backend facts for a Home (Issue 01 observability). Every
- * field is best-effort read-only evidence: an unreadable database or manifest
- * yields `null` for that field, and the `storage state` check reports the
- * structural problem separately.
+ * field is best-effort read-only evidence: an unreadable database yields
+ * `null` for that field, and the `storage state` check reports the structural
+ * problem separately.
  */
 function inspectStorageDetails(
   home: string,
   env: NodeJS.ProcessEnv
 ): StorageDetails {
   const schema = inspectStorageSchema(home);
-  const logicalLayout = schema.status === "current" || schema.status === "unsupported"
-    ? schema.currentLayoutVersion
+  const storageVersion = schema.status === "current"
+    || schema.status === "upgradeable"
+    || schema.status === "unsupported"
+    ? schema.currentVersion
     : null;
   const authoritativeBackend = "sqlite" as const;
   const dbPath = join(home, CURRENT_DATABASE_FILENAME);
@@ -196,7 +200,8 @@ function inspectStorageDetails(
     }
   }
   return {
-    logicalLayout,
+    storageVersion,
+    minimumSupportedVersion: schema.minimumSupportedVersion,
     authoritativeBackend,
     databasePath,
     journalMode,
@@ -225,7 +230,7 @@ type SchemaInspection = StorageSchemaState | Readonly<{
   detail: string;
 }>;
 
-type StorageCompatibilityStatus = "current" | "unsupported";
+type StorageCompatibilityStatus = "current" | "upgradeable" | "unsupported";
 
 type CompatibilityInspection = Readonly<{
   check: DoctorCheck;
@@ -385,13 +390,25 @@ function checkSchema(
       return {
         name: "storage schema",
         status: "ok",
-        detail: `current=${state.currentVersion} latest=${state.latestVersion}`
+        detail:
+          `current=${state.currentVersion} latest=${state.latestVersion} `
+          + `minimum=${state.minimumSupportedVersion}`
+      };
+    case "upgradeable":
+      return {
+        name: "storage schema",
+        status: "unsupported",
+        detail:
+          `current=${state.currentVersion} latest=${state.latestVersion} `
+          + `minimum=${state.minimumSupportedVersion} migration=available`
       };
     case "unsupported":
       return {
         name: "storage schema",
         status: "unsupported",
-        detail: `current=${state.currentVersion} latest=${state.latestVersion} direction=${state.direction}`
+        detail:
+          `current=${state.currentVersion} latest=${state.latestVersion} `
+          + `minimum=${state.minimumSupportedVersion} direction=${state.direction}`
       };
     case "invalid":
       return { name: "storage schema", status: "invalid", detail: state.detail };
@@ -426,9 +443,21 @@ function inspectCompatibility(
         name,
         status: "unsupported",
         detail:
-          `unsupported contract: ${schema.incompatibleComponent} is ${schema.direction} `
-          + `(current=${schema.currentVersion}, required=${schema.latestVersion}). `
-          + "Preserve this Home and initialize a new Home."
+          `storage version is ${schema.direction} `
+          + `(current=${schema.currentVersion}, supported=`
+          + `${schema.minimumSupportedVersion}..${schema.latestVersion}).`
+      }
+    };
+  }
+  if (schema.status === "upgradeable") {
+    return {
+      storageStatus: "upgradeable",
+      check: {
+        name,
+        status: "unsupported",
+        detail:
+          `migration available from ${schema.currentVersion} to ${schema.latestVersion}; `
+          + "run `yui upgrade` or `yui update`."
       }
     };
   }
@@ -438,8 +467,8 @@ function inspectCompatibility(
       name,
       status: "ok",
       detail:
-        `current layout=${schema.currentLayoutVersion}/${schema.latestLayoutVersion} `
-        + `aggregate=${schema.currentAggregateSchemaVersion}/${schema.latestAggregateSchemaVersion}`
+        `current=${schema.currentVersion}/${schema.latestVersion} `
+        + `minimum=${schema.minimumSupportedVersion}`
     }
   };
 }

@@ -101,7 +101,11 @@ export YUI_HOME=/absolute/path/to/yui-home
 yui setup
 ```
 
-home 中包含 `schema.json`、权威 SQLite 数据库 `yui.db`、Project Catalog、项目知识和 Controller 发现文件。稳定 Project checkout 与受管理 worktree 位于 home 外部的 workspace。运行时只接受当前存储契约：不会回退读取 `state.json`、转换旧 schema 或猜测旧 ID。
+home 中包含权威 SQLite 数据库 `yui.db`、Project Catalog、项目知识和
+Controller 发现文件。稳定 Project checkout 与受管理 worktree 位于 home
+外部的 workspace。旧 `schema.json` 与 `state.json` 只作为历史证据存在，
+不再是版本权威。运行时只接受当前存储契约；支持区间内的早期存储版本只允许
+通过显式升级入口。
 
 所有 Task-owned 记录族都在各自 Task 内分配单调递增的本地 ID。因此，不同
 Task 可以同时拥有 `work-item-1`、`turn-1` 或 `input-1`。受管 Task
@@ -111,8 +115,12 @@ Task 的命令（例如 `task work create`、`task integration start`）仍使�
 Task 内的本地子记录 ID。Candidate 只在所属 WorkItem 内递增，并同时保存
 Task 与 WorkItem provenance。
 
-Yui 只支持当前 aggregate-v31 / Task-v7 schema。旧 home 不提供转换、
-双读或历史记录推断；需要使用新版本时初始化全新的 `YUI_HOME`。当前引用契约见
+Yui Home 只有一个存储版本，权威值是 SQLite 中连续且校验和有效的迁移
+ledger 头。CLI 同时公布当前存储版本和最小支持迁移版本。普通运行时代码只读取
+最新结构，不提供双读；`yui upgrade --dry-run` 只显示迁移计划，
+`yui upgrade` 会停住正在运行的 Controller、创建一致性备份、在一个事务中执行
+全部缺失迁移并校验最新结构。处于支持区间内的任意历史 Home 都可以直接跨多个
+版本升级，无需逐个安装中间版本。当前引用契约见
 [Task 本地 ID](../docs/task-local-identity.md)。
 
 ## 快速开始
@@ -627,13 +635,13 @@ yui task role release <task-id> <role>
 
 Codex Role thread 可在 Desktop 中直接查看和操作；Desktop 已有 active Turn 时，Yui 只保留待投递工作并等待，不会失败或重复投递。`view`、`takeover`、`release` 继续作为 Claude 等独立进程 Provider 的人工控制入口。Yui 不写入全局 Hook/config，也不启动、重启或停止共享 daemon；Codex CLI/daemon 故障由 Task 生命周期之外修复。Global Operator 与 global Role 继续使用原生交互式 CLI，不属于受管理 Task Provider 协议；Yui 在内部将 Codex 的 Global TUI 连接到同一个默认 App Server，用户不能通过 Agent 或 Role 参数覆盖该连接，Session Manifest 自带不依赖启动进程环境的 Global Context 命令，因此同一 thread 可直接切换到 Desktop 继续对话。
 
-当新版本需要离线迁移 Home 时，应等待当前 Turn 完成，然后从普通 shell
-执行 `yui session stop --all`，再重新执行 `yui update`。停止命令会先整体预检：
-只要仍有 Session 正在运行或存在未决生命周期工作，就不会开始停止；全部空闲
-时会先阻止新的 Leader 调度，停止并等待 Controller 完全退出，重新检查运行时
-事实后再停止 Task Role 和 global Role Session。成功后 Controller 保持停止，
-应紧接着执行 `yui update`。如果当前安装版本还没有这条命令，应手动退出提示中
-列出的全部 managed Session；新的 staged CLI 不能写入尚待迁移的旧 Home。
+`yui update` 会用目标版本先做只读预检，在停住精确的旧 Controller 后自动执行
+所需的离线迁移，再校验并启动新 Controller。若升级前希望结束所有 Agent
+活动，可先执行 `yui session stop --all`；这不是存储版本链的一部分。
+Yui 0.15.0 建立 storage version 1 和迁移下限。更早版本（包括 0.14.2）
+创建的 Home 不在这条兼容链上：应保留给匹配的历史 Yui 版本查看，或者初始化
+新的 Home。从 0.15.0 开始，后续版本必须保留完整迁移链，因此可以由
+`yui update` 直接跨版本升级。
 
 tmux 会在 pane 创建时固定其历史容量。配置该限制之前创建的 Role 会保留原容量；Yui 会在 Terminal attach 和 Web 中提示用户退出并重新进入一次，从而创建具有 100,000 行历史的新 pane。
 
@@ -675,10 +683,10 @@ yui controller restart
 
 `controller restart` 会用当前安装的 Yui 版本替换 Controller 进程及其调度循环、socket 服务，不会停止或重启已受管的 tmux/Agent 会话；普通 Session 命令按协议与存储身份兼容，不要求 Controller 与 CLI 包版本完全相同。
 
-成功的 `setup`、`upgrade` 和 `update` 都会确保当前 Home 有一个运行中的
-Controller；如果之前没有运行，会在完成后启动。只读命令和
-`upgrade --dry-run` 不会启动 Controller。`update` 只有在新二进制健康检查通过后，
-才会替换或启动 Controller。
+成功的 `setup` 和 `update` 会确保当前 Home 有一个运行中的 Controller。
+`upgrade` 只会在迁移前存在 Controller 时恢复它；只读命令和
+`upgrade --dry-run` 不会启动 Controller。`update` 只有在迁移和新二进制健康
+检查都通过后，才会替换或启动 Controller。
 
 恢复 reconciliation 默认每 120 秒执行一次。普通持久状态变化只会将 Task、Role 或 Operator key 放入队列并立即返回；固定 100ms 窗口内到达的 key 会合并触发一次不重叠的定向处理。Operator 呈现使用独立 lane，不会被 Task 的 Git/worktree 操作阻塞；周期 Git/worktree 处理只覆盖仍有持久 Task mailbox 工作的 Task，活动 Role 的存活检查合并为一次 tmux inventory。来自 Provider 原生事件或受支持 Hook 的结构化 Agent Driver observation，会经过精确 fence 后进入持久 runtime inbox。终态 Turn observation 会原子记录精确的 Turn 结果。持久 WorkMailbox 会冻结当前 processing 批次，期间的新事件合并到下一 pending 批次；失败会释放当前批次供恢复。推荐输入与 pending Turn 共用最近 deadline 选择器，不依赖恢复扫描间隔；显式 `task reconcile` 仍会立即请求恢复扫描。保留的闭环为：
 
@@ -724,6 +732,7 @@ Web 端可以通过与 Terminal 相同的持久化 CLI 路径回答 open InputRe
 
 ```sh
 yui update
+yui upgrade [--dry-run]
 yui config agent add|list|show|capabilities|update|remove
 yui config role add|list|show|update|remove|bind|unbind
 yui config profile add|list|show|update|remove|reset
@@ -749,9 +758,9 @@ npm test
 npm run lint
 ```
 
-`npm test` 只保留秒级核心 smoke：CLI 启动、正常 SQLite Task、受支持迁移和内置
-Agent Driver。针对当前修改编写的 TDD、异常数据和故障复现仅作为开发期证据，需求完成后
-删除，不累积为常驻回归测试。具体约束见
+`npm test` 只保留秒级核心 smoke：CLI 启动、正常 SQLite Task、存储基线、
+目标驱动更新和内置 Agent Driver。针对当前修改编写的 TDD、异常数据和故障复现
+仅作为开发期证据，需求完成后删除，不累积为常驻回归测试。具体约束见
 [验证策略](../docs/testing/verification-levels.md)。
 
 如需让用户终端使用当前 checkout，可逆地接管用户级 `yui` 命令：

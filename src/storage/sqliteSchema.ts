@@ -8,28 +8,25 @@
  *
  *   - `global_sequences` (§5.3): global record ID high-water marks.
  *   - `outbox` (§5.4): durable outbox with `UNIQUE(request_id)` for exactly-once.
- *   - `config`: the `YuiConfig` singleton (the design keeps `home_meta` for
- *     identity/revision/versions; config is a separate singleton).
+ *   - `config`: the `YuiConfig` singleton (`home_meta` keeps identity/revision).
  *
  * Record payloads are stored two ways, per §4: typed columns for fields that are
  * queried/filtered/used-for-CAS, and a `payload` JSON column holding the full
- * versioned record (including its family `schemaVersion`). The record axis of
- * the three-axis versioning is therefore unchanged.
+ * current record. Record-local `schemaVersion` tags remain validation guards;
+ * they are not independent Home compatibility axes. Any historical payload
+ * rewrite belongs to the ordered Home migration that introduced the new shape.
  *
- * The migration runner is idempotent: it records applied versions in
- * `schema_migrations` and uses `CREATE TABLE IF NOT EXISTS`, so re-running on an
- * already-current database is a no-op and a crash mid-migration is rolled back
- * by SQLite (DDL is transactional) and re-applied on the next open.
+ * The migration runner is append-only and idempotent: it records one ordered
+ * Home version in `schema_migrations`. Re-running an already-current database
+ * is a no-op; a crash mid-upgrade rolls the whole migration transaction back.
  */
 import { createHash } from "node:crypto";
 import type Database from "better-sqlite3";
 
-/** The current SQLite layout version. */
-export const SQLITE_LAYOUT_VERSION = 8;
-/** The aggregate version of the normalized SQLite schema. */
-export const SQLITE_AGGREGATE_VERSION = 2;
-/** The current schema migration version. */
-export const SQLITE_SCHEMA_VERSION = 1;
+import {
+  CURRENT_STORAGE_VERSION,
+  MIN_SUPPORTED_STORAGE_VERSION
+} from "./storageVersions.js";
 
 /** Telemetry retention bounds (§4.4). Open question 3 in §11; defaults from the design. */
 export const TELEMETRY_KEEP_PER_GENERATION = 200;
@@ -42,20 +39,19 @@ export const TELEMETRY_TURN_CAP = 50_000;
  * the store; `journal_mode=WAL` is a persistent database property set on open.
  * The migration itself only contains schema objects.
  *
- * This is the direct current baseline for a new Home. Its checksum rejects any
- * database initialized from a different physical contract.
+ * This is the Yui 0.15.0 / storage-version-1 baseline. Future releases append
+ * migrations after it so fresh and upgraded databases converge on the same
+ * current contract.
  */
 const BASELINE_CORE_SQL = `
 -- Global catalog and coordination (§4.1) -------------------------------------
 
 CREATE TABLE IF NOT EXISTS home_meta (
-  id                INTEGER PRIMARY KEY CHECK (id = 1),
-  home_identity     TEXT NOT NULL,
-  revision          INTEGER NOT NULL,
-  layout_version    INTEGER NOT NULL,
-  aggregate_version INTEGER NOT NULL,
-  created_at        TEXT NOT NULL,
-  updated_at        TEXT NOT NULL
+  id            INTEGER PRIMARY KEY CHECK (id = 1),
+  home_identity TEXT NOT NULL,
+  revision      INTEGER NOT NULL,
+  created_at    TEXT NOT NULL,
+  updated_at    TEXT NOT NULL
 );
 
 CREATE TABLE IF NOT EXISTS config (
@@ -472,7 +468,7 @@ END;
  * Session owner physical identity records.
  *
  * One row per runtime generation, keyed by runtime generation id. The payload column
- * stores the full versioned JSON record; typed columns support the
+ * stores the full current JSON record; typed columns support the
  * reconciliation queries (task/role lookup, PID liveness).
  */
 const BASELINE_SESSION_OWNER_SQL = `
@@ -494,9 +490,8 @@ CREATE INDEX IF NOT EXISTS idx_session_owners_task
 /**
  * Resource GC registry.
  *
- * GC-owned table for resource lifecycle records.  The registry is GC's own
- * state — it is not part of the aggregate and never participates in aggregate
- * versioning.  Records are stored as full versioned JSON in `payload`, with
+ * GC-owned table for resource lifecycle records. The registry is GC's own
+ * state. Records are stored as full current JSON in `payload`, with
  * typed columns for the fields GC queries (disposition, kind, task_id).
  */
 const BASELINE_RESOURCE_REGISTRY_SQL = `
@@ -677,17 +672,38 @@ const MIGRATION_1_SQL = [
   BASELINE_CONTEXT_SNAPSHOT_SQL
 ].join("\n");
 
-interface Migration {
+export type StorageMigration = Readonly<{
   version: number;
-  axis: "layout" | "aggregate" | "record";
-  recordKind?: string;
+  name: string;
+  introducedIn: string;
   sql: string;
-}
+}>;
 
-/** Future compatible releases append new migrations after this baseline. */
-const MIGRATIONS: readonly Migration[] = [
-  { version: 1, axis: "layout", sql: MIGRATION_1_SQL }
-];
+/** Released migrations are append-only and must never be rewritten. */
+const MIGRATIONS: readonly StorageMigration[] = Object.freeze([
+  {
+    version: 1,
+    name: "v0.15.0-baseline",
+    introducedIn: "0.15.0",
+    sql: MIGRATION_1_SQL
+  }
+]);
+
+for (let index = 0; index < MIGRATIONS.length; index += 1) {
+  const expectedVersion = MIN_SUPPORTED_STORAGE_VERSION + index;
+  if (MIGRATIONS[index]?.version !== expectedVersion) {
+    throw new Error(
+      `Storage migration registry must be contiguous from `
+        + `${MIN_SUPPORTED_STORAGE_VERSION}; missing version ${expectedVersion}.`
+    );
+  }
+}
+if (MIGRATIONS.at(-1)?.version !== CURRENT_STORAGE_VERSION) {
+  throw new Error(
+    `Storage migration registry head ${String(MIGRATIONS.at(-1)?.version)} does not match `
+      + `CURRENT_STORAGE_VERSION ${CURRENT_STORAGE_VERSION}.`
+  );
+}
 
 /** Current hot-path indexes whose absence would invalidate a current Home. */
 const REQUIRED_SCHEMA_INDEXES = [
@@ -715,11 +731,10 @@ export class SqliteSchemaMigrationError extends Error {
 
 const SCHEMA_MIGRATIONS_SQL = `
     CREATE TABLE schema_migrations (
-      version     INTEGER PRIMARY KEY,
-      axis        TEXT NOT NULL CHECK (axis IN ('layout','aggregate','record')),
-      record_kind TEXT,
-      applied_at  TEXT NOT NULL,
-      checksum    TEXT NOT NULL
+      version    INTEGER PRIMARY KEY,
+      name       TEXT NOT NULL,
+      applied_at TEXT NOT NULL,
+      checksum   TEXT NOT NULL
     )
   `;
 
@@ -762,19 +777,41 @@ function ensureMigrationLedger(
 
 type AppliedMigrationRow = Readonly<{
   version: unknown;
-  axis: unknown;
-  record_kind: unknown;
+  name: unknown;
   checksum: unknown;
 }>;
 
-/** Validate the applied prefix and return its versions for the migration loop. */
+type AppliedMigrations = Readonly<{
+  versions: ReadonlySet<number>;
+  currentVersion: number;
+  currentChecksum: string;
+}>;
+
+function validateMigrationLedgerColumns(db: Database.Database): void {
+  const columns = new Set(
+    (db.prepare("PRAGMA table_info(schema_migrations)").all() as Array<{ name?: unknown }>)
+      .flatMap(({ name }) => typeof name === "string" ? [name] : [])
+  );
+  if (
+    columns.size === 4
+    && ["version", "name", "applied_at", "checksum"].every((name) => columns.has(name))
+  ) {
+    return;
+  }
+  throw new SqliteSchemaMigrationError(
+    "schema_migrations columns do not match the storage-version-1 ledger"
+  );
+}
+
+/** Validate the applied linear prefix and return its current head. */
 function validateAppliedMigrations(
   db: Database.Database,
   ledgerWasCreated: boolean
-): Set<number> {
+): AppliedMigrations {
+  validateMigrationLedgerColumns(db);
   const expected = new Map(MIGRATIONS.map((migration) => [migration.version, migration]));
   const rows = db.prepare(
-    "SELECT version, axis, record_kind, checksum FROM schema_migrations ORDER BY version"
+    "SELECT version, name, checksum FROM schema_migrations ORDER BY version"
   ).all() as AppliedMigrationRow[];
   if (rows.length === 0 && !ledgerWasCreated) {
     throw new SqliteSchemaMigrationError(
@@ -789,23 +826,26 @@ function validateAppliedMigrations(
     }
     const version = row.version as number;
     const migration = expected.get(version);
-    if (migration === undefined) {
-      throw new SqliteSchemaMigrationError(`unknown migration version ${version}`);
-    }
     if (applied.has(version)) {
       throw new SqliteSchemaMigrationError(`duplicate migration version ${version}`);
     }
     applied.add(version);
 
-    const expectedRecordKind = migration.recordKind ?? null;
-    if (row.axis !== migration.axis) {
-      throw new SqliteSchemaMigrationError(
-        `migration ${version} axis ${String(row.axis)} does not match ${migration.axis}`
-      );
+    if (migration === undefined) {
+      if (version <= CURRENT_STORAGE_VERSION) {
+        throw new SqliteSchemaMigrationError(`unknown migration version ${version}`);
+      }
+      if (typeof row.name !== "string" || row.name.length === 0
+        || typeof row.checksum !== "string" || row.checksum.length === 0) {
+        throw new SqliteSchemaMigrationError(
+          `future migration ${version} metadata is invalid`
+        );
+      }
+      continue;
     }
-    if (row.record_kind !== expectedRecordKind) {
+    if (row.name !== migration.name) {
       throw new SqliteSchemaMigrationError(
-        `migration ${version} record_kind ${String(row.record_kind)} does not match ${String(expectedRecordKind)}`
+        `migration ${version} name ${String(row.name)} does not match ${migration.name}`
       );
     }
     const expectedChecksum = checksum(migration.sql);
@@ -818,14 +858,20 @@ function validateAppliedMigrations(
 
   const versions = [...applied].sort((left, right) => left - right);
   for (let index = 0; index < versions.length; index += 1) {
-    const expectedVersion = index + 1;
+    const expectedVersion = MIN_SUPPORTED_STORAGE_VERSION + index;
     if (versions[index] !== expectedVersion) {
       throw new SqliteSchemaMigrationError(
         `migration ledger has a gap before version ${versions[index]}`
       );
     }
   }
-  return applied;
+  const currentVersion = versions.at(-1) ?? 0;
+  const head = rows.at(-1);
+  return {
+    versions: applied,
+    currentVersion,
+    currentChecksum: typeof head?.checksum === "string" ? head.checksum : ""
+  };
 }
 
 /**
@@ -861,6 +907,26 @@ function validateSchemaObjects(db: Database.Database): void {
       );
     }
   }
+
+  const homeMetaColumns = (
+    db.prepare("PRAGMA table_info(home_meta)").all() as Array<{ name?: unknown }>
+  ).map(({ name }) => name);
+  const expectedHomeMetaColumns = [
+    "id",
+    "home_identity",
+    "revision",
+    "created_at",
+    "updated_at"
+  ];
+  if (
+    homeMetaColumns.length !== expectedHomeMetaColumns.length
+    || homeMetaColumns.some((name, index) => name !== expectedHomeMetaColumns[index])
+  ) {
+    throw new SqliteSchemaMigrationError(
+      "home_meta columns do not match the current storage contract",
+      "schema object"
+    );
+  }
 }
 
 export interface MigrationResult {
@@ -877,11 +943,41 @@ export type SqliteSchemaMigrationState = Readonly<{
   currentChecksum: string;
   /** Schema version required by this release. */
   targetVersion: number;
+  /** Oldest storage version for which this CLI carries a complete upgrade path. */
+  minimumSupportedVersion: number;
   /** Checksum expected at the target ledger head. */
   targetChecksum: string;
   /** Ordered versions that an explicit upgrade must apply. */
   pendingVersions: readonly number[];
 }>;
+
+export type StorageMigrationStep = Readonly<{
+  fromVersion: number;
+  toVersion: number;
+  name: string;
+  introducedIn: string;
+}>;
+
+/** Return the one linear upgrade path from a supported source to this release. */
+export function storageMigrationPlan(
+  currentVersion: number
+): readonly StorageMigrationStep[] | null {
+  if (
+    !Number.isInteger(currentVersion)
+    || currentVersion < MIN_SUPPORTED_STORAGE_VERSION
+    || currentVersion > CURRENT_STORAGE_VERSION
+  ) {
+    return null;
+  }
+  return MIGRATIONS
+    .filter(({ version }) => version > currentVersion)
+    .map(({ version, name, introducedIn }) => ({
+      fromVersion: version - 1,
+      toVersion: version,
+      name,
+      introducedIn
+    }));
+}
 
 export type SqliteSchemaMigrationMode = "apply" | "validate";
 
@@ -900,19 +996,29 @@ export function inspectSqliteSchemaMigrations(
 ): SqliteSchemaMigrationState {
   const ledgerWasCreated = ensureMigrationLedger(db, "validate");
   const applied = validateAppliedMigrations(db, ledgerWasCreated);
+  if (applied.currentVersion > CURRENT_STORAGE_VERSION) {
+    return {
+      currentVersion: applied.currentVersion,
+      currentChecksum: applied.currentChecksum,
+      targetVersion: CURRENT_STORAGE_VERSION,
+      minimumSupportedVersion: MIN_SUPPORTED_STORAGE_VERSION,
+      targetChecksum: checksum(MIGRATIONS.at(-1)!.sql),
+      pendingVersions: []
+    };
+  }
   const pendingVersions = MIGRATIONS
-    .filter((migration) => !applied.has(migration.version))
+    .filter((migration) => !applied.versions.has(migration.version))
     .map((migration) => migration.version);
   if (pendingVersions.length === 0) validateSchemaObjects(db);
-  const current = MIGRATIONS[applied.size - 1];
   const target = MIGRATIONS.at(-1)!;
-  if (current === undefined) {
+  if (applied.currentVersion === 0) {
     throw new SqliteSchemaMigrationError("schema_migrations ledger has no current head");
   }
   return {
-    currentVersion: applied.size,
-    currentChecksum: checksum(current.sql),
-    targetVersion: SQLITE_SCHEMA_VERSION,
+    currentVersion: applied.currentVersion,
+    currentChecksum: applied.currentChecksum,
+    targetVersion: CURRENT_STORAGE_VERSION,
+    minimumSupportedVersion: MIN_SUPPORTED_STORAGE_VERSION,
     targetChecksum: checksum(target.sql),
     pendingVersions
   };
@@ -937,20 +1043,44 @@ export function migrateSqliteSchema(
     // prevents a manually altered or partially recorded ledger from silently
     // skipping a later schema/data step.
     const applied = validateAppliedMigrations(db, ledgerWasCreated);
-    const pending = MIGRATIONS.filter((migration) => !applied.has(migration.version));
+    if (applied.currentVersion > CURRENT_STORAGE_VERSION) {
+      throw new SqliteSchemaMigrationError(
+        `storage version ${applied.currentVersion} is newer than supported `
+          + `${CURRENT_STORAGE_VERSION}`,
+        "admission"
+      );
+    }
+    if (applied.currentVersion !== 0
+      && applied.currentVersion < MIN_SUPPORTED_STORAGE_VERSION) {
+      throw new SqliteSchemaMigrationError(
+        `storage version ${applied.currentVersion} is older than the minimum supported `
+          + `${MIN_SUPPORTED_STORAGE_VERSION}`,
+        "admission"
+      );
+    }
+    const pending = MIGRATIONS.filter(
+      (migration) => !applied.versions.has(migration.version)
+    );
     if (!ledgerWasCreated && pending.length > 0 && options.mode === "validate") {
       throw new SqliteSchemaMigrationError(
-        `SQLite schema ${applied.size} requires an explicit upgrade to ${SQLITE_SCHEMA_VERSION}`,
+        `Storage version ${applied.currentVersion} requires an explicit upgrade to `
+          + `${CURRENT_STORAGE_VERSION}`,
         "admission"
       );
     }
     const newlyApplied: number[] = [];
     for (const migration of pending) {
       db.exec(migration.sql);
+      const appliedAt = new Date().toISOString();
       db.prepare(
-        `INSERT INTO schema_migrations (version, axis, record_kind, applied_at, checksum)
-         VALUES (?, ?, ?, ?, ?)`
-      ).run(migration.version, migration.axis, migration.recordKind ?? null, new Date().toISOString(), checksum(migration.sql));
+        `INSERT INTO schema_migrations (version, name, applied_at, checksum)
+         VALUES (?, ?, ?, ?)`
+      ).run(
+        migration.version,
+        migration.name,
+        appliedAt,
+        checksum(migration.sql)
+      );
       newlyApplied.push(migration.version);
     }
     validateSchemaObjects(db);
@@ -959,7 +1089,7 @@ export function migrateSqliteSchema(
   const newlyApplied = options.mode === "apply" && !db.inTransaction
     ? db.transaction(migrate)()
     : migrate();
-  return { applied: newlyApplied, version: SQLITE_SCHEMA_VERSION };
+  return { applied: newlyApplied, version: CURRENT_STORAGE_VERSION };
 }
 
 /** The names of every table the schema creates (for tests/introspection). */
