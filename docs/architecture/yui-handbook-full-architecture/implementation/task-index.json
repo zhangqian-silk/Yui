@@ -1,0 +1,225 @@
+{
+  "status": "design",
+  "tasks": [
+    {
+      "id": "T00",
+      "title": "实施基线与模块契约",
+      "requires": [],
+      "task": "tasks/T00-implementation-baseline.md",
+      "design": "designs/T00-implementation-baseline.md",
+      "scenarios": [
+        "S39",
+        "S44"
+      ]
+    },
+    {
+      "id": "T01",
+      "title": "基础宿主与操作事实",
+      "requires": [
+        "T00"
+      ],
+      "task": "tasks/T01-kernel-host.md",
+      "design": "designs/T01-kernel-host.md",
+      "scenarios": [
+        "S09",
+        "S10",
+        "S20",
+        "S25",
+        "S34",
+        "S44",
+        "S45"
+      ]
+    },
+    {
+      "id": "T02",
+      "title": "能力入口与内建实现接入",
+      "requires": [
+        "T01"
+      ],
+      "task": "tasks/T02-capability-entry.md",
+      "design": "designs/T02-capability-entry.md",
+      "scenarios": [
+        "S25",
+        "S30",
+        "S34",
+        "S39",
+        "S45"
+      ]
+    },
+    {
+      "id": "T03",
+      "title": "任务事实、角色配置与 Context",
+      "requires": [
+        "T02"
+      ],
+      "task": "tasks/T03-task-context.md",
+      "design": "designs/T03-task-context.md",
+      "scenarios": [
+        "S03",
+        "S05",
+        "S06",
+        "S07",
+        "S08",
+        "S10",
+        "S15",
+        "S16",
+        "S18",
+        "S19",
+        "S20",
+        "S36",
+        "S41",
+        "S43",
+        "S46"
+      ]
+    },
+    {
+      "id": "T04",
+      "title": "统一 AgentEndpoint 与运行时适配",
+      "requires": [
+        "T02"
+      ],
+      "task": "tasks/T04-agent-endpoint.md",
+      "design": "designs/T04-agent-endpoint.md",
+      "scenarios": [
+        "S09",
+        "S11",
+        "S12",
+        "S14",
+        "S17",
+        "S18",
+        "S19",
+        "S21",
+        "S22",
+        "S23",
+        "S24",
+        "S35",
+        "S39",
+        "S41",
+        "S43"
+      ]
+    },
+    {
+      "id": "T05",
+      "title": "Project、Resource 与成果保存",
+      "requires": [
+        "T02"
+      ],
+      "task": "tasks/T05-project-resource.md",
+      "design": "designs/T05-project-resource.md",
+      "scenarios": [
+        "S04",
+        "S13",
+        "S22",
+        "S23",
+        "S26",
+        "S27",
+        "S28",
+        "S37"
+      ]
+    },
+    {
+      "id": "T06",
+      "title": "统一 CLI 与 Web 入口",
+      "requires": [
+        "T03"
+      ],
+      "task": "tasks/T06-surface.md",
+      "design": "designs/T06-surface.md",
+      "scenarios": [
+        "S15",
+        "S16",
+        "S19",
+        "S20",
+        "S30",
+        "S36",
+        "S38",
+        "S46"
+      ]
+    },
+    {
+      "id": "T07",
+      "title": "ACP 接入与第三 Agent 验证",
+      "requires": [
+        "T04"
+      ],
+      "task": "tasks/T07-acp-agent.md",
+      "design": "designs/T07-acp-agent.md",
+      "scenarios": [
+        "S11",
+        "S12",
+        "S24",
+        "S35"
+      ]
+    },
+    {
+      "id": "T08",
+      "title": "Draft Leader 与正式执行",
+      "requires": [
+        "T03",
+        "T04",
+        "T05"
+      ],
+      "task": "tasks/T08-draft-leader.md",
+      "design": "designs/T08-draft-leader.md",
+      "scenarios": [
+        "S01",
+        "S02",
+        "S27",
+        "S40"
+      ]
+    },
+    {
+      "id": "T09",
+      "title": "插件开发工具与受权执行",
+      "requires": [
+        "T02",
+        "T05"
+      ],
+      "task": "tasks/T09-plugin-sdk.md",
+      "design": "designs/T09-plugin-sdk.md",
+      "scenarios": [
+        "S28",
+        "S29",
+        "S31",
+        "S34",
+        "S45"
+      ]
+    },
+    {
+      "id": "T10",
+      "title": "原 Task 中的 Agent 自扩展",
+      "requires": [
+        "T03",
+        "T04",
+        "T09"
+      ],
+      "task": "tasks/T10-self-extension.md",
+      "design": "designs/T10-self-extension.md",
+      "scenarios": [
+        "S28",
+        "S32",
+        "S33",
+        "S42",
+        "S45"
+      ]
+    },
+    {
+      "id": "T11",
+      "title": "按使用边界热插拔",
+      "requires": [
+        "T04",
+        "T09"
+      ],
+      "task": "tasks/T11-hot-reload.md",
+      "design": "designs/T11-hot-reload.md",
+      "scenarios": [
+        "S14",
+        "S25",
+        "S35",
+        "S37",
+        "S42",
+        "S45"
+      ]
+    }
+  ]
+}

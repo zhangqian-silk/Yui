@@ -15,6 +15,10 @@ execution and continuity, but they are not competing sources of Task truth.
 
 The current implementation restores the useful Role/Agent/session and CLI framework without restoring the later data-maintenance, lease, schedule, and recovery-ledger systems.
 
+The [target architecture handbook](docs/architecture/README.md) preserves the
+2026-09-06 design baseline for the upcoming refactor; it does not describe
+already implemented behavior.
+
 ## Requirements
 
 - Node.js 20.17+, 22.9+, or 24.x

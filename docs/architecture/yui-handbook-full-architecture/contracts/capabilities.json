@@ -1,0 +1,890 @@
+{
+  "status": "design-catalog",
+  "notes": [
+    "命名为目标契约示意，实施可适配现有CLI路径。",
+    "所有actor由可信入口获得；下列authority说明不是可由参数声明的权限。",
+    "effects以声明能力的最大可能范围分类，纯本地分支可复用事务而不复制账本。",
+    "call桥解析目标descriptor后采用其真实effect和权限，桥自身不授予任何额外权限。"
+  ],
+  "capabilities": [
+    {
+      "name": "task.create",
+      "summary": "建立一个目标及其 Draft",
+      "version": "1",
+      "effect": "local-mutation",
+      "inputSchema": {
+        "type": "object",
+        "required": [
+          "title",
+          "objective"
+        ],
+        "properties": {
+          "title": {
+            "type": "string"
+          },
+          "objective": {
+            "type": "string"
+          }
+        }
+      },
+      "outputContract": "TaskRecord",
+      "authority": "user/operator",
+      "requestIdRequired": true
+    },
+    {
+      "name": "task.read",
+      "summary": "读取任务事实",
+      "version": "1",
+      "effect": "query",
+      "inputSchema": {
+        "type": "object",
+        "required": [
+          "taskId"
+        ],
+        "properties": {
+          "taskId": {
+            "type": "string"
+          }
+        }
+      },
+      "outputContract": "TaskRecord",
+      "authority": "authorized reader",
+      "requestIdRequired": false
+    },
+    {
+      "name": "task.update",
+      "summary": "修改明确任务字段",
+      "version": "1",
+      "effect": "local-mutation",
+      "inputSchema": {
+        "type": "object",
+        "required": [
+          "taskId",
+          "patch"
+        ],
+        "properties": {
+          "taskId": {
+            "type": "string"
+          },
+          "patch": {
+            "type": "object"
+          }
+        }
+      },
+      "outputContract": "TaskRecord",
+      "authority": "user/operator/leader",
+      "requestIdRequired": true
+    },
+    {
+      "name": "task.activate",
+      "summary": "请求开始正式交付",
+      "version": "1",
+      "effect": "external-operation",
+      "inputSchema": {
+        "type": "object",
+        "required": [
+          "taskId",
+          "timing"
+        ],
+        "properties": {
+          "taskId": {
+            "type": "string"
+          },
+          "timing": {
+            "anyOf": [
+              {
+                "const": "now"
+              },
+              {
+                "type": "object",
+                "required": [
+                  "afterPlanningTurnId"
+                ],
+                "properties": {
+                  "afterPlanningTurnId": {
+                    "type": "string"
+                  }
+                }
+              }
+            ]
+          }
+        }
+      },
+      "outputContract": "OperationRef",
+      "authority": "user/operator/leader",
+      "requestIdRequired": true
+    },
+    {
+      "name": "task.complete",
+      "summary": "记录明确完成结果",
+      "version": "1",
+      "effect": "local-mutation",
+      "inputSchema": {
+        "type": "object",
+        "required": [
+          "taskId",
+          "summary"
+        ],
+        "properties": {
+          "taskId": {
+            "type": "string"
+          },
+          "summary": {
+            "type": "string"
+          }
+        }
+      },
+      "outputContract": "TaskRecord",
+      "authority": "user/operator/leader",
+      "requestIdRequired": true
+    },
+    {
+      "name": "task.cancel",
+      "summary": "明确停止追求该目标",
+      "version": "1",
+      "effect": "local-mutation",
+      "inputSchema": {
+        "type": "object",
+        "required": [
+          "taskId",
+          "reason"
+        ],
+        "properties": {
+          "taskId": {
+            "type": "string"
+          },
+          "reason": {
+            "type": "string"
+          }
+        }
+      },
+      "outputContract": "TaskRecord",
+      "authority": "user/operator/leader",
+      "requestIdRequired": true
+    },
+    {
+      "name": "brief.update",
+      "summary": "维护当前任务认知",
+      "version": "1",
+      "effect": "local-mutation",
+      "inputSchema": {
+        "type": "object",
+        "required": [
+          "taskId",
+          "patch"
+        ],
+        "properties": {
+          "taskId": {
+            "type": "string"
+          },
+          "patch": {
+            "type": "object"
+          }
+        }
+      },
+      "outputContract": "BriefRecord",
+      "authority": "user/operator/leader",
+      "requestIdRequired": true
+    },
+    {
+      "name": "decision.record",
+      "summary": "保存重要选择及原因",
+      "version": "1",
+      "effect": "local-mutation",
+      "inputSchema": {
+        "type": "object",
+        "required": [
+          "taskId",
+          "text"
+        ],
+        "properties": {
+          "taskId": {
+            "type": "string"
+          },
+          "text": {
+            "type": "string"
+          }
+        }
+      },
+      "outputContract": "RecordRef",
+      "authority": "user/operator/leader",
+      "requestIdRequired": true
+    },
+    {
+      "name": "work.create",
+      "summary": "建立独立责任",
+      "version": "1",
+      "effect": "local-mutation",
+      "inputSchema": {
+        "type": "object",
+        "required": [
+          "taskId",
+          "objective"
+        ],
+        "properties": {
+          "taskId": {
+            "type": "string"
+          },
+          "objective": {
+            "type": "string"
+          }
+        }
+      },
+      "outputContract": "WorkItem",
+      "authority": "user/operator/leader",
+      "requestIdRequired": true
+    },
+    {
+      "name": "work.edit",
+      "summary": "修改当前责任描述或分配",
+      "version": "1",
+      "effect": "local-mutation",
+      "inputSchema": {
+        "type": "object",
+        "required": [
+          "workItemId",
+          "patch"
+        ],
+        "properties": {
+          "workItemId": {
+            "type": "string"
+          },
+          "patch": {
+            "type": "object"
+          }
+        }
+      },
+      "outputContract": "WorkItem",
+      "authority": "user/operator/leader",
+      "requestIdRequired": true
+    },
+    {
+      "name": "work.retire",
+      "summary": "明确不再推进该责任",
+      "version": "1",
+      "effect": "local-mutation",
+      "inputSchema": {
+        "type": "object",
+        "required": [
+          "workItemId",
+          "reason"
+        ],
+        "properties": {
+          "workItemId": {
+            "type": "string"
+          },
+          "reason": {
+            "type": "string"
+          }
+        }
+      },
+      "outputContract": "WorkItem",
+      "authority": "user/operator/leader",
+      "requestIdRequired": true
+    },
+    {
+      "name": "work.dispatch",
+      "summary": "执行明确的 Assignment",
+      "version": "1",
+      "effect": "external-operation",
+      "inputSchema": {
+        "type": "object",
+        "required": [
+          "workItemId",
+          "roleId"
+        ],
+        "properties": {
+          "workItemId": {
+            "type": "string"
+          },
+          "roleId": {
+            "type": "string"
+          }
+        }
+      },
+      "outputContract": "OperationRef",
+      "authority": "user/operator/leader",
+      "requestIdRequired": true
+    },
+    {
+      "name": "work.accept",
+      "summary": "选择被接受的结果",
+      "version": "1",
+      "effect": "local-mutation",
+      "inputSchema": {
+        "type": "object",
+        "required": [
+          "workItemId",
+          "candidateId"
+        ],
+        "properties": {
+          "workItemId": {
+            "type": "string"
+          },
+          "candidateId": {
+            "type": "string"
+          }
+        }
+      },
+      "outputContract": "WorkItem",
+      "authority": "user/operator/leader",
+      "requestIdRequired": true
+    },
+    {
+      "name": "candidate.submit",
+      "summary": "保存一版明确结果",
+      "version": "1",
+      "effect": "local-mutation",
+      "inputSchema": {
+        "type": "object",
+        "required": [
+          "taskId",
+          "source",
+          "artifacts"
+        ],
+        "properties": {
+          "taskId": {
+            "type": "string"
+          },
+          "source": {
+            "type": "object"
+          },
+          "artifacts": {
+            "type": "array"
+          }
+        }
+      },
+      "outputContract": "Candidate",
+      "authority": "authorized contributor",
+      "requestIdRequired": true
+    },
+    {
+      "name": "candidate.read",
+      "summary": "读取结果版本与来源",
+      "version": "1",
+      "effect": "query",
+      "inputSchema": {
+        "type": "object",
+        "required": [
+          "candidateId"
+        ],
+        "properties": {
+          "candidateId": {
+            "type": "string"
+          }
+        }
+      },
+      "outputContract": "Candidate",
+      "authority": "authorized reader",
+      "requestIdRequired": false
+    },
+    {
+      "name": "review.request",
+      "summary": "委派独立判断",
+      "version": "1",
+      "effect": "external-operation",
+      "inputSchema": {
+        "type": "object",
+        "required": [
+          "candidateId",
+          "roleId"
+        ],
+        "properties": {
+          "candidateId": {
+            "type": "string"
+          },
+          "roleId": {
+            "type": "string"
+          }
+        }
+      },
+      "outputContract": "OperationRef",
+      "authority": "user/operator/leader",
+      "requestIdRequired": true
+    },
+    {
+      "name": "review.read",
+      "summary": "读取 Candidate 与 Reviewer Turn 引用",
+      "version": "1",
+      "effect": "query",
+      "inputSchema": {
+        "type": "object",
+        "required": [
+          "reviewId"
+        ],
+        "properties": {
+          "reviewId": {
+            "type": "string"
+          }
+        }
+      },
+      "outputContract": "Review",
+      "authority": "authorized reader",
+      "requestIdRequired": false
+    },
+    {
+      "name": "role.update",
+      "summary": "修改角色当前配置",
+      "version": "1",
+      "effect": "local-mutation",
+      "inputSchema": {
+        "type": "object",
+        "required": [
+          "roleId",
+          "patch"
+        ],
+        "properties": {
+          "roleId": {
+            "type": "string"
+          },
+          "patch": {
+            "type": "object"
+          }
+        }
+      },
+      "outputContract": "RoleRecord",
+      "authority": "authorized manager",
+      "requestIdRequired": true
+    },
+    {
+      "name": "role.read",
+      "summary": "查看当前配置及其来源",
+      "version": "1",
+      "effect": "query",
+      "inputSchema": {
+        "type": "object",
+        "required": [
+          "roleId"
+        ],
+        "properties": {
+          "roleId": {
+            "type": "string"
+          }
+        }
+      },
+      "outputContract": "RoleRecord",
+      "authority": "authorized reader",
+      "requestIdRequired": false
+    },
+    {
+      "name": "context.read",
+      "summary": "获取核心工作集",
+      "version": "1",
+      "effect": "query",
+      "inputSchema": {
+        "type": "object",
+        "required": [
+          "taskId"
+        ],
+        "properties": {
+          "taskId": {
+            "type": "string"
+          }
+        }
+      },
+      "outputContract": "ContextSnapshot",
+      "authority": "authorized reader",
+      "requestIdRequired": false
+    },
+    {
+      "name": "context.delta",
+      "summary": "读取固定上界内的变化",
+      "version": "1",
+      "effect": "query",
+      "inputSchema": {
+        "type": "object",
+        "required": [
+          "taskId",
+          "cursor"
+        ],
+        "properties": {
+          "taskId": {
+            "type": "string"
+          },
+          "cursor": {
+            "type": "object"
+          }
+        }
+      },
+      "outputContract": "ContextDelta",
+      "authority": "authorized reader",
+      "requestIdRequired": false
+    },
+    {
+      "name": "context.inspect",
+      "summary": "展开一个确切事实或产物",
+      "version": "1",
+      "effect": "query",
+      "inputSchema": {
+        "type": "object",
+        "required": [
+          "recordId"
+        ],
+        "properties": {
+          "recordId": {
+            "type": "string"
+          }
+        }
+      },
+      "outputContract": "RecordOrArtifact",
+      "authority": "authorized reader",
+      "requestIdRequired": false
+    },
+    {
+      "name": "message.send",
+      "summary": "保存面向角色的消息",
+      "version": "1",
+      "effect": "local-mutation",
+      "inputSchema": {
+        "type": "object",
+        "required": [
+          "to",
+          "body"
+        ],
+        "properties": {
+          "to": {
+            "type": "object"
+          },
+          "body": {
+            "type": "string"
+          }
+        }
+      },
+      "outputContract": "Message",
+      "authority": "authorized sender",
+      "requestIdRequired": true
+    },
+    {
+      "name": "input.ask",
+      "summary": "保存需要用户回答的问题",
+      "version": "1",
+      "effect": "local-mutation",
+      "inputSchema": {
+        "type": "object",
+        "required": [
+          "taskId",
+          "question"
+        ],
+        "properties": {
+          "taskId": {
+            "type": "string"
+          },
+          "question": {
+            "type": "string"
+          }
+        }
+      },
+      "outputContract": "InputRequest",
+      "authority": "authorized role",
+      "requestIdRequired": true
+    },
+    {
+      "name": "input.answer",
+      "summary": "关联用户回答",
+      "version": "1",
+      "effect": "local-mutation",
+      "inputSchema": {
+        "type": "object",
+        "required": [
+          "inputId",
+          "answer"
+        ],
+        "properties": {
+          "inputId": {
+            "type": "string"
+          },
+          "answer": {
+            "type": "string"
+          }
+        }
+      },
+      "outputContract": "InputRequest",
+      "authority": "user/operator",
+      "requestIdRequired": true
+    },
+    {
+      "name": "runtime.inspect",
+      "summary": "查看原执行或会话证据",
+      "version": "1",
+      "effect": "query",
+      "inputSchema": {
+        "type": "object",
+        "required": [
+          "sessionId"
+        ],
+        "properties": {
+          "sessionId": {
+            "type": "string"
+          }
+        }
+      },
+      "outputContract": "RuntimeObservation",
+      "authority": "authorized reader",
+      "requestIdRequired": false
+    },
+    {
+      "name": "runtime.cancel",
+      "summary": "请求取消一次执行",
+      "version": "1",
+      "effect": "external-operation",
+      "inputSchema": {
+        "type": "object",
+        "required": [
+          "sessionId",
+          "attemptId"
+        ],
+        "properties": {
+          "sessionId": {
+            "type": "string"
+          },
+          "attemptId": {
+            "type": "string"
+          }
+        }
+      },
+      "outputContract": "OperationRef",
+      "authority": "authorized manager",
+      "requestIdRequired": true
+    },
+    {
+      "name": "runtime.detach",
+      "summary": "解除 Yui 自己的附件",
+      "version": "1",
+      "effect": "external-operation",
+      "inputSchema": {
+        "type": "object",
+        "required": [
+          "sessionId"
+        ],
+        "properties": {
+          "sessionId": {
+            "type": "string"
+          }
+        }
+      },
+      "outputContract": "OperationRef",
+      "authority": "authorized manager",
+      "requestIdRequired": true
+    },
+    {
+      "name": "resource.inspect",
+      "summary": "读取授权资源描述或观察",
+      "version": "1",
+      "effect": "query",
+      "inputSchema": {
+        "type": "object",
+        "required": [
+          "resourceId"
+        ],
+        "properties": {
+          "resourceId": {
+            "type": "string"
+          }
+        }
+      },
+      "outputContract": "ResourceObservation",
+      "authority": "authorized reader",
+      "requestIdRequired": false
+    },
+    {
+      "name": "artifact.store",
+      "summary": "保存具体结果内容或外部版本引用",
+      "version": "1",
+      "effect": "external-operation",
+      "inputSchema": {
+        "type": "object",
+        "required": [
+          "source"
+        ],
+        "properties": {
+          "source": {
+            "type": "object"
+          }
+        }
+      },
+      "outputContract": "ArtifactRef",
+      "authority": "authorized contributor",
+      "requestIdRequired": true
+    },
+    {
+      "name": "artifact.read",
+      "summary": "读取保存的成果",
+      "version": "1",
+      "effect": "query",
+      "inputSchema": {
+        "type": "object",
+        "required": [
+          "artifactId"
+        ],
+        "properties": {
+          "artifactId": {
+            "type": "string"
+          }
+        }
+      },
+      "outputContract": "ArtifactContent",
+      "authority": "authorized reader",
+      "requestIdRequired": false
+    },
+    {
+      "name": "capability.search",
+      "summary": "查询可见能力目录",
+      "version": "1",
+      "effect": "query",
+      "inputSchema": {
+        "type": "object",
+        "required": [
+          "query"
+        ],
+        "properties": {
+          "query": {
+            "type": "string"
+          }
+        }
+      },
+      "outputContract": "CapabilityDescriptor[]",
+      "authority": "authorized caller",
+      "requestIdRequired": false
+    },
+    {
+      "name": "capability.describe",
+      "summary": "读取契约及候选实现",
+      "version": "1",
+      "effect": "query",
+      "inputSchema": {
+        "type": "object",
+        "required": [
+          "name"
+        ],
+        "properties": {
+          "name": {
+            "type": "string"
+          }
+        }
+      },
+      "outputContract": "CapabilityDescriptor[]",
+      "authority": "authorized caller",
+      "requestIdRequired": false
+    },
+    {
+      "name": "plugin.create",
+      "summary": "建立独立开发目录和声明",
+      "version": "1",
+      "effect": "external-operation",
+      "inputSchema": {
+        "type": "object",
+        "required": [
+          "pluginId",
+          "scope"
+        ],
+        "properties": {
+          "pluginId": {
+            "type": "string"
+          },
+          "scope": {
+            "type": "object"
+          }
+        }
+      },
+      "outputContract": "DevelopmentRef",
+      "authority": "authorized manager",
+      "requestIdRequired": true
+    },
+    {
+      "name": "plugin.validate",
+      "summary": "在授权环境验证实际产物",
+      "version": "1",
+      "effect": "external-operation",
+      "inputSchema": {
+        "type": "object",
+        "required": [
+          "sourceRef"
+        ],
+        "properties": {
+          "sourceRef": {
+            "type": "string"
+          }
+        }
+      },
+      "outputContract": "PluginValidation",
+      "authority": "authorized manager",
+      "requestIdRequired": true
+    },
+    {
+      "name": "plugin.activate",
+      "summary": "注册经过验证且受权的完整贡献",
+      "version": "1",
+      "effect": "external-operation",
+      "inputSchema": {
+        "type": "object",
+        "required": [
+          "artifactRef",
+          "scope"
+        ],
+        "properties": {
+          "artifactRef": {
+            "type": "string"
+          },
+          "scope": {
+            "type": "object"
+          }
+        }
+      },
+      "outputContract": "OperationRef",
+      "authority": "authorized manager",
+      "requestIdRequired": true
+    },
+    {
+      "name": "plugin.disable",
+      "summary": "停止新的独立使用",
+      "version": "1",
+      "effect": "local-mutation",
+      "inputSchema": {
+        "type": "object",
+        "required": [
+          "pluginId",
+          "scope"
+        ],
+        "properties": {
+          "pluginId": {
+            "type": "string"
+          },
+          "scope": {
+            "type": "object"
+          }
+        }
+      },
+      "outputContract": "PluginInstance",
+      "authority": "authorized manager",
+      "requestIdRequired": true
+    },
+    {
+      "name": "plugin.reload",
+      "summary": "按调用或会话边界替换实现",
+      "version": "1",
+      "effect": "external-operation",
+      "inputSchema": {
+        "type": "object",
+        "required": [
+          "pluginId",
+          "artifactRef",
+          "scope"
+        ],
+        "properties": {
+          "pluginId": {
+            "type": "string"
+          },
+          "artifactRef": {
+            "type": "string"
+          },
+          "scope": {
+            "type": "object"
+          }
+        }
+      },
+      "outputContract": "OperationRef",
+      "authority": "authorized manager",
+      "requestIdRequired": true
+    }
+  ]
+}

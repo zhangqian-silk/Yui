@@ -1,0 +1,549 @@
+{
+  "status": "planned",
+  "scenarios": [
+    {
+      "id": "S01",
+      "title": "Draft 的 Leader 对话",
+      "given": "存在未激活 Task，尚无常驻 Leader Session。",
+      "when": "用户通过 Task 入口进入对话，并询问任务细节。",
+      "then": "路由到该 Task 的 Leader，按需启动 planning 承载；不要求先建立 delivery 环境或先激活。",
+      "status": "planned",
+      "tasks": [
+        "T08"
+      ]
+    },
+    {
+      "id": "S02",
+      "title": "规划事实可接手",
+      "given": "Leader 已把目标、当前思路和重要决定写入 Task。",
+      "when": "关闭原 Session，使用新的兼容 Agent 会话读取 Context。",
+      "then": "新会话能读取已经确认的规划信息；不需要恢复旧终端或完整工具日志。",
+      "status": "planned",
+      "tasks": [
+        "T08"
+      ]
+    },
+    {
+      "id": "S03",
+      "title": "Role 配置与实际执行分开",
+      "given": "一个 Worker 的 Turn 正使用 Agent A。",
+      "when": "Leader 将 Role 当前配置改为 Agent B。",
+      "then": "当前 Turn 仍保留 A 的实际配置和结果来源；后续明确执行可以选择 B，WorkItem 身份不变。",
+      "status": "planned",
+      "tasks": [
+        "T03"
+      ]
+    },
+    {
+      "id": "S04",
+      "title": "直接完成无 Git 任务",
+      "given": "Task 只需产出一份文本说明，没有 Project 或 Git 资源。",
+      "when": "Leader 保存说明并提交完成。",
+      "then": "允许 direct 完成，不强制建立 WorkItem、Review、branch 或 worktree；说明在重启后仍可读。",
+      "status": "planned",
+      "tasks": [
+        "T05"
+      ]
+    },
+    {
+      "id": "S05",
+      "title": "进度与结果独立",
+      "given": "已存在被讨论或被接受的 Candidate。",
+      "when": "Leader 更新 Brief.currentFocus。",
+      "then": "进度可见，Candidate 内容与验收不被自动改写或撤销；无需重新执行。",
+      "status": "planned",
+      "tasks": [
+        "T03"
+      ]
+    },
+    {
+      "id": "S06",
+      "title": "需求变化的显式判断",
+      "given": "已有结果来源于较早的任务说明。",
+      "when": "Leader 修改要求，阅读原结果并明确接受其仍然适用。",
+      "then": "接受可记录具体选择和说明，不以所有记录 revision 相等作为门禁；原 Candidate 内容不变。",
+      "status": "planned",
+      "tasks": [
+        "T03"
+      ]
+    },
+    {
+      "id": "S07",
+      "title": "Review 原始结果单份保存",
+      "given": "Reviewer 针对一个固定 Candidate 运行。",
+      "when": "Reviewer 返回包含建议、疑问或混合意见的文本。",
+      "then": "原文只保存在 Reviewer Turn；Review 引用它，Core 不自动解析 verdict 或创建修复 WorkItem。",
+      "status": "planned",
+      "tasks": [
+        "T03"
+      ]
+    },
+    {
+      "id": "S08",
+      "title": "责任不因尝试失败消失",
+      "given": "WorkItem 仍为 open。",
+      "when": "其 Worker Turn 因 CLI 错误结束。",
+      "then": "错误和已有结果进入原 Turn，通知 Leader；WorkItem 仍可继续分配或由 Leader处理。",
+      "status": "planned",
+      "tasks": [
+        "T03"
+      ]
+    },
+    {
+      "id": "S09",
+      "title": "效果未知不自动重放",
+      "given": "外部服务接受了请求，但 Yui 未收到最终回执。",
+      "when": "连接断开或调用再次使用同一请求身份。",
+      "then": "保留原操作和 unknown；不自动切 Provider／PTY 再执行，真实外部次数可核对。",
+      "status": "planned",
+      "tasks": [
+        "T01",
+        "T04"
+      ]
+    },
+    {
+      "id": "S10",
+      "title": "并发编辑不覆盖",
+      "given": "两位受权调用者读到同一 Brief revision。",
+      "when": "一方更新后，另一方提交过期写入。",
+      "then": "后一写入获得当前版本和明确冲突，不覆盖前者；冲突仅影响该写入，不使历史结果无效。",
+      "status": "planned",
+      "tasks": [
+        "T01",
+        "T03"
+      ]
+    },
+    {
+      "id": "S11",
+      "title": "原生身份按证据保存",
+      "given": "一个 Endpoint 只提供本地关联或传输写入，未返回 native Turn ID。",
+      "when": "Yui 建立 Turn 并显示执行状态。",
+      "then": "本地 attempt 与 native ID 区分，缺失原生字段保持缺失，不伪造 native acceptance。",
+      "status": "planned",
+      "tasks": [
+        "T04",
+        "T07"
+      ]
+    },
+    {
+      "id": "S12",
+      "title": "长请求正常等待",
+      "given": "协议请求持续连接且尚未返回终态。",
+      "when": "超过一般短调用时间但没有明确失败证据。",
+      "then": "仍表示 pending；不自动重试或认定 input 未接受，最终关联响应归原请求。",
+      "status": "planned",
+      "tasks": [
+        "T04",
+        "T07"
+      ]
+    },
+    {
+      "id": "S13",
+      "title": "结果版本明确",
+      "given": "Candidate 已引用文件的一版固定内容。",
+      "when": "原工作文件随后被继续修改。",
+      "then": "读取 Candidate 仍得到被提交的那版内容或明确外部版本；参考 URL 不冒充固定结果。",
+      "status": "planned",
+      "tasks": [
+        "T05"
+      ]
+    },
+    {
+      "id": "S14",
+      "title": "既有 Session 保持实现",
+      "given": "Session 已由实现 A 打开。",
+      "when": "发布实现 B，并在该 Session 开始下一 Turn。",
+      "then": "默认仍使用 A 和必要状态依赖，除非显式按可验证方式重建；不在每 Turn 强制升级。",
+      "status": "planned",
+      "tasks": [
+        "T04",
+        "T11"
+      ]
+    },
+    {
+      "id": "S15",
+      "title": "Context 核心一致读取",
+      "given": "Task 在持续写入消息和结果。",
+      "when": "读取 Context 并分页获取 delta。",
+      "then": "核心数据与 cursor 同一读视图，分页上界固定；外部观察另有时间和来源。",
+      "status": "planned",
+      "tasks": [
+        "T03",
+        "T06"
+      ]
+    },
+    {
+      "id": "S16",
+      "title": "读取不代表送达",
+      "given": "Message 尚未被目标 Agent 接受。",
+      "when": "用户或 Agent 读取 Context。",
+      "then": "Message 不因此被标为已送达；投递接受依据实际执行证据。",
+      "status": "planned",
+      "tasks": [
+        "T03",
+        "T06"
+      ]
+    },
+    {
+      "id": "S17",
+      "title": "忙碌输入保留",
+      "given": "目标 Role 的原生会话有活跃执行。",
+      "when": "出现新消息或多次 Wake。",
+      "then": "保留同一待投递输入并合并提醒，不创建竞争会话或丢消息。",
+      "status": "planned",
+      "tasks": [
+        "T04"
+      ]
+    },
+    {
+      "id": "S18",
+      "title": "局部故障交 Leader",
+      "given": "Worker 或 Reviewer 无法继续或主动求助。",
+      "when": "故障被可信入口观察。",
+      "then": "保存原事实并通知该 Task 当前 Leader，不自动升级成整个 Task 失败。",
+      "status": "planned",
+      "tasks": [
+        "T03",
+        "T04"
+      ]
+    },
+    {
+      "id": "S19",
+      "title": "Leader 故障交 Operator",
+      "given": "Leader 承载不可用，任务事实仍存在。",
+      "when": "系统记录失败或 Leader 提出求助。",
+      "then": "经已有消息路径通知 Operator，提供 Task 和执行引用，由 Operator决定具体操作。",
+      "status": "planned",
+      "tasks": [
+        "T03",
+        "T04",
+        "T06"
+      ]
+    },
+    {
+      "id": "S20",
+      "title": "Operator 由用户处理",
+      "given": "Operator 无法启动或其会话异常。",
+      "when": "系统观察到该问题。",
+      "then": "保留普通事实和待处理输入；不自动创建备用 Operator、恢复 Task、专门 watchdog 或救援 Agent。",
+      "status": "planned",
+      "tasks": [
+        "T01",
+        "T03",
+        "T06"
+      ]
+    },
+    {
+      "id": "S21",
+      "title": "迟到和重复结果关联",
+      "given": "旧 Turn 已有终态，后继 Turn 正在执行。",
+      "when": "旧执行终态重放或延迟到达。",
+      "then": "只关联原 Turn，重复幂等；不完成或失败后继 Turn。",
+      "status": "planned",
+      "tasks": [
+        "T04"
+      ]
+    },
+    {
+      "id": "S22",
+      "title": "多路尝试关系",
+      "given": "同一 Assignment 有两个副本，其中一个需要重试。",
+      "when": "Leader请求重试并选择结果综合。",
+      "then": "重试仍属于原副本，综合明确选择来源；不把重试当独立第三意见，外部发布不默认复制。",
+      "status": "planned",
+      "tasks": [
+        "T04",
+        "T05"
+      ]
+    },
+    {
+      "id": "S23",
+      "title": "请求停止与实际停止分开",
+      "given": "资源仍可能被子进程或原生后台活动写入。",
+      "when": "发出取消或更换 Role 后准备冲突执行。",
+      "then": "只凭取消请求或管理变更不能宣称资源停止；可查证、等待或换隔离资源，无关工作不被整体锁住。",
+      "status": "planned",
+      "tasks": [
+        "T04",
+        "T05"
+      ]
+    },
+    {
+      "id": "S24",
+      "title": "用户原生对话共存",
+      "given": "用户直接在原生 UI 启动会话执行。",
+      "when": "Yui 同时准备提交输入。",
+      "then": "按真实 busy／输入能力处理，保留请求；不争抢唯一对话所有权或悄悄混淆两轮结果。",
+      "status": "planned",
+      "tasks": [
+        "T04",
+        "T07"
+      ]
+    },
+    {
+      "id": "S25",
+      "title": "短工具实现切换",
+      "given": "工具 A 已有进行中调用。",
+      "when": "注册工具 B 并发起新独立调用。",
+      "then": "已有调用仍用 A，新调用可用 B；A 在真实使用释放后才 dispose。",
+      "status": "planned",
+      "tasks": [
+        "T01",
+        "T02",
+        "T11"
+      ]
+    },
+    {
+      "id": "S26",
+      "title": "真实资源目标识别",
+      "given": "同一个可写资源有两个展示别名。",
+      "when": "两个操作分别使用不同别名尝试冲突写入。",
+      "then": "资源能力识别真实目标并执行其必要条件，不只比较名称；不引入第二份资源真相。",
+      "status": "planned",
+      "tasks": [
+        "T05"
+      ]
+    },
+    {
+      "id": "S27",
+      "title": "空执行环境",
+      "given": "Task 不需要额外目录或资源准备。",
+      "when": "执行 Activation。",
+      "then": "空环境计划合法，Task 可以进入 active，不为了满足框架模型创建 worktree。",
+      "status": "planned",
+      "tasks": [
+        "T05",
+        "T08"
+      ]
+    },
+    {
+      "id": "S28",
+      "title": "Scope 不授予权限",
+      "given": "Task-local 插件声明访问一个尚未授权资源。",
+      "when": "Agent 尝试调用该能力。",
+      "then": "缺授权返回明确事实；scope 和 manifest 本身不提供权限，Agent可请求 Operator／用户。",
+      "status": "planned",
+      "tasks": [
+        "T05",
+        "T09",
+        "T10"
+      ]
+    },
+    {
+      "id": "S29",
+      "title": "初始化只注册",
+      "given": "候选插件初始化失败或试图先进行业务写入。",
+      "when": "执行 activate。",
+      "then": "不发布半套能力；初始化不允许借注册阶段完成业务副作用，当前可用 Provider 不受影响。",
+      "status": "planned",
+      "tasks": [
+        "T09"
+      ]
+    },
+    {
+      "id": "S30",
+      "title": "能力歧义和缺失可读",
+      "given": "当前可见范围存在两个同名实现，或没有对应能力。",
+      "when": "Agent search／describe／call。",
+      "then": "返回候选或 unavailable，显式选择后才调用；不按加载顺序覆盖，不阻止核心 Task 读取。",
+      "status": "planned",
+      "tasks": [
+        "T02",
+        "T06"
+      ]
+    },
+    {
+      "id": "S31",
+      "title": "验证与激活同一内容",
+      "given": "插件 A 已通过验证。",
+      "when": "源文件或打包依赖改成 B 后请求激活。",
+      "then": "不能仅凭版本号复用 A 的报告，实际摘要与报告不符时需验证相应内容。",
+      "status": "planned",
+      "tasks": [
+        "T09"
+      ]
+    },
+    {
+      "id": "S32",
+      "title": "原 Task 实际自扩展",
+      "given": "Active Task 缺一个资料转换能力。",
+      "when": "真实 Leader 编写、验证、Task-local 激活并使用插件。",
+      "then": "不改 Yui 源码和重启 Controller，原任务获得可读取业务结果；仅加载成功不足以通过。",
+      "status": "planned",
+      "tasks": [
+        "T10"
+      ]
+    },
+    {
+      "id": "S33",
+      "title": "Agent 修复插件继续工作",
+      "given": "自写插件的一项验证因输入边界失败。",
+      "when": "Leader读取报告、修改实现并重新验证。",
+      "then": "在原 Task 继续，未通过内容不覆盖已可用实现；不由框架自动创建修复工作流。",
+      "status": "planned",
+      "tasks": [
+        "T10"
+      ]
+    },
+    {
+      "id": "S34",
+      "title": "效果与输出失败并存",
+      "given": "外部动作已部分或全部发生。",
+      "when": "插件输出不符合 schema 或后续处理抛错。",
+      "then": "已得回执和部分结果仍保留，不能标为无效果并自动重跑整个动作。",
+      "status": "planned",
+      "tasks": [
+        "T01",
+        "T02",
+        "T09"
+      ]
+    },
+    {
+      "id": "S35",
+      "title": "新 Session 使用新实现",
+      "given": "实现 A 的旧 Session 仍可用，B 已成功注册。",
+      "when": "创建一个新 Session。",
+      "then": "新 Session 默认采用 B，旧 Session 的实际配置不被改写；B 加载失败时原路径仍可用。",
+      "status": "planned",
+      "tasks": [
+        "T04",
+        "T07",
+        "T11"
+      ]
+    },
+    {
+      "id": "S36",
+      "title": "展示当前配置与实际来源",
+      "given": "Role 当前配置已变化，但旧执行仍存在。",
+      "when": "CLI 和 Web 显示当前任务。",
+      "then": "清楚呈现当前配置与各 Turn 实际使用的配置，不把历史结果标签重写。",
+      "status": "planned",
+      "tasks": [
+        "T03",
+        "T06"
+      ]
+    },
+    {
+      "id": "S37",
+      "title": "历史成果独立读取",
+      "given": "旧插件已无使用者，其可执行代码按保留策略释放。",
+      "when": "用户读取历史 Candidate／Review／完成说明。",
+      "then": "内容和必要来源仍可读，不要求重新启动旧插件；再次执行是新的能力请求。",
+      "status": "planned",
+      "tasks": [
+        "T05",
+        "T11"
+      ]
+    },
+    {
+      "id": "S38",
+      "title": "展示贡献可卸载",
+      "given": "一个插件提供专用 CLI 命令或结果面板。",
+      "when": "停用该展示贡献。",
+      "then": "注册资源正确撤销，Task 与成果不删除，通用读取路径仍可用。",
+      "status": "planned",
+      "tasks": [
+        "T06"
+      ]
+    },
+    {
+      "id": "S39",
+      "title": "实现并存但事实单一",
+      "given": "同一受支持版本中有当前和目标实现可选。",
+      "when": "逐项切换新调用或创建新 Session。",
+      "then": "一次工作只落一条路径，共用唯一 Store／Controller；效果未知不自动走另一实现。",
+      "status": "planned",
+      "tasks": [
+        "T00",
+        "T02",
+        "T04"
+      ]
+    },
+    {
+      "id": "S40",
+      "title": "当前 planning Turn 发起激活",
+      "given": "Leader 正在 Draft 对话中。",
+      "when": "该 Turn 调用 Activation，随后结束；或用户在等待中取消。",
+      "then": "请求立即返回引用而不自等待；结束后按当前有效意图采用；已取消请求不被继续执行。",
+      "status": "planned",
+      "tasks": [
+        "T08"
+      ]
+    },
+    {
+      "id": "S41",
+      "title": "管理交接保留工作",
+      "given": "Operator 为 Task 更换 Leader 承载，旧 Worker 仍在工作。",
+      "when": "原 Worker 返回结果，旧 Leader 尝试新管理操作。",
+      "then": "结果归原 Turn 并交当前 Leader；旧管理入口不继续越权；Worker 分配不自动重建。",
+      "status": "planned",
+      "tasks": [
+        "T03",
+        "T04"
+      ]
+    },
+    {
+      "id": "S42",
+      "title": "旧 Session 使用新增工具",
+      "given": "Agent Session 已通过稳定 Yui 桥运行。",
+      "when": "Task-local 激活一个新的短工具，并在后续桥调用中使用。",
+      "then": "工具可发现和调用，不要求热改原生 schema 或升级 Endpoint；旧 Session 仍按原实现运行。",
+      "status": "planned",
+      "tasks": [
+        "T10",
+        "T11"
+      ]
+    },
+    {
+      "id": "S43",
+      "title": "结束与重开不重播历史",
+      "given": "Task 已结束，历史里有未决或已接受输入。",
+      "when": "迟到结果到达，随后用户显式重开。",
+      "then": "迟到结果只归档；重开不自动重新发送所有历史输入，负责人明确选择后续工作。",
+      "status": "planned",
+      "tasks": [
+        "T03",
+        "T04"
+      ]
+    },
+    {
+      "id": "S44",
+      "title": "存储采用有明确路径",
+      "given": "隔离 Home 使用当前受支持存储版本。",
+      "when": "执行需要 schema 变化的受控升级。",
+      "then": "升级、备份和验证步骤明确；不假定旧 binary 能读取新 schema，也不以代码切路由冒充数据库回退。",
+      "status": "planned",
+      "tasks": [
+        "T00",
+        "T01"
+      ]
+    },
+    {
+      "id": "S45",
+      "title": "当前授权影响新副作用",
+      "given": "调用者曾有资源 grant，且持有旧实例句柄。",
+      "when": "撤回 grant 后继续发起新的受控外部动作。",
+      "then": "新动作按当前授权拒绝；历史回执保留，generation 不能提供永久旧权限。",
+      "status": "planned",
+      "tasks": [
+        "T01",
+        "T02",
+        "T09",
+        "T10",
+        "T11"
+      ]
+    },
+    {
+      "id": "S46",
+      "title": "Context 可选来源独立",
+      "given": "Task 核心记录有效，可选上下文提供者失败或超时。",
+      "when": "读取工作 Context 或打开 Task 页面。",
+      "then": "核心目标、消息和结果仍可读，附带来源 unavailable；不以可选扩展失败阻断所有读取。",
+      "status": "planned",
+      "tasks": [
+        "T03",
+        "T06"
+      ]
+    }
+  ]
+}
