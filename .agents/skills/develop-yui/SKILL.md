@@ -116,18 +116,39 @@ force Review through a Core gate. Route findings to the original owner; the
 Leader fixes small Task-main issues directly and creates a Repair WorkItem only
 when the repair is itself a substantial independently owned requirement.
 
-## Implement the current Yui contract
+## Implement one current contract with an explicit migration boundary
 
-Yui implements one current persistent contract. A layout, aggregate, record, or
-configuration schema change replaces that current contract and updates its
-centralized version declarations and validators. Historical Homes remain
-unsupported and untouched; do not add migration, dual-read, or compatibility
-paths unless the user explicitly changes that product policy.
+Yui runtime implements one current persistent contract. The Home has one
+storage version, and each persistent schema or payload change appends exactly
+one immutable, contiguous migration. Keep the complete forward chain from the
+declared minimum supported storage version to the current version so the newest
+CLI can upgrade any valid Home in that range without intermediate releases.
+Ordinary stores never dual-read, normalize, or write historical shapes; only
+`yui upgrade` and the migration phase of `yui update` may interpret them.
 
-For all other behavior, implement and validate only the current contract. Do
-not preserve transitional paths or add recovery logic for malformed, partial,
-manually modified, or historically leaked Homes, Sessions, worktrees,
-configuration, or runtime artifacts. Fail closed and report a bounded
-diagnosis or cleanup recommendation instead. An explicitly retired Task is an
-isolation boundary rather than a repair path: preserve its stored history and
-skip only the runtime cross-reference checks that would block healthy Tasks.
+The compatibility line starts at Yui 0.15.0 / storage version 1. Pre-0.15.0
+Homes are outside the migration floor: preserve them for their matching
+historical release or initialize a new Home, but do not add a pre-baseline
+adapter or migration.
+
+Do not add independent layout, aggregate, or record-family compatibility axes.
+Record-local protocol tags may validate the current payload, but a change to a
+persisted payload belongs to the single Home migration for that release. Never
+rewrite an already released migration or lower the migration floor merely to
+discard valid history.
+
+Treat the target-driven update handshake as part of that long-lived migration
+contract. Keep the staged binary's `upgrade --update-preflight` and
+`upgrade --update-apply` success/blocker semantics backward compatible with
+every updater released since the single-version baseline, including the
+parent-owned handover-lock proof used by `--update-apply`; add fields rather
+than renaming or removing the fields an older updater consumes. Otherwise a
+complete migration chain would still be unreachable through `yui update`.
+
+Migrations preserve valid stored history; they do not heuristically repair
+malformed, partial, manually modified, or historically leaked Homes, Sessions,
+worktrees, configuration, or runtime artifacts. Fail closed and report a
+bounded diagnosis or cleanup recommendation instead. An explicitly retired
+Task is an isolation boundary rather than a repair path: preserve its stored
+history and skip only the runtime cross-reference checks that would block
+healthy Tasks.

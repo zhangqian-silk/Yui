@@ -1,63 +1,52 @@
-import { readFileSync } from "node:fs";
+import { existsSync, readdirSync } from "node:fs";
 import { join } from "node:path";
-import { writeTextFileAtomically } from "./durableFile.js";
+
+import Database from "better-sqlite3";
+
 import {
-  CURRENT_AGGREGATE_SCHEMA_VERSION,
-  CURRENT_STORAGE_LAYOUT_VERSION
+  inspectSqliteSchemaMigrations,
+  storageMigrationPlan
+} from "./sqliteSchema.js";
+import {
+  CURRENT_STORAGE_VERSION,
+  MIN_SUPPORTED_STORAGE_VERSION
 } from "./storageVersions.js";
-import { currentRecordVersions } from "./upgrade/recordVersions.js";
 
-export { CURRENT_STORAGE_LAYOUT_VERSION, CURRENT_AGGREGATE_SCHEMA_VERSION };
-export const STORAGE_SCHEMA_FILE = "schema.json";
+export {
+  CURRENT_STORAGE_VERSION,
+  MIN_SUPPORTED_STORAGE_VERSION
+} from "./storageVersions.js";
 
-export type StorageSchemaManifest = Readonly<{
-  /** Schema version of this manifest record itself. */
-  schemaVersion: 1;
-  /** On-disk layout version. This is not a domain-record schema version. */
-  storageVersion: number;
-  aggregateSchemaVersion: number;
-  /** Authoritative persisted version for each record family known to this Home. */
-  recordVersions: Readonly<Record<string, number>>;
-  updatedAt: string;
+export const CURRENT_DATABASE_FILENAME = "yui.db";
+
+type StorageVersionFields = Readonly<{
+  currentVersion: number;
+  latestVersion: number;
+  minimumSupportedVersion: number;
+  databasePath: string;
 }>;
 
 export type StorageSchemaState =
   | Readonly<{
       status: "uninitialized";
       latestVersion: number;
-      latestLayoutVersion: number;
-      latestAggregateSchemaVersion: number;
-      manifestPath: string;
+      minimumSupportedVersion: number;
+      databasePath: string;
     }>
-  | Readonly<{
-      status: "current";
-      currentVersion: number;
-      latestVersion: number;
-      currentLayoutVersion: number;
-      latestLayoutVersion: number;
-      currentAggregateSchemaVersion: number;
-      latestAggregateSchemaVersion: number;
-      manifestPath: string;
-    }>
-  | Readonly<{
+  | (StorageVersionFields & Readonly<{ status: "current" }>)
+  | (StorageVersionFields & Readonly<{
+      status: "upgradeable";
+      pendingVersions: readonly number[];
+    }>)
+  | (StorageVersionFields & Readonly<{
       status: "unsupported";
-      incompatibleComponent: "layout" | "aggregate" | "record";
       direction: "older" | "newer";
-      currentVersion: number;
-      latestVersion: number;
-      currentLayoutVersion: number;
-      latestLayoutVersion: number;
-      currentAggregateSchemaVersion: number;
-      latestAggregateSchemaVersion: number;
-      recordFamily?: string;
-      manifestPath: string;
-    }>
+    }>)
   | Readonly<{
       status: "invalid";
       latestVersion: number;
-      latestLayoutVersion: number;
-      latestAggregateSchemaVersion: number;
-      manifestPath: string;
+      minimumSupportedVersion: number;
+      databasePath: string;
       detail: string;
     }>;
 
@@ -78,154 +67,99 @@ export class StorageSchemaError extends Error {
   }
 }
 
+/**
+ * Inspect the one authoritative SQLite migration head without changing it.
+ *
+ * `schema.json` and `state.json` are recognized only to prevent setup from
+ * overwriting an old Home whose SQLite authority is missing. They are not
+ * version authorities for current Homes.
+ */
 export function inspectStorageSchema(rootDir: string): StorageSchemaState {
-  const manifestPath = join(rootDir, STORAGE_SCHEMA_FILE);
-  const raw = readOptionalText(manifestPath);
-  if (raw === null) {
-    return {
-      status: "uninitialized",
-      latestVersion: CURRENT_STORAGE_LAYOUT_VERSION,
-      latestLayoutVersion: CURRENT_STORAGE_LAYOUT_VERSION,
-      latestAggregateSchemaVersion: CURRENT_AGGREGATE_SCHEMA_VERSION,
-      manifestPath
-    };
-  }
-
-  let manifest: ParsedStorageManifest;
-  try {
-    manifest = parseStorageManifest(raw);
-  } catch (error) {
-    return {
-      status: "invalid",
-      latestVersion: CURRENT_STORAGE_LAYOUT_VERSION,
-      latestLayoutVersion: CURRENT_STORAGE_LAYOUT_VERSION,
-      latestAggregateSchemaVersion: CURRENT_AGGREGATE_SCHEMA_VERSION,
-      manifestPath,
-      detail: error instanceof Error ? error.message : String(error)
-    };
-  }
-
-  if (manifest.storageVersion !== CURRENT_STORAGE_LAYOUT_VERSION) {
+  const databasePath = join(rootDir, CURRENT_DATABASE_FILENAME);
+  const hasPreBaselineEvidence =
+    existsSync(join(rootDir, "schema.json")) || existsSync(join(rootDir, "state.json"));
+  if (hasPreBaselineEvidence) {
     return {
       status: "unsupported",
-      incompatibleComponent: "layout",
-      direction: manifest.storageVersion < CURRENT_STORAGE_LAYOUT_VERSION ? "older" : "newer",
-      currentVersion: manifest.storageVersion,
-      latestVersion: CURRENT_STORAGE_LAYOUT_VERSION,
-      currentLayoutVersion: manifest.storageVersion,
-      latestLayoutVersion: CURRENT_STORAGE_LAYOUT_VERSION,
-      currentAggregateSchemaVersion: manifest.aggregateSchemaVersion,
-      latestAggregateSchemaVersion: CURRENT_AGGREGATE_SCHEMA_VERSION,
-      manifestPath
-    };
-  }
-  if (manifest.aggregateSchemaVersion !== CURRENT_AGGREGATE_SCHEMA_VERSION) {
-    return {
-      status: "unsupported",
-      incompatibleComponent: "aggregate",
-      direction: manifest.aggregateSchemaVersion < CURRENT_AGGREGATE_SCHEMA_VERSION
-        ? "older"
-        : "newer",
-      currentVersion: manifest.aggregateSchemaVersion,
-      latestVersion: CURRENT_AGGREGATE_SCHEMA_VERSION,
-      currentLayoutVersion: manifest.storageVersion,
-      latestLayoutVersion: CURRENT_STORAGE_LAYOUT_VERSION,
-      currentAggregateSchemaVersion: manifest.aggregateSchemaVersion,
-      latestAggregateSchemaVersion: CURRENT_AGGREGATE_SCHEMA_VERSION,
-      manifestPath
-    };
-  }
-
-  const currentRecords = currentRecordVersions();
-  if (manifest.recordVersions === undefined) {
-    return {
-      status: "unsupported",
-      incompatibleComponent: "record",
       direction: "older",
       currentVersion: 0,
-      latestVersion: 1,
-      currentLayoutVersion: manifest.storageVersion,
-      latestLayoutVersion: CURRENT_STORAGE_LAYOUT_VERSION,
-      currentAggregateSchemaVersion: manifest.aggregateSchemaVersion,
-      latestAggregateSchemaVersion: CURRENT_AGGREGATE_SCHEMA_VERSION,
-      manifestPath
+      latestVersion: CURRENT_STORAGE_VERSION,
+      minimumSupportedVersion: MIN_SUPPORTED_STORAGE_VERSION,
+      databasePath
     };
   }
-  for (const [kind, currentEntry] of Object.entries(currentRecords)) {
-    const persisted = manifest.recordVersions[kind];
-    if (persisted === undefined) {
-      return {
-        status: "unsupported",
-        incompatibleComponent: "record",
-        direction: "older",
-        currentVersion: 0,
-        latestVersion: currentEntry.version,
-        currentLayoutVersion: manifest.storageVersion,
-        latestLayoutVersion: CURRENT_STORAGE_LAYOUT_VERSION,
-        currentAggregateSchemaVersion: manifest.aggregateSchemaVersion,
-        latestAggregateSchemaVersion: CURRENT_AGGREGATE_SCHEMA_VERSION,
-        recordFamily: kind,
-        manifestPath
-      };
+  if (!existsSync(databasePath)) {
+    if (existsSync(rootDir)) {
+      try {
+        if (readdirSync(rootDir).length > 0) {
+          return invalid(
+            databasePath,
+            new Error("The authoritative yui.db is missing from a non-empty Home.")
+          );
+        }
+      } catch (error) {
+        return invalid(databasePath, error);
+      }
     }
-    if (persisted !== currentEntry.version) {
-      return {
-        status: "unsupported",
-        incompatibleComponent: "record",
-        direction: persisted < currentEntry.version ? "older" : "newer",
-        currentVersion: persisted,
-        latestVersion: currentEntry.version,
-        currentLayoutVersion: manifest.storageVersion,
-        latestLayoutVersion: CURRENT_STORAGE_LAYOUT_VERSION,
-        currentAggregateSchemaVersion: manifest.aggregateSchemaVersion,
-        latestAggregateSchemaVersion: CURRENT_AGGREGATE_SCHEMA_VERSION,
-        recordFamily: kind,
-        manifestPath
-      };
-    }
+    return {
+      status: "uninitialized",
+      latestVersion: CURRENT_STORAGE_VERSION,
+      minimumSupportedVersion: MIN_SUPPORTED_STORAGE_VERSION,
+      databasePath
+    };
   }
 
-  return {
-    status: "current",
-    currentVersion: manifest.storageVersion,
-    latestVersion: CURRENT_STORAGE_LAYOUT_VERSION,
-    currentLayoutVersion: manifest.storageVersion,
-    latestLayoutVersion: CURRENT_STORAGE_LAYOUT_VERSION,
-    currentAggregateSchemaVersion: manifest.aggregateSchemaVersion,
-    latestAggregateSchemaVersion: CURRENT_AGGREGATE_SCHEMA_VERSION,
-    manifestPath
-  };
+  let database: Database.Database;
+  try {
+    database = new Database(databasePath, { readonly: true, fileMustExist: true });
+  } catch (error) {
+    return invalid(databasePath, error);
+  }
+
+  try {
+    const migration = inspectSqliteSchemaMigrations(database);
+    const fields: StorageVersionFields = {
+      currentVersion: migration.currentVersion,
+      latestVersion: CURRENT_STORAGE_VERSION,
+      minimumSupportedVersion: MIN_SUPPORTED_STORAGE_VERSION,
+      databasePath
+    };
+    if (migration.currentVersion === CURRENT_STORAGE_VERSION) {
+      return { status: "current", ...fields };
+    }
+    if (migration.currentVersion > CURRENT_STORAGE_VERSION) {
+      return { status: "unsupported", direction: "newer", ...fields };
+    }
+    if (migration.currentVersion < MIN_SUPPORTED_STORAGE_VERSION) {
+      return { status: "unsupported", direction: "older", ...fields };
+    }
+    const plan = storageMigrationPlan(migration.currentVersion);
+    if (plan === null) {
+      return {
+        status: "invalid",
+        latestVersion: CURRENT_STORAGE_VERSION,
+        minimumSupportedVersion: MIN_SUPPORTED_STORAGE_VERSION,
+        databasePath,
+        detail:
+          `Storage migration registry has no complete path from `
+          + `${migration.currentVersion} to ${CURRENT_STORAGE_VERSION}.`
+      };
+    }
+    return {
+      status: "upgradeable",
+      pendingVersions: plan.map(({ toVersion }) => toVersion),
+      ...fields
+    };
+  } catch (error) {
+    return invalid(databasePath, error);
+  } finally {
+    database.close();
+  }
 }
 
-export function ensureStorageSchema(rootDir: string, now = new Date()): void {
+/** Require the current storage contract without normalizing historical data. */
+export function requireCurrentStorageSchema(rootDir: string): void {
   const state = inspectStorageSchema(rootDir);
-  if (state.status === "uninitialized") {
-    writeCurrentStorageManifest(rootDir, now);
-    return;
-  }
-  requireInspectedSchema(state);
-}
-
-/** Persist the current three-axis manifest through the existing atomic-file seam. */
-export function writeCurrentStorageManifest(rootDir: string, now = new Date()): void {
-  const recordVersions: Record<string, number> = {};
-  for (const [kind, entry] of Object.entries(currentRecordVersions())) {
-    recordVersions[kind] = entry.version;
-  }
-  const manifest: StorageSchemaManifest = {
-    schemaVersion: 1,
-    storageVersion: CURRENT_STORAGE_LAYOUT_VERSION,
-    aggregateSchemaVersion: CURRENT_AGGREGATE_SCHEMA_VERSION,
-    recordVersions,
-    updatedAt: now.toISOString()
-  };
-  writeTextFileAtomically(
-    join(rootDir, STORAGE_SCHEMA_FILE),
-    `${JSON.stringify(manifest, null, 2)}\n`
-  );
-}
-
-function requireInspectedSchema(state: StorageSchemaState): void {
   switch (state.status) {
     case "current":
       return;
@@ -237,142 +171,32 @@ function requireInspectedSchema(state: StorageSchemaState): void {
     case "invalid":
       throw new StorageSchemaError(
         "STORAGE_SCHEMA_INVALID",
-        `Invalid storage schema manifest at ${state.manifestPath}: ${state.detail}`
+        `Invalid storage at ${state.databasePath}: ${state.detail}`
+      );
+    case "upgradeable":
+      throw new StorageSchemaError(
+        "STORAGE_SCHEMA_UNSUPPORTED",
+        `Storage version ${state.currentVersion} requires an explicit upgrade to `
+          + `${state.latestVersion}. Run \`yui upgrade\` or \`yui update\`.`
       );
     case "unsupported":
-      throw unsupportedVersion(
-        state.currentVersion,
-        state.latestVersion,
-        state.incompatibleComponent,
-        state.recordFamily
+      throw new StorageSchemaError(
+        "STORAGE_SCHEMA_UNSUPPORTED",
+        state.direction === "newer"
+          ? `Storage version ${state.currentVersion} is newer than supported `
+            + `${state.latestVersion}; use a newer Yui release.`
+          : `Storage version ${state.currentVersion} is older than the minimum supported `
+            + `${state.minimumSupportedVersion}.`
       );
   }
 }
 
-function unsupportedVersion(
-  current: number,
-  required: number,
-  component: "layout" | "aggregate" | "record",
-  recordFamily?: string
-): StorageSchemaError {
-  if (component === "record" && recordFamily === undefined) {
-    return new StorageSchemaError(
-      "STORAGE_SCHEMA_UNSUPPORTED",
-      "This Home predates the current record-version manifest. Preserve it for inspection and initialize a new Home."
-    );
-  }
-  const label = component === "layout"
-    ? "Storage layout"
-    : component === "aggregate"
-      ? "Aggregate schema"
-      : `Record family '${recordFamily}'`;
-  if (current < required) {
-    return new StorageSchemaError(
-      "STORAGE_SCHEMA_UNSUPPORTED",
-      `${label} ${current} is older than required ${component} version ${required}; use the matching Yui version or initialize a new Home.`
-    );
-  }
-  return new StorageSchemaError(
-    "STORAGE_SCHEMA_UNSUPPORTED",
-    `${label} ${current} is newer than supported ${component} version ${required}; use a newer Yui release.`
-  );
-}
-
-export type ParsedStorageManifest = Readonly<{
-  schemaVersion: 1;
-  storageVersion: number;
-  aggregateSchemaVersion: number;
-  recordVersions?: Readonly<Record<string, number>>;
-  updatedAt: string;
-}>;
-
-function parseStorageManifest(raw: string): ParsedStorageManifest {
-  const value = parseJsonObject(raw, "Storage schema manifest");
-  return parseStorageSchemaManifest(value);
-}
-
-/** Strictly parse one already-decoded manifest object through the shared contract. */
-export function parseStorageSchemaManifest(value: unknown): ParsedStorageManifest {
-  if (!isRecord(value)) throw new Error("Storage schema manifest must be an object");
-  assertKeys(
-    value,
-    ["schemaVersion", "storageVersion", "aggregateSchemaVersion", "updatedAt"],
-    ["recordVersions"],
-    "Storage schema manifest"
-  );
-  if (value.schemaVersion !== 1) throw new Error("schemaVersion must be 1");
-  if (!Number.isInteger(value.storageVersion) || (value.storageVersion as number) < 1) {
-    throw new Error("storageVersion must be a positive integer");
-  }
-  const aggregateSchemaVersion = value.aggregateSchemaVersion;
-  if (!Number.isInteger(aggregateSchemaVersion) || (aggregateSchemaVersion as number) < 1) {
-    throw new Error("aggregateSchemaVersion must be a positive integer");
-  }
-  if (typeof value.updatedAt !== "string" || !Number.isFinite(Date.parse(value.updatedAt))) {
-    throw new Error("updatedAt must be an ISO timestamp");
-  }
-  let recordVersions: Readonly<Record<string, number>> | undefined;
-  if (Object.hasOwn(value, "recordVersions")) {
-    if (!isRecord(value.recordVersions)) throw new Error("recordVersions must be an object");
-    const known = currentRecordVersions();
-    const kinds = Object.keys(value.recordVersions);
-    const unknown = kinds.filter((kind) => !Object.hasOwn(known, kind));
-    if (unknown.length > 0) {
-      throw new Error(`recordVersions has unknown family: ${unknown[0]}`);
-    }
-    const parsed: Record<string, number> = {};
-    for (const kind of kinds) {
-      const version = value.recordVersions[kind];
-      if (!Number.isInteger(version) || (version as number) < 1) {
-        throw new Error(`recordVersions['${kind}'] must be a positive integer`);
-      }
-      parsed[kind] = version as number;
-    }
-    recordVersions = Object.freeze(parsed);
-  }
+function invalid(databasePath: string, error: unknown): StorageSchemaState {
   return {
-    schemaVersion: 1,
-    storageVersion: value.storageVersion as number,
-    aggregateSchemaVersion: aggregateSchemaVersion as number,
-    ...(recordVersions === undefined ? {} : { recordVersions }),
-    updatedAt: value.updatedAt
+    status: "invalid",
+    latestVersion: CURRENT_STORAGE_VERSION,
+    minimumSupportedVersion: MIN_SUPPORTED_STORAGE_VERSION,
+    databasePath,
+    detail: error instanceof Error ? error.message : String(error)
   };
-}
-
-function parseJsonObject(raw: string, label: string): Record<string, unknown> {
-  let value: unknown;
-  try {
-    value = JSON.parse(raw) as unknown;
-  } catch (error) {
-    throw new Error(`${label} is not valid JSON`, { cause: error });
-  }
-  if (!isRecord(value)) throw new Error(`${label} must be an object`);
-  return value;
-}
-
-function assertKeys(
-  value: Record<string, unknown>,
-  requiredKeys: readonly string[],
-  optionalKeys: readonly string[],
-  label: string
-): void {
-  const expected = new Set([...requiredKeys, ...optionalKeys]);
-  const unknown = Object.keys(value).filter((key) => !expected.has(key));
-  const missing = requiredKeys.filter((key) => !Object.hasOwn(value, key));
-  if (unknown.length > 0) throw new Error(`${label} has unknown field: ${unknown[0]}`);
-  if (missing.length > 0) throw new Error(`${label} is missing field: ${missing[0]}`);
-}
-
-
-function readOptionalText(path: string): string | null {
-  try {
-    return readFileSync(path, "utf8");
-  } catch (error) {
-    if (error instanceof Error && "code" in error && error.code === "ENOENT") return null;
-    throw error;
-  }
-}
-
-function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null && !Array.isArray(value);
 }

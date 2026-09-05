@@ -342,7 +342,7 @@ export function renderRuntimeIdentitySection(input: Readonly<{
     `  Entry digest    ${build.entryDigest}`,
     `  Source commit   ${build.sourceCommit}`,
     `  Node            ${build.nodeVersion} (${build.platform})`,
-    `  Storage         layout ${storage.logicalLayout} (manifest ${storage.manifestStatus}) · backend ${storage.configuredBackend} · worker ${storage.workerEnabled ? "on" : "off"}`,
+    `  Storage         version ${storage.storageVersion} (status ${storage.storageStatus}, minimum ${storage.minimumStorageVersion}) · backend ${storage.configuredBackend} · worker ${storage.workerEnabled ? "on" : "off"}`,
     `  Store files     state.json ${storage.physicalStateJson.present ? "present" : "absent"} · yui.db ${storage.physicalDatabase.present ? "present" : "absent"}${storage.physicalDatabase.wal ? " +WAL" : ""}${storage.physicalDatabase.present && storage.physicalDatabase.health !== UNSUPPORTED ? ` (${storage.physicalDatabase.health})` : ""}`
   ];
   for (const finding of storage.findings) {

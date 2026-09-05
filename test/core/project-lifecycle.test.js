@@ -17,8 +17,8 @@ import {
 import { createProject } from "../../dist/repository/project.js";
 import { TaskWorkspaceCoordinator } from "../../dist/repository/taskWorkspaceCoordinator.js";
 import { FileTaskWorkspacePreparer } from "../../dist/repository/taskWorkspacePreparer.js";
-import { latestStorageVersionState } from "../../dist/storage/upgrade/recordVersions.js";
 import { inspectStorageSchema } from "../../dist/storage/storageSchema.js";
+import { initializeCurrentTaskStore } from "../../dist/storage/currentTaskStore.js";
 import { SqliteTaskStore } from "../../dist/storage/sqliteStore.js";
 import { projectNextAction } from "../../dist/task/nextAction.js";
 import { activateTask, createTask } from "../../dist/task/task.js";
@@ -774,25 +774,13 @@ test("a retired Project refuses every knowledge write while keeping reads", asyn
   assert.ok(proposals.output.length > 0, "the proposals read path must stay open");
 });
 
-test("production storage rejects historical record versions", () => {
-  const latest = latestStorageVersionState();
+test("production storage admission is owned by the SQLite migration head", () => {
   const home = mkdtempSync(join(tmpdir(), "yui-historical-record-"));
   try {
-    writeFileSync(join(home, "schema.json"), JSON.stringify({
-      schemaVersion: 1,
-      storageVersion: latest.layout,
-      aggregateSchemaVersion: latest.aggregate,
-      recordVersions: {
-        ...Object.fromEntries(Object.entries(latest.record).map(([kind, entry]) => [kind, entry.version])),
-        project: latest.record.project.version - 1
-      },
-      updatedAt: now.toISOString()
-    }));
+    initializeCurrentTaskStore(home).close();
     const state = inspectStorageSchema(home);
-    assert.equal(state.status, "unsupported");
-    assert.equal(state.incompatibleComponent, "record");
-    assert.equal(state.recordFamily, "project");
-    assert.equal(state.direction, "older");
+    assert.equal(state.status, "current");
+    assert.equal(existsSync(join(home, "schema.json")), false);
   } finally {
     rmSync(home, { recursive: true, force: true });
   }

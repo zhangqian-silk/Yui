@@ -5,14 +5,16 @@ import type { HomeIdentity } from "../repository/homeIdentity.js";
 import type { TaskStore } from "./taskStore.js";
 import { StorageRecordError } from "./taskStore.js";
 import { readSqliteHomeIdentity, SqliteTaskStore } from "./sqliteStore.js";
-import { ensureStorageSchema, inspectStorageSchema } from "./storageSchema.js";
+import {
+  CURRENT_DATABASE_FILENAME,
+  inspectStorageSchema
+} from "./storageSchema.js";
 
-export const CURRENT_DATABASE_FILENAME = "yui.db";
+export { CURRENT_DATABASE_FILENAME } from "./storageSchema.js";
 
 /** Initialize a new Home, or open an existing Home at the exact current contract. */
 export function initializeCurrentTaskStore(home: string): TaskStore {
   if (inspectStorageSchema(home).status === "uninitialized") {
-    ensureStorageSchema(home);
     return new SqliteTaskStore(home);
   }
   return openCurrentTaskStore(home);
@@ -23,7 +25,10 @@ export function openCurrentTaskStore(home: string): SqliteTaskStore {
   const schema = inspectStorageSchema(home);
   if (schema.status !== "current") {
     throw new StorageRecordError(
-      "This Home does not use the current storage contract. Preserve it for read-only history and initialize a new Home."
+      schema.status === "upgradeable"
+        ? `This Home uses storage version ${schema.currentVersion}; run \`yui upgrade\` `
+          + `to reach ${schema.latestVersion}.`
+        : "This Home does not use a supported storage contract."
     );
   }
   if (!existsSync(join(home, CURRENT_DATABASE_FILENAME))) {

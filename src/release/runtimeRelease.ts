@@ -61,7 +61,7 @@ export type ActiveReleasePointer = Readonly<{
 }>;
 
 export type RuntimeIdentityReceipt = Readonly<{
-  schemaVersion: 1;
+  schemaVersion: 2;
   version: string;
   /** Executable that owns the Controller process (for example `node`). */
   executablePath: string;
@@ -75,8 +75,8 @@ export type RuntimeIdentityReceipt = Readonly<{
   cliRealpath: string;
   controllerRealpath: string;
   controllerProtocolVersion: number;
-  storageLayoutVersion: number;
-  aggregateSchemaVersion: number;
+  storageVersion: number;
+  minimumStorageVersion: number;
   storageBackend: "file" | "sqlite";
   workerEnabled: boolean;
   pid: number;
@@ -695,7 +695,7 @@ function validateRuntimeIdentity(value: unknown): RuntimeIdentityReceipt {
   if (
     value === null
     || typeof value !== "object"
-    || (value as { schemaVersion?: unknown }).schemaVersion !== 1
+    || (value as { schemaVersion?: unknown }).schemaVersion !== 2
     || typeof (value as { version?: unknown }).version !== "string"
     || typeof (value as { executablePath?: unknown }).executablePath !== "string"
     || (value as { executablePath?: unknown }).executablePath === ""
@@ -703,6 +703,11 @@ function validateRuntimeIdentity(value: unknown): RuntimeIdentityReceipt {
     || typeof (value as { buildId?: unknown }).buildId !== "string"
     || typeof (value as { cliRealpath?: unknown }).cliRealpath !== "string"
     || typeof (value as { controllerRealpath?: unknown }).controllerRealpath !== "string"
+    || !isPositiveInteger((value as { controllerProtocolVersion?: unknown }).controllerProtocolVersion)
+    || !isPositiveInteger((value as { storageVersion?: unknown }).storageVersion)
+    || !isPositiveInteger((value as { minimumStorageVersion?: unknown }).minimumStorageVersion)
+    || ((value as { minimumStorageVersion?: number }).minimumStorageVersion as number)
+      > ((value as { storageVersion?: number }).storageVersion as number)
     || typeof (value as { pid?: unknown }).pid !== "number"
     || typeof (value as { processStartIdentity?: unknown }).processStartIdentity !== "string"
     || ((value as { mode?: unknown }).mode !== "primary"
@@ -736,6 +741,10 @@ function isHandoverPhase(value: unknown): value is HandoverFencePhase {
 
 function isStringArray(value: unknown): value is string[] {
   return Array.isArray(value) && value.every((entry) => typeof entry === "string");
+}
+
+function isPositiveInteger(value: unknown): value is number {
+  return Number.isSafeInteger(value) && (value as number) > 0;
 }
 
 function isEexist(error: unknown): boolean {

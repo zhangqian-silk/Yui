@@ -207,17 +207,17 @@ the checks requested for its current target.
 
 ## Storage boundary
 
-This contract uses aggregate schema 31:
+The current storage contract contains:
 
 - WorkItem v15;
 - Turn v5 with TurnResult v2;
 - ReviewRound v8.
 
-There is intentionally no compatibility migration from earlier aggregate
-contracts. An older Home is unsupported by this release and must be opened
-with its matching Yui version or replaced with a newly initialized Home.
-Current validators reject retired semantic result fields instead of preserving
-or adapting them.
+These record-local tags are current-shape validation guards, not independent
+Home compatibility axes. A storage migration that changes one of these payloads
+must rewrite it to the current shape and advance the single Home storage
+version. Runtime validators reject retired semantic result fields instead of
+carrying dual behavior.
 
 ## Verification
 

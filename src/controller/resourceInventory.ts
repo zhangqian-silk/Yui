@@ -121,7 +121,7 @@ export type RuntimeHomeFact = Readonly<{
   yuiHome: string;
   homeId?: string;
   exists: boolean;
-  storageStatus: "current" | "uninitialized" | "invalid" | "unsupported";
+  storageStatus: "current" | "upgradeable" | "uninitialized" | "invalid" | "unsupported";
   discovery: ControllerDiscoveryFact;
   panes: readonly RuntimePaneFact[];
   roles: readonly RuntimeRoleFact[];

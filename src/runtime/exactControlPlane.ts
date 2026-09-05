@@ -45,9 +45,7 @@ export type ExactControlPlanePreflightOptions = Readonly<{
   identity?: YuiVersionIdentity;
   inspectStorage?: (home: string) => StorageSchemaState | Readonly<{
     status: string;
-    currentLayoutVersion?: number;
-    currentAggregateSchemaVersion?: number;
-    incompatibleComponent?: "layout" | "aggregate" | "record";
+    currentVersion?: number;
     direction?: "older" | "newer";
   }>;
   callController?: (
@@ -149,7 +147,7 @@ export function extractExactControlArgument(args: readonly string[]): Readonly<{
 
 /**
  * One read-only gate shared by every managed Task control command. It verifies
- * the frozen executable/CLI/Home/digest, protocol and scalar-storage identity,
+ * the frozen executable/CLI/Home/digest, protocol and storage identity,
  * on-disk schema, and any live Controller before command routing may construct
  * a writable store. Package version alone may advance at the same managed path
  * so an existing Session can cross an explicitly compatible in-place update.
@@ -176,18 +174,11 @@ export async function assertExactControlPlanePreflight(
   if (storage.status !== "current") {
     throw new Error(`Exact control-plane storage is not current: ${storage.status}.`);
   }
-  if (storage.currentLayoutVersion !== descriptor.identity.storageLayoutVersion) {
+  if (storage.currentVersion !== descriptor.identity.storageVersion) {
     throw new Error(
-      "Exact control-plane storage layout does not match its frozen descriptor "
-        + `(expected ${descriptor.identity.storageLayoutVersion}, found `
-        + `${storage.currentLayoutVersion ?? "unknown"}).`
-    );
-  }
-  if (storage.currentAggregateSchemaVersion !== descriptor.identity.aggregateSchemaVersion) {
-    throw new Error(
-      "Exact control-plane aggregate schema does not match its frozen descriptor "
-        + `(expected ${descriptor.identity.aggregateSchemaVersion}, found `
-        + `${storage.currentAggregateSchemaVersion ?? "unknown"}).`
+      "Exact control-plane storage version does not match its frozen descriptor "
+        + `(expected ${descriptor.identity.storageVersion}, found `
+        + `${storage.currentVersion ?? "unknown"}).`
     );
   }
 
@@ -225,18 +216,11 @@ export async function assertCompatibleControlPlanePreflight(
   if (storage.status !== "current") {
     throw new Error(`Managed control-plane storage is not current: ${storage.status}.`);
   }
-  if (storage.currentLayoutVersion !== identity.storageLayoutVersion) {
+  if (storage.currentVersion !== identity.storageVersion) {
     throw new Error(
-      "Managed control-plane storage layout is incompatible "
-        + `(expected ${identity.storageLayoutVersion}, found `
-        + `${storage.currentLayoutVersion ?? "unknown"}).`
-    );
-  }
-  if (storage.currentAggregateSchemaVersion !== identity.aggregateSchemaVersion) {
-    throw new Error(
-      "Managed control-plane aggregate schema is incompatible "
-        + `(expected ${identity.aggregateSchemaVersion}, found `
-        + `${storage.currentAggregateSchemaVersion ?? "unknown"}).`
+      "Managed control-plane storage version is incompatible "
+        + `(expected ${identity.storageVersion}, found `
+        + `${storage.currentVersion ?? "unknown"}).`
     );
   }
   if (options.checkController !== false) {
@@ -265,14 +249,14 @@ export function assertControllerStatusIdentity(
   );
   assertControllerField(status.version, expected.version, "version");
   assertControllerField(
-    status.storageLayoutVersion,
-    expected.storageLayoutVersion,
-    "storage layout"
+    status.storageVersion,
+    expected.storageVersion,
+    "storage version"
   );
   assertControllerField(
-    status.aggregateSchemaVersion,
-    expected.aggregateSchemaVersion,
-    "aggregate schema"
+    status.minimumStorageVersion,
+    expected.minimumStorageVersion,
+    "minimum storage migration version"
   );
 }
 
@@ -283,19 +267,24 @@ function validateVersionIdentity(value: unknown): YuiVersionIdentity {
     value.controllerProtocolVersion,
     "Controller protocol version"
   );
-  const storageLayoutVersion = requireVersion(
-    value.storageLayoutVersion,
-    "Storage layout version"
+  const storageVersion = requireVersion(
+    value.storageVersion,
+    "Storage version"
   );
-  const aggregateSchemaVersion = requireVersion(
-    value.aggregateSchemaVersion,
-    "Aggregate schema version"
+  const minimumStorageVersion = requireVersion(
+    value.minimumStorageVersion,
+    "Minimum storage migration version"
   );
+  if (minimumStorageVersion > storageVersion) {
+    throw new Error(
+      "Minimum storage migration version cannot exceed the current storage version."
+    );
+  }
   return {
     version,
     controllerProtocolVersion,
-    storageLayoutVersion,
-    aggregateSchemaVersion
+    storageVersion,
+    minimumStorageVersion
   };
 }
 
@@ -307,8 +296,7 @@ function assertContinuityIdentity(
 ): void {
   for (const field of [
     "controllerProtocolVersion",
-    "storageLayoutVersion",
-    "aggregateSchemaVersion"
+    "storageVersion"
   ] as const) {
     if (expected[field] !== actual[field]) {
       throw new Error(
@@ -335,14 +323,9 @@ function assertControllerContinuityIdentity(
     "protocol"
   );
   assertControllerField(
-    status.storageLayoutVersion,
-    expected.storageLayoutVersion,
-    "storage layout"
-  );
-  assertControllerField(
-    status.aggregateSchemaVersion,
-    expected.aggregateSchemaVersion,
-    "aggregate schema"
+    status.storageVersion,
+    expected.storageVersion,
+    "storage version"
   );
 }
 

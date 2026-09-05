@@ -1,22 +1,16 @@
 /**
- * Scalar storage version constants.
+ * The one durable compatibility axis for a Yui Home.
  *
- * These live in their own module so that `storageSchema.ts`, `recordVersions.ts`,
- * and `taskStore.ts` can all import them without creating a circular dependency.
- * `storageSchema.ts` re-exports them as the public storage-contract boundary.
- */
-
-/**
- * Version of the on-disk layout (`schema.json` plus the SQLite database).
+ * Version 1 is the clean baseline introduced by Yui 0.15.0: SQLite's migration
+ * ledger is authoritative and the historical layout/aggregate/record-version
+ * manifest is not part of the active Home. Pre-0.15.0 Homes are outside this
+ * compatibility line and remain untouched.
  *
- * Layout 8 is the current SQLite WAL control-plane layout: the authoritative
- * store is `yui.db`. Layout 8 is the only physical layout this release reads
- * and writes. Historical aggregate contracts are rejected without mutation.
+ * Runtime code reads only {@link CURRENT_STORAGE_VERSION}. The explicit
+ * upgrade boundary carries every forward migration from
+ * {@link MIN_SUPPORTED_STORAGE_VERSION} to the current version so one target
+ * CLI can upgrade any valid Home in that interval without installing
+ * intermediate Yui releases.
  */
-export const CURRENT_STORAGE_LAYOUT_VERSION = 8;
-
-/**
- * Aggregate 31 makes Agent results opaque, removes parsed Review/finding
- * authority, and intentionally has no upgrade path from earlier contracts.
- */
-export const CURRENT_AGGREGATE_SCHEMA_VERSION = 31;
+export const MIN_SUPPORTED_STORAGE_VERSION = 1;
+export const CURRENT_STORAGE_VERSION = 1;

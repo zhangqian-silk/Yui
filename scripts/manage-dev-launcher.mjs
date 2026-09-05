@@ -607,13 +607,8 @@ function readControllerDiscoveryForReset(homePath, homeId, discoveryPath) {
 
 async function readHomeIdForReset(homePath) {
   const databasePath = join(homePath, "yui.db");
-  const manifest = JSON.parse(readFileSync(join(homePath, "schema.json"), "utf8"));
   let homeId;
-  if (
-    Number.isSafeInteger(manifest?.storageVersion)
-    && manifest.storageVersion >= 7
-    && pathExists(databasePath)
-  ) {
+  if (pathExists(databasePath)) {
     const { default: Database } = await import("better-sqlite3");
     const database = new Database(databasePath, { readonly: true, fileMustExist: true });
     try {
@@ -743,8 +738,8 @@ function probeController(discovery) {
             "homeFilesystemId",
             "controllerInstanceId",
             "version",
-            "storageLayoutVersion",
-            "aggregateSchemaVersion",
+            "storageVersion",
+            "minimumStorageVersion",
             "runtime"
           ].includes(key))
           || result.running !== true
@@ -753,6 +748,10 @@ function probeController(discovery) {
           || result.homeFilesystemId !== discovery.homeFilesystemId
           || result.controllerInstanceId !== discovery.controllerInstanceId
           || !Number.isSafeInteger(result.pid) || result.pid <= 0
+          || !Number.isSafeInteger(result.storageVersion) || result.storageVersion <= 0
+          || !Number.isSafeInteger(result.minimumStorageVersion)
+          || result.minimumStorageVersion <= 0
+          || result.minimumStorageVersion > result.storageVersion
           || (
             Object.hasOwn(result, "protocolVersion")
             && (!Number.isSafeInteger(result.protocolVersion) || result.protocolVersion <= 0)
@@ -761,10 +760,6 @@ function probeController(discovery) {
             Object.hasOwn(result, "version")
             && (typeof result.version !== "string" || result.version.length === 0)
           )
-          || ["storageLayoutVersion", "aggregateSchemaVersion"].some((key) => (
-            Object.hasOwn(result, key)
-            && (!Number.isSafeInteger(result[key]) || result[key] <= 0)
-          ))
           || ["uptimeMs", "rssBytes"].some((key) => (
             Object.hasOwn(result, key)
             && (!Number.isSafeInteger(result[key]) || result[key] < 0)
@@ -1242,22 +1237,35 @@ async function assertCompatibleDevHome(homePath) {
   if (state.status === "current") return;
   if (state.status === "uninitialized") {
     if (readdirSync(homePath).length === 0) return;
-    throw incompatibleDevHomeError(state.manifestPath, "schema manifest is missing");
+    throw incompatibleDevHomeError(state.databasePath, "authoritative yui.db is missing");
   }
   if (state.status === "invalid") {
-    throw incompatibleDevHomeError(state.manifestPath, state.detail);
+    throw incompatibleDevHomeError(state.databasePath, state.detail);
+  }
+  if (state.status === "upgradeable") {
+    const localLauncher = join(dirname(homePath), "bin", DEV_LAUNCHER_NAME);
+    throw incompatibleDevHomeError(
+      state.databasePath,
+      `storage ${state.currentVersion} can migrate to ${state.latestVersion}`,
+      `Run 'make install-local', then '${localLauncher} upgrade', then retry 'make link'.`
+    );
   }
   throw incompatibleDevHomeError(
-    state.manifestPath,
-    `expected storage ${state.latestLayoutVersion} and aggregate ${state.latestAggregateSchemaVersion}; `
-      + `found storage ${state.currentLayoutVersion} and aggregate ${state.currentAggregateSchemaVersion}`
+    state.databasePath,
+    `expected current storage ${state.latestVersion} `
+      + `(minimum migratable ${state.minimumSupportedVersion}); `
+      + `found storage ${state.currentVersion} (${state.status})`
   );
 }
 
-function incompatibleDevHomeError(schemaPath, detail) {
+function incompatibleDevHomeError(
+  databasePath,
+  detail,
+  action = "Run 'make dev-reset' to move the existing home aside, then retry 'make link'."
+) {
   return new Error(
-    `Development home schema is incompatible at ${schemaPath}: ${detail}. `
-      + "Run 'make dev-reset' to move the existing home aside, then retry 'make link'."
+    `Development home storage is incompatible at ${databasePath}: ${detail}. `
+      + action
   );
 }
 
