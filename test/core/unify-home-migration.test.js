@@ -880,7 +880,8 @@ test("P2: a clean migrating Home reports migration-ready with the unify step (up
   const collapseStep = preflight.steps.find((s) => s.name === "collapse-worktree-layout");
   assert.ok(collapseStep !== undefined, "the collapse-worktree-layout step is planned");
   assert.equal(collapseStep.fromVersion, UNIFY_TARGET_VERSION);
-  assert.equal(collapseStep.toVersion, CURRENT_STORAGE_VERSION);
+  assert.equal(collapseStep.toVersion, UNIFY_TARGET_VERSION + 1);
+  assert.equal(preflight.steps.at(-1).toVersion, CURRENT_STORAGE_VERSION);
 });
 
 test("P2: dry-run and update-preflight surface the same blockers as execute {reason,detail}", async (t) => {

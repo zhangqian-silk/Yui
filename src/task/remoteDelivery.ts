@@ -3,11 +3,15 @@ import type { AgentRun } from "../agentRun/agentRun.js";
 import type { ManagedWorkspace } from "../worktree/managedWorkspace.js";
 import type { PublicationReference } from "./publicationReference.js";
 import type { Task } from "./task.js";
+import type { IntegrationAttempt } from "../integration/integrationAttempt.js";
+import { publicationAdoption } from "./publicationAdoption.js";
 
 export type RemoteDeliveryStatus =
   | "none"
   | "unavailable"
   | "pending"
+  | "uncovered"
+  | "unverified"
   | "partial"
   | "merged";
 export type RemoteDeliverySource =
@@ -22,6 +26,7 @@ export type ProjectMergeCoverage =
   | "missing"
   | "missing-local-commit"
   | "stale"
+  | "head-mismatch"
   | "open"
   | "closed"
   | "merged"
@@ -39,6 +44,9 @@ export type ProjectRemoteDelivery = Readonly<{
   directory: string;
   baseCommit: string | null;
   expectedLocalCommit: string | null;
+  /** The selected candidate covering the accepted head; never replaces it. */
+  deliveryLocalCommit: string | null;
+  adoption: TaskEvent | null;
   codeDelivery: ProjectCodeDelivery;
   publication: PublicationReference | null;
   state: PublicationReference["state"] | null;
@@ -72,6 +80,7 @@ export type TaskRemoteDeliveryFacts = Readonly<{
   publications: readonly PublicationReference[];
   managedWorkspaces: readonly ManagedWorkspace[];
   runs: readonly AgentRun[];
+  integrations?: readonly IntegrationAttempt[];
   currentCandidate?: TaskRemoteDeliveryCandidate | null;
 }>;
 
@@ -104,15 +113,23 @@ export function projectTaskRemoteDelivery(
       ? []
       : projectPublications.filter(
         (reference) => reference.localCommit === expectedLocalCommit
+          || publicationAdoption(reference, expected.event, expectedLocalCommit,
+            facts.events, facts.publications, facts.integrations ?? []).event !== null
       );
     const publication = bestPublication(
       matching.length > 0 ? matching : projectPublications
     );
-    const coverage = projectCoverage(codeDelivery, expectedLocalCommit, publication);
+    const adoptionEvidence = publication === null ? null
+      : publicationAdoption(publication, expected.event, expectedLocalCommit,
+        facts.events, facts.publications, facts.integrations ?? []);
+    const adoption = adoptionEvidence?.event ?? null;
+    const covers = expectedLocalCommit !== null && publication !== null
+      && (publication.localCommit === expectedLocalCommit || adoption !== null);
+    const headMatches = publication?.headCommit === undefined
+      || publication.headCommit === publication.localCommit;
+    const coverage = projectCoverage(codeDelivery, expectedLocalCommit, publication, covers, headMatches);
     const merged = codeDelivery === "none"
-      || (publication !== null
-        && expectedLocalCommit !== null
-        && publication.localCommit === expectedLocalCommit
+      || (covers && headMatches
         && publication.state === "merged");
     const verified = codeDelivery === "none"
       || (merged && publication?.verification === "verified");
@@ -121,6 +138,8 @@ export function projectTaskRemoteDelivery(
       directory: binding.directory,
       baseCommit,
       expectedLocalCommit,
+      deliveryLocalCommit: covers ? publication.localCommit ?? null : null,
+      adoption,
       codeDelivery,
       publication,
       state: publication?.state ?? null,
@@ -130,11 +149,12 @@ export function projectTaskRemoteDelivery(
       merged,
       verified,
       reason: projectCoverageReason(
-        codeDelivery,
         expectedLocalCommit,
         publication,
-        coverage
-      )
+        coverage,
+        adoption
+      ) + (coverage === "stale" && adoptionEvidence?.reason
+        ? ` ${adoptionEvidence.reason}` : "")
     };
   });
   const codeProjects = projects.filter((project) => project.codeDelivery !== "none");
@@ -147,8 +167,9 @@ export function projectTaskRemoteDelivery(
     : codeProjects.some((project) => project.coverage === "head-unavailable")
       ? "unavailable"
       : allMerged
-        ? "merged"
-        : mergedProjectCount > 0 ? "partial" : "pending";
+        ? allVerified ? "merged" : "unverified"
+        : mergedProjectCount > 0 ? "partial"
+          : codeProjects.some(p => p.state === "merged") ? "uncovered" : "pending";
   return {
     taskId: facts.task.id,
     source: expected.source,
@@ -214,7 +235,7 @@ function expectedDelivery(facts: TaskRemoteDeliveryFacts): ExpectedDelivery {
   };
 }
 
-function completionEvent(
+export function completionEvent(
   events: readonly TaskEvent[],
   completedAt: string
 ): TaskEvent | undefined {
@@ -282,7 +303,7 @@ function candidateCommits(
   );
 }
 
-function commitMap(value: string | undefined): Map<string, string> {
+export function commitMap(value: string | undefined): Map<string, string> {
   const result = new Map<string, string>();
   for (const entry of value?.split(",") ?? []) {
     const separator = entry.indexOf("@");
@@ -328,23 +349,26 @@ function publicationRank(reference: PublicationReference): number {
 function projectCoverage(
   codeDelivery: ProjectCodeDelivery,
   expectedLocalCommit: string | null,
-  publication: PublicationReference | null
+  publication: PublicationReference | null,
+  covers: boolean,
+  headMatches: boolean
 ): ProjectMergeCoverage {
   if (codeDelivery === "none") return "not-applicable";
   if (expectedLocalCommit === null) return "head-unavailable";
   if (publication === null) return "missing";
   if (publication.localCommit === undefined) return "missing-local-commit";
-  if (publication.localCommit !== expectedLocalCommit) return "stale";
+  if (!headMatches) return "head-mismatch";
+  if (!covers) return "stale";
   if (publication.state === "open") return "open";
   if (publication.state === "closed") return "closed";
   return publication.verification === "verified" ? "verified" : "merged";
 }
 
 function projectCoverageReason(
-  codeDelivery: ProjectCodeDelivery,
   expectedLocalCommit: string | null,
   publication: PublicationReference | null,
-  coverage: ProjectMergeCoverage
+  coverage: ProjectMergeCoverage,
+  adoption: TaskEvent | null
 ): string {
   switch (coverage) {
     case "not-applicable":
@@ -356,15 +380,17 @@ function projectCoverageReason(
     case "missing-local-commit":
       return `Publication ${publication!.id} does not record a local commit.`;
     case "stale":
-      return `Publication ${publication!.id} covers ${publication!.localCommit}, not the expected Task head ${expectedLocalCommit}.`;
+      return `Publication ${publication!.id} is ${publication!.state}, but its local candidate ${publication!.localCommit} has no valid adoption covering accepted Task head ${expectedLocalCommit}.`;
+    case "head-mismatch":
+      return `Publication ${publication!.id} is ${publication!.state}, but observed remote head ${publication!.headCommit} differs from local candidate ${publication!.localCommit}; verification is invalid.`;
     case "open":
       return `Publication ${publication!.id} covers the Task head but is still open.`;
     case "closed":
       return `Publication ${publication!.id} covers the Task head but is closed without merge.`;
     case "merged":
-      return `Publication ${publication!.id} reports the exact Task head as merged.`;
+      return `Publication ${publication!.id} reports a covering candidate as merged, but remote verification is still required.`;
     case "verified":
-      return `Publication ${publication!.id} verifies the exact Task head as merged.`;
+      return `Publication ${publication!.id} verifies ${adoption === null ? "the exact Task head" : `candidate ${publication!.localCommit} adopted by ${adoption.id}`} as merged.`;
   }
 }
 

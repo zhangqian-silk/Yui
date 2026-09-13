@@ -16,7 +16,7 @@ import { join } from "node:path";
 import test from "node:test";
 import Database from "better-sqlite3";
 
-import { migrateSqliteSchema } from "../../dist/storage/sqliteSchema.js";
+import { migrateSqliteSchema, storageMigrationPlan } from "../../dist/storage/sqliteSchema.js";
 import { managedTaskRoot, managedWorktreeRoot } from "../../dist/storage/homeLayout.js";
 import { SqliteTaskStore } from "../../dist/storage/sqliteStore.js";
 import { CURRENT_STORAGE_VERSION } from "../../dist/storage/storageVersions.js";
@@ -28,6 +28,7 @@ import { sanitizedTestEnv } from "../helpers/sanitizedEnv.mjs";
 // (real worktrees at `tasks/<taskId>/<owner>/<projectDirectory>`). These tests
 // seed the v19 NATIVE on-disk shape directly and drive the real runner to head.
 const V19 = 24;
+const pendingVersions = Array.from({ length: CURRENT_STORAGE_VERSION - V19 }, (_, index) => V19 + index + 1);
 
 const gitEnv = sanitizedTestEnv({
   GIT_AUTHOR_NAME: "Yui Test",
@@ -158,8 +159,11 @@ function runMigration(db) {
   return migrateSqliteSchema(db, { mode: "apply" });
 }
 
-test("collapse: a v19 Home is exactly one forward step below head", () => {
-  assert.equal(V19 + 1, CURRENT_STORAGE_VERSION);
+test("collapse: the pre-collapse Home retains its fixed next migration as the chain grows", () => {
+  const first = storageMigrationPlan(V19)[0];
+  assert.equal(first.name, "collapse-worktree-layout");
+  assert.equal(first.toVersion, 25);
+  assert.equal(first.fromVersion, V19);
 });
 
 test("collapse: real worktrees replace their v19 view symlinks at the single-layer path", (t) => {
@@ -203,7 +207,7 @@ test("collapse: real worktrees replace their v19 view symlinks at the single-lay
   );
 
   const result = runMigration(db);
-  assert.deepEqual(result.applied, [CURRENT_STORAGE_VERSION]);
+  assert.deepEqual(result.applied, pendingVersions);
 
   // (1) The real worktrees now live at the single-layer Task/owner path — exactly
   // where the v19 view symlink used to point the runtime.
@@ -296,7 +300,7 @@ test("collapse: an integration attempt moves under integrations/<id> with the bo
   );
 
   const result = runMigration(db);
-  assert.deepEqual(result.applied, [CURRENT_STORAGE_VERSION]);
+  assert.deepEqual(result.applied, pendingVersions);
 
   // The integration worktree now lives at
   // `tasks/<taskId>/integrations/<integrationId>/<boundDirectory>`.
@@ -419,7 +423,7 @@ test("collapse: a Home already single-layer is a clean no-op", (t) => {
   const { home, db } = openV19Home(t, "yui-collapse-noop-");
   // No managed_workspaces rows under the legacy worktree/ root: nothing to relocate.
   const result = runMigration(db);
-  assert.deepEqual(result.applied, [CURRENT_STORAGE_VERSION], "schema still advances to head");
+  assert.deepEqual(result.applied, pendingVersions, "schema still advances to head");
   assert.equal(existsSync(worktreeRoot(home)), false, "no worktree tree fabricated");
   const ledgerHead = db
     .prepare("SELECT MAX(version) AS version FROM schema_migrations")

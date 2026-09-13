@@ -875,6 +875,7 @@ export function storedPublicationReference(value: unknown): PublicationReference
   if (reference.sourceBranch !== undefined) fields.push("sourceBranch");
   if (reference.targetBranch !== undefined) fields.push("targetBranch");
   if (reference.localCommit !== undefined) fields.push("localCommit");
+  if (reference.headCommit !== undefined) fields.push("headCommit");
   if (reference.remoteCommit !== undefined) fields.push("remoteCommit");
   if (reference.evidence !== undefined) fields.push("evidence");
   if (reference.supersedes !== undefined) fields.push("supersedes");

@@ -30,6 +30,8 @@ export type PublicationReference = Readonly<{
   sourceBranch?: string;
   targetBranch?: string;
   localCommit?: string;
+  /** Exact source head observed at the remote PR/MR, independent of coverage. */
+  headCommit?: string;
   remoteCommit?: string;
   state: PublicationState;
   verification: PublicationVerification;
@@ -52,6 +54,7 @@ export type PublicationReferenceInput = Readonly<{
   sourceBranch?: string;
   targetBranch?: string;
   localCommit?: string;
+  headCommit?: string;
   remoteCommit?: string;
   state?: PublicationState;
   verification?: PublicationVerification;
@@ -104,6 +107,9 @@ export function createPublicationReference(
     }),
     ...(input.localCommit === undefined ? {} : {
       localCommit: requireCommit(input.localCommit, "Publication local commit")
+    }),
+    ...(input.headCommit === undefined ? {} : {
+      headCommit: requireCommit(input.headCommit, "Publication remote head")
     }),
     ...(input.remoteCommit === undefined ? {} : {
       remoteCommit: requireCommit(input.remoteCommit, "Publication remote commit")
@@ -174,6 +180,13 @@ export function validatePublicationReference(
   }
   if (reference.localCommit !== undefined) {
     requireCommit(reference.localCommit, "Publication local commit");
+  }
+  if (reference.headCommit !== undefined) {
+    requireCommit(reference.headCommit, "Publication remote head");
+    if (reference.verification === "verified"
+      && reference.headCommit !== reference.localCommit) {
+      throw new Error("Verified publication remote head must match its local commit.");
+    }
   }
   if (reference.remoteCommit !== undefined) {
     requireCommit(reference.remoteCommit, "Publication remote commit");

@@ -335,9 +335,13 @@ export function renderTaskDetail(detail, data, t, locale, actions) {
         "muted mono",
         project.directory + " · " + project.coverage + " · "
           + (project.expectedLocalCommit ? project.expectedLocalCommit.slice(0, 12) : "unknown")
+          + " → " + (project.deliveryLocalCommit ? project.deliveryLocalCommit.slice(0, 12) : "unknown")
           + " → "
           + (project.remoteCommit ? project.remoteCommit.slice(0, 12) : "unknown")
+          + " · PR/MR: " + (project.state || "none")
+          + (project.adoption ? " · " + project.adoption.id : "")
       ));
+      card.append(node("p", "record-copy", project.reason));
     });
     summaryBody.append(card);
   }

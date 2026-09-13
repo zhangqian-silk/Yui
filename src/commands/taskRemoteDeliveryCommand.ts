@@ -15,6 +15,7 @@ export type TaskRemoteDeliveryStore = Pick<
   | "listPublicationReferences"
   | "listManagedWorkspaces"
   | "listRuns"
+  | "listIntegrationAttempts"
 >;
 
 export type TaskRemoteDeliveryProof = Readonly<{
@@ -69,6 +70,7 @@ export function projectTaskRemoteDeliveryFromStore(
     publications: store.listPublicationReferences(task.id),
     managedWorkspaces: store.listManagedWorkspaces(task.id),
     runs: store.listRuns(task.id),
+    integrations: store.listIntegrationAttempts(task.id),
     currentCandidate
   });
 }
@@ -85,6 +87,7 @@ export function createTaskRemoteDeliveryProof(
     publications,
     managedWorkspaces: store.listManagedWorkspaces(task.id),
     runs: store.listRuns(task.id),
+    integrations: store.listIntegrationAttempts(task.id),
     currentCandidate
   });
   return {
@@ -112,6 +115,15 @@ export function assertTaskRemoteDeliveryProof(
   )) {
     throw usageError(`Task Publication evidence changed after remote-delivery preflight: ${task.id}.`);
   }
+  // Recheck semantic adoption/Integration facts as well as Publication versions.
+  // For provisional cancelled Tasks retain the frozen candidate used at preflight.
+  const current = projectTaskRemoteDeliveryFromStore(store, task, {
+    projects: proof.delivery.projects.flatMap(p => p.expectedLocalCommit === null
+      ? [] : [{ projectId: p.projectId, commit: p.expectedLocalCommit }])
+  });
+  if (!isDeepStrictEqual(current, proof.delivery)) {
+    throw usageError(`Task delivery evidence changed after remote-delivery preflight: ${task.id}.`);
+  }
   assertTaskRemoteDeliveryIntegrated(proof.delivery);
   return proof.delivery;
 }
@@ -128,8 +140,7 @@ export function assertTaskRemoteDeliveryIntegrated(
       throw usageError(
         `Task ${delivery.taskId} has no frozen completion heads for: ${
           headUnavailable.map(({ projectId }) => projectId).join(", ")
-        }. Reopen and complete it again to record exact heads before archiving; `
-        + "An explicitly authorized --force archive retains this evidence gap."
+        }. Historical acceptance cannot be inferred from a merge or archive.`
       );
     }
     const uncovered = delivery.projects
@@ -142,8 +153,8 @@ export function assertTaskRemoteDeliveryIntegrated(
     throw usageError(
       `Task ${delivery.taskId} is not fully merged into remote delivery: ${
         uncovered || "expected Project heads are unavailable"
-      }. Record confirmed current-head evidence with task publication upsert, `
-      + "or use task archive --abandon for an intentional non-merge."
+      }. Inspect each Project reason with task remote-delivery. Record confirmed Publication facts; `
+      + "for a changed post-completion candidate, review publication diff and explicitly adopt its acceptance."
     );
   }
   if (delivery.allVerified) return;
@@ -161,8 +172,7 @@ export function assertTaskRemoteDeliveryIntegrated(
   throw usageError(
     `Task ${delivery.taskId} has merged Publication evidence that is not verified: `
     + `${unverified || "verification evidence is unavailable"}. Run task publication verify `
-    + "for each Publication, or repeat task archive --integrated --force to explicitly "
-    + "archive despite evidence gaps, retaining the original delivery facts."
+    + "for each Publication only when the provider read is authorized."
   );
 }
 
@@ -185,12 +195,14 @@ export function renderTaskRemoteDelivery(
     ...delivery.projects.map((project) => (
       `${indent}- ${project.directory} (${project.projectId}): `
       + `expected=${shortCommit(project.expectedLocalCommit)}; `
+      + `candidate=${shortCommit(project.deliveryLocalCommit)}; `
+      + `adoption=${project.adoption?.id ?? "none"}; `
       + `base=${shortCommit(project.baseCommit)}; `
       + `publication=${project.publication?.id ?? "none"}; `
       + `state=${project.state ?? "none"}; `
       + `verification=${project.verification ?? "none"}; `
       + `remote=${shortCommit(project.remoteCommit)}; `
-      + `coverage=${project.coverage}`
+      + `coverage=${project.coverage}\n${indent}  ${project.reason}`
     ))
   ];
   return `${lines.join("\n")}\n`;
