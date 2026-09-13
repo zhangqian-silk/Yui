@@ -1302,6 +1302,19 @@ UPDATE review_rounds SET payload = json_set(payload, '$.executionGroup.lanes', j
     // The data/filesystem transform is the substantive step; the SQL is inert.
     sql: COLLAPSE_WORKTREE_LAYOUT_SQL,
     migrateData: migrateCollapseWorktreeLayout
+  },
+  {
+    version: 26,
+    name: "publication-candidate-adoption",
+    introducedIn: "0.15.12",
+    // Add optional Publication.headCommit (the observed PR/MR source head) and
+    // publication.candidate-adopted events binding publicationId, completionEventId,
+    // projectId, acceptedCommit/localCommit, acceptedTree/candidateTree, diffDigest,
+    // acceptance and by, optionally integrationId/integrationDigest. Derived
+    // task.archived mergeCoverage may also be uncovered or unverified.
+    // No stored delivery index and no inferred adoption or verification:
+    // valid old Publication, completion and archive payloads remain byte-identical.
+    sql: "SELECT 1; -- fixed acceptance-to-publication evidence; preserve all historical facts"
   }
 ]);
 

@@ -693,17 +693,29 @@ const taskChildren: readonly NodeInput[] = [
   {
     name: "publication",
     summary: "Create or update external PR/MR publication evidence for a Task.",
-    sections: [{ id: "manage", title: "Commands", entries: ["upsert", "verify", "list", "show"] }],
+    sections: [{ id: "manage", title: "Commands", entries: ["upsert", "diff", "adopt", "verify", "list", "show"] }],
     children: [
       {
         name: "upsert",
         summary: "Create or immutably update an external PR/MR and its publication state.",
-        usage: "yui task publication upsert <task> --project <project> --provider <github|gitlab> --repository <owner/name> --kind <pull-request|merge-request> --id <external-id> [--url <url>] [--title <text>] [--source-branch <branch>] [--target-branch <branch>] [--local-commit <sha>] [--remote-commit <sha>] [--state <open|merged|closed>] [--reported|--verified] [--evidence <text>] [--merged-at <iso-timestamp>]",
-        options: ["--project", "--provider", "--repository", "--kind", "--id", "--url", "--title", "--source-branch", "--target-branch", "--local-commit", "--remote-commit", "--state", "--reported", "--verified", "--evidence", "--merged-at"]
+        usage: "yui task publication upsert <task> --project <project> --provider <github|gitlab> --repository <owner/name> --kind <pull-request|merge-request> --id <external-id> [--url <url>] [--title <text>] [--source-branch <branch>] [--target-branch <branch>] [--local-commit <sha>] [--head-commit <sha>] [--remote-commit <sha>] [--state <open|merged|closed>] [--reported|--verified] [--evidence <text>] [--merged-at <iso-timestamp>]",
+        options: ["--project", "--provider", "--repository", "--kind", "--id", "--url", "--title", "--source-branch", "--target-branch", "--local-commit", "--head-commit", "--remote-commit", "--state", "--reported", "--verified", "--evidence", "--merged-at"]
+      },
+      {
+        name: "diff",
+        summary: "Read a completed Task's fixed acceptance-to-publication candidate diff using local Git only.",
+        usage: "yui task publication diff <task>/<publication> [--integration <id>]",
+        options: ["--integration"]
+      },
+      {
+        name: "adopt",
+        summary: "Explicitly accept the reviewed publication candidate as covering the original completion.",
+        usage: "yui task publication adopt <task>/<publication> --reviewed-diff <sha256> --acceptance <text> [--integration <id>]",
+        options: ["--reviewed-diff", "--acceptance", "--integration"]
       },
       {
         name: "verify",
-        summary: "Verify one current GitHub PR against the exact Task delivery head through gh.",
+        summary: "Observe the current PR/MR head and merge through its provider; record verification separately from Task coverage.",
         usage: "yui task publication verify (<task>/<publication-id> | <task> <publication-id>)"
       },
       {

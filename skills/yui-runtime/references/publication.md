@@ -13,6 +13,26 @@ deployment status. After merge, use `yui task publication verify` only when
 current authorization covers that external provider read. Otherwise retain
 reported evidence and state the verification gap.
 
+Keep the completion head as the original acceptance evidence. If an authorized
+post-completion integration produced a different publication candidate, record
+its exact local commit, then read `task publication diff <task>/<publication>`.
+Inspect the complete delta against the original acceptance, including removals,
+conflict resolutions and additional changes. Only when that candidate still
+satisfies the result and its relevant increments are accepted, record
+`task publication adopt <task>/<publication> --reviewed-diff <sha256> --acceptance <text>`.
+Explain the semantic judgment and verification/review evidence in the acceptance.
+When an existing Task Integration produced that exact candidate, include
+`--integration <id>` in diff and adopt to bind its committed evidence.
+Ancestry or Integration success alone is not acceptance; do not reopen the Task,
+rewrite completion, or mark a merge verified to bridge an evidence gap.
+
+Adoption records a fixed decision, not remote verification or publication
+authority. The verify operation observes the exact Publication candidate through
+its provider and records contrary head/state facts as reported successors,
+invalidating previous verification. Metadata and verification updates may retain
+adoption while the candidate is unchanged; a changed candidate needs a new
+decision. Archived history is read-only to these adopt/verify operations.
+
 Use `yui task remote-delivery <task>` to explain external delivery. Publication
 is not Candidate acceptance, Review, Integration or Task completion.
 
