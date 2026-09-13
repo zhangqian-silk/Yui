@@ -56,6 +56,11 @@ Task 完成。
 和覆盖度；采样不阻塞生命周期事件。度量绝不触发模型选择、唤醒、重试、资源释放
 或接受。
 
+[Task 用量与耗时](observability/README.zh-CN.md#task-用量与耗时)跨历史 Session
+复用此 reducer。Task 围栏内的观察不是完整账单保证。缺少明确互斥合同时，原生
+子计数不加入父 Session 总量，也不作为额外请求。原始 Session 累计值与安全归属
+的 Task 增量分开；仅精确请求/Run 绑定支持 WorkItem 分配。
+
 ## 原生子代
 
 原生 subagent 是父对话内部的协作，不是 Yui Role、Lane 或独立的受管工作区 owner。

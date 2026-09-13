@@ -1,11 +1,10 @@
 import type { ContextSnapshot } from "../context/contextSnapshot.js";
 import type { TaskEvent } from "../event/taskEvent.js";
-import type {
-  ExecutionGroup,
-  WorkItemExecutionGroup
-} from "../execution/workItemExecution.js";
+import type { ExecutionGroup } from "../execution/workItemExecution.js";
 import type { AgentRun } from "../agentRun/agentRun.js";
 import type { SessionTokenMetrics } from "../runtime/sessionTokenMetrics.js";
+import { projectTaskUsageMetrics, type TaskUsageMetrics } from "../runtime/taskUsageMetrics.js";
+import type { Task } from "../task/task.js";
 import type { WorkItem, WorkItemStatus } from "../workItem/workItem.js";
 
 export type TaskDagNodeStatus =
@@ -41,12 +40,7 @@ export type TaskDagProjection = Readonly<{
   blockedIds: readonly string[];
 }>;
 
-export type TaskCostProjection = Readonly<{
-  tokens: number;
-  toolCalls: number;
-  wallClockSeconds: number;
-  tokensObservable: boolean;
-  toolCallsObservable: boolean;
+export type TaskCostProjection = TaskUsageMetrics & Readonly<{
   laneCount: number;
   groupCount: number;
   retryCount: number;
@@ -102,6 +96,7 @@ export type TaskObservabilityProjection = Readonly<{
 }>;
 
 export type TaskObservabilityInput = Readonly<{
+  task: Pick<Task, "id" | "status" | "createdAt" | "completedAt" | "retiredAt">;
   workItems: readonly WorkItem[];
   executionGroups: readonly ExecutionGroup[];
   runs: readonly AgentRun[];
@@ -123,7 +118,7 @@ export function buildTaskObservabilityProjection(
   const dag = projectDag(input.workItems);
   const workItems = input.workItems.map((item) => {
     const groups = item.executionGroups;
-    const itemCost = projectWorkItemCost(groups, input.runs, now);
+    const itemCost = projectCost({ ...input, now }, groups, item.id);
     const itemContext = projectContext(groups, input.runs, input.contextSnapshots);
     const producerObservability = projectWorkItemProducerObservability(item, input.runs);
     return Object.freeze({
@@ -136,7 +131,7 @@ export function buildTaskObservabilityProjection(
       resultCount: producerObservability?.resultCount ?? null
     });
   });
-  const cost = projectCost(input.executionGroups, input.runs, input.events, now);
+  const cost = projectCost({ ...input, now }, input.executionGroups);
   const context = projectContext(input.executionGroups, input.runs, input.contextSnapshots);
   return Object.freeze({
     dag,
@@ -266,61 +261,20 @@ function dependencyEdgeStatus(
 }
 
 function projectCost(
+  input: TaskObservabilityInput,
   groups: readonly ExecutionGroup[],
-  runs: readonly AgentRun[],
-  _events: readonly TaskEvent[],
-  now: Date
+  workItemId?: string
 ): TaskCostProjection {
   const uniqueGroups = [...new Map(groups.map((group) => [group.id, group])).values()];
   const groupIds = new Set(uniqueGroups.map(({ id }) => id));
-  const attempts = runs.filter(({ executionGroupId }) => (
+  const attempts = input.runs.filter(({ executionGroupId }) => (
     executionGroupId !== undefined && groupIds.has(executionGroupId)
   ));
   const laneCount = uniqueGroups.reduce((total, group) => total + group.lanes.length, 0);
   return Object.freeze({
-    tokens: 0,
-    toolCalls: 0,
-    wallClockSeconds: uniqueGroups.reduce(
-      (total, group) => total + groupDurationSeconds(group, now),
-      0
-    ),
-    tokensObservable: false,
-    toolCallsObservable: false,
+    ...projectTaskUsageMetrics({ ...input, workItemId }),
     laneCount,
     groupCount: uniqueGroups.length,
-    retryCount: Math.max(0, attempts.length - laneCount),
-    marginalValuePercent: null,
-    marginalValueStatus: "unavailable"
-  });
-}
-
-function projectWorkItemCost(
-  groups: readonly WorkItemExecutionGroup[],
-  runs: readonly AgentRun[],
-  now: Date
-): TaskCostProjection {
-  const groupIds = new Set(groups.map(({ id }) => id));
-  const attempts = runs.filter(({ executionGroupId }) => (
-    executionGroupId !== undefined && groupIds.has(executionGroupId)
-  ));
-  const wallClockSeconds = groups.reduce((total, group) => {
-    const started = Date.parse(group.createdAt);
-    const ended = group.lanes.some(({ disposition }) => disposition === "open")
-      ? now.getTime()
-      : Date.parse(group.updatedAt);
-    return total + (Number.isFinite(started) && Number.isFinite(ended)
-      ? Math.max(0, Math.floor((ended - started) / 1_000))
-      : 0);
-  }, 0);
-  const laneCount = groups.reduce((total, group) => total + group.lanes.length, 0);
-  return Object.freeze({
-    tokens: 0,
-    toolCalls: 0,
-    wallClockSeconds,
-    tokensObservable: false,
-    toolCallsObservable: false,
-    laneCount,
-    groupCount: groups.length,
     retryCount: Math.max(0, attempts.length - laneCount),
     marginalValuePercent: null,
     marginalValueStatus: "unavailable"
@@ -372,14 +326,4 @@ function projectContext(
     compressionRatio: null,
     compressionStatus: "unavailable"
   });
-}
-
-function groupDurationSeconds(group: ExecutionGroup, now: Date): number {
-  const started = Date.parse(group.createdAt);
-  const ended = group.lanes.some(({ disposition }) => disposition === "open")
-    ? now.getTime()
-    : Date.parse(group.updatedAt);
-  return Number.isFinite(started) && Number.isFinite(ended)
-    ? Math.max(0, Math.floor((ended - started) / 1_000))
-    : 0;
 }

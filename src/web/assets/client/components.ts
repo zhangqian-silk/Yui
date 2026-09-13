@@ -229,17 +229,36 @@ export function workItemExecutionCard(projection, t) {
   return card;
 }
 
+export function usageMetricText(metric, t, suffix) {
+  if (!metric || metric.value == null) return t("detail.unobserved");
+  return metric.value + (suffix || "") + (metric.status === "partial" ? " · " + t("detail.partial") : "");
+}
+
+function usageTile(label, metric, t, suffix) {
+  const tile = metricTile(label, usageMetricText(metric, t, suffix));
+  if (metric?.reasons?.length) {
+    tile.append(node("small", "muted", metric.reasons.map(function (reason) {
+      return t("usage.reason." + reason);
+    }).join("; ")));
+  }
+  return tile;
+}
+
 export function observabilityMetricCard(observability, t) {
   if (!observability) return null;
   const card = node("div", "observability-metrics");
   const cost = observability.cost || {};
   const context = observability.context || {};
-  card.append(metricTile(t("detail.tokens"), cost.tokens + (cost.tokensObservable === false ? "*" : "")));
-  card.append(metricTile(t("detail.toolCalls"), cost.toolCalls + (cost.toolCallsObservable === false ? "*" : "")));
-  card.append(metricTile(t("detail.wallClock"), cost.wallClockSeconds + "s"));
+  card.append(usageTile(t("detail.tokens"), cost.tokens, t));
+  card.append(usageTile(t("detail.toolCalls"), cost.toolCalls, t));
+  card.append(usageTile(t("detail.elapsed"), cost.elapsedSeconds, t, "s"));
+  card.append(usageTile(t("detail.executionSum"), cost.executionSeconds, t, "s"));
   card.append(metricTile(t("detail.ready"), (observability.dag?.readyIds || []).length, { hot: true }));
   card.append(metricTile(t("detail.contextSnapshots"), context.snapshotCount));
   const contextMeta = node("div", "record-meta observability-context-meta");
+  contextMeta.append(node("span", "", t("detail.usageScope")));
+  contextMeta.append(node("span", "", t("detail.observedThrough") + " · "
+    + (cost.observedThrough ? formatDateTime(cost.observedThrough) : t("detail.unobserved"))));
   contextMeta.append(node("span", "", t("detail.contextBytes") + " · "
     + (context.totalBytes === null ? t("detail.partial") : context.totalBytes + " B")));
   contextMeta.append(node("span", "", t("detail.compression") + " · " + t("detail.unavailable")));
@@ -535,14 +554,9 @@ export function workItemCard(item, titles, t, locale, actions, taskId) {
   if (item.observability) {
     const observability = item.observability;
     const metrics = node("div", "record-meta work-item-observability");
-    metrics.append(node("span", "", t("detail.cost") + " · "
-      + (observability.cost.tokensObservable
-        ? observability.cost.tokens + " tokens"
-        : t("detail.unobserved"))));
-    metrics.append(node("span", "", observability.cost.toolCallsObservable
-      ? observability.cost.toolCalls + " tools"
-      : t("detail.unobserved")));
-    metrics.append(node("span", "", observability.cost.wallClockSeconds + "s"));
+    metrics.append(usageTile(t("detail.tokens"), observability.cost.tokens, t));
+    metrics.append(usageTile(t("detail.toolCalls"), observability.cost.toolCalls, t));
+    metrics.append(usageTile(t("detail.executionSum"), observability.cost.executionSeconds, t, "s"));
     metrics.append(node("span", "", t("detail.contextSnapshots") + " · "
       + observability.context.snapshotCount));
     metrics.append(node("span", "", t("detail.results") + " · "
