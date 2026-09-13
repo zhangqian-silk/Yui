@@ -21,6 +21,7 @@
 | Task 内记录如何引用？ | [局部身份](../task-local-identity.zh-CN.md) |
 | Role、Profile 与运行配置如何生效？ | [角色与配置](../roles-and-configuration.zh-CN.md) |
 | 怎样交付、集成和归档？ | [交付生命周期](../task-delivery.zh-CN.md) |
+| Project refresh 同步什么，怎样报告部分失败？ | [Project refresh](../project-refresh.zh-CN.md) |
 | Provider、ACP 与配置事实如何接入？ | [Provider Runtime](../provider-runtime.zh-CN.md) |
 | 运行观察和错误由谁解释？ | [Agent Drivers](../agent-runtime-drivers.zh-CN.md) |
 | 如何创建、验证与采用插件？ | [插件 SDK](../plugin-sdk.zh-CN.md) |
