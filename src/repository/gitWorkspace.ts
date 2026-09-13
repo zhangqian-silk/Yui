@@ -3,6 +3,8 @@ import { createHash, randomBytes } from "node:crypto";
 import { lstat, mkdir, readFile, realpath, rm } from "node:fs/promises";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { promisify } from "node:util";
+import { cleanupFailure } from "../workspace/cleanupInspection.js";
+import { externalProgramConfigViolations } from "../artifacts/managedGit.js";
 
 const executeFile = promisify(execFile);
 
@@ -144,6 +146,8 @@ export interface GitWorkspacePort {
   }>): Promise<{ addedLines: number; deletedLines: number }>;
   headRef(repositoryPath: string): Promise<string>;
   isClean(repositoryPath: string): Promise<boolean>;
+  /** Read-only status for diagnostics/cleanup: no index refresh or filter execution. */
+  inspectClean(repositoryPath: string): Promise<boolean>;
   mergeWorktree(input: Readonly<{
     targetPath: string;
     sourceRefs: readonly string[];
@@ -201,6 +205,7 @@ export interface GitWorkspacePort {
     directory: string;
     taskSegment: string;
     roleName: string;
+    expectedBranch?: string;
   }>): Promise<GitWorkspaceState>;
   /** Inspect a durable workspace entry after its Project catalog path changed.
    * The worktree is trusted only when its exact branch/head is retained in the
@@ -227,6 +232,9 @@ export interface GitWorkspacePort {
    * unadopted worktrees that are safe to discard. */
   removeStrandedWorktree(path: string): Promise<GitWorkspaceRemoval>;
   /** Delete a clean, standalone Task clone only at its exact managed identity. */
+  inspectTaskClone(input: Readonly<{
+    path: string; container: string; directory: string; taskSegment: string; branch: string;
+  }>): Promise<GitWorkspaceState>;
   removeTaskClone(input: Readonly<{
     path: string; container: string; directory: string; taskSegment: string; branch: string;
   }>): Promise<GitWorkspaceRemoval>;
@@ -945,9 +953,14 @@ export class NodeGitWorkspace implements GitWorkspacePort {
 
   async isClean(repositoryPath: string): Promise<boolean> {
     const root = (await this.inspect(repositoryPath)).root;
-    const status = await git([
-      "-C", root, "status", "--porcelain=v1", "--untracked-files=all"
-    ]);
+    const status = await git(["--no-optional-locks", "-C", root,
+      "status", "--porcelain=v1", "--untracked-files=all"]);
+    return status.length === 0;
+  }
+
+  async inspectClean(repositoryPath: string): Promise<boolean> {
+    const root = (await this.inspect(repositoryPath)).root;
+    const status = await readWorktreeStatus(root);
     return status.length === 0;
   }
 
@@ -1228,31 +1241,44 @@ export class NodeGitWorkspace implements GitWorkspacePort {
   async removeTaskClone(input: Readonly<{
     path: string; container: string; directory: string; taskSegment: string; branch: string;
   }>): Promise<GitWorkspaceRemoval> {
+    const state = await this.inspectTaskClone(input);
+    if (state !== "clean") return state;
+    await rm(managedPath(resolve(input.container), input.directory), { recursive: true });
+    return "removed";
+  }
+
+  async inspectTaskClone(input: Readonly<{
+    path: string; container: string; directory: string; taskSegment: string; branch: string;
+  }>): Promise<GitWorkspaceState> {
     const identity = worktreeIdentity(input.taskSegment, "main");
     const expected = managedPath(resolve(input.container), input.directory);
     if (resolve(input.path) !== expected || input.branch !== identity.branch) {
-      throw new Error("Task clone does not match its recorded managed identity.");
+      cleanupFailure("workspace-identity-mismatch", "Task clone does not match its recorded managed identity.",
+        { branch: identity.branch }, { branch: input.branch, pathMatches: resolve(input.path) === expected });
     }
     const kind = await pathKind(expected);
     if (kind === undefined) return "missing";
-    if (kind === "symlink") throw new Error("Task clone must not be a symbolic link.");
+    if (kind === "symlink") cleanupFailure("workspace-identity-mismatch",
+      "Task clone must not be a symbolic link.", "real directory", "symbolic link");
     await canonicalContainer(input.container, false);
     if (await realpath(expected) !== expected || await pathKind(join(expected, ".git")) !== "directory") {
-      throw new Error("Task clone is not a standalone owned Git directory.");
+      cleanupFailure("workspace-identity-mismatch", "Task clone is not a standalone owned Git directory.",
+        "standalone owned clone", "different Git layout or symbolic ancestor");
     }
     const repository = await this.inspect(expected);
     if (repository.root !== expected || repository.gitDirectory !== join(expected, ".git")) {
-      throw new Error("Task clone Git ownership cannot be established.");
+      cleanupFailure("workspace-identity-mismatch", "Task clone Git ownership cannot be established.",
+        "exact root and Git directory", "different Git ownership");
     }
     await assertExpectedBranch(expected, input.branch);
-    if (!await this.isClean(expected)) return "dirty";
+    if (!await this.inspectClean(expected)) return "dirty";
     const worktrees = (await git(["-C", expected, "worktree", "list", "--porcelain", "-z"]))
       .split("\0").filter(line => line.startsWith("worktree "));
     if (worktrees.length !== 1 || worktrees[0] !== `worktree ${expected}`) {
-      throw new Error("Task clone still owns Git worktree registrations; retained.");
+      cleanupFailure("git-worktree-registrations", "Task clone still owns Git worktree registrations; retained.",
+        1, worktrees.length);
     }
-    await rm(expected, { recursive: true });
-    return "removed";
+    return "clean";
   }
 
   async inspectRecordedWorktree(input: Readonly<{
@@ -1318,17 +1344,26 @@ export class NodeGitWorkspace implements GitWorkspacePort {
     directory: string;
     taskSegment: string;
     roleName: string;
+    /** Integration uses a separate branch identity, still supplied by its owner. */
+    expectedBranch?: string;
   }>): Promise<GitWorkspaceState> {
     const container = resolve(input.container);
     const path = managedPath(container, input.directory);
     const kind = await pathKind(path);
-    if (kind === undefined) return "missing";
-    if (kind === "symlink") throw new Error("Managed worktree path must not be a symbolic link.");
+    const branch = input.expectedBranch ?? worktreeIdentity(input.taskSegment, input.roleName).branch;
+    if (kind === undefined) {
+      const project = await this.inspect(input.repositoryPath);
+      await inspectMissingWorktreeRegistration(project.root, path, branch);
+      return "missing";
+    }
+    if (kind === "symlink") cleanupFailure("workspace-identity-mismatch",
+      "Managed worktree path must not be a symbolic link.", "real directory", "symbolic link");
 
     const canonicalContainerPath = await canonicalContainer(container, false);
     const project = await this.inspect(input.repositoryPath);
     await assertOwnedWorktree(project, canonicalContainerPath, path);
-    const porcelain = await git(["-C", path, "status", "--porcelain=v1", "--untracked-files=all"]);
+    await assertExpectedBranch(path, branch);
+    const porcelain = await readWorktreeStatus(path);
     return porcelain.length > 0 ? "dirty" : "clean";
   }
 
@@ -1374,9 +1409,7 @@ export class NodeGitWorkspace implements GitWorkspacePort {
       if (input.discardChanges === true) {
         await git(["-C", repository.root, "worktree", "remove", "--force", "--", path]);
       } else {
-        const porcelain = await git([
-          "-C", path, "status", "--porcelain=v1", "--untracked-files=all"
-        ]);
+        const porcelain = await readWorktreeStatus(path);
         if (porcelain.length > 0) return "dirty";
         if (
           input.expectedBaseCommit !== undefined
@@ -1404,14 +1437,21 @@ export class NodeGitWorkspace implements GitWorkspacePort {
  * workspace's registration as a side effect of cleaning this exact owner.
  */
 async function removeMissingWorktreeRegistration(repositoryRoot: string, path: string, branch: string): Promise<void> {
-  const records = (await git(["-C", repositoryRoot, "worktree", "list", "--porcelain", "-z"])).split("\0\0");
-  const fields = records.map(record => record.split("\0")).find(record => record.includes(`worktree ${path}`));
-  if (fields === undefined) return;
-  if (!fields.includes(`branch refs/heads/${branch}`) || fields.some(field => field.startsWith("locked"))) {
-    throw new Error(`Missing worktree has uncertain or locked Git ownership: ${path}; metadata retained.`);
-  }
+  if (!await inspectMissingWorktreeRegistration(repositoryRoot, path, branch)) return;
   if (await pathKind(path) !== undefined) throw new Error(`Worktree reappeared before metadata cleanup: ${path}.`);
   await git(["-C", repositoryRoot, "worktree", "remove", "--force", "--", path]);
+}
+
+async function inspectMissingWorktreeRegistration(repositoryRoot: string, path: string, branch: string): Promise<boolean> {
+  const records = (await git(["-C", repositoryRoot, "worktree", "list", "--porcelain", "-z"])).split("\0\0");
+  const fields = records.map(record => record.split("\0")).find(record => record.includes(`worktree ${path}`));
+  if (fields === undefined) return false;
+  if (!fields.includes(`branch refs/heads/${branch}`) || fields.some(field => field.startsWith("locked"))) {
+    cleanupFailure("git-registration-mismatch", "Missing worktree has uncertain or locked Git ownership; metadata retained.",
+      { branch, locked: false }, { branch: fields.find(field => field.startsWith("branch "))?.slice(7) ?? null,
+        locked: fields.some(field => field.startsWith("locked")) });
+  }
+  return true;
 }
 
 async function deleteBranchIfPresent(repositoryRoot: string, branch: string): Promise<void> {
@@ -1477,7 +1517,7 @@ async function assertExpectedBranch(path: string, expected: string, allowRebase 
   }
   const branch = await gitLine(["-C", path, "symbolic-ref", "--short", "HEAD"]);
   if (branch !== expected) {
-    throw new Error(`Managed worktree is on an unexpected branch: ${branch}.`);
+    cleanupFailure("workspace-identity-mismatch", "Managed worktree is on an unexpected branch.", expected, branch);
   }
 }
 
@@ -1499,7 +1539,8 @@ async function assertOwnedWorktree(
     "Managed Git common directory"
   );
   if (common !== project.gitDirectory) {
-    throw new Error("Managed worktree belongs to another project.");
+    cleanupFailure("workspace-identity-mismatch", "Managed worktree belongs to another project.",
+      "Task main Git common directory", "different Git common directory");
   }
 }
 
@@ -1677,12 +1718,71 @@ async function pathKind(path: string): Promise<"directory" | "symlink" | undefin
   }
 }
 
-async function git(args: readonly string[]): Promise<string> {
+/** Status can execute clean/process filters to compare equal-size changed
+ * files. Preserve native normalization: report unknown instead of disabling
+ * a filter and misclassifying its output as clean/dirty. Include scopes so a
+ * native global/worktree include cannot hide the same execution requirement.
+ */
+async function readWorktreeStatus(path: string): Promise<string> {
+  await assertStatusProgramsAbsent(path);
+  return readStatusGit(path, ["status", "--porcelain=v1", "--untracked-files=all"]);
+}
+
+async function readStatusGit(path: string, args: readonly string[]): Promise<string> {
+  return git(["--no-optional-locks", "-c", "core.fsmonitor=false",
+    "-c", "protocol.allow=never", "-c", "protocol.file.allow=never",
+    "-C", path, ...args], { GIT_NO_LAZY_FETCH: "1" });
+}
+
+async function assertStatusProgramsAbsent(path: string): Promise<void> {
+  const configuration = await readStatusGit(path, ["config", "--list", "--null", "--includes"]);
+  const filters = externalProgramConfigViolations(configuration)
+    .filter(key => key.startsWith("filter.") && (key.endsWith(".clean") || key.endsWith(".process")));
+  const files = (await readStatusGit(path, ["ls-files", "--stage", "-z"])).split("\0");
+  if (filters.length > 0) {
+    // Merely having native LFS configured globally is not a violation. Only
+    // filters selected by tracked regular files' effective attributes can run
+    // during status. check-attr reads those selections without executing them.
+    const configured = new Set(filters.map(key => key.slice(7, key.lastIndexOf("."))));
+    const tracked = [...new Set(files.filter(line => line.startsWith("100"))
+      .map(line => line.slice(line.indexOf("\t") + 1)))];
+    for (let offset = 0; offset < tracked.length; offset += 128) {
+      const attributes = (await readStatusGit(path, ["check-attr", "-z", "filter", "--",
+        ...tracked.slice(offset, offset + 128)])).split("\0");
+      for (let index = 2; index < attributes.length; index += 3) {
+        if (!configured.has(attributes[index]!.toLowerCase())) continue;
+        cleanupFailure("git-status-requires-filter", "Git status may execute a selected filter program; read-only inspection will not run it.",
+          "status without external filter execution",
+          { trackedPath: attributes[index - 2], filter: attributes[index] }, "unknown");
+      }
+    }
+  }
+  // Status also examines initialized submodules. Inspect their configuration
+  // before asking Git to recurse; uninitialized gitlinks execute nothing.
+  for (const record of files.filter(line => line.startsWith("160000 "))) {
+    const child = join(path, record.slice(record.indexOf("\t") + 1));
+    assertContained(path, child);
+    const gitEntry = await lstat(join(child, ".git")).catch(error => {
+      if (isErrno(error, "ENOENT")) return undefined;
+      throw error;
+    });
+    if (gitEntry === undefined) continue;
+    if (await realpath(child) !== child
+      || (await readStatusGit(child, ["rev-parse", "--show-toplevel"])).trimEnd() !== child) {
+      cleanupFailure("workspace-identity-mismatch", "Submodule identity cannot be safely inspected.",
+        "owned submodule directory", "different or symbolic root");
+    }
+    await assertStatusProgramsAbsent(child);
+  }
+}
+
+async function git(args: readonly string[], environment?: NodeJS.ProcessEnv): Promise<string> {
   try {
     const result = await executeFile("git", [...args], {
       encoding: "utf8",
       maxBuffer: 1024 * 1024,
-      timeout: 30_000
+      timeout: 30_000,
+      ...(environment === undefined ? {} : { env: { ...process.env, ...environment } })
     });
     return result.stdout;
   } catch (error) {

@@ -61,6 +61,9 @@ regressions, and fast regressions do not establish real-model behavior.
 16. explicit force archive commits before cleanup and preserves uncertain
     delivery/runtime evidence; partial cleanup and late results remain traceable,
     while archived runtime resources never become automatically safe to delete.
+    Archive preflight preserves durable records and the Git index, distinguishes
+    frozen-result differences, and cleanup rechecks moved heads, owner branches
+    and new dirt. Read-only Git status never executes configured clean filters.
 17. Host facts reach the existing Inbox even when its compiled store cannot
     read the Home; Controller-side fencing, ACK-loss replay, and legacy-Host
     upgrade refusal preserve the original execution. A frozen independent v1
@@ -83,6 +86,9 @@ The Integration continuation regressions use disposable Git repositories,
 SQLite and fake Jobs, without a provider or shared Home. Their test bodies
 take about 3 seconds on the development host; validation settlement adds
 about 1.4 seconds to the initial 1.5-second coverage.
+Archive preflight adds three small disposable Git/SQLite scenarios (about
+one second of test bodies); broader owner/diagnostic combinations remain
+temporary validation evidence, not a second permanent matrix.
 
 ## Skill and instruction changes
 

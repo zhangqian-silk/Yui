@@ -2,6 +2,8 @@ import type { ConfiguredAgent } from "../agent/agent.js";
 import { roleLaunchEventPayload, saveTaskRoleUpdate } from "../role/taskRoleUpdate.js";
 import { createHash, randomUUID } from "node:crypto";
 import { archiveDeliveryWarnings, archiveRetainedResources, renderArchiveDiagnostics, taskArchiveDiagnostics } from "../task/archiveDiagnostics.js";
+import { archiveSettlementChecks } from "../task/archivePreflight.js";
+import { CleanupInspectionError } from "../workspace/cleanupInspection.js";
 import { join } from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import { createRunInput } from "../context/runInputContract.js";
@@ -2030,32 +2032,8 @@ function archiveTaskCommand(
       )
       : undefined;
     if (!request.force) {
-      assertNoOpenInputRequests(tx, task.id, "archiving the Task");
-      const unsettledWork = tx.listWorkItems(task.id).find((item) => item.status === "open");
-      if (unsettledWork !== undefined) {
-        throw usageError(`Work Item ${unsettledWork.id} must be accepted or explicitly retired before archive.`);
-      }
-      const unresolvedIntegration = tx.listIntegrationAttempts(task.id).find((integration) => (
-        integration.status === "running"
-        || integration.status === "blocked"
-        || integration.status === "conflicted"
-        || integration.status === "validating"
-      ));
-      if (unresolvedIntegration !== undefined) {
-        throw usageError(
-          `Task ${task.id} has an unresolved Integration Attempt: ${unresolvedIntegration.id}.`
-        );
-      }
-      const activeArchiveJob = tx.listDurableJobs(task.id).find((job) => (
-        job.status === "queued"
-        || job.status === "running"
-        || (job.status === "unknown-needs-attention" && job.acknowledgedAt === undefined)
-      ));
-      if (activeArchiveJob !== undefined) {
-        throw usageError(
-          `Task ${task.id} has an active DurableJob: ${activeArchiveJob.id}/${activeArchiveJob.status}.`
-        );
-      }
+      const checks = archiveSettlementChecks(tx, task);
+      if (checks.length > 0) throw new CleanupInspectionError(checks);
       if (task.cwd !== undefined || tx.listManagedWorkspaces(task.id).length > 0) {
         throw usageError(`Task ${task.id} still has managed worktrees; clean them before archiving.`);
       }
@@ -2347,14 +2325,15 @@ function assertTaskRetirementProof(
 }
 
 export function parseTaskArchiveArguments(
-  args: readonly string[]
+  args: readonly string[],
+  command: "archive" | "archive-preflight" = "archive"
 ): Readonly<{
   taskId: string;
   disposition: "integrated" | "abandoned";
   force: boolean;
 }> {
   const usage = "Task archive usage: "
-    + "yui task archive <id> (--integrated|--abandon) [--force].";
+    + `yui task ${command} <id> (--integrated|--abandon) [--force].`;
   const taskId = args[0]?.trim();
   const flags = args.slice(1);
   if (taskId === undefined
@@ -2404,18 +2383,8 @@ export function validateTaskArchiveRequest(
     throw usageError(`Task ${task.id} must be completed or retired before it can be archived.`);
   }
   if (task.status !== "archived" && !request.force) {
-    assertNoOpenInputRequests(store, task.id, "archiving the Task");
-    const unresolvedIntegration = store.listIntegrationAttempts(task.id).find((integration) => (
-      integration.status === "running"
-      || integration.status === "blocked"
-      || integration.status === "conflicted"
-      || integration.status === "validating"
-    ));
-    if (unresolvedIntegration !== undefined) {
-      throw usageError(
-        `Task ${task.id} has an unresolved Integration Attempt: ${unresolvedIntegration.id}.`
-      );
-    }
+    const checks = archiveSettlementChecks(store, task);
+    if (checks.length > 0) throw new CleanupInspectionError(checks);
   }
   return request;
 }

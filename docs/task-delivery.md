@@ -92,14 +92,48 @@ explicit input/work selection and never replays previous delivery requests.
 Archive is a separate authorized action after active work is settled and
 resources are clean and removable. Choose integrated delivery or deliberate
 abandonment explicitly. Integrated archive requires exact merged heads and
-verified publication evidence. An explicitly authorized verification override
-cannot bypass missing or stale heads or an unmerged result.
+verified publication evidence. Explicit user/Operator `--force` authorization
+may commit an eligible terminal Task's archive despite unsettled work, delivery
+gaps or cleanup blockers. It commits archive and its audit first, then makes one
+foreground safe-cleanup attempt. It never proves delivery, acknowledges unknown
+input, grants permission to discard changes, or retries cleanup on repeat archive.
 
 Managed WorkItem resources must be integrated or deliberately abandoned before
 cleanup. Review, Lane and Integration resources must be settled. Dirty worktrees
 remain for the Agent to resolve; no implicit reset or force deletion occurs.
 Task main branches and durable Task records retain recovery information.
 Archived Tasks cannot reopen.
+
+`yui task archive-preflight <task> (--integrated|--abandon) [--force] [--json]`
+reads current admission, delivery and exact-owner cleanup checks in one report.
+It is available before and after archive, including to the Task's authorized
+Leader reader. `--force` here only selects the behavior to inspect. It never
+archives, prepares workspaces, refreshes Git indexes, stops Sessions, acquires
+maintenance locks, fetches remote data, or writes a cleanup plan.
+
+Each blocking/unknown check has a resource, reason code, expected and observed
+values, source references and existing inspection/disposition commands. Git
+paths outside the authorized Task are redacted. The report distinguishes
+missing Candidate workspace, changed workspace identity/metadata/path, missing
+frozen commit, moved HEAD, dirty worktree, missing/locked Git registration,
+unintegrated result, uncovered delivery, unsettled owner and unknown execution.
+Status inspection disables optional index writes and filesystem-monitor hooks.
+If a tracked file selects a configured clean/process filter (including an
+initialized submodule's), it reports `git-status-requires-filter` as unknown instead of
+executing the program or bypassing normalization and guessing clean/dirty.
+Historical Candidate paths remain immutable. A path difference, including one
+consistent with an earlier layout migration, does not itself prove a safe
+relocation: without an exact mapping the check reports the difference and
+retains the resource; it does not repair history or weaken commit/owner checks.
+
+Preflight is an observation, not a removal permit. Cleanup reloads the same
+checks and Git verifies ownership/dirt again at removal. A Task-main clone's
+dependent registrations are expected before child cleanup and must be absent
+before clone removal. Archive preserves new dirt even in a failed Integration
+workspace; the separate explicit Integration cleanup command keeps its existing
+disposable-conflict behavior. A finished force cleanup means the foreground
+attempt ended, not that every resource was released. Current retained references
+and exact physical runtime evidence remain separate from historical diagnostics.
 
 Use each command's `--help` to inspect its exact authority and options before
 cleanup; reading a lifecycle document does not authorize an external write.

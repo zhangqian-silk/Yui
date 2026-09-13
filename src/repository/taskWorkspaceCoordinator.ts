@@ -3,6 +3,8 @@ import { lstat } from "node:fs/promises";
 import { isArchivePersistenceFailure, recordArchiveCleanup, type ArchiveDiagnostic } from "../task/archiveDiagnostics.js";
 import { projectTaskRemoteDeliveryFromStore } from "../commands/taskRemoteDeliveryCommand.js";
 import { WorkItemChangeSetManager } from "../workspace/workItemChangeSetManager.js";
+import { archiveSettlementChecks, archiveExecutionChecks } from "../task/archivePreflight.js";
+import { CleanupInspectionError } from "../workspace/cleanupInspection.js";
 
 import {
   hasRuntimeLifecycleWork,
@@ -216,6 +218,8 @@ export class TaskWorkspaceCoordinator {
       if (task.status !== "completed" && task.status !== "cancelled") {
         throw new Error(`Task must be completed or retired before archive cleanup: ${task.id}.`);
       }
+      const settlement = [...archiveSettlementChecks(this.store, task), ...archiveExecutionChecks(this.store, taskId)];
+      if (settlement.length > 0) throw new CleanupInspectionError(settlement);
       const managedWorkspaces = [...this.store.listManagedWorkspaces(task.id)]
         .sort((left, right) => managedWorkspaceKey(left.owner)
           .localeCompare(managedWorkspaceKey(right.owner)));
@@ -257,104 +261,18 @@ export class TaskWorkspaceCoordinator {
         workItems: allWorkItems,
         reviewRounds: allReviewRounds
       };
-      for (const round of reviewRounds) {
-        if (round.status !== "completed" && round.status !== "failed") {
-          throw new Error(`ReviewRound must be terminal before archive cleanup: ${round.id}.`);
-        }
-        if (await this.preparer.inspectReviewRoundWorkspace(task.id, round.id) === "dirty") {
-          return {
-            taskId,
-            status: "retained-dirty",
-            ...(task.cwd === undefined ? {} : { path: task.cwd }),
-            error: `ReviewRound worktree is dirty: ${round.id}.`,
-            reason: "dirty-worktree",
-            resource: `review-round:${task.id}/${round.id}`,
-            retryable: true
-          };
-        }
+      const checks = [];
+      for (const workspace of managedWorkspaces) {
+        const workspaceDisposition = workspace.owner.type === "work-item"
+          && this.store.getWorkItem(task.id, workspace.owner.workItemId)?.status === "retired" ? "abandoned" : disposition;
+        const inspected = await this.preparer.inspectWorkspaceCleanup(workspace, workspaceDisposition);
+        // Child worktrees are removed first below. Their Git registrations
+        // necessarily exist now; the clone's removal boundary rechecks them
+        // after every child cleanup and never removes an unresolved owner.
+        checks.push(...inspected.filter(c => !(workspace.owner.type === "task"
+          && c.reason === "git-worktree-registrations")));
       }
-      for (const item of workItems) {
-        if (await this.preparer.inspectWorkItemWorkspace(task.id, item.id) === "dirty") {
-          return {
-            taskId,
-            status: "retained-dirty",
-            ...(task.cwd === undefined ? {} : { path: task.cwd }),
-            error: `WorkItem worktree is dirty: ${item.id}.`,
-            reason: "dirty-worktree",
-            resource: `work-item:${task.id}/${item.id}`,
-            retryable: true
-          };
-        }
-      }
-      for (const workspace of laneWorkspaces) {
-        if (workspace.owner.type !== "execution-lane") continue;
-        if (await this.preparer.inspectExecutionLaneWorkspace(
-          task.id,
-          workspace.owner.executionGroupId,
-          workspace.owner.executionLaneId
-        ) === "dirty") {
-          return {
-            taskId,
-            status: "retained-dirty",
-            ...(task.cwd === undefined ? {} : { path: task.cwd }),
-            error: `Execution Lane worktree is dirty: ${managedWorkspaceKey(workspace.owner)}.`,
-            reason: "dirty-worktree",
-            resource: managedWorkspaceKey(workspace.owner),
-            retryable: true
-          };
-        }
-      }
-      for (const workspace of integrationWorkspaces) {
-        if (workspace.owner.type !== "integration-attempt") continue;
-        const attempt = this.store.getIntegrationAttempt(
-          task.id,
-          workspace.owner.integrationAttemptId
-        );
-        if (attempt === null
-          || attempt.status === "running"
-          || attempt.status === "blocked"
-          || attempt.status === "conflicted"
-          || attempt.status === "validating") {
-          throw new Error(
-            `IntegrationAttempt must be terminal before archive cleanup: ${
-              workspace.owner.integrationAttemptId
-            }.`
-          );
-        }
-        if (await this.preparer.inspectIntegrationWorkspace(task.id, attempt.id) === "dirty") {
-          return {
-            taskId,
-            status: "retained-dirty",
-            ...(task.cwd === undefined ? {} : { path: task.cwd }),
-            error: `Integration worktree is dirty: ${attempt.id}.`,
-            reason: "dirty-worktree",
-            resource: `integration-attempt:${task.id}/${attempt.id}`,
-            retryable: true
-          };
-        }
-      }
-      const state = await this.preparer.inspectTaskMainWorkspace(taskId);
-      if (state === "dirty") {
-        return {
-          taskId,
-          status: "retained-dirty",
-          ...(task.cwd === undefined ? {} : { path: task.cwd }),
-          error: `Task main worktree is dirty: ${task.id}.`,
-          reason: "dirty-worktree",
-          resource: `task-worktree:${task.id}`,
-          retryable: true
-        };
-      }
-      const activeRole = this.store.listRoles(taskId)
-        .find((role) => this.store.getActiveRun(taskId, role.name) !== null);
-      if (activeRole !== undefined) {
-        throw new WorkspaceCleanupBlockedError(
-          "active-turn",
-          `role:${task.id}/${activeRole.name}`,
-          true,
-          `Task Role still has an active AgentRun: ${task.id}/${activeRole.name}.`
-        );
-      }
+      if (checks.length > 0) throw new CleanupInspectionError(checks);
       const roleNames = this.store.listRoles(taskId).map(({ name }) => name);
       await this.#stopLiveRoles(taskId, roleNames);
       await this.runtime.assertTaskPhysicalResourcesReleased?.(task.id);
@@ -374,7 +292,8 @@ export class TaskWorkspaceCoordinator {
         if (workspace.owner.type === "integration-attempt") {
           await this.preparer.cleanupIntegrationWorkspace(
             task.id,
-            workspace.owner.integrationAttemptId
+            workspace.owner.integrationAttemptId,
+            { preserveChanges: true }
           );
         }
       }
@@ -391,15 +310,19 @@ export class TaskWorkspaceCoordinator {
         );
       }
       this.#assertTaskArchiveLifecycle(task);
-      return this.preparer.cleanupTaskForArchive(taskId);
+      return this.preparer.cleanupTaskForArchive(taskId, disposition);
     } catch (error) {
       const task = this.store.getTask(taskId);
       return {
         taskId,
-        status: "failed",
+        status: error instanceof CleanupInspectionError && error.checks.every(c => c.reason === "dirty-worktree")
+          ? "retained-dirty" : "failed",
         ...(task?.cwd === undefined ? {} : { path: task.cwd }),
         error: error instanceof Error ? error.message : String(error),
-        ...(error instanceof WorkspaceCleanupBlockedError
+        ...(error instanceof CleanupInspectionError
+          ? { checks: error.checks, reason: error.checks[0]?.reason ?? "cleanup-failed",
+              resource: error.checks[0]?.resource ?? `task:${taskId}`, retryable: true }
+          : error instanceof WorkspaceCleanupBlockedError
           ? {
               reason: error.reason,
               resource: error.resource,
@@ -449,15 +372,8 @@ export class TaskWorkspaceCoordinator {
     for (const role of this.store.listRoles(taskId)) {
       const released = await attempt({ resource: `role:${taskId}/${role.name}`,
         detail: "Exact Role runtime stop." }, async () => {
-        const provider = this.store.getTaskRoleSessionSet(taskId, role.name)?.providerBinding;
-        const mailbox = this.store.getWorkMailbox({ kind: "role", taskId, roleName: role.name });
-        if (mailbox?.processing != null && (provider?.run == null
-          || !["completed", "failed", "cancelled"].includes(provider.run.status))) {
-          throw new Error(`Original mailbox claim ${mailbox.processing.batchId} retained; execution outcome is not known.`);
-        }
-        if (provider?.run != null && !["completed", "failed", "cancelled"].includes(provider.run.status)) {
-          throw new Error(`Provider input ${provider.run.attemptId}/${provider.run.status} retained; establish exact quiescence before resolving it.`);
-        }
+        const checks = archiveExecutionChecks(this.store, taskId).filter(c => c.resource === `role:${taskId}/${role.name}`);
+        if (checks.length > 0) throw new CleanupInspectionError(checks);
         await this.#stopLiveRoles(taskId, [role.name]);
         return "released";
       });
@@ -465,12 +381,8 @@ export class TaskWorkspaceCoordinator {
     }
     const physicalReleased = await attempt({ resource: `runtime:${taskId}`,
       detail: "Verify exact physical resource release before workspace deletion." }, async () => {
-      const activeRun = this.store.listRuns(taskId).find(r => r.status === "active");
-      const job = this.store.listDurableJobs(taskId).find(j =>
-        ["queued", "running", "unknown-needs-attention"].includes(j.status));
-      if (activeRun !== undefined || job !== undefined) {
-        throw new Error(`Execution resources retained: ${activeRun?.id ?? job?.id}; archive is not proof of quiescence.`);
-      }
+      const checks = archiveExecutionChecks(this.store, taskId);
+      if (checks.length > 0) throw new CleanupInspectionError(checks);
       if (!runtimeReleased) throw new Error("One or more Role runtimes could not be safely released.");
       if (this.runtime.assertTaskPhysicalResourcesReleased === undefined) {
         throw new Error("Physical resource release inspection is unavailable; workspace references retained.");
@@ -510,7 +422,7 @@ export class TaskWorkspaceCoordinator {
                 return this.preparer.cleanupExecutionLaneWorkspace(taskId, owner.executionGroupId, owner.executionLaneId);
               case "integration-attempt":
                 if (await this.preparer.inspectIntegrationWorkspace(taskId, owner.integrationAttemptId) === "dirty") return "dirty";
-                return this.preparer.cleanupIntegrationWorkspace(taskId, owner.integrationAttemptId);
+                return this.preparer.cleanupIntegrationWorkspace(taskId, owner.integrationAttemptId, { preserveChanges: true });
               case "task": {
                 const current = this.store.getTask(taskId)!;
                 const delivery = projectTaskRemoteDeliveryFromStore(this.store, current);
@@ -529,7 +441,7 @@ export class TaskWorkspaceCoordinator {
                     if (actual.baseCommit !== expected) throw new Error(`Task main HEAD changed: ${entry.path}; retained.`);
                   }
                 }
-                const result = await this.preparer.cleanupTaskForArchive(taskId);
+                const result = await this.preparer.cleanupTaskForArchive(taskId, disposition);
                 if (result.status !== "removed") throw new Error(result.error ?? "Task main or dependent workspace retained.");
                 return "removed";
               }

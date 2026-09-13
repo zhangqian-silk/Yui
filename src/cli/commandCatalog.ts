@@ -494,6 +494,12 @@ const taskChildren: readonly NodeInput[] = [
     options: ["--json"]
   },
   {
+    name: "archive-preflight",
+    summary: "Inspect current archive and exact-owner cleanup blockers without changing state or authorizing removal.",
+    usage: "yui task archive-preflight <id> (--integrated|--abandon) [--force] [--json]",
+    options: ["--integrated", "--abandon", "--force", "--json"]
+  },
+  {
     name: "archive",
     summary: "Archive a terminal Task; explicit --force commits despite delivery/cleanup warnings, retaining unsafe resources.",
     usage: "yui task archive <id> (--integrated|--abandon) [--force]",
@@ -1577,7 +1583,7 @@ export const ROOT_COMMAND = buildNode({
       name: "task",
       summary: "Manage Tasks, WorkItems, AgentRuns, and integration.",
       sections: [
-        { id: "lifecycle", title: "Lifecycle", entries: ["create", "project", "base", "update", "activate", "activation", "execution", "complete", "cancel", "reopen", "retire", "list", "show", "context", "next-action", "remote-delivery", "archive", "replace", "reconcile", "upstream", "artifact"] },
+        { id: "lifecycle", title: "Lifecycle", entries: ["create", "project", "base", "update", "activate", "activation", "execution", "complete", "cancel", "reopen", "retire", "list", "show", "context", "next-action", "remote-delivery", "archive-preflight", "archive", "replace", "reconcile", "upstream", "artifact"] },
         { id: "collaboration", title: "Collaboration", entries: ["message", "input", "grant", "workflow", "publication", "work", "run", "review", "integration", "role", "overlap", "change-set"] },
         { id: "knowledge", title: "Task Knowledge", entries: ["brief", "decision", "milestone", "event", "continuation", "wake"] }
       ],
