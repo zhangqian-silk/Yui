@@ -25,18 +25,41 @@ and incident-specific scripts temporary. Remove their harnesses after the
 change, preserving useful reports. Real-resource results do not replace fast
 regressions, and fast regressions do not establish real-model behavior.
 
+## Coverage, not test count
+
+Keep three complementary kinds of evidence: a few normal paths through real
+entry points and component wiring; critical regressions for durable intent,
+idempotency, authority, isolation and historical storage; and cheap pure-logic
+checks for meaningful branching. A passing suite proves its assertions, not
+the absence of every bug.
+
+Pin constants that are persisted or public contracts (event names, protocol
+identifiers, historical encodings), with an independent literal expectation.
+Where possible, also prove the current reader understands migrated data.
+Do not derive expected and actual values from the same constant, or lock an
+internal default merely because it is a constant.
+
+Merge tests only when each assertion has an identified surviving scenario.
+Identical constant checks and repeated setup can be consolidated; similar
+names do not make Task and Global authority boundaries interchangeable.
+Do not target a particular test count or delete safety checks to hit a time
+budget. A temporary deliberate fault can confirm that a critical check detects
+its intended regression; no permanent mutation service or broad fault matrix
+is required.
+
 ## Permanent core smoke
 
 `npm test` and `npm run test:core` build the checkout and run one permanent suite:
 
-1. the packaged CLI starts and exposes setup/update/upgrade/Task commands;
+1. the built CLI starts and its catalog exposes setup/update/upgrade/Task commands;
 2. one normal SQLite Task and Message survive a reopen;
 3. a supported historical Home migrates through the linear storage chain to current;
 4. the built-in Codex and Claude Drivers are registered;
 5. one independent declarative plugin is created, validated, called and disabled
    through authenticated ingress, with its selection and validation preserved.
 6. a Task starts from durable Operator input, exposes planning Context and enters
-   delivery with its original intent and captured planning authority preserved.
+   delivery with its original intent and captured planning authority preserved;
+   scratch workspace release does not require a fabricated Git identity.
 7. Session replacement preserves pending original Messages and independent work;
    old Sessions keep scoped reads but cannot regain write authority;
 8. InputRequests survive Session replacement without a synthetic AgentRun;
@@ -86,12 +109,16 @@ regressions, and fast regressions do not establish real-model behavior.
     cumulative baselines, Session replacement and native child overlap. A small
     event fixture checks direct Leader/parallel time semantics and the shared
     CLI/Web/audit lifetime projection without collecting Provider data.
+20. explicit cleanup releases retained terminals without affecting other Tasks
+    or claiming that live resources are gone; Controller replacement waits for
+    the old process to exit.
 
 Keep the test phase seconds-scale; measure TypeScript build separately. Record
 incremental runtime when adding a critical regression. The seven recovery boundary
 cases initially add about 0.4 seconds of test bodies (about 0.6 seconds standalone,
-including module startup) on the development host. Avoid sleep-based checks or
-mandatory model/daemon launches in the permanent suite.
+including module startup) on the development host. Keep real-model launches out
+of this suite. Real tmux/CLI lifecycle checks belong to the bounded package smoke
+below, not a second core daemon matrix.
 The Integration continuation regressions use disposable Git repositories,
 SQLite and fake Jobs, without a provider or shared Home. Their test bodies
 take about 3 seconds on the development host; validation settlement adds
@@ -115,10 +142,22 @@ do not add prose-matching tests or claim model validation from static checks.
 
 ## CI and release
 
-`ci.yml` runs the core smoke plus one package-assembly/start check. It does not
-run a second lint pass or a separate broad regression suite. `publish.yml` reuses that
-exact gated commit and adds only tag, artifact, install, and provenance checks
-that are unique to publishing.
+`ci.yml` builds once and runs core plus one assembled-package normal-path smoke
+on every PR, without another lint or broad regression suite.
+`node scripts/smoke-runtime-package.mjs --assembled .release-stage` exercises
+the actual CLI/Controller/Host/SQLite and isolated tmux, replacing only the
+external Provider with a deterministic fixture. It covers setup, durable input
+and idempotency across restart, scratch activation, native result ingestion,
+completion preserving the conversation, and archive releasing live/dead panes
+and grouped viewers without affecting a similarly named neighboring session.
+The fixture owns a fresh Home and its PATH, installs cleanup before setup,
+and never calls an installed model Agent.
+
+`publish.yml` runs the same smoke against the freshly installed package through
+`YUI_INSTALLED_ROOT`, adding actual npm-bin, dependency, supported Node version,
+artifact and provenance boundaries. This validates runtime integration, not
+real-model behavior. Pure contract and safety tests remain in `test/core`;
+production wiring is exercised here rather than only through mocked ports.
 
 Configured Agents acting as developers or reviewers are ordinary execution
 resources. Using a live provider or model as the subject of validation is

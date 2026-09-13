@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { SqliteTaskStore } from "../../dist/storage/sqliteStore.js";
@@ -12,8 +12,9 @@ import { buildRunContextPack } from "../../dist/context/runContextPack.js";
 import { requestTaskActivation } from "../../dist/task/taskActivationService.js";
 import { terminalizeExactTaskRun } from "../../dist/lifecycle/exactRunTerminalization.js";
 import { FileTaskWorkspacePreparer } from "../../dist/repository/taskWorkspacePreparer.js";
+import { completeTask } from "../../dist/task/task.js";
 
-test("a Task starts from durable Operator intent and enters delivery after planning", async t => {
+test("a scratch Task preserves Operator intent through planning, activation and workspace release", async t => {
   const root = mkdtempSync(join(tmpdir(), "yui-task-start-smoke-"));
   const home = join(root, "home");
   const workspace = join(root, "workspace");
@@ -43,10 +44,21 @@ test("a Task starts from durable Operator intent and enters delivery after plann
     taskId: task.id, roleName: "leader", agentId: "codex", runId: run.id,
     outcome: { status: "completed", output: "Planning captured; delivery requested." }
   }, now));
-  await new FileTaskWorkspacePreparer(home, store, undefined, () => now).activateTaskWorkspace(task.id);
+  const preparer = new FileTaskWorkspacePreparer(home, store, undefined, () => now);
+  await preparer.activateTaskWorkspace(task.id);
   assert.equal(store.getTask(task.id).status, "active");
   assert.equal(store.getTask(task.id).activationRequest.disposition, "adopted");
   assert.equal(store.getRun(task.id, run.id).effective.executionAuthority, "planning");
   assert.equal(store.listMessages(task.id)[0].body, "Produce the requested result and preserve its evidence.");
   assert.ok(store.getWorkMailbox({ kind: "role", taskId: task.id, roleName: "leader" })?.pending);
+  const active = store.getTask(task.id);
+  const scratch = store.getTaskWorkspace(task.id);
+  assert.equal(active.workspaceIdentity, undefined, "Scratch environments do not fabricate a Git identity.");
+  assert.deepEqual(scratch.entries, []);
+  assert.equal(await preparer.inspectTaskMainWorkspace(task.id), "missing");
+  store.saveTask(completeTask(active, now, { by: "user", summary: "Scratch work accepted" }));
+  assert.equal((await preparer.cleanupTaskForArchive(task.id, "abandoned")).status, "removed");
+  assert.equal(store.getTaskWorkspace(task.id), null);
+  assert.equal(existsSync(scratch.root), false);
+  assert.equal(store.listMessages(task.id)[0].body, "Produce the requested result and preserve its evidence.");
 });

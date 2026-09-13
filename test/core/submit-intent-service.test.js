@@ -160,12 +160,6 @@ test("develop on an unplanned Draft records a submit-develop activation and queu
   assert.equal(request.operation.requestId, `submit-${result.message.id}`);
   // A submit-develop immediate request is Controller-adoptable (§2.4).
   assert.equal(activationRequestIsControllerAdoptable(request), true);
-});
-
-test("develop stays a Draft: it never activates the Task itself", (t) => {
-  const store = newStore(t);
-  const task = newDraft(store);
-  userSubmit(store, task.id, "build it", "develop");
   // The request is recorded but Task.status is still the only lifecycle: the
   // shared service records the request and queues processing; it does not flip
   // the Task to active inside the submission transaction.
@@ -214,29 +208,20 @@ test("develop on a stopped-gate Draft saves the message but records no activatio
   assert.equal(store.getTask(task.id).activationRequest, undefined);
 });
 
-test("discuss on an active Task is delivery context and never downgrades to Draft", (t) => {
+test("active Task submissions preserve execution state for both discuss and develop", (t) => {
   const store = newStore(t);
   const active = activateTask(createTask(store.nextTaskId(), "Active task", now()), now());
   store.saveTask(active);
-  const result = userSubmit(store, active.id, "a delivery note", "discuss");
-
-  assert.equal(result.feedback.phase, "active");
-  assert.equal(result.feedback.planning, "none");
-  assert.equal(result.feedback.delivery, "queued");
-  assert.equal(result.queuedForLeader, true);
-  assert.equal(store.getTask(active.id).status, "active");
-  assert.equal(events(store, active.id, "task.planning-entered").length, 0);
-});
-
-test("develop on an active Task never re-activates it", (t) => {
-  const store = newStore(t);
-  const active = activateTask(createTask(store.nextTaskId(), "Active task", now()), now());
-  store.saveTask(active);
-  const result = userSubmit(store, active.id, "keep building", "develop");
-
-  assert.equal(result.feedback.phase, "active");
-  assert.equal(result.feedback.delivery, "queued");
-  assert.equal(store.getTask(active.id).activationRequest, undefined);
+  for (const intent of ["discuss", "develop"]) {
+    const result = userSubmit(store, active.id, "a delivery note", intent);
+    assert.equal(result.feedback.phase, "active");
+    assert.equal(result.feedback.planning, "none");
+    assert.equal(result.feedback.delivery, "queued");
+    assert.equal(result.queuedForLeader, true);
+    assert.equal(store.getTask(active.id).status, "active");
+    assert.equal(events(store, active.id, "task.planning-entered").length, 0);
+    assert.equal(store.getTask(active.id).activationRequest, undefined);
+  }
 });
 
 test("an operator submission carries user authority and enters planning like a user discuss", (t) => {

@@ -18,17 +18,32 @@ Yui 是一个单用户本地产品。永久验证保护关键的 happy path 和�
 完成后移除它们的 harness，并保留有用的报告。真实资源结果不替代快速回归，快速回归也
 不确立真实模型行为。
 
+## 关注覆盖，而不是测试数量
+
+保留三类互补证据：经过真实入口和组件组装的少量正常链路；保护持久意图、幂等、权限、
+隔离和历史存储的关键回归；覆盖有意义分支的低成本纯逻辑检查。全绿证明断言成立，
+不证明不存在任何缺陷。
+
+持久化或公开契约中的常量值得固定，例如事件名、协议标识和历史编码；保留独立字面值
+期望，并尽量证明当前读取逻辑能理解迁移后的数据。不要让预期值和实际值都来自同一个
+常量，也不因内部默认值是常量就锁死它。
+
+合并测试前，明确每项断言由哪个保留场景继续保护。相同常量检查和重复初始化可以合并，
+但名称相似不代表 Task 与 Global 权限边界可互相替代。不以数量为目标，也不为耗时
+预算删除安全检查。可临时引入明确错误来确认关键检查能拦截对应回归，无需永久变异
+测试服务或宽泛故障矩阵。
+
 ## 永久 core smoke
 
 `npm test` 和 `npm run test:core` 构建 checkout 并运行一个永久套件：
 
-1. 打包后的 CLI 能启动，并暴露 setup/update/upgrade/Task 命令；
+1. 构建后的 CLI 能启动，命令目录暴露 setup/update/upgrade/Task 命令；
 2. 一个普通的 SQLite Task 和 Message 能在重开后存活；
 3. 一个受支持的历史 Home 沿线性存储链迁移到当前版本；
 4. 内置的 Codex 与 Claude Driver 已注册；
 5. 一个独立的声明式插件通过认证入口被创建、验证、调用和停用，其选择和验证被保留。
 6. 一个 Task 从持久的 Operator 输入启动，暴露规划 Context，并在原始意图和捕获的
-   planning 权限被保留的情况下进入交付。
+   planning 权限被保留的情况下进入交付；scratch 工作区释放不要求虚构 Git 身份。
 7. Session 替换保留待处理的原始 Message 和独立工作；旧 Session 保留范围受限的读取，
    但不能重获写权限；
 8. InputRequest 在没有合成 AgentRun 的情况下经受 Session 替换；
@@ -64,10 +79,13 @@ Yui 是一个单用户本地产品。永久验证保护关键的 happy path 和�
 19. Task 用量在精确请求、累计基线、Session 替换和原生子执行重叠下区分真实零、
     部分与未知。小型事件 fixture 覆盖直接 Leader/并行耗时，以及 CLI/Web/audit
     共享的全生命周期投影，不采集 Provider 数据。
+20. 明确清理释放保留终端、不影响其他 Task、不把存活资源报告为已释放；
+    Controller 替换确认旧进程退出。
 
 把测试阶段保持在秒级；单独度量 TypeScript 构建。新增一个关键回归时记录其增量运行
 时长。这七个恢复边界用例在开发主机上最初约增加 0.4 秒的测试体（独立运行约 0.6 秒，
-含模块启动）。避免在永久套件中使用基于 sleep 的检查或强制的模型/daemon 启动。
+含模块启动）。真实模型调用不进入该套件；真实 tmux/CLI 生命周期由下面有界的
+package smoke 覆盖，不在 core 中维护第二套 daemon 矩阵。
 归档预检新增三个可丢弃 Git/SQLite 场景，测试体约一秒；更广的 owner/诊断组合
 保留为临时验证证据，不形成第二套永久矩阵。
 
@@ -83,9 +101,18 @@ package-start 检查跟随已安装树中的本地 Skill 引用，包括跨 Role
 
 ## CI 与发布
 
-`ci.yml` 运行 core smoke 加一个包装配/启动检查。它不运行第二遍 lint，也不运行单独的
-宽泛回归套件。`publish.yml` 复用那个确切的、已过门的提交，只增加发布独有的 tag、
-产物、安装和 provenance 检查。
+`ci.yml` 在每个 PR 上构建一次，运行 core 及一个组装包正常链路检查，不重复 lint，
+也不增加宽泛回归套件。
+`node scripts/smoke-runtime-package.mjs --assembled .release-stage` 经过真实
+CLI/Controller/Host/SQLite 与隔离 tmux，仅用确定性夹具替换外部 Provider。它验证
+setup、输入跨重启持久化及幂等、scratch 激活、原生结果入库、完成后保留会话，以及
+归档释放活/死 pane 和附属查看 session，且不影响相似名称的相邻 session。
+夹具拥有新建 Home 和独立 PATH，在 setup 前建立清理责任，不调用安装的真实模型 Agent。
+
+`publish.yml` 通过 `YUI_INSTALLED_ROOT` 对刚安装的包执行同一个 smoke，增加真实
+npm bin、依赖、受支持 Node 版本、产物和 provenance 边界。这证明运行时集成，不证明
+真实模型行为。纯契约与安全检查保留在 `test/core`，生产组件组装在这里验证，
+不只依赖模拟端口。
 
 作为开发者或审查者的已配置 Agent 是普通执行资源。把一个真实 provider 或模型作为验证
 对象则不同：付费 API、共享 Home、生产系统、真实账号额度以及其他不可丢弃的外部效果，

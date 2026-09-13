@@ -5,8 +5,7 @@ import {
   decideSubmissionRouting,
   describeSubmissionFeedback,
   draftActivationState,
-  normalizeSubmissionIntent,
-  TASK_PLANNING_ENTERED_EVENT
+  normalizeSubmissionIntent
 } from "../../dist/task/taskSubmission.js";
 
 const EMPTY_PLAN = { kind: "empty" };
@@ -23,10 +22,6 @@ function route(overrides) {
     ...overrides
   });
 }
-
-test("planning-entered event constant is stable", () => {
-  assert.equal(TASK_PLANNING_ENTERED_EVENT, "task.planning-entered");
-});
 
 test("normalizeSubmissionIntent defaults an omitted intent to discuss", () => {
   assert.equal(normalizeSubmissionIntent(undefined), "discuss");
@@ -190,13 +185,9 @@ function feedback(overrides) {
   });
 }
 
-test("feedback always states the saved facet", () => {
-  const result = feedback({ routing: { kind: "record" } });
-  assert.deepEqual(result.saved, { taskId: "task-1", messageId: "message-1" });
-});
-
 test("record feedback: saved, unplanned, nothing queued or activated", () => {
   const result = feedback({ routing: { kind: "record" } });
+  assert.deepEqual(result.saved, { taskId: "task-1", messageId: "message-1" });
   assert.equal(result.phase, "draft-unplanned");
   assert.equal(result.planning, "none");
   assert.equal(result.activation, "none");

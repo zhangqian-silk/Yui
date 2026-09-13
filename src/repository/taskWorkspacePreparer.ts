@@ -2633,6 +2633,7 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
     if (main.owner.type !== "task") {
       throw new Error(`Task main workspace ownership is invalid: ${task.id}.`);
     }
+    if (main.entries.length === 0) return "missing";
     return this.#inspectEntries(task.id, this.#taskSegment(task), MAIN_WORKTREE, main.entries);
   }
 
@@ -2655,7 +2656,8 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
     if (main !== null) {
       await this.#assertWorkspaceCleanup(main, disposition);
       assertTaskArchiveState(requireTask(this.store, task.id), task);
-      if (await this.#inspectEntries(
+      // Scratch-only workspaces have no Git entries or Git workspace identity.
+      if (main.entries.length > 0 && await this.#inspectEntries(
         task.id,
         this.#taskSegment(task),
         MAIN_WORKTREE,

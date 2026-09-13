@@ -6,6 +6,7 @@ let upgraded = false;
 let turnSequence = 0;
 let activeTurnId;
 const controlled = process.env.YUI_FAKE_CONTROLLED === "1";
+const threadId = process.env.YUI_FAKE_THREAD_ID ?? "fake-thread-1";
 
 process.stdin.on("data", (chunk) => {
   input = Buffer.concat([input, chunk]);
@@ -76,10 +77,13 @@ function handleMessage(message) {
   const respond = (result) => sendJson({ id: message.id, result });
   switch (message.method) {
     case "initialize":
-      respond({ codexHome: "/tmp/fake-codex-home" });
+      respond({ codexHome: process.env.CODEX_HOME ?? "/tmp/fake-codex-home" });
       break;
     case "thread/start":
-      respond({ thread: { id: "fake-thread-1" } });
+      respond({ thread: { id: threadId } });
+      break;
+    case "thread/resume":
+      respond({ thread: { id: message.params.threadId, status: { type: "idle" }, turns: [] } });
       break;
     case "thread/name/set":
       respond({});
@@ -87,7 +91,7 @@ function handleMessage(message) {
     case "thread/read":
       respond({
         thread: {
-          id: "fake-thread-1",
+          id: message.params.threadId ?? threadId,
           status: { type: activeTurnId === undefined ? "idle" : "active" },
           turns: activeTurnId === undefined ? [] : [{ id: activeTurnId, status: "inProgress", items: [] }]
         }
@@ -96,23 +100,29 @@ function handleMessage(message) {
     case "thread/goal/get":
       respond({ goal: null });
       break;
+    case "thread/backgroundTerminals/clean":
+      respond({});
+      break;
+    case "thread/backgroundTerminals/list":
+      respond({ data: [], nextCursor: null });
+      break;
     case "turn/start":
       turnSequence += 1;
-      const turnId = controlled ? `fake-turn-${turnSequence}` : "fake-turn-1";
+      const turnId = `fake-turn-${turnSequence}`;
       if (controlled) activeTurnId = turnId;
       respond({ turn: { id: turnId } });
       setImmediate(() => {
         sendJson({
           method: "turn/started",
-          params: { threadId: "fake-thread-1", turn: { id: turnId } }
+          params: { threadId, turn: { id: turnId } }
         });
         if (controlled) return;
         sendJson({
           method: "turn/completed",
           params: {
-            threadId: "fake-thread-1",
+            threadId,
             turn: {
-              id: "fake-turn-1",
+              id: turnId,
               status: "completed",
               items: [{ id: "item-1", type: "agentMessage", text: "Native Codex result." }]
             }
@@ -128,7 +138,7 @@ function handleMessage(message) {
       activeTurnId = undefined;
       setImmediate(() => sendJson({
         method: "turn/completed",
-        params: { threadId: "fake-thread-1", turn: {
+        params: { threadId, turn: {
           id: `fake-turn-${turnSequence}`, status: "interrupted", items: []
         } }
       }));

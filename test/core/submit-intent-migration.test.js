@@ -3,12 +3,11 @@ import test from "node:test";
 import Database from "better-sqlite3";
 
 import { migrateSubmitIntent } from "../../dist/storage/migrations/submitIntent.js";
-import { TASK_PLANNING_ENTERED_EVENT } from "../../dist/task/taskSubmission.js";
+import { TASK_PLANNING_ENTERED_EVENT, draftHasEnteredPlanning } from "../../dist/task/taskSubmission.js";
 import {
   applySubmitIntentFixtureSchema,
   buildSubmitIntentFixtureRows,
   createSubmitIntentFixtureDatabase,
-  seedSubmitIntentFixture,
   SUBMIT_INTENT_UNAFFECTED_TASKS
 } from "../fixtures/submitIntentFixture.mjs";
 
@@ -22,13 +21,10 @@ function planningEnteredEvents(db, taskId) {
     .sort((a, b) => Number(a.eventId.slice("event-".length)) - Number(b.eventId.slice("event-".length)));
 }
 
-test("the migration event type matches the runtime planning-entered constant", () => {
-  // Tripwire: the helper inlines the literal so a released migration stays
-  // frozen; this asserts the inlined value never diverges from the owner.
-  assert.equal(PLANNING_ENTERED, TASK_PLANNING_ENTERED_EVENT);
-});
-
-test("submit-intent migration derives planning-entered exactly where expected", () => {
+test("historical planning events retain their wire name and are read by the current runtime", () => {
+  // This literal is a stored contract, not an internal tuning constant. Keep
+  // the independent expectation next to the actual migration/reader check.
+  assert.equal(TASK_PLANNING_ENTERED_EVENT, PLANNING_ENTERED);
   const db = createSubmitIntentFixtureDatabase();
   const { expectedPlanningEntered } = buildSubmitIntentFixtureRows();
   try {
@@ -42,6 +38,12 @@ test("submit-intent migration derives planning-entered exactly where expected", 
         `${taskId} planning-entered must reference ${messageId}`);
       // Intent is recorded as discuss and never inferred from the body.
       assert.equal(rows[0].event.payload.intent, "discuss");
+      assert.equal(draftHasEnteredPlanning({
+        listEvents: () => rows.map(row => row.event),
+        listRuns: () => [],
+        getTaskRoleSessionSet: () => null
+      }, { id: taskId, status: "draft" }), true,
+      "Current planning must recognize the historical stored event, without a Run or Session.");
     }
 
     for (const taskId of SUBMIT_INTENT_UNAFFECTED_TASKS) {
@@ -57,10 +59,14 @@ test("submit-intent migration derives planning-entered exactly where expected", 
   }
 });
 
-test("submit-intent migration is idempotent across repeated runs", () => {
+test("submit-intent migration preserves original events and is idempotent across repeated runs", () => {
   const db = createSubmitIntentFixtureDatabase();
   try {
+    const originalMessages = db.prepare("SELECT task_id, event_id, payload FROM events WHERE type = 'message.sent' ORDER BY task_id, event_id").all();
     migrateSubmitIntent(db);
+    assert.deepEqual(
+      db.prepare("SELECT task_id, event_id, payload FROM events WHERE type = 'message.sent' ORDER BY task_id, event_id").all(),
+      originalMessages, "migration must not touch existing message.sent events");
     const first = db.prepare("SELECT task_id, event_id, type, occurred_at, payload FROM events ORDER BY task_id, event_id").all();
     migrateSubmitIntent(db);
     migrateSubmitIntent(db);
@@ -129,20 +135,6 @@ test("submit-intent migration on an empty database is a no-op", () => {
     applySubmitIntentFixtureSchema(db);
     migrateSubmitIntent(db);
     assert.equal(db.prepare("SELECT count(*) AS n FROM events").get().n, 0);
-  } finally {
-    db.close();
-  }
-});
-
-test("submit-intent migration preserves the seeded message.sent events untouched", () => {
-  const db = new Database(":memory:");
-  try {
-    applySubmitIntentFixtureSchema(db);
-    seedSubmitIntentFixture(db);
-    const before = db.prepare("SELECT task_id, event_id, payload FROM events WHERE type = 'message.sent' ORDER BY task_id, event_id").all();
-    migrateSubmitIntent(db);
-    const after = db.prepare("SELECT task_id, event_id, payload FROM events WHERE type = 'message.sent' ORDER BY task_id, event_id").all();
-    assert.deepEqual(after, before, "migration must not touch existing message.sent events");
   } finally {
     db.close();
   }
