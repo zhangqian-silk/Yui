@@ -25,6 +25,7 @@ not a claim that every real Provider scenario has been validated.
 | How are records referenced inside a Task? | [Task-local identity](../task-local-identity.md) |
 | How do Roles, Profiles and run configuration take effect? | [Roles and configuration](../roles-and-configuration.md) |
 | How do delivery, integration and archive work? | [Task delivery](../task-delivery.md) |
+| What does Project refresh synchronize, and how are partial failures reported? | [Project refresh](../project-refresh.md) |
 | How do Provider, ACP and configuration facts connect? | [Provider runtime](../provider-runtime.md) |
 | Who interprets runtime observations and errors? | [Agent Drivers](../agent-runtime-drivers.md) |
 | How are plugins created, validated and adopted? | [Plugin SDK](../plugin-sdk.md) |

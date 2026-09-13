@@ -21,11 +21,37 @@ export type PreparedGitWorktree = Readonly<{
 
 export type GitWorkspaceRemoval = "removed" | "missing" | "dirty";
 export type GitWorkspaceState = "missing" | "clean" | "dirty";
+export type GitRefreshTracking =
+  | Readonly<{ status: "unmanaged"; reason: string }>
+  | Readonly<{
+    status: "current" | "updated" | "failed";
+    remoteName: string;
+    ref: string;
+    fromCommit: string | null;
+    toCommit: string | null;
+    reason?: string;
+  }>;
 export type GitWorkspaceRefresh = Readonly<{
   fromCommit: string;
   toCommit: string;
   changed: boolean;
+  tracking: GitRefreshTracking;
 }>;
+
+/** Observed partial effects, not a rollback or permission to replay a refresh. */
+export class GitWorkspaceRefreshError extends Error {
+  constructor(message: string, readonly result: Readonly<{
+    fromCommit: string;
+    toCommit: string | null;
+    changed: boolean | null;
+    verifiedCommit?: string;
+    tracking: GitRefreshTracking;
+    temporaryRef?: string;
+  }>, options?: ErrorOptions) {
+    super(message, options);
+    this.name = "GitWorkspaceRefreshError";
+  }
+}
 
 /** A remote branch resolved without changing the caller's checkout. */
 export type GitRemoteHead = Readonly<{
@@ -481,55 +507,124 @@ export class NodeGitWorkspace implements GitWorkspacePort {
       initial.baseCommit
     );
     const stableBranch = configuredStableRef === "HEAD"
-      ? await resolveRemoteHeadBranch(remote)
+      ? await resolveRemoteHeadBranch(remote, initial.root)
       : configuredStableRef;
     if (stableBranch !== configuredStableRef) {
       await this.#assertRefreshCheckout(initial.root, stableBranch, initial.baseCommit);
     }
 
-    const stableRemoteRef = `refs/heads/${stableBranch}`;
-    await git(["-C", initial.root, "fetch", "--no-tags", remote, stableRemoteRef]);
-    const fetchedCommit = (await gitLine([
-      "-C", initial.root,
-      "rev-parse", "--verify", "--end-of-options", "FETCH_HEAD^{commit}"
-    ])).toLowerCase();
-
-    // The advertised SHA must match what was fetched. A network race, a ref
-    // that moved mid-fetch, or any inconsistency fails closed: the stable
-    // checkout is never advanced to an unverified commit.
-    const advertisedCommit = await resolveRemoteBranchCommit(remote, stableBranch);
-    if (fetchedCommit !== advertisedCommit) {
-      throw new Error(
-        `Project remote stable branch changed while it was fetched: ${stableBranch}.`
+    const mapping = await resolveFetchTracking(initial.root, remote, stableBranch);
+    const previous = mapping.status === "managed"
+      ? await readDirectTrackingRef(initial.root, mapping.ref)
+      : null;
+    let tracking: GitRefreshTracking = mapping.status === "managed"
+      ? { status: "current", remoteName: mapping.remoteName, ref: mapping.ref,
+        fromCommit: previous, toCommit: previous }
+      : { status: "unmanaged", reason: mapping.reason };
+    const temporaryRef = `refs/yui/project-refresh/${randomBytes(16).toString("hex")}`;
+    let fetchedCommit: string | undefined;
+    let verifiedCommit: string | undefined;
+    let failure: unknown;
+    let cleanupFailed = false;
+    const assertMapping = async (): Promise<void> => {
+      const current = await resolveFetchTracking(initial.root, remote, stableBranch);
+      if (JSON.stringify(current) !== JSON.stringify(mapping)) {
+        throw new Error("Project fetch URL or tracking mapping changed during refresh.");
+      }
+    };
+    try {
+      // An empty refmap disables opportunistic tracking updates even when the
+      // Project URL is a named remote. Ignore configured prune/submodule effects.
+      await git([
+        "-C", initial.root, "fetch", "--no-tags", "--no-prune", "--no-prune-tags",
+        "--no-recurse-submodules", "--no-auto-maintenance", "--no-write-fetch-head", "--refmap=",
+        remote, `refs/heads/${stableBranch}:${temporaryRef}`
+      ]);
+      fetchedCommit = await resolveFetchedCommit(initial.root, temporaryRef);
+      const advertisedCommit = await resolveRemoteBranchCommit(remote, stableBranch, initial.root);
+      if (fetchedCommit !== advertisedCommit) {
+        throw new Error(
+          `Project remote stable branch changed while it was fetched: ${stableBranch}.`
+        );
+      }
+      verifiedCommit = fetchedCommit;
+      await assertMapping();
+      await this.#assertRefreshCheckout(initial.root, stableBranch, initial.baseCommit);
+      if (fetchedCommit !== initial.baseCommit) {
+        if (!await this.isAncestor(initial.root, initial.baseCommit, fetchedCommit)) {
+          throw new Error(
+            `Project checkout cannot be fast-forwarded from ${initial.baseCommit} to ${fetchedCommit}.`
+          );
+        }
+        await git(["-C", initial.root, "merge", "--ff-only", "--no-edit", fetchedCommit]);
+      }
+      await this.#assertRefreshCheckout(initial.root, stableBranch, fetchedCommit);
+      await assertMapping();
+      if (mapping.status === "managed") {
+        // Do not follow a symbolic tracking ref into somebody else's branch.
+        await readDirectTrackingRef(initial.root, mapping.ref);
+        const old = previous ?? "0".repeat(fetchedCommit.length);
+        // Verify the stable branch and CAS the one configured destination in
+        // the same Git transaction. HEAD/index/worktree still use normal ff.
+        await git(["-C", initial.root, "update-ref", "--stdin"], [
+          "start", "option no-deref",
+          `verify refs/heads/${stableBranch} ${fetchedCommit}`,
+          "option no-deref",
+          `update ${mapping.ref} ${fetchedCommit} ${old}`,
+          "prepare", "commit", ""
+        ].join("\n"));
+        tracking = {
+          status: previous === fetchedCommit ? "current" : "updated",
+          remoteName: mapping.remoteName, ref: mapping.ref,
+          fromCommit: previous, toCommit: fetchedCommit
+        };
+      }
+      await this.#assertRefreshCheckout(initial.root, stableBranch, fetchedCommit);
+      await assertMapping();
+      if (mapping.status === "managed"
+        && await readDirectTrackingRef(initial.root, mapping.ref) !== fetchedCommit) {
+        throw new Error(`Project tracking ref changed after refresh: ${mapping.ref}.`);
+      }
+    } catch (error) {
+      failure = error;
+    } finally {
+      if (fetchedCommit !== undefined) {
+        cleanupFailed = !await gitSucceeds([
+          "-C", initial.root, "update-ref", "--no-deref", "-d", temporaryRef, fetchedCommit
+        ]);
+        if (cleanupFailed && failure === undefined) {
+          failure = new Error(`Project refresh temporary ref cleanup failed: ${temporaryRef}.`);
+        }
+      }
+    }
+    if (failure !== undefined) {
+      const head = await this.inspect(initial.root, "HEAD").then((value) => value.baseCommit, () => null);
+      const detail = failure instanceof Error ? failure.message : String(failure);
+      if (mapping.status === "managed") {
+        tracking = {
+          status: "failed", remoteName: mapping.remoteName, ref: mapping.ref,
+          fromCommit: previous,
+          toCommit: await readDirectTrackingRef(initial.root, mapping.ref).catch(() => null),
+          reason: detail
+        };
+      }
+      throw new GitWorkspaceRefreshError(
+        `Project refresh failed: ${detail} HEAD ${initial.baseCommit} -> ${head ?? "unknown"}; ` +
+        (tracking.status === "unmanaged" ? `tracking unmanaged: ${tracking.reason}` :
+          `tracking ${tracking.ref}: ${tracking.fromCommit ?? "absent"} -> ${tracking.toCommit ?? "absent or unreadable"}`) +
+        (cleanupFailed ? `; temporary ref retained: ${temporaryRef}` : ""),
+        { fromCommit: initial.baseCommit, toCommit: head,
+          changed: head === null ? null : head !== initial.baseCommit,
+          ...(verifiedCommit === undefined ? {} : { verifiedCommit }), tracking,
+          ...(cleanupFailed || fetchedCommit === undefined ? { temporaryRef } : {}) },
+        { cause: failure }
       );
     }
-
-    await this.#assertRefreshCheckout(initial.root, stableBranch, initial.baseCommit);
-    if (fetchedCommit === initial.baseCommit) {
-      return {
-        fromCommit: initial.baseCommit,
-        toCommit: fetchedCommit,
-        changed: false
-      };
-    }
-    if (!await gitSucceeds([
-      "-C", initial.root,
-      "merge-base", "--is-ancestor", initial.baseCommit, fetchedCommit
-    ])) {
-      throw new Error(
-        `Project checkout cannot be fast-forwarded from ${initial.baseCommit} to ${fetchedCommit}.`
-      );
-    }
-
-    await git([
-      "-C", initial.root,
-      "merge", "--ff-only", "--no-edit", fetchedCommit
-    ]);
-    await this.#assertRefreshCheckout(initial.root, stableBranch, fetchedCommit);
     return {
       fromCommit: initial.baseCommit,
-      toCommit: fetchedCommit,
-      changed: true
+      toCommit: verifiedCommit!,
+      changed: initial.baseCommit !== verifiedCommit,
+      tracking
     };
   }
 
@@ -885,42 +980,15 @@ export class NodeGitWorkspace implements GitWorkspacePort {
     branch: string;
   }>): Promise<GitRemoteTrackingRef | null> {
     const root = (await this.inspect(input.repositoryPath)).root;
-    const wantedUrl = requireText(input.remoteUrl, "Project remote URL");
-    let output: string;
-    try {
-      output = await git([
-        "-C", root,
-        "config", "--get-regexp", "--null",
-        "^remote\\..*\\.url$"
-      ]);
-    } catch {
-      return null;
-    }
-    const records = output.split("\0").filter((record) => record.length > 0);
-    const matches: Array<Readonly<{ remoteName: string; url: string }>> = [];
-    for (const record of records) {
-      const separator = record.indexOf("\n");
-      if (separator < 0) continue;
-      const key = record.slice(0, separator).trim();
-      const url = record.slice(separator + 1).trim();
-      const prefix = "remote.";
-      const suffix = ".url";
-      if (!key.startsWith(prefix) || !key.endsWith(suffix) || url !== wantedUrl) continue;
-      matches.push({ remoteName: key.slice(prefix.length, -suffix.length), url });
-    }
-    if (matches.length !== 1) return null;
-    const remoteName = requireText(matches[0]!.remoteName, "Git remote name");
     const branch = await safeFetchBranch(input.branch);
-    const ref = `refs/remotes/${remoteName}/${branch}`;
-    if (!await gitSucceeds(["check-ref-format", ref])) {
-      throw new Error("Git remote tracking ref is invalid.");
-    }
-    if (!await this.refExists(root, ref)) return null;
+    const mapping = await resolveFetchTracking(root, safeRemote(input.remoteUrl), branch);
+    if (mapping.status !== "managed") return null;
+    if (!await this.refExists(root, mapping.ref)) return null;
     return {
-      remoteName,
-      remoteUrl: matches[0]!.url,
-      ref,
-      commit: (await this.inspect(root, ref)).baseCommit
+      remoteName: mapping.remoteName,
+      remoteUrl: mapping.remoteUrl,
+      ref: mapping.ref,
+      commit: (await this.inspect(root, mapping.ref)).baseCommit
     };
   }
 
@@ -1067,6 +1135,11 @@ export class NodeGitWorkspace implements GitWorkspacePort {
     stableRef: string,
     expectedCommit: string
   ): Promise<void> {
+    // Status can take time. Re-read branch and HEAD after it so a checkout
+    // switched while status was running is not subsequently fast-forwarded.
+    if (!await this.isClean(repositoryPath)) {
+      throw new Error("Project checkout must be clean before it can be refreshed.");
+    }
     if (stableRef !== "HEAD") {
       const currentBranch = await this.headRef(repositoryPath);
       if (currentBranch !== stableRef) {
@@ -1079,9 +1152,6 @@ export class NodeGitWorkspace implements GitWorkspacePort {
     const head = await this.inspect(repositoryPath, "HEAD");
     if (head.baseCommit !== expectedCommit) {
       throw new Error("Project checkout changed while it was being refreshed.");
-    }
-    if (!await this.isClean(head.root)) {
-      throw new Error("Project checkout must be clean before it can be refreshed.");
     }
   }
 
@@ -1677,13 +1747,15 @@ async function pathKind(path: string): Promise<"directory" | "symlink" | undefin
   }
 }
 
-async function git(args: readonly string[]): Promise<string> {
+async function git(args: readonly string[], input?: string): Promise<string> {
   try {
-    const result = await executeFile("git", [...args], {
+    const execution = executeFile("git", [...args], {
       encoding: "utf8",
       maxBuffer: 1024 * 1024,
       timeout: 30_000
     });
+    if (input !== undefined) execution.child.stdin!.end(input);
+    const result = await execution;
     return result.stdout;
   } catch (error) {
     const stderr = typeof error === "object" && error !== null && "stderr" in error
@@ -1710,6 +1782,141 @@ async function gitLine(args: readonly string[]): Promise<string> {
     throw new Error("Git returned invalid output.");
   }
   return lines[0];
+}
+
+type FetchSpec = Readonly<{ source: string; destination?: string; negative: boolean }>;
+type FetchTrackingMapping = (
+  | Readonly<{ status: "managed"; remoteName: string; remoteUrl: string; ref: string }>
+  | Readonly<{ status: "unmanaged"; reason: string }>
+) & Readonly<{ evidence: string }>;
+
+/** Match one exact or one-star Git refspec, in either direction. */
+function refspecCapture(pattern: string, ref: string): string | null {
+  const star = pattern.indexOf("*");
+  if (star < 0) return pattern === ref ? "" : null;
+  const prefix = pattern.slice(0, star);
+  const suffix = pattern.slice(star + 1);
+  return ref.startsWith(prefix) && ref.endsWith(suffix)
+    && ref.length >= prefix.length + suffix.length
+    ? ref.slice(prefix.length, ref.length - suffix.length) : null;
+}
+
+async function parseFetchSpec(value: string): Promise<FetchSpec | null> {
+  const negative = value.startsWith("^");
+  const text = value.replace(/^[+^]/u, "");
+  const parts = text.split(":");
+  const source = parts[0]!;
+  const destination = parts[1] || undefined;
+  if (parts.length > 2 || (negative && parts.length !== 1)
+    || !source.startsWith("refs/")
+    || !await gitSucceeds(["check-ref-format", "--refspec-pattern", source])
+    || (destination !== undefined && (
+      !destination.startsWith("refs/")
+      || !await gitSucceeds(["check-ref-format", "--refspec-pattern", destination])
+      || source.includes("*") !== destination.includes("*")
+    ))) return null;
+  return { source, ...(destination === undefined ? {} : { destination }), negative };
+}
+
+async function gitConfigValues(root: string, key: string): Promise<string[]> {
+  try {
+    return (await git(["-C", root, "config", "--null", "--get-all", key]))
+      .split("\0").filter((value) => value.length > 0);
+  } catch (error) {
+    const cause = error instanceof Error ? error.cause : undefined;
+    if (typeof cause === "object" && cause !== null && "code" in cause && cause.code === 1) {
+      return [];
+    }
+    throw error;
+  }
+}
+
+/**
+ * Prove a unique configured fetch destination, never infer it from a remote
+ * name. Git resolves insteadOf aliases; push URLs are deliberately irrelevant.
+ * Unsafe/ambiguous configurations remain usable for HEAD-only refresh.
+ */
+async function resolveFetchTracking(
+  root: string, remote: string, branch: string
+): Promise<FetchTrackingMapping> {
+  const wantedUrl = await gitLine(["-C", root, "ls-remote", "--get-url", "--", remote]);
+  const names = (await git(["-C", root, "remote"])).trim().split("\n").filter(Boolean).sort();
+  const remotes = await Promise.all(names.map(async (name) => ({
+    name,
+    urls: (await git(["-C", root, "remote", "get-url", "--all", "--", name])).trimEnd().split("\n"),
+    specs: await gitConfigValues(root, `remote.${name}.fetch`)
+  })));
+  const evidence = JSON.stringify({ wantedUrl, remotes });
+  const unmanaged = (reason: string): FetchTrackingMapping => ({ status: "unmanaged", reason, evidence });
+  const matching = remotes.filter(({ urls }) => urls[0] === wantedUrl);
+  if (matching.length !== 1 || matching[0]!.urls.length !== 1) {
+    return unmanaged("Project fetch URL does not identify exactly one single-URL Git remote.");
+  }
+  const selected = matching[0]!;
+  const candidates = await Promise.all(remotes.map(async (entry) => ({
+    ...entry, parsed: await Promise.all(entry.specs.map(parseFetchSpec))
+  })));
+  if (candidates.some(({ parsed: specs }) => specs.some((spec) => spec === null))) {
+    return unmanaged("A configured fetch refspec is outside the supported full-ref exact/one-star mapping.");
+  }
+  const parsed = candidates.map((entry) => ({
+    ...entry, parsed: entry.parsed.filter((spec): spec is FetchSpec => spec !== null)
+  }));
+  const source = `refs/heads/${branch}`;
+  const excluded = (specs: readonly FetchSpec[], ref: string): boolean =>
+    specs.some((spec) => spec.negative && refspecCapture(spec.source, ref) !== null);
+  const selectedSpecs = parsed.find(({ name }) => name === selected.name)!.parsed;
+  if (excluded(selectedSpecs, source)) return unmanaged(`Fetch refspec excludes ${source}.`);
+  const destinations = new Set<string>();
+  for (const spec of selectedSpecs) {
+    if (spec.negative || spec.destination === undefined) continue;
+    const capture = refspecCapture(spec.source, source);
+    if (capture !== null) destinations.add(spec.destination.replace("*", capture));
+  }
+  if (destinations.size !== 1) {
+    return unmanaged(`Fetch refspec does not map ${source} to exactly one destination.`);
+  }
+  const ref = [...destinations][0]!;
+  if (!ref.startsWith("refs/remotes/") || !await gitSucceeds(["check-ref-format", ref])) {
+    return unmanaged(`Fetch destination is not a supported remote-tracking ref: ${ref}.`);
+  }
+  for (const entry of parsed) {
+    for (const spec of entry.parsed) {
+      if (spec.negative || spec.destination === undefined) continue;
+      const capture = refspecCapture(spec.destination, ref);
+      if (capture === null) continue;
+      const otherSource = spec.source.replace("*", capture);
+      if (!excluded(entry.parsed, otherSource)
+        && (entry.name !== selected.name || otherSource !== source)) {
+        return unmanaged(`Another fetch source also manages ${ref}.`);
+      }
+    }
+  }
+  try {
+    await readDirectTrackingRef(root, ref);
+  } catch (error) {
+    return unmanaged(error instanceof Error ? error.message : String(error));
+  }
+  return { status: "managed", remoteName: selected.name, remoteUrl: wantedUrl, ref, evidence };
+}
+
+async function readDirectTrackingRef(root: string, ref: string): Promise<string | null> {
+  const output = await git([
+    "-C", root, "for-each-ref", "--format=%(refname)%09%(objectname)%09%(symref)", "--", ref
+  ]);
+  const record = output.split("\n").find((line) => line.split("\t")[0] === ref);
+  if (record === undefined) {
+    // for-each-ref omits dangling symbolic refs. Never treat those as absent.
+    if (await gitSucceeds(["-C", root, "symbolic-ref", "--quiet", ref])) {
+      throw new Error(`Tracking destination is symbolic: ${ref}.`);
+    }
+    return null;
+  }
+  const [, commit, symbolic] = record.split("\t");
+  if (symbolic !== "" || commit === undefined || !isCommit(commit)) {
+    throw new Error(`Tracking destination is not a direct object ref: ${ref}.`);
+  }
+  return commit.toLowerCase();
 }
 
 function safeIdentity(value: string, label: string): string {
@@ -1740,10 +1947,13 @@ async function safeFetchBranch(value: string): Promise<string> {
   return branch;
 }
 
-async function resolveRemoteHeadBranch(remote: string): Promise<string> {
+async function resolveRemoteHeadBranch(remote: string, repositoryPath?: string): Promise<string> {
   let output: string;
   try {
-    output = await git(["ls-remote", "--symref", remote, "HEAD"]);
+    output = await git([
+      ...(repositoryPath === undefined ? [] : ["-C", repositoryPath]),
+      "ls-remote", "--symref", remote, "HEAD"
+    ]);
   } catch (error) {
     const detail = error instanceof Error ? error.message : "Git command failed.";
     throw new Error(`Project remote HEAD could not be resolved: ${detail}`, { cause: error });
@@ -1765,11 +1975,16 @@ async function resolveRemoteHeadBranch(remote: string): Promise<string> {
   }
 }
 
-async function resolveRemoteBranchCommit(remote: string, branch: string): Promise<string> {
+async function resolveRemoteBranchCommit(
+  remote: string, branch: string, repositoryPath?: string
+): Promise<string> {
   const target = `refs/heads/${branch}`;
   let output: string;
   try {
-    output = await git(["ls-remote", "--refs", remote, target]);
+    output = await git([
+      ...(repositoryPath === undefined ? [] : ["-C", repositoryPath]),
+      "ls-remote", "--refs", remote, target
+    ]);
   } catch (error) {
     const detail = error instanceof Error ? error.message : "Git command failed.";
     throw new Error(

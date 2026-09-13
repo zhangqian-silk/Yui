@@ -2,14 +2,17 @@ import { existsSync } from "node:fs";
 import { readdir, rename, rm } from "node:fs/promises";
 import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 
-import { usageError } from "../errors/cliError.js";
+import { CliError, usageError } from "../errors/cliError.js";
 import { defaultTableWidth, renderTable } from "../output/table.js";
 import {
   healCheckoutSwap,
   restoreCheckoutSwap,
   swapManagedCheckout
 } from "../repository/checkoutSwap.js";
-import { NodeGitWorkspace, type GitWorkspacePort } from "../repository/gitWorkspace.js";
+import {
+  GitWorkspaceRefreshError, NodeGitWorkspace,
+  type GitWorkspacePort, type GitWorkspaceRefresh
+} from "../repository/gitWorkspace.js";
 import { acquireProjectMaintenanceLock } from "../repository/projectMaintenanceLock.js";
 import {
   addProjectKnowledge,
@@ -92,10 +95,14 @@ export async function runProjectCommand(
   }
   if (command === "refresh") {
     const refreshed = await refreshProject(rest, store, options);
+    const head = refreshed.changed
+      ? `Refreshed project ${refreshed.project.id}: ${refreshed.fromCommit} -> ${refreshed.toCommit}`
+      : `Project ${refreshed.project.id} HEAD is already current at ${refreshed.toCommit}`;
+    const tracking = refreshed.tracking;
     return {
-      output: refreshed.changed
-        ? `Refreshed project ${refreshed.project.id}: ${refreshed.fromCommit} -> ${refreshed.toCommit}\n`
-        : `Project ${refreshed.project.id} is already current at ${refreshed.toCommit}\n`,
+      output: `${head}\n` + (tracking.status === "unmanaged"
+        ? `Tracking unmanaged: ${tracking.reason}\n`
+        : `Tracking ${tracking.status}: ${tracking.ref} at ${tracking.toCommit}\n`),
       data: refreshed
     };
   }
@@ -160,12 +167,7 @@ async function refreshProject(
   args: readonly string[],
   store: ProjectCommandStore,
   options: ProjectCommandOptions
-): Promise<Readonly<{
-  project: Project;
-  fromCommit: string;
-  toCommit: string;
-  changed: boolean;
-}>> {
+): Promise<GitWorkspaceRefresh & Readonly<{ project: Project }>> {
   if (args.length !== 1) {
     throw usageError("Project refresh usage: yui project refresh <project>.");
   }
@@ -191,6 +193,13 @@ async function refreshProject(
       stableRef: current.stableBranch
     });
     return { project: current, ...refreshed };
+  } catch (error) {
+    if (error instanceof GitWorkspaceRefreshError) {
+      throw new CliError("RUNTIME_ERROR", error.message, undefined, {
+        projectId: project.id, refresh: error.result
+      });
+    }
+    throw error;
   } finally {
     releaseMaintenance();
   }
