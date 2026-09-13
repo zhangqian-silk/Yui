@@ -67,6 +67,13 @@ than guessed. Incremental observers report health and coverage; sampling does
 not block lifecycle events. Metrics never trigger model selection, wake, retry,
 resource release or acceptance.
 
+[Task usage and time](observability/README.md#task-usage-and-time) reuse this
+reducer across historical Sessions. Task-fenced observations are not a billing
+completeness guarantee. Native child counters are excluded from parent Session
+totals without an explicit non-overlap contract; they are never extra requests.
+Raw cumulative Session counters and safely attributable Task increments remain
+distinct, and only exact request/Run bindings support WorkItem allocation.
+
 ## Native children
 
 Native subagents are collaboration inside a parent conversation, not Yui Roles,

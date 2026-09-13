@@ -170,6 +170,7 @@ export type TaskExecutionReadStore = Readonly<{
 type TaskExecutionTask = Readonly<Pick<
   Task,
   "id" | "title" | "status" | "executionGate" | "projectBindings" | "cwd"
+  | "createdAt" | "completedAt" | "retiredAt"
 >>;
 
 export type TaskExecutionFacts = Readonly<{
@@ -181,6 +182,8 @@ export type TaskExecutionFacts = Readonly<{
     status?: string;
   }>[];
   runs: readonly AgentRun[];
+  /** Lifetime usage includes obsolete runs; scheduling still uses current runs. */
+  usageRuns?: readonly AgentRun[];
   runDelivery?: Readonly<Record<string, ProviderTurnStatus | "unobserved">>;
   workItems?: readonly WorkItem[];
   inputRequests?: readonly InputRequest[];
@@ -220,8 +223,9 @@ export function buildTaskExecutionProjection(
   if (task === null) return null;
   const roles = store.listRoles?.(taskId) ?? [];
   const events = store.listEvents?.(taskId) ?? [];
+  const usageRuns = store.listRuns?.(taskId) ?? [];
   const runs = operationalTaskRecords(
-    store.listRuns?.(taskId) ?? [],
+    usageRuns,
     events,
     "run"
   );
@@ -240,6 +244,7 @@ export function buildTaskExecutionProjection(
     task,
     roles,
     runs,
+    usageRuns,
     runDelivery: Object.fromEntries(runs.map((run) => {
       const observed = store.getTaskRoleSessionSet?.(taskId, run.roleName)?.providerBinding?.run;
       return [run.id, observed?.runId === run.id ? observed.status : "unobserved"];
@@ -291,6 +296,7 @@ export function projectTaskExecutionFromFacts(
   return projectTaskExecution({
     ...facts,
     runs,
+    usageRuns: facts.usageRuns ?? facts.runs,
     executionGroups
   });
 }
@@ -336,9 +342,10 @@ export function projectTaskExecution(
     });
   });
   const observability = buildTaskObservabilityProjection({
+    task,
     workItems,
     executionGroups: observabilityGroups,
-    runs,
+    runs: facts.usageRuns ?? runs,
     events,
     contextSnapshots: facts.contextSnapshots,
     sessionTokens,

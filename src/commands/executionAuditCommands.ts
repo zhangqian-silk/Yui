@@ -7,6 +7,7 @@
  */
 import { usageError } from "../errors/cliError.js";
 import { defaultTableWidth, renderTable } from "../output/table.js";
+import { formatUsageMetric } from "../runtime/taskUsageMetrics.js";
 import {
   runExecutionAudit,
   type ExecutionAuditOptions,
@@ -350,6 +351,15 @@ export function renderExecutionAudit(
     }
   } else {
     lines.push("", ...sectionError("orchestration", report));
+  }
+
+  if (report.usage.status === "ok" && report.usage.data !== undefined) {
+    lines.push("", "Observed usage — Task lifetime, observed sources only (audit time window not applied):");
+    for (const usage of report.usage.data) {
+      lines.push(`  ${usage.taskId}: tokens=${formatUsageMetric(usage.tokens)}; tools=${formatUsageMetric(usage.toolCalls)}; elapsed=${formatUsageMetric(usage.elapsedSeconds, "s")}; native execution sum=${formatUsageMetric(usage.executionSeconds, "s")}`);
+    }
+  } else {
+    lines.push("", ...sectionError("usage", report));
   }
 
   if (report.storage.status === "ok" && report.storage.data !== undefined) {

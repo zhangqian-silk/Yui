@@ -19,6 +19,7 @@ import type { TaskStore } from "../storage/taskStore.js";
 import type { AgentRun } from "../agentRun/agentRun.js";
 import type { TaskRoleSessionSet } from "../executor/agentExecutor.js";
 import { runtimeObservationFromTaskEvent } from "../runtime/runtimeObservation.js";
+import { projectTaskUsageMetrics, type TaskUsageMetrics } from "../runtime/taskUsageMetrics.js";
 import {
   classifyRunFailure,
   classifyIntegrationAttempt,
@@ -239,6 +240,8 @@ export type ExecutionAuditReport = Readonly<{
     tasks: readonly TaskOrchestrationMetrics[];
     advisoryCount: number;
   }>>;
+  /** Explicitly lifetime-scoped, even when other audit sections have a window. */
+  usage: AuditSection<readonly TaskUsageMetrics[]>;
   storage: AuditSection<StorageAudit>;
   runtimeProtocol: AuditSection<RuntimeProtocolAudit>;
   topLongRunning: AuditSection<readonly LongRunEntry[]>;
@@ -457,6 +460,7 @@ export function runExecutionAudit(
       agentErrors: section,
       workItems: section,
       orchestration: section,
+      usage: section,
       storage: section,
       runtimeProtocol: section,
       topLongRunning: section
@@ -893,6 +897,21 @@ export function runExecutionAudit(
     }
   })();
 
+  const usage = ((): AuditSection<readonly TaskUsageMetrics[]> => {
+    try {
+      return ok(taskIds.map((taskId) => {
+        const task = store.getTask(taskId);
+        if (task === null) throw new Error(`Task not found: ${taskId}.`);
+        return projectTaskUsageMetrics({
+          task, events: store.listEvents(taskId), runs: store.listRuns(taskId),
+          now: new Date(generatedAt)
+        });
+      }));
+    } catch (error) {
+      return failed<readonly TaskUsageMetrics[]>(error);
+    }
+  })();
+
   const storage = ((): AuditSection<StorageAudit> => {
     try {
       let stateJsonBytes: number | Unsupported = UNSUPPORTED;
@@ -1032,6 +1051,7 @@ export function runExecutionAudit(
     agentErrors,
     workItems,
     orchestration,
+    usage,
     storage,
     runtimeProtocol,
     topLongRunning
