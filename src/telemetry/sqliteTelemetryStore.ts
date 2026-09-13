@@ -1,6 +1,9 @@
+import Database from "better-sqlite3";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
-import Database from "better-sqlite3";
+import { CURRENT_DATABASE_FILENAME as COMMITTED_DATABASE_FILENAME } from "../storage/currentTaskStore.js";
+import { migrateSqliteSchema } from "../storage/sqliteSchema.js";
+import { AsyncTaskStoreClient } from "../storage/storeRpc.js";
 import {
   DEFAULT_RUN_CAP,
   DEFAULT_TERMINAL_KEEP,
@@ -13,15 +16,14 @@ import type {
   TelemetryProgressEntry,
   TelemetryStore
 } from "./telemetryStore.js";
-import { migrateSqliteSchema } from "../storage/sqliteSchema.js";
-import { CURRENT_DATABASE_FILENAME as COMMITTED_DATABASE_FILENAME } from "../storage/currentTaskStore.js";
 
 /**
  * Default sidecar implementation: the telemetry tables live inside the Home's
  * authoritative `yui.db`, so a Home has one durable database
  * has one file to manage, back up, and migrate. The store opens its own
- * connection to that file: the write path is a single serialized writer (the
- * "WAL worker") and stays isolated from the business store's connection.
+ * connection for cold synchronous reads/explicit retention. Ingestion writes
+ * use the existing persistence-worker RPC, shared with the Controller when
+ * available; standalone consumers lazily own and close their own client.
  *
  * Writes are best-effort and never block the Controller event loop: `observe`
  * only merges into a bounded in-memory queue; a background flush drains it in
@@ -42,6 +44,7 @@ export type SqliteTelemetryStoreOptions = Readonly<{
   runCap?: number;
   /** Max queued observations before the sidecar starts dropping. */
   maxPending?: number;
+  writer?: Pick<AsyncTaskStoreClient, "flushTelemetry">;
 }>;
 
 export class SqliteTelemetryStore implements TelemetryStore {
@@ -50,6 +53,10 @@ export class SqliteTelemetryStore implements TelemetryStore {
   readonly #terminalKeep: number;
   readonly #turnCap: number;
   readonly #maxPending: number;
+  readonly #home: string;
+  readonly #writer: Pick<AsyncTaskStoreClient, "flushTelemetry"> | undefined;
+  #ownedWriter?: AsyncTaskStoreClient;
+  #flushing?: Promise<void>;
   #db: Database.Database | null = null;
   #failed = false;
   #lastError: string | null = null;
@@ -62,6 +69,8 @@ export class SqliteTelemetryStore implements TelemetryStore {
 
   constructor(home: string, options: SqliteTelemetryStoreOptions = {}) {
     this.mode = options.mode ?? "on";
+    this.#home = home;
+    this.#writer = options.writer;
     this.#path = join(home, COMMITTED_DATABASE_FILENAME);
     this.#terminalKeep = options.terminalKeep ?? DEFAULT_TERMINAL_KEEP;
     this.#turnCap = options.runCap ?? DEFAULT_RUN_CAP;
@@ -72,8 +81,7 @@ export class SqliteTelemetryStore implements TelemetryStore {
 
   observe(entry: TelemetryProgressEntry): void {
     if (this.#closed) return;
-    const db = this.#ensureDb();
-    if (db === null) {
+    if (this.#failed) {
       this.#dropped++;
       return;
     }
@@ -108,9 +116,13 @@ export class SqliteTelemetryStore implements TelemetryStore {
   async close(): Promise<void> {
     if (this.#closed) return;
     this.#closed = true;
-    await this.#flushPending();
-    this.#db?.close();
-    this.#db = null;
+    try {
+      await this.#flushPending();
+    } finally {
+      await this.#ownedWriter?.close();
+      this.#db?.close();
+      this.#db = null;
+    }
   }
 
   // -- TelemetryReader -----------------------------------------------------------
@@ -294,6 +306,7 @@ export class SqliteTelemetryStore implements TelemetryStore {
   #ensureDb(): Database.Database | null {
     if (this.#db !== null) return this.#db;
     if (this.#failed || this.#closed) return null;
+    let opening: Database.Database | undefined;
     try {
       // The telemetry tables live in the Home's authoritative database; the
       // store never creates `yui.db` itself. Wiring fails closed on Homes
@@ -301,16 +314,18 @@ export class SqliteTelemetryStore implements TelemetryStore {
       if (!existsSync(this.#path)) {
         throw new Error(`Telemetry database not found: ${this.#path}`);
       }
-      const db = new Database(this.#path);
+      const db = opening = new Database(this.#path);
       db.pragma("journal_mode = WAL");
       db.pragma("synchronous = FULL");
       db.pragma("foreign_keys = ON");
-      db.pragma("busy_timeout = 5000");
+      // Cold diagnostic reads/retention must not wait behind a semantic writer.
+      db.pragma("busy_timeout = 0");
       db.pragma("wal_autocheckpoint = 1000");
       migrateSqliteSchema(db, { mode: "validate" });
       this.#db = db;
       return db;
     } catch (error) {
+      opening?.close();
       this.#failed = true;
       this.#lastError = error instanceof Error ? error.message : String(error);
       return null;
@@ -327,46 +342,29 @@ export class SqliteTelemetryStore implements TelemetryStore {
     handle.unref?.();
   }
 
-  async #flushPending(): Promise<void> {
-    if (this.#pending.size === 0) return;
-    const db = this.#ensureDb();
-    if (db === null) {
-      this.#dropped += this.#pending.size;
-      this.#pending.clear();
-      return;
-    }
-    const batch = new Map(this.#pending);
-    this.#pending.clear();
-    const upsert = db.prepare(
-      `INSERT INTO telemetry (task_id, role_name, turn_id, progress_id, sequence, payload, received_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?)
-       ON CONFLICT(task_id, role_name, turn_id, progress_id) DO UPDATE SET
-         sequence = excluded.sequence,
-         payload = excluded.payload,
-         received_at = excluded.received_at
-       WHERE excluded.received_at >= telemetry.received_at`
-    );
-    try {
-      const touchedRuns = new Map<string, Readonly<{ taskId: string; runId: string }>>();
-      db.transaction(() => {
-        for (const entry of batch.values()) {
-          upsert.run(
-            entry.taskId, entry.roleName, entry.runId, entry.progressId,
-            entry.sequence ?? null, JSON.stringify(entry.payload), entry.receivedAt
-          );
-          touchedRuns.set(`${entry.taskId}\0${entry.runId}`, {
-            taskId: entry.taskId,
-            runId: entry.runId
-          });
-        }
-        for (const { taskId, runId } of touchedRuns.values()) {
-          this.capRun(taskId, runId);
-        }
-      })();
-      this.#applied += batch.size;
-    } catch (error) {
-      this.#lastError = error instanceof Error ? error.message : String(error);
-      this.#dropped += batch.size;
+  #flushPending(): Promise<void> {
+    this.#flushing ??= this.#drain().finally(() => { this.#flushing = undefined; });
+    return this.#flushing;
+  }
+
+  async #drain(): Promise<void> {
+    while (this.#pending.size > 0) {
+      const batch: TelemetryProgressEntry[] = [];
+      for (const [key, entry] of this.#pending) {
+        this.#pending.delete(key);
+        batch.push(entry);
+        if (batch.length === 256) break;
+      }
+      try {
+        const writer = this.#writer ?? (this.#ownedWriter ??= new AsyncTaskStoreClient(
+          this.#home, { readPoolSize: 1 }
+        ));
+        await writer.flushTelemetry(batch, this.#turnCap);
+        this.#applied += batch.length;
+      } catch (error) {
+        this.#lastError = error instanceof Error ? error.message : String(error);
+        this.#dropped += batch.length;
+      }
     }
   }
 }

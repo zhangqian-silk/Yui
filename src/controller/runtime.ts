@@ -1,3 +1,12 @@
+import { isDeepStrictEqual } from "node:util";
+import type { ConfiguredAgent } from "../agent/agent.js";
+import {
+  AGENT_OPERATIONAL_ENVIRONMENT_NAMES,
+  NATIVE_AGENT_ENVIRONMENT_NAMES,
+  nativeAgentEnvironmentNames,
+  YUI_MANAGED_RUNTIME_ENVIRONMENT_NAMES
+} from "../agent/launchEnvironment.js";
+import { runPurposeAdmitsTaskState } from "../agentRun/agentRun.js";
 import {
   reconciliationIntervalMilliseconds,
   resolveAgentLaunchInactivityTimeoutSeconds,
@@ -7,47 +16,67 @@ import {
   resolveTmuxBin,
   resolveTmuxHistoryLimit
 } from "../config/yuiConfig.js";
-import { resolve } from "node:path";
-import { isDeepStrictEqual } from "node:util";
 import { controllerSocketPath } from "../core/controllerEndpoint.js";
 import type { ControllerDispatcher } from "../core/controllerServer.js";
 import type { JsonValue } from "../core/protocol.js";
-import { type GlobalRole, type Role } from "../role/role.js";
-import type { ConfiguredAgent } from "../agent/agent.js";
-import {
-  AGENT_OPERATIONAL_ENVIRONMENT_NAMES,
-  NATIVE_AGENT_ENVIRONMENT_NAMES,
-  nativeAgentEnvironmentNames,
-  YUI_MANAGED_RUNTIME_ENVIRONMENT_NAMES
-} from "../agent/launchEnvironment.js";
-import {
-  hasRuntimeCleanupObligation,
-  runtimeLifecycleTarget
-} from "../runtime/lifecycleReservation.js";
-import {
-  agentProcessReadinessProbe,
-  ExecutorRegistry
-} from "../executor/executorRegistry.js";
-import {
-  activeLiveRoleAgentSession,
-  roleAgentSessionResumeMode
-} from "../executor/agentExecutor.js";
-import {
-  roleSessionMayContinue,
-  effectiveLaunchConfig,
-  resolveEffectiveLaunch,
-  type EffectiveLaunchSnapshot
-} from "../executor/effectiveLaunch.js";
+import { createTaskEvent } from "../event/taskEvent.js";
 import {
   AgentConfigurationCatalogService,
   validateAgentLaunchConfiguration
 } from "../executor/agentConfigurationCatalog.js";
 import {
-  isTaskOwnedWorkspace,
-  sameManagedWorkspaceIdentity
-} from "../worktree/managedWorkspace.js";
+  activeLiveRoleAgentSession,
+  roleAgentSessionResumeMode
+} from "../executor/agentExecutor.js";
+import {
+  effectiveLaunchConfig,
+  resolveEffectiveLaunch,
+  roleSessionMayContinue,
+  type EffectiveLaunchSnapshot
+} from "../executor/effectiveLaunch.js";
+import {
+  agentProcessReadinessProbe,
+  ExecutorRegistry
+} from "../executor/executorRegistry.js";
 import { FileRoleLaunchPlanner } from "../executor/fileRoleLaunchPlanner.js";
-import type { TaskStore } from "../storage/taskStore.js";
+import { createKernelPorts } from "../kernel/kernelPorts.js";
+import { createGlobalRoleMessage } from "../message/message.js";
+import {
+  FileTaskWorkspacePreparer,
+  type TaskWorkspacePreparer
+} from "../repository/taskWorkspacePreparer.js";
+import { createResourceAutoGc } from "../resources/autoResourceGc.js";
+import { type GlobalRole, type Role } from "../role/role.js";
+import { builtinAgentDriverRegistry } from "../runtime/builtinAgentDrivers.js";
+import { assertExecutionEnvironmentCurrent } from "../runtime/executionEnvironment.js";
+import { appendGlobalProcessExitObservation } from "../runtime/globalProcessExitStore.js";
+import {
+  AgentHostPromptPushAdapter,
+  FileTaskRuntimeIsolation,
+  ProviderContinuationReconciliationService,
+  TmuxSessionHost,
+  type ActivePromptPushPort,
+  type AgentEnvironmentRefreshPort,
+  type ProviderContinuationMetadataPort,
+  type RuntimeLaunchPreparationPort,
+  type SessionHostPort,
+  type TaskRuntimeIsolationPort
+} from "../runtime/index.js";
+import { launchBrokerForHome } from "../runtime/launchBroker.js";
+import {
+  hasRuntimeCleanupObligation,
+  runtimeLifecycleTarget
+} from "../runtime/lifecycleReservation.js";
+import {
+  classifyRuntimeProcessExit,
+  validateRuntimeProcessExitObservation
+} from "../runtime/processExitObservation.js";
+import { replayRuntimeProcessExitOutbox } from "../runtime/processExitOutbox.js";
+import { providerRetryPrompt } from "../runtime/providerRetry.js";
+import {
+  createRuntimeObservation,
+  runtimeObservationFromTaskEvent
+} from "../runtime/runtimeObservation.js";
 import { openCurrentTaskStore } from "../storage/currentTaskStore.js";
 import { managedRuntimeRoot } from "../storage/homeLayout.js";
 import { SqliteTaskStore } from "../storage/sqliteStore.js";
@@ -55,93 +84,63 @@ import {
   AsyncTaskStoreClient,
   resolveStoreWorkerEnabledForHome
 } from "../storage/storeRpc.js";
-import {
-  FileTaskWorkspacePreparer,
-  type TaskWorkspacePreparer
-} from "../repository/taskWorkspacePreparer.js";
+import type { TaskStore } from "../storage/taskStore.js";
+import { SurfaceContributions } from "../surface/surfaceContributions.js";
+import { taskOwnsManagedWorkspace } from "../task/task.js";
+import { openSchedulerTelemetry } from "../telemetry/telemetryWiring.js";
 import { NodeCommandExecutor } from "../tmux/commandExecutor.js";
 import { TmuxManager, yuiTmuxServerName } from "../tmux/tmuxManager.js";
+import { createControllerWeb } from "../web/controllerWeb.js";
+import { TmuxWebTerminalService } from "../web/tmuxWebTerminal.js";
+import { createWebTaskSurface } from "../web/webTaskSurface.js";
 import {
-  AgentHostPromptPushAdapter,
-  FileTaskRuntimeIsolation,
-  TmuxSessionHost,
-  type ActivePromptPushPort,
-  type AgentEnvironmentRefreshPort,
-  type RuntimeLaunchPreparationPort,
-  ProviderContinuationReconciliationService,
-  type ProviderContinuationMetadataPort,
-  type TaskRuntimeIsolationPort,
-  type SessionHostPort
-} from "../runtime/index.js";
+  isTaskOwnedWorkspace,
+  sameManagedWorkspaceIdentity
+} from "../worktree/managedWorkspace.js";
+import { AgentRuntimeObserver } from "./agentRuntimeObserver.js";
+import { createCapabilityDispatcher } from "./capabilityBridge.js";
+import { FileTaskWorkflowRuntime } from "./clientRuntime.js";
 import {
   startFileTaskController,
   type ControllerRuntimeOptions,
   type RunningFileTaskController
 } from "./controller.js";
 import {
-  AgentHostProviderTurnFenceError,
+  ephemeralDomainFromEnvironment,
+  recordEphemeralTmuxTarget
+} from "./domainIdentity.js";
+import { createEphemeralResourceReaper } from "./ephemeralResourceReaper.js";
+import {
   AgentHostProviderSessionBusyError,
+  AgentHostProviderTurnFenceError,
   FileSchedulerStoreAdapter
 } from "./fileSchedulerStoreAdapter.js";
-import { openSchedulerTelemetry } from "../telemetry/telemetryWiring.js";
+import { deliverGlobalInputs } from "./globalInputDelivery.js";
+import { authorizeJobStart } from "./jobControl.js";
 import {
   createFileArtifactPort,
   createLinuxProcessPort,
   DurableJobSupervisor
 } from "./jobSupervisor.js";
-import { authorizeJobStart } from "./jobControl.js";
-import { createKernelPorts } from "../kernel/kernelPorts.js";
-import { createCapabilityDispatcher } from "./capabilityBridge.js";
-import { createControllerWeb } from "../web/controllerWeb.js";
-import { createWebTaskSurface } from "../web/webTaskSurface.js";
-import { SurfaceContributions } from "../surface/surfaceContributions.js";
-import { TmuxWebTerminalService } from "../web/tmuxWebTerminal.js";
-import { FileTaskWorkflowRuntime } from "./clientRuntime.js";
-import { FileRuntimeEventInbox } from "./runtimeEventInbox.js";
-import { AgentRuntimeObserver } from "./agentRuntimeObserver.js";
-import {
-  AsyncRuntimeEventProcessor,
-  FileRuntimeEventProcessor,
-  createAsyncRuntimeObserver
-} from "./runtimeEventProcessor.js";
-import {
-  RuntimeLaunchCoordinator,
-  type CoordinatedRuntimeLaunchRequest
-} from "./runtimeLaunchCoordinator.js";
-import {
-  ephemeralDomainFromEnvironment,
-  recordEphemeralTmuxTarget
-} from "./domainIdentity.js";
-import { createEphemeralResourceReaper } from "./ephemeralResourceReaper.js";
-import { scanControllerResourceInventory } from "./resourceInventoryLinux.js";
-import { ResourceInventoryClient } from "./resourceInventoryRpc.js";
-import { createResourceAutoGc } from "../resources/autoResourceGc.js";
+import { createProviderRetryHooks } from "./providerRetryDelivery.js";
 import {
   createRuntimeResourceActivityTracker,
   type RuntimePaneFact,
   type RuntimeResourceSampleIdentity
 } from "./resourceInventory.js";
+import { scanControllerResourceInventory } from "./resourceInventoryLinux.js";
+import { ResourceInventoryClient } from "./resourceInventoryRpc.js";
+import { FileRuntimeEventInbox } from "./runtimeEventInbox.js";
+import {
+  AsyncRuntimeEventProcessor,
+  createAsyncRuntimeObserver,
+  FileRuntimeEventProcessor
+} from "./runtimeEventProcessor.js";
+import {
+  RuntimeLaunchCoordinator,
+  type CoordinatedRuntimeLaunchRequest
+} from "./runtimeLaunchCoordinator.js";
 import { SessionOwnerReconciliation } from "./sessionOwnerReconciliation.js";
-import { launchBrokerForHome } from "../runtime/launchBroker.js";
-import { assertExecutionEnvironmentCurrent } from "../runtime/executionEnvironment.js";
-import {
-  classifyRuntimeProcessExit,
-  validateRuntimeProcessExitObservation
-} from "../runtime/processExitObservation.js";
-import { replayRuntimeProcessExitOutbox } from "../runtime/processExitOutbox.js";
-import { appendGlobalProcessExitObservation } from "../runtime/globalProcessExitStore.js";
-import { deliverGlobalInputs } from "./globalInputDelivery.js";
-import { providerRetryPrompt } from "../runtime/providerRetry.js";
-import { createProviderRetryHooks } from "./providerRetryDelivery.js";
-import { createGlobalRoleMessage } from "../message/message.js";
-import { builtinAgentDriverRegistry } from "../runtime/builtinAgentDrivers.js";
-import {
-  createRuntimeObservation,
-  runtimeObservationFromTaskEvent
-} from "../runtime/runtimeObservation.js";
-import { createTaskEvent } from "../event/taskEvent.js";
-import { runPurposeAdmitsTaskState } from "../agentRun/agentRun.js";
-import { taskOwnsManagedWorkspace } from "../task/task.js";
 
 export type FileTaskControllerFactoryOptions = ControllerRuntimeOptions & Readonly<{
   store?: TaskStore;
@@ -211,11 +210,15 @@ export async function startFileTaskControllerRuntime(
     : undefined;
   let closeKernel = async (): Promise<void> => {};
   let closeWeb = async (): Promise<void> => {};
+  let closeTelemetry = async (): Promise<void> => {};
   try {
+    const telemetry = options.schedulerStore === undefined
+      ? openSchedulerTelemetry(home, store.getConfig(), asyncStoreClient) : null;
+    closeTelemetry = () => telemetry?.sink.close() ?? Promise.resolve();
     const schedulerStore = options.schedulerStore
       ?? new FileSchedulerStoreAdapter(
         store,
-        openSchedulerTelemetry(home, store.getConfig())
+        telemetry
       );
     const domainIdentity = options.domainIdentity
       ?? ephemeralDomainFromEnvironment(options.environment ?? process.env);
@@ -726,12 +729,12 @@ export async function startFileTaskControllerRuntime(
     }
     let resourceClose: Promise<void> | undefined;
     const closeResources = (): Promise<void> => {
-      resourceClose ??= Promise.all([
+      resourceClose ??= closeTelemetry().finally(() => Promise.all([
         web.close(),
         kernel.close(),
         asyncStoreClient?.close() ?? Promise.resolve(),
         inventoryClient?.close() ?? Promise.resolve()
-      ]).then(() => undefined).finally(() => {
+      ])).then(() => undefined).finally(() => {
         ownedStore?.close();
       });
       return resourceClose;
@@ -764,6 +767,7 @@ export async function startFileTaskControllerRuntime(
   } catch (error) {
     // The socket may never have opened. Startup failure must still release
     // this attempt's workers/instances instead of leaving an uncallable process.
+    await closeTelemetry().catch(() => undefined);
     await Promise.allSettled([
       closeWeb(),
       closeKernel(),

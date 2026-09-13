@@ -11,7 +11,7 @@ import {
   stopTaskExecution,
   type TaskCompletedBy
 } from "../task/task.js";
-import { taskActor } from "./taskActor.js";
+import { taskActor } from "../task/taskAuthority.js";
 
 export type TaskExecutionStopRequest = Readonly<{
   taskId: string;

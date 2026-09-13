@@ -1205,13 +1205,41 @@ export const ROOT_COMMAND = buildNode({
     { id: "general", title: "General", entries: [
       "help", "version", "update", "upgrade", "setup", "doctor"
     ] },
-    { id: "workflow", title: "Workflow", entries: ["operator", "project", "task"] },
+    { id: "workflow", title: "Workflow", entries: ["operator", "role", "project", "task"] },
     { id: "configuration", title: "Configuration", entries: ["config"] },
     { id: "operations", title: "Operations", entries: ["web", "controller", "session", "execution", "capability", "job", "jobs", "telemetry", "release"] },
     { id: "resources", title: "Resources", entries: ["resources"] },
     { id: "internal", title: "Internal", entries: ["internal"] }
   ],
   children: [
+    {
+      name: "role",
+      summary: "Queue input or control an exact current Global Role Turn.",
+      sections: [{ id: "input", title: "Input control", entries: ["message", "interrupt"] }],
+      children: [
+        {
+          name: "message", summary: "Send durable input to a Global Role.",
+          sections: [{ id: "input", title: "Input control", entries: ["queue", "steer"] }],
+          children: [
+            {
+              name: "queue", summary: "Queue input for the next legal delivery opportunity.",
+              usage: "yui role message queue <role> (<text>|--body-file <path|->) --request-id <id>",
+              options: ["--request-id", "--body-file"], fileOptions: ["--body-file"]
+            },
+            {
+              name: "steer", summary: "Steer the exact current native Turn.",
+              usage: "yui role message steer <role> (<text>|--body-file <path|->) --request-id <id> --expected-target <turn>",
+              options: ["--request-id", "--expected-target", "--body-file"], fileOptions: ["--body-file"]
+            }
+          ]
+        },
+        {
+          name: "interrupt", summary: "Request cancellation of the exact current native Turn.",
+          usage: "yui role interrupt <role> --expected-target <turn> [--request-id <id>] [--then-message <message>]",
+          options: ["--request-id", "--expected-target", "--then-message"]
+        }
+      ]
+    },
     { name: "help", summary: "Show root or scoped command help.", usage: "yui help [command ...]", commandPathArguments: true },
     { name: "version", summary: "Print the installed Yui version." },
     { name: "update", summary: "Install the latest published Yui package globally." },

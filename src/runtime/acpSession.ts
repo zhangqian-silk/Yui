@@ -48,9 +48,8 @@ import {
   terminateProcessGroup,
   type JsonObject
 } from "./jsonLineChannel.js";
+import { ProviderDeliveryUnknownError, ProviderTurnRejectedError } from "./providerErrors.js";
 import {
-  ProviderDeliveryUnknownError,
-  ProviderTurnRejectedError,
   type StructuredProviderProcessExit,
   type StructuredProviderSession,
   type StructuredProviderTurnInput,

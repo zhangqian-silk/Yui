@@ -2,37 +2,37 @@ import { createHash, randomBytes } from "node:crypto";
 import { chmod, mkdir, mkdtemp, readFile, rename, rm, writeFile } from "node:fs/promises";
 import { dirname, join, resolve } from "node:path";
 
-import { releaseWorkflowScratchRoot } from "../storage/homeLayout.js";
 import { runUpdate, type StagedPackage, type UpdatePorts, type UpdateResult } from "../cli/updateOrchestrator.js";
 import { activatedControllerEntrypoint } from "../cli/updatePorts.js";
-import {
-  restartFileTaskController,
-  stopFileTaskController,
-  type FileControllerClientOptions
-} from "../controller/clientRuntime.js";
 import {
   runProjectCommand,
   type ProjectCommandOptions,
   type ProjectCommandStore
 } from "../commands/projectCommands.js";
 import {
-  createFileReleaseIdempotencyStore,
-  type ReleaseIdempotencyStore
-} from "./releaseIdempotencyStore.js";
+  restartFileTaskController,
+  stopFileTaskController,
+  type FileControllerClientOptions
+} from "../controller/clientRuntime.js";
 import { isConcreteVersion } from "../domain/validation.js";
-import { resolveProject } from "../repository/project.js";
-import type { ReleaseStepPlan, ReleaseWorkflowSource } from "./releaseWorkflow.js";
-import {
-  resolveVerificationGate
-} from "../verification/verificationGateService.js";
-import { findL2ArtifactForCommit } from "../verification/gateArtifactStore.js";
-import type { GateArtifactStorePort } from "../verification/gateArtifact.js";
 import {
   createExecFileCommandRunner,
   createPinnedCommandRunner,
   resolveExecutable,
   type CommandRunner
 } from "../external/pinnedCommandRunner.js";
+import { resolveProject } from "../repository/project.js";
+import { releaseWorkflowScratchRoot } from "../storage/homeLayout.js";
+import type { GateArtifactStorePort } from "../verification/gateArtifact.js";
+import { findL2ArtifactForCommit } from "../verification/gateArtifactStore.js";
+import {
+  resolveVerificationGate
+} from "../verification/verificationGateService.js";
+import {
+  createFileReleaseIdempotencyStore,
+  type ReleaseIdempotencyStore
+} from "./releaseIdempotencyStore.js";
+import type { ReleaseStepPlan, ReleaseWorkflowSource } from "./releaseWorkflow.js";
 
 export { resolveExecutable } from "../external/pinnedCommandRunner.js";
 export type { CommandRunner } from "../external/pinnedCommandRunner.js";
@@ -1427,7 +1427,7 @@ async function queryIdentityFor(
  */
 function deriveIdentityFromPlan(
   step: ReleaseStepPlan,
-  source: ReleaseWorkflowSource | undefined
+  _source: ReleaseWorkflowSource | undefined
 ): Readonly<{ kind: string; value: string }> | undefined {
   switch (step.kind) {
     case "version-tag": {

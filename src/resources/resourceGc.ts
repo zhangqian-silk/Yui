@@ -21,7 +21,6 @@ import { execFile, execFileSync } from "node:child_process";
 import {
   existsSync,
   mkdirSync,
-  readFileSync,
   renameSync,
   rmSync,
   writeFileSync
@@ -29,20 +28,6 @@ import {
 import { dirname, join, resolve } from "node:path";
 import { promisify } from "node:util";
 
-import {
-  removeResourceRecord,
-  isResourceQuarantinePath,
-  resourceQuarantineRoot,
-  upsertResourceRecord
-} from "./resourceRegistry.js";
-import type { ResourceRegistryStore } from "./resourceRegistryStore.js";
-import { createResourceRegistryStore } from "./resourceRegistryStore.js";
-import {
-  isReleasable,
-  isTerminalTaskStatus,
-  type ResourceRecord,
-  type ResourceRegistryState
-} from "./resourceTypes.js";
 import {
   scanLiveReferences,
   type LiveReferencePorts,
@@ -52,6 +37,20 @@ import {
   discoverResources,
   type DiscoveredResource
 } from "./resourceDiscovery.js";
+import {
+  isResourceQuarantinePath,
+  removeResourceRecord,
+  resourceQuarantineRoot,
+  upsertResourceRecord
+} from "./resourceRegistry.js";
+import type { ResourceRegistryStore } from "./resourceRegistryStore.js";
+import { withResourceRegistry } from "./resourceRegistryStore.js";
+import {
+  isReleasable,
+  isTerminalTaskStatus,
+  type ResourceRecord,
+  type ResourceRegistryState
+} from "./resourceTypes.js";
 
 const executeFile = promisify(execFile);
 
@@ -112,7 +111,7 @@ type ClassifiedResource = Readonly<{
  */
 export async function planResourceGc(input: ResourceGcInput): Promise<GcPlan> {
   const home = resolve(input.home);
-  const registryStore = input.registryStore ?? createResourceRegistryStore(home);
+  const registry = withResourceRegistry(home, input.registryStore, store => store.load());
   const discovered = await discoverResources({
     home,
     projects: input.projects,
@@ -123,7 +122,6 @@ export async function planResourceGc(input: ResourceGcInput): Promise<GcPlan> {
   const paths = discovered.map(({ record }) => record.path);
   // Also scan original paths of quarantined records so a new reference is
   // visible in the plan (restore itself happens in apply/purge/restore-all).
-  const registry = registryStore.load();
   appendRegistryScanPaths(registry, paths, home);
   const scan = await scanLiveReferences({
     home,
@@ -333,8 +331,8 @@ export async function applyResourceGc(
 
   const home = resolve(input.home);
   const now = input.now;
-  const registryStore = input.registryStore ?? createResourceRegistryStore(home);
-  let registry = registryStore.load();
+  const previous = withResourceRegistry(home, input.registryStore, store => store.load());
+  let registry = previous;
   const applied: ResourceRecord[] = [];
   const failed: ResourceRecord[] = [];
   const restored: ResourceRecord[] = [];
@@ -419,8 +417,7 @@ export async function applyResourceGc(
     }
   }
 
-  registryStore.save(registry);
-  registryStore.close();
+  withResourceRegistry(home, input.registryStore, store => store.save(registry, previous));
   return Object.freeze({
     planned: plan,
     applied: Object.freeze(applied),
@@ -504,7 +501,7 @@ async function quarantineResource(
 }
 
 function writeQuarantineReceipt(
-  home: string,
+  _home: string,
   record: ResourceRecord,
   now: Date,
   method: "move" | "git-worktree-remove",
@@ -632,8 +629,7 @@ export async function purgeResourceQuarantine(
   const resolvedHome = resolve(home);
   const ttlHours = options.ttlHours ?? DEFAULT_QUARANTINE_TTL_HOURS;
   const ttlMs = ttlHours * 3_600_000;
-  const registryStore = createResourceRegistryStore(resolvedHome);
-  const registry = registryStore.load();
+  const registry = withResourceRegistry(resolvedHome, undefined, store => store.load());
   const quarantined = Object.values(registry.records)
     .filter((record) => record.quarantine !== undefined
       && (record.disposition === "quarantined" || record.disposition === "cleanup-failed"));
@@ -727,8 +723,7 @@ export async function purgeResourceQuarantine(
     }
   }
 
-  registryStore.save(state);
-  registryStore.close();
+  withResourceRegistry(resolvedHome, undefined, store => store.save(state, registry));
   return Object.freeze({
     planned: Object.freeze({
       home: resolvedHome,
@@ -758,8 +753,7 @@ export async function restoreAllResourceGc(
   options: { now: Date }
 ): Promise<GcResult> {
   const resolvedHome = resolve(home);
-  const registryStore = createResourceRegistryStore(resolvedHome);
-  const registry = registryStore.load();
+  const registry = withResourceRegistry(resolvedHome, undefined, store => store.load());
   const quarantined = Object.values(registry.records)
     .filter((record) => record.quarantine !== undefined
       && (record.disposition === "quarantined" || record.disposition === "cleanup-failed"));
@@ -778,8 +772,7 @@ export async function restoreAllResourceGc(
     }
   }
 
-  registryStore.save(state);
-  registryStore.close();
+  withResourceRegistry(resolvedHome, undefined, store => store.save(state, registry));
   return Object.freeze({
     planned: Object.freeze({
       home: resolvedHome,

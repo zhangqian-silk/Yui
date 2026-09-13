@@ -9,6 +9,14 @@ import {
   type ConfiguredAgent
 } from "../agent/agent.js";
 import { operationalAgentEnvironment } from "../agent/launchEnvironment.js";
+import { resolveTmuxBin } from "../config/yuiConfig.js";
+import { compileRoleSessionContext } from "../context/roleSessionContext.js";
+import {
+  EPHEMERAL_DOMAIN_GRACE_MS,
+  readEphemeralDomainIdentity,
+  readLinuxProcessStartIdentity
+} from "../controller/domainIdentity.js";
+import { usageError } from "../errors/cliError.js";
 import {
   inspectAgentCapabilities,
   resolveAgentAdapter,
@@ -19,16 +27,15 @@ import {
   assertCodexLaunchOverridesAvailable,
   inspectCodexLaunchConfig
 } from "../executor/codexConfigConflict.js";
+import { resolveEffectiveLaunch } from "../executor/effectiveLaunch.js";
 import {
   nativeAdditionalDirectories,
   nativeAgentWorkspace,
   withNativeProjectDirectories
 } from "../executor/fileRoleLaunchPlanner.js";
-import { resolveEffectiveLaunch } from "../executor/effectiveLaunch.js";
-import { compileRoleSessionContext } from "../context/roleSessionContext.js";
-import { usageError } from "../errors/cliError.js";
 import { defaultTableWidth, renderTable } from "../output/table.js";
-import { resolveYuiHome } from "../storage/taskStore.js";
+import type { ReviewConfig } from "../review/reviewConfig.js";
+import type { GlobalRole } from "../role/role.js";
 import {
   CURRENT_DATABASE_FILENAME,
   openCurrentTaskStore
@@ -38,18 +45,11 @@ import {
   type StorageSchemaState
 } from "../storage/storageSchema.js";
 import { resolveStoreWorkerEnabledForHome } from "../storage/storeRpc.js";
-import { resolveTmuxBin } from "../config/yuiConfig.js";
+import { resolveYuiHome } from "../storage/taskStore.js";
 import {
   CommandExecutionError,
   type CommandExecutor
 } from "../tmux/commandExecutor.js";
-import {
-  EPHEMERAL_DOMAIN_GRACE_MS,
-  readEphemeralDomainIdentity,
-  readLinuxProcessStartIdentity
-} from "../controller/domainIdentity.js";
-import type { GlobalRole } from "../role/role.js";
-import type { ReviewConfig } from "../review/reviewConfig.js";
 
 export type DoctorStatus = "ok" | "missing" | "unsupported" | "invalid";
 
@@ -419,7 +419,7 @@ function checkSchema(
 
 /** Diagnose admission to the exact current storage contract without repair. */
 function inspectCompatibility(
-  home: string,
+  _home: string,
   homeCheck: DoctorCheck,
   schema: SchemaInspection
 ): CompatibilityInspection {

@@ -1,15 +1,17 @@
-import { usageError, taskNotFound } from "../errors/cliError.js";
+import { runExecutionObservation, type AgentRun } from "../agentRun/agentRun.js";
+import { isGitArtifactRefString, parseGitArtifactRef } from "../artifacts/gitArtifactRef.js";
+import { taskNotFound, usageError } from "../errors/cliError.js";
+import type { TaskEvent } from "../event/taskEvent.js";
+import { expandTaskMessageResult, type TaskMessage } from "../message/message.js";
 import { resolveManagedTaskReader } from "../runtime/managedCaller.js";
+import { providerRetryProjection } from "../runtime/providerRetry.js";
+import type { ContextRecordFamily, ContextRecordQuery } from "../storage/contextRecords.js";
 import type { TaskStore } from "../storage/taskStore.js";
+import { projectTaskRemoteDeliveryFromStore } from "../task/remoteDeliveryService.js";
+import { managedWorkspaceKey } from "../worktree/managedWorkspace.js";
 import { contextContentDigest } from "./contextSnapshot.js";
 import { buildRunContextPack } from "./runContextPack.js";
 import { sourceRunContextValue } from "./sourceRunContext.js";
-import { expandTaskMessageResult, type TaskMessage } from "../message/message.js";
-import { managedWorkspaceKey } from "../worktree/managedWorkspace.js";
-import { runExecutionObservation, type AgentRun } from "../agentRun/agentRun.js";
-import { isGitArtifactRefString, parseGitArtifactRef } from "../artifacts/gitArtifactRef.js";
-import { projectTaskRemoteDeliveryFromStore } from "../commands/taskRemoteDeliveryCommand.js";
-import { providerRetryProjection } from "../runtime/providerRetry.js";
 
 const MAX_RECORDS = 256;
 const MAX_VALUE_BYTES = 4096;
@@ -40,17 +42,21 @@ export type ContextObservationProvider = Readonly<{
 export function readTaskContext(
   store: TaskStore, taskId: string, environment: NodeJS.ProcessEnv = {}
 ) {
-  return store.transaction((reader) => {
-    const entries = authorizedEntries(reader, taskId, environment);
+  return store.readTransaction((reader) => {
+    const scope = authorizeContext(reader, taskId, environment);
+    const sources = authorizedSources(reader, scope);
+    const count = sources.reduce((total, source) => total + source.count, 0);
     const cursor = currentCursor(reader, taskId);
     // Reserve a small, classified view before ordinary history consumes the
     // page. Counts and samples come from the exact same authorized read.
-    const attention = summarizeAttention(entries);
+    const attention = summarizeAttention(reader, taskId, scope.allow);
     let bytes = Buffer.byteLength(JSON.stringify(attention));
     const records: Array<{ ref: Ref; summary?: string; value?: unknown; omitted: boolean;
       execution?: ReturnType<typeof runExecutionObservation> }> = [];
-    const runtimeEvents = entries.some((entry) => entry.ref.store === "run") ? reader.listEvents(taskId) : [];
-    for (const entry of entries) {
+    let runtimeEvents: TaskEvent[] | undefined;
+    page: for (const source of sources) for (const entry of source.read()) {
+      if (records.length >= MAX_RECORDS) break page;
+      if (entry.ref.store === "run") runtimeEvents ??= reader.listEventsByType(taskId, ["runtime.agent-error"]);
       const valueBytes = Buffer.byteLength(JSON.stringify(entry.value));
       const content = valueBytes > MAX_VALUE_BYTES
         ? { ref: entry.ref, summary: summarize(entry.value), omitted: true }
@@ -63,15 +69,15 @@ export function readTaskContext(
           (entry.value as { name: string }).name)?.providerBinding)
       } : {}) };
       const size = Buffer.byteLength(JSON.stringify(record));
-      if (records.length >= MAX_RECORDS || bytes + size > MAX_PAGE_BYTES) break;
+      if (bytes + size > MAX_PAGE_BYTES) break page;
       records.push(record);
       bytes += size;
     }
     return {
       taskId, coreCursor: encode(cursor), throughCursor: encode(cursor),
       attention,
-      records, count: entries.length,
-      omitted: { records: entries.length - records.length, values: records.filter((r) => r.omitted).length },
+      records, count,
+      omitted: { records: count - records.length, values: records.filter((r) => r.omitted).length },
       observations: [] as ContextObservation[],
       limits: { records: MAX_RECORDS, valueBytes: MAX_VALUE_BYTES, pageBytes: MAX_PAGE_BYTES,
         attentionRefsPerCategory: MAX_ATTENTION_REFS, attentionRefBytesPerCategory: MAX_VALUE_BYTES }
@@ -79,28 +85,30 @@ export function readTaskContext(
   });
 }
 
-function summarizeAttention(entries: readonly Entry[]) {
+function summarizeAttention(store: TaskStore, taskId: string, allow: Set<string> | undefined) {
   const group = () => ({ count: 0, refs: [] as Ref[], omittedRefs: 0 });
   const attention = {
     openInputs: group(), pendingOperations: group(), unknownOperations: group()
   };
-  const bytes = { openInputs: 0, pendingOperations: 0, unknownOperations: 0 };
-  for (const entry of entries) {
-    const status = (entry.value as { status?: string }).status;
-    const category = entry.ref.store === "input-request" && status === "open" ? "openInputs"
-      : entry.ref.store === "job" && status === "unknown-needs-attention" ? "unknownOperations"
-      : entry.ref.store === "job" && (status === "queued" || status === "running") ? "pendingOperations"
-      : undefined;
-    if (category === undefined) continue;
+  for (const [category, family, statuses] of [
+    ["openInputs", "input-request", ["open"]],
+    ["pendingOperations", "job", ["queued", "running"]],
+    ["unknownOperations", "job", ["unknown-needs-attention"]]
+  ] as const) {
+    const page = store.queryContextRecords(taskId, {
+      family, statuses, ids: allowedIds(allow, family), limit: MAX_ATTENTION_REFS
+    });
     const summary = attention[category];
-    summary.count++;
-    const size = Buffer.byteLength(JSON.stringify(entry.ref)) + 1;
-    if (summary.refs.length < MAX_ATTENTION_REFS && bytes[category] + size <= MAX_VALUE_BYTES) {
-      summary.refs.push(entry.ref);
-      bytes[category] += size;
-    } else {
-      summary.omittedRefs++;
+    summary.count = page.count;
+    let bytes = 0;
+    for (const { id, value } of page.records) {
+      const ref = materialize(family, id, value).ref;
+      const size = Buffer.byteLength(JSON.stringify(ref)) + 1;
+      if (bytes + size > MAX_VALUE_BYTES) break;
+      summary.refs.push(ref);
+      bytes += size;
     }
+    summary.omittedRefs = summary.count - summary.refs.length;
   }
   return attention;
 }
@@ -114,11 +122,10 @@ export function readTaskContextDelta(
   input: Readonly<{ after: string; continuation?: string; limit?: number }>,
   environment: NodeJS.ProcessEnv = {}
 ) {
-  return store.transaction((reader) => {
+  return store.readTransaction((reader) => {
     const { allow } = authorizeContext(reader, taskId, environment);
-    const history = reader.listEvents(taskId);
     const start = decode(input.after, taskId);
-    const now = currentCursor(reader, taskId, history);
+    const now = currentCursor(reader, taskId);
     const continuation = input.continuation === undefined ? undefined : decodePage(input.continuation, taskId);
     const bound = continuation ?? now;
     const after = continuation?.after ?? start.sequence;
@@ -130,13 +137,14 @@ export function readTaskContextDelta(
     if (!Number.isSafeInteger(limit) || limit < 1 || limit > MAX_EVENTS) {
       throw usageError(`Context delta limit must be between 1 and ${MAX_EVENTS}.`);
     }
-    const events = history
-      .filter((event) => isAllowed(allow, "task-event", event.id)
-        && sequence(event.id) > after && sequence(event.id) <= bound.sequence)
-      .sort((a, b) => sequence(a.id) - sequence(b.id));
+    const selected = reader.queryContextRecords(taskId, {
+      family: "task-event", ids: allowedIds(allow, "task-event"),
+      afterSequence: after, throughSequence: bound.sequence, limit
+    });
     const page: Array<{ ref: Ref; value?: unknown; omitted: boolean }> = [];
     let bytes = 0;
-    for (const event of events) {
+    for (const { value } of selected.records) {
+      const event = value as TaskEvent;
       const entry = materialize("task-event", event.id, event);
       const record = Buffer.byteLength(JSON.stringify(event)) > MAX_VALUE_BYTES
         ? { ref: entry.ref, omitted: true }
@@ -147,10 +155,10 @@ export function readTaskContextDelta(
       bytes += size;
     }
     const last = page.at(-1)?.ref.refId;
-    const more = events.length > page.length;
+    const more = selected.count > page.length;
     const through = { taskId, sequence: bound.sequence, revision: bound.revision };
     return {
-      taskId, events: page, count: events.length, throughCursor: encode(through),
+      taskId, events: page, count: selected.count, throughCursor: encode(through),
       ...(more && last !== undefined
         ? { continuation: encode({ ...through, after: sequence(last) }) } : {}),
       observations: [] as ContextObservation[]
@@ -162,7 +170,7 @@ export function inspectTaskContext(
   store: TaskStore, taskId: string, selector: Readonly<{ store: string; refId: string; digest?: string }>,
   environment: NodeJS.ProcessEnv = {}
 ) {
-  return store.transaction((reader) => {
+  return store.readTransaction((reader) => {
     const scope = authorizeContext(reader, taskId, environment);
     const value = isAllowed(scope.allow, selector.store, selector.refId)
       ? inspectValue(reader, scope, selector) : null;
@@ -182,7 +190,8 @@ export function inspectTaskContext(
     const response = { ...entry, ...(expansion !== undefined && "result" in expansion
       ? { result: expansion.result } : {}),
       ...(selector.store === "run" ? { execution: runExecutionObservation(value as AgentRun,
-        reader.getTaskRoleSessionSet(taskId, (value as AgentRun).roleName)?.providerBinding, reader.listEvents(taskId)) } : {}),
+        reader.getTaskRoleSessionSet(taskId, (value as AgentRun).roleName)?.providerBinding,
+        reader.listEventsByType(taskId, ["runtime.agent-error"])) } : {}),
       coreCursor: encode(currentCursor(reader, taskId)) };
     if (Buffer.byteLength(JSON.stringify(response)) > MAX_INSPECT_BYTES) {
       throw usageError("Expanded Context exceeds the bounded inspect limit.", undefined,
@@ -195,7 +204,7 @@ export function inspectTaskContext(
 export function listContextMessages(
   store: TaskStore, taskId: string, environment: NodeJS.ProcessEnv = {}
 ): TaskMessage[] {
-  return store.transaction((reader) => {
+  return store.readTransaction((reader) => {
     const { allow } = authorizeContext(reader, taskId, environment);
     return reader.listMessages(taskId)
       .filter((message) => isAllowed(allow, "task-message", message.id))
@@ -270,62 +279,27 @@ function authorizeContext(store: TaskStore, taskId: string, environment: NodeJS.
     allow = new Set(pack.authority.readableRefs.map((ref) => `${ref.store}:${ref.refId}`));
     allow.add(`role:${caller.roleName}`);
     allow.add(`turn:${caller.currentRunId}`);
-    // A steer targets exactly one Role's current native Turn and is never shared
-    // Task intent (decision-3 §9). A Leader steer in particular stores as an
-    // untargeted `user` Message (no recipient/WorkItem/Run scope, since a Leader
-    // holds no Assignment), so recognize it explicitly: the shared block below
-    // must never leak it, and the steer-delta block authorizes it only to its own
-    // recipient. `interruptThen.reusedInput` is the interrupt-then composition
-    // whose carried input can itself be a steer.
-    const isSteerMessage = (message: TaskMessage) =>
-      message.inputControl?.action === "steer"
-      || message.interruptThen?.reusedInput?.action === "steer";
-    // A frozen Assignment is not a cutoff for the Task's current user intent.
-    // Untargeted human/Operator messages are shared Task requirements; scoped
-    // messages, other Roles' results, and steers still require an explicit grant.
-    const sharedMessageIds = new Set(store.listMessages(taskId)
-      .filter(message => (message.kind === "user" || message.kind === "operator")
-        && message.recipient === undefined && message.workItemId === undefined
-        && message.runId === undefined && !isSteerMessage(message))
-      .map(message => message.id));
-    for (const id of sharedMessageIds) allow.add(`task-message:${id}`);
-    for (const event of store.listEvents(taskId)) {
-      if (event.type.startsWith("message.") && sharedMessageIds.has(event.payload.messageId)) {
-        allow.add(`task-event:${event.id}`);
-      }
-    }
-    // A steer targets this Role's exact current native Turn (decision-3 §9,
-    // message-5 gap E). Unlike a queued or addressed Message — which reaches the
-    // Role through a new AgentRun's frozen Context pack — a steer is pushed into
-    // the *current* turn and is never captured by any frozen snapshot. So the
-    // steer header directs the recipient to reconcile the input "through your
-    // authorized Context read path"; that path must therefore resolve the exact
-    // steer Message it names. Authorize the steers addressed to this caller's
-    // exact current Assignment scope as a live delta — the same way untargeted
-    // user intent is layered on — WITHOUT expanding the frozen Assignment's
-    // readableRefs. Scope is the tightest signal a steer carries (it never gains
-    // a continuation runId), so a steer for a different WorkItem/Round is not
-    // authorized, and only genuine steers gain this read (an ordinary addressed
-    // Message still requires its own frozen delta).
+    // Shared current user intent and this exact Assignment's live steers augment
+    // the frozen refs. Query identities only: another Role's results, ordinary
+    // addressed messages and Leader steers remain outside this scope.
     const run = store.getRun(taskId, caller.currentRunId);
-    const steerMessageIds = new Set(store.listMessages(taskId)
-      .filter(message => isSteerMessage(message)
-        && message.recipient?.roleName === caller.roleName
-        && message.recipient.workItemId === run?.workItemId
-        && message.recipient.reviewRoundId === run?.reviewRoundId)
-      .map(message => message.id));
-    for (const id of steerMessageIds) allow.add(`task-message:${id}`);
-    for (const event of store.listEvents(taskId)) {
-      if (event.type.startsWith("message.") && steerMessageIds.has(event.payload.messageId)) {
-        allow.add(`task-event:${event.id}`);
-      }
-    }
+    const current = store.contextInputReferences(taskId, {
+      roleName: caller.roleName, workItemId: run?.workItemId, reviewRoundId: run?.reviewRoundId
+    });
+    for (const id of current.messages) allow.add(`task-message:${id}`);
+    for (const id of current.events) allow.add(`task-event:${id}`);
   }
   return { task, allow, caller };
 }
 
 function isAllowed(allow: Set<string> | undefined, family: string, id: string): boolean {
   return allow === undefined || allow.has(`${family}:${id}`);
+}
+
+function allowedIds(allow: Set<string> | undefined, family: string): string[] | undefined {
+  const prefix = `${family}:`;
+  return allow === undefined ? undefined : [...allow]
+    .filter(ref => ref.startsWith(prefix)).map(ref => ref.slice(prefix.length));
 }
 
 function roleProfile(role: NonNullable<ReturnType<TaskStore["getRole"]>>) {
@@ -377,7 +351,10 @@ function inspectValue(
       return store.getWorkItem(taskId, parts[0]!)?.candidates
         .find((candidate) => candidate.id === parts[1]) ?? null;
     }
-    case "task-message": return store.listMessages(taskId).find((message) => message.id === refId) ?? null;
+    case "task-message":
+    case "publication":
+    case "task-event":
+      return store.queryContextRecords(taskId, { family, ids: [refId], limit: 1 }).records[0]?.value ?? null;
     case "run": return store.getRun(taskId, refId);
     case "source-run": {
       if (!allow?.has(`source-turn:${refId}`)) return null;
@@ -422,19 +399,28 @@ function inspectValue(
     case "task-decision": return store.getDecision(taskId, refId);
     case "task-milestone": return store.getMilestone(taskId, refId);
     case "job": return store.getDurableJob(taskId, refId);
-    case "publication": return store.listPublicationReferences(taskId).find((item) => item.id === refId) ?? null;
-    case "task-event": return store.listEvents(taskId).find((event) => event.id === refId) ?? null;
     default: return null;
   }
 }
 
-function authorizedEntries(store: TaskStore, taskId: string, environment: NodeJS.ProcessEnv): Entry[] {
-  const { task, allow, caller } = authorizeContext(store, taskId, environment);
-  const entries: Entry[] = [];
+type EntrySource = { count: number; read(): Iterable<Entry> };
+
+function authorizedSources(store: TaskStore, { task, allow, caller }: ReturnType<typeof authorizeContext>): EntrySource[] {
+  const taskId = task.id;
+  const sources: EntrySource[] = [];
   const add = (family: string, id: string, value: unknown) => {
     if (value !== null && isAllowed(allow, family, id)) {
-      entries.push(materialize(family, id, value));
+      sources.push({ count: 1, read: () => [materialize(family, id, value)] });
     }
+  };
+  const query = (family: ContextRecordFamily, options: Partial<ContextRecordQuery> = {}) => {
+    const selection = { ...options, family, ids: allowedIds(allow, family) };
+    const { count } = store.queryContextRecords(taskId, { ...selection, limit: 0 });
+    sources.push({ count, *read() {
+      for (const { id, value } of store.queryContextRecords(taskId, {
+        ...selection, limit: MAX_RECORDS
+      }).records) yield materialize(family, id, value);
+    } });
   };
   add("task", taskId, task);
   add("task-brief", taskId, store.getTaskBrief(taskId));
@@ -453,43 +439,44 @@ function authorizedEntries(store: TaskStore, taskId: string, environment: NodeJS
     }
   }
   // Current responsibilities and unanswered inputs precede historical bulk.
-  for (const request of store.listInputRequests(taskId).filter((r) => r.status === "open")) add("input-request", request.id, request);
-  for (const item of store.listWorkItems(taskId).sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))) {
-    add("work-item", item.id, item);
-    if (allow?.has(`accepted-work-item:${item.id}`)) add("accepted-work-item", item.id, item);
-    for (const candidate of [...item.candidates].reverse()) add("candidate", `${item.id}/${candidate.id}`, candidate);
+  query("input-request", { statuses: ["open"] });
+  query("work-item");
+  for (const id of allowedIds(allow, "accepted-work-item") ?? []) {
+    add("accepted-work-item", id, store.getWorkItem(taskId, id));
   }
+  query("candidate");
   // File artifacts are not enumerated into the synchronous Context listing: the
   // core cursor does not cover file edits and an ambient directory index here
   // would be the forbidden update-time mirror (§3.7). Current artifacts are
   // listed on demand via the async `artifact.list` capability; frozen Candidate
   // artifacts remain reachable as commit-pinned pointers under their Candidate.
-  for (const preparation of store.listEnvironmentPreparations(taskId)) add("environment-preparation", preparation.id, preparation);
-  for (const workspace of store.listManagedWorkspaces(taskId)) add("managed-workspace", managedWorkspaceKey(workspace.owner), workspace);
+  query("environment-preparation");
+  query("managed-workspace");
   if (caller?.currentRunId !== undefined) {
     add("managed-workspace", `${taskId}/${caller.roleName}`,
       store.getRun(taskId, caller.currentRunId)?.workspace ?? null);
   }
-  for (const changeSet of store.listChangeSets(taskId)) add("change-set", changeSet.id, changeSet);
-  for (const message of store.listMessages(taskId).reverse()) add("task-message", message.id, message);
-  for (const run of store.listRuns(taskId).reverse()) {
-    add("run", run.id, run);
-    if (allow?.has(`source-turn:${run.id}`)) add("source-run", run.id, sourceRunContextValue(run));
+  query("change-set");
+  query("task-message", { descending: true });
+  query("run", { descending: true });
+  for (const id of allowedIds(allow, "source-turn") ?? []) {
+    const run = store.getRun(taskId, id);
+    if (run !== null) add("source-run", id, sourceRunContextValue(run));
   }
-  for (const round of store.listReviewRounds(taskId).reverse()) add("review-round", round.id, round);
-  for (const request of store.listInputRequests(taskId).filter((r) => r.status !== "open")) add("input-request", request.id, request);
+  query("review-round", { descending: true });
+  query("input-request", { excludeStatuses: ["open"] });
   if (allow === undefined) {
     add("mailbox", "task", store.getWorkMailbox({ kind: "task", taskId }));
     for (const role of store.listRoles(taskId)) {
       add("mailbox", `role:${role.name}`, store.getWorkMailbox({ kind: "role", taskId, roleName: role.name }));
     }
   }
-  for (const decision of store.listDecisions(taskId)) add("task-decision", decision.id, decision);
-  for (const milestone of store.listMilestones(taskId)) add("task-milestone", milestone.id, milestone);
-  for (const job of store.listDurableJobs(taskId)) add("job", job.id, job);
-  for (const publication of store.listPublicationReferences(taskId)) add("publication", publication.id, publication);
-  for (const event of store.listEvents(taskId).reverse()) add("task-event", event.id, event);
-  return entries;
+  query("task-decision");
+  query("task-milestone");
+  query("job");
+  query("publication");
+  query("task-event", { descending: true });
+  return sources;
 }
 
 export function materialize(store: string, refId: string, value: unknown): Entry {
@@ -497,8 +484,8 @@ export function materialize(store: string, refId: string, value: unknown): Entry
   const record = value as Record<string, unknown>;
   return { ref: { store, refId, revision: String(record.revision ?? record.updatedAt ?? record.createdAt ?? digest), digest }, value };
 }
-function currentCursor(store: TaskStore, taskId: string, events = store.listEvents(taskId)): Cursor {
-  return { taskId, sequence: events.reduce((max, e) => Math.max(max, sequence(e.id)), 0), revision: store.getStateRevision() };
+function currentCursor(store: TaskStore, taskId: string): Cursor {
+  return { taskId, sequence: store.latestEventSequence(taskId), revision: store.getStateRevision() };
 }
 function sequence(id: string): number {
   const result = /^event-(\d+)$/.exec(id);

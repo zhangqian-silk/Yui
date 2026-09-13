@@ -20,12 +20,12 @@ Two task-level record families back it:
   exact source (repository + pinned commit, optionally an artifact), an
   immutable ordered step plan, and one persisted record per step.
 
-The engine (`src/release/releaseWorkflowEngine.ts`) is a pure library; the
+The engine (`src/release/releaseWorkflowEngine.ts`) owns persisted transitions and the workflow lock; the
 `yui task workflow` and `yui task grant` commands drive it. Every external
 system sits behind `ReleaseWorkflowPorts`
-(`src/release/releaseWorkflowPorts.ts`), so the whole workflow is testable
-with deterministic fakes and no real GitHub, npm, git, Controller, or process
-side effect.
+(`src/release/releaseWorkflowPorts.ts`). Disposable SQLite and deterministic
+external ports exercise recovery without real GitHub, npm, git, Controller,
+or model effects.
 
 ## Authorization model
 
@@ -214,9 +214,11 @@ The key is passed to every `executeStep` call for that step, including
 retries after a confirmed-absent timeout. The port contract requires
 `executeStep` to be idempotent under the same key: a retried attempt must not
 produce a second side effect. The engine side of the contract is stricter
-still — it never calls `executeStep` for a step it has marked `unknown`; it
-re-queries by the recorded identity instead. The fakes record every key, so
-the test suite proves at-most-once execution directly.
+still — it never blindly calls `executeStep` for an `unknown` step; it first
+re-queries by the recorded identity. A deterministic core scenario checks
+uncertain-effect queries, confirmed-step reuse and grant exhaustion against
+real SQLite. This proves those engine boundaries, not the idempotency of real
+external services or every release adapter.
 
 ## Operator guide
 

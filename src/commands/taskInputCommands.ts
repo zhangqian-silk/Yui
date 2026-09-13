@@ -1,3 +1,6 @@
+import type { AgentRun } from "../agentRun/agentRun.js";
+import type { MailboxTarget } from "../coordination/workMailbox.js";
+import { enqueueWork } from "../coordination/workMailboxQueue.js";
 import {
   dataError,
   roleNotFound,
@@ -17,22 +20,19 @@ import {
   type InputBlockedRef,
   type InputChoice,
   type InputRequest,
-  type InputRequestPolicy,
-  type InputRequester
+  type InputRequester,
+  type InputRequestPolicy
 } from "../input/inputRequest.js";
 import { defaultTableWidth, renderTable } from "../output/table.js";
 import { formatTimestamp } from "../output/timePresentation.js";
 import { type Role } from "../role/role.js";
-import type { AgentRun } from "../agentRun/agentRun.js";
-import { enqueueWork } from "../coordination/workMailboxQueue.js";
-import type { MailboxTarget } from "../coordination/workMailbox.js";
+import { requireManagedTaskCaller } from "../runtime/managedCaller.js";
 import {
   isRoleRunStalled,
   RUN_RECOVERED_EVENT
 } from "../scheduler/roleRunStall.js";
 import type { TaskStore } from "../storage/taskStore.js";
 import type { Task } from "../task/task.js";
-import { requireManagedTaskCaller } from "../runtime/managedCaller.js";
 import {
   resolveTaskRecordReference
 } from "../task/taskRecordReference.js";
@@ -556,10 +556,6 @@ function requiredText(value: string | undefined, label: string): string {
   return normalized;
 }
 
-function trimmed(value: string | undefined): string | undefined {
-  const normalized = value?.trim();
-  return normalized === undefined || normalized.length === 0 ? undefined : normalized;
-}
 
 function exactIdentity(value: string | undefined): string | undefined {
   if (value === undefined || value.includes("\0")) return undefined;

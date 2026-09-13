@@ -1,14 +1,14 @@
-import { dirname, join, relative, isAbsolute } from "node:path";
+import { dirname, isAbsolute, join, relative } from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import type { TaskStore } from "../storage/taskStore.js";
+import { projectTaskRemoteDeliveryFromStore } from "../task/remoteDeliveryService.js";
 import type { Task } from "../task/task.js";
 import type { WorkItemWorkspaceDisposition } from "../workItem/workItem.js";
-import { managedWorkspaceKey, managedWorktreeName, type ManagedWorkspace } from "../worktree/managedWorkspace.js";
-import { WorkItemChangeSetManager } from "../workspace/workItemChangeSetManager.js";
 import { cleanupCheckFromError, type CleanupCheck } from "../workspace/cleanupInspection.js";
-import { projectTaskRemoteDeliveryFromStore } from "../commands/taskRemoteDeliveryCommand.js";
-import { taskWorkspaceRefSegment } from "./taskWorkspaceIdentity.js";
+import { WorkItemChangeSetManager } from "../workspace/workItemChangeSetManager.js";
+import { managedWorkspaceKey, managedWorktreeName, type ManagedWorkspace } from "../worktree/managedWorkspace.js";
 import { integrationWorktreeIdentity, worktreeIdentity, type GitWorkspacePort } from "./gitWorkspace.js";
+import { taskWorkspaceRefSegment } from "./taskWorkspaceIdentity.js";
 
 /** Current owner facts + the same Git inspection used immediately before removal.
  * No preparation, locks, Git refresh, runtime stop, DB writes or repair.

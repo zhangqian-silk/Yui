@@ -12,7 +12,7 @@ import type {
   DurableJobStep
 } from "../job/durableJob.js";
 import type { DurableJobCaller } from "./jobControl.js";
-import { resolveJobCaller } from "../commands/taskActor.js";
+import { resolveJobCaller } from "../task/taskAuthority.js";
 import {
   callFileTaskController,
   type FileControllerClientOptions

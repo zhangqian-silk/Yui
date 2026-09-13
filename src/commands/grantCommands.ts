@@ -10,12 +10,8 @@ import {
 import { defaultTableWidth, renderTable } from "../output/table.js";
 import { formatTimestamp } from "../output/timePresentation.js";
 import type { Task } from "../task/task.js";
+import type { TaskCommandExecution, TaskCommandOptions, TaskWorkflowStore } from "./taskCommandTypes.js";
 import { isCurrentGlobalOperator } from "./taskInputCommands.js";
-import type {
-  TaskCommandExecution,
-  TaskCommandOptions,
-  TaskWorkflowStore
-} from "./taskCommands.js";
 
 const CEILINGS: ReadonlySet<string> = new Set(["none", "reversible", "irreversible"]);
 
@@ -355,9 +351,6 @@ function recordTaskEvent(
   ));
 }
 
-function requiredOption(options: ReadonlyMap<string, string>, name: string): string {
-  return requiredText(options.get(name), name);
-}
 
 function optionalOption(options: ReadonlyMap<string, string>, name: string): string | undefined {
   if (!options.has(name)) return undefined;

@@ -20,6 +20,7 @@ import {
 } from "node:fs";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { jobStepDirectory } from "./stepDirectory.js";
 
 import { writeTextFileAtomically } from "../storage/durableFile.js";
 import { readLinuxProcessStartIdentity } from "../controller/domainIdentity.js";
@@ -153,7 +154,7 @@ export async function runDurableJobRunner(
         // Issue 08: a structured argv step executes without a shell so its
         // tokens can never be reinterpreted; a legacy command step keeps the
         // shell form. A per-step cwd/env override applies to either form.
-        const stepCwd = step.cwd ?? spec.workspace;
+        const stepCwd = jobStepDirectory(spec.workspace, step.cwd);
         const stepEnv = step.env === undefined
           ? spec.env
           : { ...spec.env, ...step.env };

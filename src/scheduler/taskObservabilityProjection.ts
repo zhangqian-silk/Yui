@@ -174,7 +174,6 @@ function projectDag(workItems: readonly WorkItem[]): TaskDagProjection {
   const edges: TaskDagEdge[] = [];
   for (const item of workItems) {
     for (const dependency of item.dependsOn) {
-      const target = byId.get(dependency);
       const status = dependencyEdgeStatus(dependency, byId);
       edges.push({ from: dependency, to: item.id, status });
       dependents.get(dependency)?.push(item.id);

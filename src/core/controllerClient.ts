@@ -1,25 +1,25 @@
 import { randomUUID } from "node:crypto";
 import { lstat, readFile } from "node:fs/promises";
-import { createConnection, type Socket } from "node:net";
+import { createConnection } from "node:net";
 import { join } from "node:path";
 
+import { isControllerSocketPathForHome } from "./controllerEndpoint.js";
+import {
+  findLiveControllerProcessForHome,
+  inspectLiveControllerProcess
+} from "./controllerProcessIdentity.js";
+import { readHomeFilesystemId } from "./homeFilesystemIdentity.js";
 import {
   CONTROLLER_DISCOVERY_PATH,
-  FILE_TASK_CONTROLLER_PROTOCOL_VERSION,
-  MAX_CONTROLLER_MESSAGE_BYTES,
   ControllerProtocolError,
   encodeControllerRequest,
+  FILE_TASK_CONTROLLER_PROTOCOL_VERSION,
+  MAX_CONTROLLER_MESSAGE_BYTES,
   parseControllerDiscovery,
   parseControllerResponse,
   type ControllerDiscovery,
   type JsonValue
 } from "./protocol.js";
-import { isControllerSocketPathForHome } from "./controllerEndpoint.js";
-import { readHomeFilesystemId } from "./homeFilesystemIdentity.js";
-import {
-  findLiveControllerProcessForHome,
-  inspectLiveControllerProcess
-} from "./controllerProcessIdentity.js";
 
 export class ControllerClientError extends Error {
   constructor(readonly code: string, message: string) {

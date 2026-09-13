@@ -1,12 +1,12 @@
 import { createHash } from "node:crypto";
 
+import type { TaskEvent } from "../event/taskEvent.js";
 import type {
   AgentRuntimeObserverSource,
   AgentRuntimeOperation,
   AgentRuntimeWaitReason
 } from "./agentDriver.js";
 import { requireDriverId } from "./agentDriver.js";
-import type { TaskEvent } from "../event/taskEvent.js";
 import {
   isStandardAgentError,
   type StandardAgentError
@@ -730,10 +730,6 @@ function requireTimestamp(value: string, label: string): string {
   return timestamp;
 }
 
-function requireNonNegativeInteger(value: number, minimum: number, label: string): number {
-  if (!Number.isSafeInteger(value) || value < minimum) throw new Error(`${label} is invalid.`);
-  return value;
-}
 
 function requireIdentity(value: unknown, label: string): string {
   const identity = requireText(value, label);

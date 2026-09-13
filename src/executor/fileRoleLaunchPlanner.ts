@@ -1,11 +1,11 @@
-import { randomUUID } from "node:crypto";
 import { spawnSync } from "node:child_process";
+import { randomUUID } from "node:crypto";
 import { mkdirSync, realpathSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { isDeepStrictEqual } from "node:util";
-import { assertExecutionEnvironmentCurrent } from "../runtime/executionEnvironment.js";
 import { runPurposeAdmitsTaskState } from "../agentRun/agentRun.js";
+import { assertExecutionEnvironmentCurrent } from "../runtime/executionEnvironment.js";
 import { taskOwnsManagedWorkspace } from "../task/task.js";
 
 import {
@@ -18,13 +18,6 @@ import {
   operationalAgentEnvironment,
   selectEnvironment
 } from "../agent/launchEnvironment.js";
-import { activeRoleAgentBinding, type GlobalRole, type TaskRole } from "../role/role.js";
-import type {
-  RoleSessionLaunchMode,
-  SchedulerRoleSession
-} from "../scheduler/ports.js";
-import type { TaskStore } from "../storage/taskStore.js";
-import { planningRuntimeCwd } from "../storage/homeLayout.js";
 import {
   compileRoleSessionContext,
   roleSessionKind
@@ -33,56 +26,63 @@ import {
   materializeSessionBootstrap,
   type SessionEntryPoint
 } from "../context/sessionBootstrapManifest.js";
-import { resolveAgentAdapter } from "./agentAdapter.js";
-import type { ClaudeAgentConfig, RoleAgentConfig } from "./agentAdapter.js";
-import type { PlannedRoleSession, RoleLaunchPlanner } from "./executorRegistry.js";
-import type {
-  AgentEnvironmentRefresh,
-  AgentEnvironmentRefreshPort
-} from "../runtime/ports.js";
-import { resolveTaskRoleSessionTitle } from "../runtime/sessionTitle.js";
-import {
-  type ManagedWorkspace
-} from "../worktree/managedWorkspace.js";
-import {
-  classifyWorkspacePreflight,
-  formatWorkspacePreflightError,
-  type WorkspacePhysicalInspector
-} from "./workspacePreflightClassification.js";
-import { activeLiveRoleAgentSession, taskRoleControlTarget } from "./agentExecutor.js";
-import {
-  roleSessionMayContinue,
-  effectiveRoleForLaunch,
-  resolveEffectiveLaunch,
-  type EffectiveLaunchSnapshot
-} from "./effectiveLaunch.js";
-import {
-  parseTaskRuntimeIsolationDescriptor,
-  taskRuntimeIsolationEnvironment,
-  type TaskRuntimeIsolationDescriptor
-} from "../runtime/taskRuntimeIsolation.js";
 import { ResourceRegistrar } from "../resources/resourceRegistrar.js";
-import {
-  builtinAgentDriverRegistry,
-  builtinDriverIdForAdapter
-} from "../runtime/builtinAgentDrivers.js";
+import { activeRoleAgentBinding, type GlobalRole, type TaskRole } from "../role/role.js";
 import { managedRuntimeAdmission } from "../runtime/agentDriver.js";
 import {
   builtinAgentEndpointImplementation,
   validateAgentEndpointImplementation
 } from "../runtime/agentEndpointIdentity.js";
+import {
+  builtinAgentDriverRegistry,
+  builtinDriverIdForAdapter
+} from "../runtime/builtinAgentDrivers.js";
 import type {
   AgentHostProviderControl,
   ProviderOwnedTurn
 } from "../runtime/launchBroker.js";
+import type {
+  AgentEnvironmentRefresh,
+  AgentEnvironmentRefreshPort
+} from "../runtime/ports.js";
 import type { ProviderAuthorityFence } from "../runtime/providerAuthorityFence.js";
 import {
   assertProviderConversationReplaceable
 } from "../runtime/providerRuntimeIdentity.js";
+import { resolveTaskRoleSessionTitle } from "../runtime/sessionTitle.js";
+import {
+  parseTaskRuntimeIsolationDescriptor,
+  taskRuntimeIsolationEnvironment,
+  type TaskRuntimeIsolationDescriptor
+} from "../runtime/taskRuntimeIsolation.js";
+import type {
+  RoleSessionLaunchMode,
+  SchedulerRoleSession
+} from "../scheduler/ports.js";
+import { planningRuntimeCwd } from "../storage/homeLayout.js";
+import type { TaskStore } from "../storage/taskStore.js";
+import {
+  type ManagedWorkspace
+} from "../worktree/managedWorkspace.js";
+import type { ClaudeAgentConfig, RoleAgentConfig } from "./agentAdapter.js";
+import { resolveAgentAdapter } from "./agentAdapter.js";
+import { activeLiveRoleAgentSession, taskRoleControlTarget } from "./agentExecutor.js";
 import {
   assertCodexLaunchOverridesAvailable,
   inspectCodexLaunchConfig
 } from "./codexConfigConflict.js";
+import {
+  effectiveRoleForLaunch,
+  resolveEffectiveLaunch,
+  roleSessionMayContinue,
+  type EffectiveLaunchSnapshot
+} from "./effectiveLaunch.js";
+import type { PlannedRoleSession, RoleLaunchPlanner } from "./executorRegistry.js";
+import {
+  classifyWorkspacePreflight,
+  formatWorkspacePreflightError,
+  type WorkspacePhysicalInspector
+} from "./workspacePreflightClassification.js";
 
 export type FileRoleLaunchPlannerOptions = Readonly<{
   environment?: NodeJS.ProcessEnv;
@@ -1057,9 +1057,6 @@ const inspectWorkspacePhysicalState: WorkspacePhysicalInspector = (entry) => {
   };
 };
 
-function shellQuote(value: string): string {
-  return `'${value.replaceAll("'", "'\"'\"'")}'`;
-}
 
 function patchEnvironment(
   current: NodeJS.ProcessEnv,
@@ -1109,49 +1106,7 @@ function codexShellEnvironmentConfig(
   return `shell_environment_policy.set={${entries.join(",")}}`;
 }
 
-/**
- * Codex 0.145 discovers lifecycle hooks from its effective config. Keep Yui's
- * two handlers invocation-local: this avoids mutating CODEX_HOME or the Task
- * workspace, while the exact launch environment supplies the durable AgentRun fence.
- */
-function codexLifecycleHooksConfig(cliPath: string): string {
-  const command = [
-    shellQuote(canonicalPath(process.execPath)),
-    shellQuote(canonicalPath(cliPath)),
-    "internal",
-    "runtime-hook"
-  ].join(" ");
-  const handler = `{hooks=[{type="command",command=${JSON.stringify(command)}}]}`;
-  return `hooks={`
-    + `SessionStart=[${handler}],`
-    + `UserPromptSubmit=[${handler}],`
-    + `PreToolUse=[${handler}],`
-    + `PermissionRequest=[${handler}],`
-    + `PostToolUse=[${handler}],`
-    + `SubagentStart=[${handler}],`
-    + `SubagentStop=[${handler}],`
-    + `Stop=[${handler}]`
-    + `}`;
-}
 
-function addCodexLifecycleHooks(
-  args: readonly string[],
-  mode: "new" | "resume",
-  cliPath: string
-): string[] {
-  // Session flags are Yui-owned and exact to this launch. Hook trust bypass is
-  // still explicit because these handlers execute a local command.
-  const managed = [
-    "--enable", "hooks",
-    "--config", codexLifecycleHooksConfig(cliPath),
-    "--dangerously-bypass-hook-trust"
-  ];
-  if (mode === "new") return [...args, ...managed];
-  if (args.length < 2 || args.at(-2) !== "resume") {
-    throw new Error("Codex resume launch shape is invalid.");
-  }
-  return [...args.slice(0, -2), ...managed, ...args.slice(-2)];
-}
 
 function withCodexThreadEnvironment<T extends Readonly<{
   env: Readonly<Record<string, string>>;

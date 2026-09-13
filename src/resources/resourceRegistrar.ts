@@ -11,12 +11,12 @@ import { execFileSync } from "node:child_process";
 import { existsSync } from "node:fs";
 import { basename, dirname, resolve } from "node:path";
 
-import type { ManagedWorkspace, ManagedWorkspaceOwner } from "../worktree/managedWorkspace.js";
 import type { TaskRuntimeIsolationDescriptor } from "../runtime/taskRuntimeIsolation.js";
-import { createResourceRegistryStore } from "./resourceRegistryStore.js";
+import type { ManagedWorkspace, ManagedWorkspaceOwner } from "../worktree/managedWorkspace.js";
 import {
   upsertResourceRecord
 } from "./resourceRegistry.js";
+import { createResourceRegistryStore } from "./resourceRegistryStore.js";
 import {
   createResourceRecord,
   isReleaseNamespacePath,
@@ -157,7 +157,7 @@ export class ResourceRegistrar {
           updatedAt: timestamp
         });
       }
-      if (next !== state) store.save(next);
+      if (next !== state) store.save(next, state);
     } finally {
       store.close();
     }
@@ -195,9 +195,10 @@ export class ResourceRegistrar {
     if (records.length === 0) return;
     const store = createResourceRegistryStore(this.#home);
     try {
-      let state = store.load();
+      const previous = store.load();
+      let state = previous;
       for (const record of records) state = upsertResourceRecord(state, record);
-      store.save(state);
+      store.save(state, previous);
     } finally {
       store.close();
     }

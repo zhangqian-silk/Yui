@@ -1,3 +1,4 @@
+import { parseRepeatable } from "../cli/parseRepeatable.js";
 import { usageError } from "../errors/cliError.js";
 import { GitIntegrationService } from "../integration/gitIntegrationService.js";
 import { createIntegrationAttempt } from "../integration/integrationAttempt.js";
@@ -5,8 +6,7 @@ import { NodeGitWorkspace, type GitWorkspacePort } from "../repository/gitWorksp
 import { FileTaskWorkspacePreparer } from "../repository/taskWorkspacePreparer.js";
 import type { TaskStore } from "../storage/taskStore.js";
 import { workspaceProjectEntry } from "../worktree/managedWorkspace.js";
-import { parseRepeatable } from "./taskIntegrationCommands.js";
-import { taskLocalActor } from "./taskActor.js";
+import { taskLocalActor } from "../task/taskAuthority.js";
 
 export type TaskUpstreamCommandOptions = Readonly<{
   git?: GitWorkspacePort;

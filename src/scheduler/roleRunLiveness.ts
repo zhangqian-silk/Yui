@@ -1,17 +1,17 @@
 import {
-  selectedSchedulerRoles,
-  selectedActiveSchedulerTasks,
-  type SchedulerReconcileSelection,
-  type SchedulerRoleResourceInput,
-  type SchedulerRoleResourceEvidence,
-  type SchedulerStorePort,
-  type TmuxDeliveryPort
-} from "./ports.js";
-import { formatTaskRecordReference } from "../task/taskRecordReference.js";
-import {
   runPurposeAdmitsTaskState,
   type AgentRunPurpose
 } from "../agentRun/agentRun.js";
+import { formatTaskRecordReference } from "../task/taskRecordReference.js";
+import {
+  selectedActiveSchedulerTasks,
+  selectedSchedulerRoles,
+  type SchedulerReconcileSelection,
+  type SchedulerRoleResourceEvidence,
+  type SchedulerRoleResourceInput,
+  type SchedulerStorePort,
+  type TmuxDeliveryPort
+} from "./ports.js";
 import {
   currentRoleRunProgressAt,
   DEFAULT_WORKFLOW_STALL_CANDIDATE_AGE_MS
@@ -130,7 +130,7 @@ export async function reconcileExitedRoleRuns(
       }
     }
   }
-  for (const { task, role, run, session, inspection } of eligible) {
+  for (const { task, role, run, session } of eligible) {
       const status = batchSnapshot.statuses.get(`${task.id}\0${role.name}`);
       if (status === undefined) throw new Error("Role liveness snapshot is incomplete.");
       if (status === "present") continue;

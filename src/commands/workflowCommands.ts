@@ -15,11 +15,7 @@ import {
 import type { ReleaseWorkflowPorts } from "../release/releaseWorkflowPorts.js";
 import { openConfiguredTaskStore } from "../storage/sqliteStore.js";
 import type { Task } from "../task/task.js";
-import type {
-  TaskCommandExecution,
-  TaskCommandOptions,
-  TaskWorkflowStore
-} from "./taskCommands.js";
+import type { TaskCommandExecution, TaskCommandOptions, TaskWorkflowStore } from "./taskCommandTypes.js";
 
 const STEP_KINDS: ReadonlySet<string> = new Set([
   "pr-create-or-reuse", "ci-confirm", "merge", "version-tag",
@@ -148,7 +144,11 @@ export async function runWorkflowCommandAsync(
     // failure so the caller knows this path was compromised.
     if (typeof store.rootDirectory === "function") {
       const auditStore = openConfiguredTaskStore(store.rootDirectory());
-      recordTaskEvent(auditStore, taskId, "release-workflow.run", eventPayload, eventNow);
+      try {
+        recordTaskEvent(auditStore, taskId, "release-workflow.run", eventPayload, eventNow);
+      } finally {
+        auditStore.close();
+      }
     }
     throw error;
   }

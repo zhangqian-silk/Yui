@@ -1,7 +1,8 @@
 import { spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { mkdir, open, rm, stat } from "node:fs/promises";
+import { mkdir, open, rm } from "node:fs/promises";
 import { join, resolve } from "node:path";
+import { jobStepDirectory } from "../job/stepDirectory.js";
 
 import type { CheckResult } from "../integration/checkResult.js";
 import type { DurableJob, DurableJobStep } from "../job/durableJob.js";
@@ -272,9 +273,9 @@ export async function runGateStepsInProcess(
     const output = await open(absoluteLogPath, "w", 0o600);
     let timedOut = false;
     let child: ReturnType<typeof spawn>;
-    const stepCwd = step.cwd ?? cwd;
     const stepEnv = step.env === undefined ? env : { ...env, ...step.env };
     try {
+      const stepCwd = jobStepDirectory(cwd, step.cwd);
       if (step.argv !== undefined) {
         const [file, ...args] = step.argv;
         child = spawn(file, args, {
@@ -354,7 +355,7 @@ function sanitizeLogName(name: string): string {
  * environment/registry failure is never recorded as a Candidate test
  * failure; the Integration gate has not started when bootstrap fails.
  */
-export function checkResultsFromGateJob(job: DurableJob, home: string): CheckResult[] {
+export function checkResultsFromGateJob(job: DurableJob, _home: string): CheckResult[] {
   const results = new Map((job.result?.steps ?? []).map((step) => [step.name, step]));
   const checks: CheckResult[] = [];
   for (const step of job.steps) {
@@ -534,7 +535,7 @@ export async function runL1Gate(input: Readonly<{
   const selected = selectL1Checks(input.gate.plan, input.changedPaths);
   const outcomes = await runGateStepsInProcess(
     input.workspace,
-    planL1JobSteps(selected),
+    planL1JobSteps(selected, input.workspace),
     input.environment,
     input.logsDirectory,
     input.commit

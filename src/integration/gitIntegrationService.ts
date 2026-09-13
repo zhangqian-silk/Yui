@@ -20,11 +20,30 @@ import { promisify } from "node:util";
 import { selectEnvironment } from "../agent/launchEnvironment.js";
 import { controllerSocketPath } from "../core/controllerEndpoint.js";
 import { durableJobIdempotencyKey, type DurableJob, type DurableJobStep } from "../job/durableJob.js";
-import { applyIntegrationSource, assertIntegrationCandidate, assertRecordedSourceCandidate } from "./integrationSourceApplication.js";
+import { readRuntimeIdentity } from "../release/runtimeRelease.js";
+import type { GitWorkspaceRemoval } from "../repository/gitWorkspace.js";
 import {
-  planBootstrapJobSteps,
-  planL2JobSteps
-} from "../verification/verificationPlan.js";
+  NodeGitWorkspace,
+  type GitWorkspacePort
+} from "../repository/gitWorkspace.js";
+import { acquireProjectMaintenanceLocks } from "../repository/projectMaintenanceLock.js";
+import { taskWorkspaceRefSegment } from "../repository/taskWorkspaceIdentity.js";
+import { integrationWorkspaceRoot } from "../repository/taskWorkspacePreparer.js";
+import { ResourceRegistrar } from "../resources/resourceRegistrar.js";
+import {
+  FileTaskRuntimeIsolation,
+  type TaskRuntimeIsolationPort,
+  type TaskRuntimeIsolationPreparation
+} from "../runtime/taskRuntimeIsolation.js";
+import { managedIntegrationRuntimeRoot } from "../storage/homeLayout.js";
+import type { TaskStore } from "../storage/taskStore.js";
+import { advanceTaskProjectCommit } from "../task/task.js";
+import { yuiTmuxServerName } from "../tmux/tmuxManager.js";
+import {
+  recordGateArtifactPotentialReuse,
+  recordGateArtifactReuse
+} from "../verification/gateArtifact.js";
+import { touchGateArtifact } from "../verification/gateArtifactStore.js";
 import {
   assertNoAdHocFullSuiteChecks,
   checkResultsFromGateArtifact,
@@ -38,43 +57,28 @@ import {
   type ResolvedVerificationGate
 } from "../verification/verificationGateService.js";
 import {
-  recordGateArtifactPotentialReuse,
-  recordGateArtifactReuse
-} from "../verification/gateArtifact.js";
-import { touchGateArtifact } from "../verification/gateArtifactStore.js";
+  planBootstrapJobSteps,
+  planL2JobSteps
+} from "../verification/verificationPlan.js";
+import {
+  createManagedWorkspace,
+  type ManagedWorkspace
+} from "../worktree/managedWorkspace.js";
 import type { CheckResult } from "./checkResult.js";
-import {
-  NodeGitWorkspace,
-  type GitWorkspacePort
-} from "../repository/gitWorkspace.js";
-import type { GitWorkspaceRemoval } from "../repository/gitWorkspace.js";
-import { integrationWorkspaceRoot } from "../repository/taskWorkspacePreparer.js";
-import { acquireProjectMaintenanceLocks } from "../repository/projectMaintenanceLock.js";
-import { taskWorkspaceRefSegment } from "../repository/taskWorkspaceIdentity.js";
-import {
-  FileTaskRuntimeIsolation,
-  type TaskRuntimeIsolationPort,
-  type TaskRuntimeIsolationPreparation
-} from "../runtime/taskRuntimeIsolation.js";
-import type { TaskStore } from "../storage/taskStore.js";
-import { managedIntegrationRuntimeRoot } from "../storage/homeLayout.js";
-import { advanceTaskProjectCommit } from "../task/task.js";
-import { yuiTmuxServerName } from "../tmux/tmuxManager.js";
 import {
   recordIntegrationCheckJob,
   updateIntegrationAttempt,
   type IntegrationAttempt
 } from "./integrationAttempt.js";
 import {
-  createManagedWorkspace,
-  type ManagedWorkspace
-} from "../worktree/managedWorkspace.js";
-import { ResourceRegistrar } from "../resources/resourceRegistrar.js";
-import { readRuntimeIdentity } from "../release/runtimeRelease.js";
-import {
   findReusableIntegrationCheckEvidence,
   INTEGRATION_RUNTIME_RELEASE_ENV
 } from "./integrationCheckEvidenceReuse.js";
+import {
+  applyIntegrationSource,
+  assertIntegrationCandidate,
+  assertRecordedSourceCandidate
+} from "./integrationSourceApplication.js";
 
 const executeFile = promisify(execFile);
 
@@ -835,8 +839,8 @@ export class GitIntegrationService {
     try {
       await prepareIntegrationRuntimeHome(runtime, this.home);
       const steps = [
-        ...planBootstrapJobSteps(gate.plan),
-        ...planL2JobSteps(gate.plan)
+        ...planBootstrapJobSteps(gate.plan, path),
+        ...planL2JobSteps(gate.plan, path)
       ];
       const outcomes = await runGateStepsInProcess(
         path,
@@ -905,7 +909,7 @@ export class GitIntegrationService {
   }
 
   #runtimePreparation(
-    attempt: IntegrationAttempt,
+    _attempt: IntegrationAttempt,
     workspace: ManagedWorkspace
   ): TaskRuntimeIsolationPreparation {
     return this.runtimeIsolation.preflight({
@@ -929,7 +933,8 @@ export class GitIntegrationService {
       ? attempt.checkCommands.map((command, index) => ({
           name: `check-${index + 1}`, command, timeoutMs: 30 * 60_000
         }))
-      : [...planBootstrapJobSteps(gate.plan), ...planL2JobSteps(gate.plan)]
+      : [...planBootstrapJobSteps(gate.plan, managedWorkspace.root),
+          ...planL2JobSteps(gate.plan, managedWorkspace.root)]
         .map(step => ({ ...step, timeoutMs: 30 * 60_000 }));
     const releaseId = integrationRuntimeReleaseIdentity(this.home);
     const environment = Object.freeze({

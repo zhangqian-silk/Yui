@@ -1,38 +1,37 @@
 import { isDeepStrictEqual } from "node:util";
-import { agentNotFound, usageError } from "../errors/cliError.js";
-import { defaultTableWidth, renderTable } from "../output/table.js";
 import type { AgentAdapterId } from "../agent/adapterCatalog.js";
 import { isAgentAdapterId, supportedAgentAdapterIds } from "../agent/adapterCatalog.js";
-import {
-  adapterIdForExecutionComponent,
-  agentExecutionComponentLabel,
-  defaultExecutionComponentForAdapter,
-  executionComponentsForAdapter,
-  isAgentExecutionComponentId,
-  supportedAgentExecutionComponentIds,
-  type AgentExecutionComponentId
-} from "../agent/executionComponents.js";
 import {
   createConfiguredAgent,
   validateConfiguredAgent,
   type ConfiguredAgent as ConfiguredAgentRecord,
   type EnvironmentBinding
 } from "../agent/agent.js";
+import {
+  adapterIdForExecutionComponent,
+  agentExecutionComponentLabel,
+  defaultExecutionComponentForAdapter,
+  isAgentExecutionComponentId,
+  supportedAgentExecutionComponentIds,
+  type AgentExecutionComponentId
+} from "../agent/executionComponents.js";
 import type {
   MailboxTarget,
   WorkMailbox
 } from "../coordination/workMailbox.js";
+import { agentNotFound, usageError } from "../errors/cliError.js";
 import type {
   GlobalRoleSessionSet,
   TaskRoleSessionSet
 } from "../executor/agentExecutor.js";
+import { defaultTableWidth, renderTable } from "../output/table.js";
 import type { AgentProfile } from "../profile/agentProfile.js";
 import type { GlobalRole, TaskRole } from "../role/role.js";
-import { LIVE_SESSION_ACKNOWLEDGEMENT_OPTION } from "./roleRuntimeGuard.js";
 import {
   hasRuntimeLifecycleWork,
   runtimeLifecycleTarget
 } from "../runtime/lifecycleReservation.js";
+import { LIVE_SESSION_ACKNOWLEDGEMENT_OPTION } from "./roleRuntimeGuard.js";
 
 export type { ConfiguredAgentRecord, EnvironmentBinding };
 

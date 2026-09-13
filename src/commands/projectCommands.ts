@@ -41,7 +41,7 @@ import {
   type ProjectReferenceSummary
 } from "../repository/project.js";
 import { managedWorkspacesRoot } from "../storage/homeLayout.js";
-import { projectActor } from "./taskActor.js";
+import { projectActor } from "../task/taskAuthority.js";
 import type { Decision } from "../decision/decision.js";
 import type { Milestone } from "../milestone/milestone.js";
 import type { Task } from "../task/task.js";

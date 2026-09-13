@@ -1,16 +1,20 @@
-import { isDeepStrictEqual } from "node:util";
 import { lstat } from "node:fs/promises";
-import { isArchivePersistenceFailure, recordArchiveCleanup, type ArchiveDiagnostic } from "../task/archiveDiagnostics.js";
-import { projectTaskRemoteDeliveryFromStore } from "../commands/taskRemoteDeliveryCommand.js";
-import { WorkItemChangeSetManager } from "../workspace/workItemChangeSetManager.js";
-import { archiveSettlementChecks, archiveExecutionChecks } from "../task/archivePreflight.js";
+import { isDeepStrictEqual } from "node:util";
+import {
+  isArchivePersistenceFailure,
+  recordArchiveCleanup,
+  type ArchiveDiagnostic
+} from "../task/archiveDiagnostics.js";
+import { archiveExecutionChecks, archiveSettlementChecks } from "../task/archivePreflight.js";
+import { projectTaskRemoteDeliveryFromStore } from "../task/remoteDeliveryService.js";
 import { CleanupInspectionError } from "../workspace/cleanupInspection.js";
+import { WorkItemChangeSetManager } from "../workspace/workItemChangeSetManager.js";
 
+import type { ReviewRound } from "../review/reviewRound.js";
 import {
   hasRuntimeLifecycleWork,
   runtimeLifecycleTarget
 } from "../runtime/lifecycleReservation.js";
-import type { ReviewRound } from "../review/reviewRound.js";
 import type { TaskStore } from "../storage/taskStore.js";
 import type { Task } from "../task/task.js";
 import type {

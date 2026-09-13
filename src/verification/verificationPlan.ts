@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { isAbsolute, relative, resolve, sep } from "node:path";
 
 import {
   requireIdentity,
@@ -273,6 +274,9 @@ function normalizedTextList(raw: unknown, label: string): readonly string[] {
  */
 export function verificationPlanDigest(plan: VerificationPlan): string {
   const canonical = canonicalJson({
+    // Old artifacts may have skipped shell commands or run in the wrong cwd.
+    // Keep that history, but never reuse it as proof under corrected semantics.
+    executionContract: "workspace-argv-or-shell/v2",
     id: plan.id,
     version: plan.version,
     toolchain: plan.toolchain,
@@ -334,28 +338,35 @@ export function selectL1Checks(
 }
 
 /** Bootstrap steps as DurableJob steps, named `bootstrap-N`. */
-export function planBootstrapJobSteps(plan: VerificationPlan): readonly DurableJobStep[] {
-  return plan.bootstrap.map((step, index) => toDurableJobStep(step, `bootstrap-${index + 1}`));
+export function planBootstrapJobSteps(plan: VerificationPlan, workspace: string): readonly DurableJobStep[] {
+  return plan.bootstrap.map((step, index) => toDurableJobStep(step, `bootstrap-${index + 1}`, workspace));
 }
 
 /** L2 gate steps as DurableJob steps, named `gate-N`. */
-export function planL2JobSteps(plan: VerificationPlan): readonly DurableJobStep[] {
-  return plan.l2.steps.map((step, index) => toDurableJobStep(step, `gate-${index + 1}`));
+export function planL2JobSteps(plan: VerificationPlan, workspace: string): readonly DurableJobStep[] {
+  return plan.l2.steps.map((step, index) => toDurableJobStep(step, `gate-${index + 1}`, workspace));
 }
 
 /** L1 steps as DurableJob steps, named `l1-N`. */
-export function planL1JobSteps(steps: readonly VerificationStep[]): readonly DurableJobStep[] {
-  return steps.map((step, index) => toDurableJobStep(step, `l1-${index + 1}`));
+export function planL1JobSteps(steps: readonly VerificationStep[], workspace: string): readonly DurableJobStep[] {
+  return steps.map((step, index) => toDurableJobStep(step, `l1-${index + 1}`, workspace));
 }
 
-function toDurableJobStep(step: VerificationStep, name: string): DurableJobStep {
+function toDurableJobStep(step: VerificationStep, name: string, workspace: string): DurableJobStep {
+  if (!isAbsolute(workspace)) throw new Error("Verification workspace must be absolute.");
+  const cwd = step.cwd === undefined ? undefined : resolve(workspace, step.cwd);
+  const nested = cwd === undefined ? "" : relative(workspace, cwd);
+  if (step.cwd !== undefined && (isAbsolute(step.cwd) || nested === ".."
+    || nested.startsWith(`..${sep}`) || isAbsolute(nested))) {
+    throw new Error(`Verification step cwd is outside its workspace: ${step.name}.`);
+  }
   return {
     name,
     // The shell-equivalent command stays as the human-readable fallback and
     // the coverage-matching string; argv is the executable form.
     command: step.shell === true ? step.argv.join(" ") : shellQuote(step.argv),
-    argv: step.argv,
-    ...(step.cwd === undefined ? {} : { cwd: step.cwd }),
+    ...(step.shell === true ? {} : { argv: step.argv }),
+    ...(cwd === undefined ? {} : { cwd }),
     ...(step.env === undefined ? {} : { env: step.env })
   };
 }

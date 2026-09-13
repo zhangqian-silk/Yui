@@ -3,9 +3,9 @@
  *
  * The worker owns the {@link SqliteTaskStore} connection: one writer connection
  * (single-writer, `BEGIN IMMEDIATE`) plus a small read pool (separate WAL
- * connections that never take the write lock, §3.2). The main thread never
- * touches the db; it sends commands over a `MessageChannel` port and receives
- * results.
+ * connections for reads). Observer folds and telemetry ingestion use this
+ * worker; the Controller's synchronous scheduler still has its own connection
+ * to the same WAL database. This is an execution boundary, not another Store.
  *
  * The port handshake, dispatch, cancellation observation, and error
  * serialization are provided by the shared `core/boundedRpc` worker host
@@ -22,6 +22,8 @@
  *   - `observer` ..... a controller observer method hosted by the worker (the
  *                      `FileSchedulerStoreAdapter` folds run here, off the main
  *                      event loop).
+ *   - `telemetry` .... bounded diagnostic batch, using existing row keys and
+ *                      triggers without Task revision or outbox writes.
  *   - `expectedRevision` enforces the global revision CAS in the same txn
  *                      (§5.3); a mismatch fails with `StorageConflictError`.
  *
@@ -30,11 +32,11 @@
  */
 import { runRpcWorker } from "../core/boundedRpc.js";
 import { SqliteTaskStore } from "./sqliteStore.js";
-import { StorageRecordError } from "./taskStore.js";
 import type {
   WorkerRequest,
   WorkerResponse
 } from "./storeRpc.js";
+import { StorageRecordError } from "./taskStore.js";
 
 // -- method invocation -------------------------------------------------------
 
@@ -177,6 +179,7 @@ runRpcWorker<WorkerRequest, WorkerResponse>({
       case "call":
       case "transaction":
       case "observer":
+      case "telemetry":
         return "request";
     }
   },
@@ -185,6 +188,7 @@ runRpcWorker<WorkerRequest, WorkerResponse>({
       case "call":
       case "transaction":
       case "observer":
+      case "telemetry":
       case "cancel":
         return request.requestId;
       case "init":
@@ -193,7 +197,7 @@ runRpcWorker<WorkerRequest, WorkerResponse>({
     }
   },
   init: (request) => handleInit(request as Extract<WorkerRequest, { kind: "init" }>),
-  handle: (request) => {
+  handle: async (request) => {
     switch (request.kind) {
       case "call":
         return handleCall(request);
@@ -201,6 +205,9 @@ runRpcWorker<WorkerRequest, WorkerResponse>({
         return handleTransaction(request);
       case "observer":
         return handleObserver(request);
+      case "telemetry":
+        if (state.writer === undefined) throw new Error("Worker not initialized.");
+        return state.writer.flushTelemetry(request.entries, request.runCap);
       case "init":
       case "cancel":
       case "shutdown":

@@ -1,5 +1,5 @@
 import { usageError } from "../errors/cliError.js";
-import { resolveJobCaller } from "./taskActor.js";
+import { resolveJobCaller } from "../task/taskAuthority.js";
 import { callFileTaskController } from "../controller/clientRuntime.js";
 import type { JsonValue } from "../core/protocol.js";
 

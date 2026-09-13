@@ -1,4 +1,4 @@
-import { createHash, randomBytes } from "node:crypto";
+import { randomBytes } from "node:crypto";
 
 /**
  * The durable Home identity. Generated exactly once per Home and persisted in

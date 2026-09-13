@@ -32,7 +32,7 @@ export type ManagedTaskCaller = Readonly<{
 
 export type ManagedCallerStore = Pick<
   TaskStore,
-  "getRole" | "getActiveRun" | "getTaskRoleSessionSet" | "listEvents"
+  "getRole" | "getActiveRun" | "getTaskRoleSessionSet" | "listEventsByType"
 >;
 
 /** Immutable self-identity a managed Task Session asserts about its own process. */
@@ -190,7 +190,7 @@ function requireCurrentRuntime(
         + `as the current runtime of ${self.taskId}/${self.roleName}.`
     );
   }
-  if (role.name === "leader" && store.listEvents(self.taskId).some((event) =>
+  if (role.name === "leader" && store.listEventsByType(self.taskId, ["role.agent-bound"]).some((event) =>
     event.type === "role.agent-bound" && event.payload.role === role.name
     && event.payload.revokedNativeSessionId === self.nativeSessionId)) {
     throw new ManagedRuntimeDriftError("This Leader native Session's management authority was explicitly revoked.");

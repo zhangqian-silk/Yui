@@ -8,20 +8,9 @@ import {
 } from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import type { ConfiguredAgent } from "../agent/agent.js";
+import type { AgentRun } from "../agentRun/agentRun.js";
 import type { TaskBrief } from "../brief/taskBrief.js";
-import {
-  validateCapabilityGrant,
-  type CapabilityGrant
-} from "../grant/capabilityGrant.js";
-import {
-  validateReleaseWorkflow,
-  type ReleaseStepStatus,
-  type ReleaseWorkflow
-} from "../release/releaseWorkflow.js";
-import {
-  validatePublicationReference,
-  type PublicationReference
-} from "../task/publicationReference.js";
+import { resolveTimeZone } from "../config/timeZone.js";
 import {
   reconciliationIntervalMilliseconds,
   resolveAgentLaunchInactivityTimeoutSeconds,
@@ -39,57 +28,69 @@ import {
   resolveTmuxBin,
   resolveTmuxHistoryLimit
 } from "../config/yuiConfig.js";
-import { resolveTimeZone } from "../output/timePresentation.js";
+import type { ContextSnapshot } from "../context/contextSnapshot.js";
 import type { MailboxTarget, WorkMailbox } from "../coordination/workMailbox.js";
 import type { Decision } from "../decision/decision.js";
-import type { ContextSnapshot } from "../context/contextSnapshot.js";
 import type { TaskEvent } from "../event/taskEvent.js";
-import type { InputRequest } from "../input/inputRequest.js";
 import {
   type GlobalRoleSessionSet,
   type RoleAgentSession,
   type TaskRoleSessionSet
 } from "../executor/agentExecutor.js";
-import type { TaskMessage, GlobalRoleMessage } from "../message/message.js";
+import {
+  validateCapabilityGrant,
+  type CapabilityGrant
+} from "../grant/capabilityGrant.js";
+import type { InputRequest } from "../input/inputRequest.js";
+import type { ChangeSet } from "../integration/changeSet.js";
+import type { IntegrationAttempt } from "../integration/integrationAttempt.js";
+import type { IntegrationQueueEntry } from "../integration/integrationQueueEntry.js";
+import type { DurableJob } from "../job/durableJob.js";
+import type { GlobalRoleMessage, TaskMessage } from "../message/message.js";
 import type { Milestone } from "../milestone/milestone.js";
-import type { AgentRun } from "../agentRun/agentRun.js";
+import type { PluginIntent, PluginIntentFailure } from "../plugins/pluginIntent.js";
+import type { PluginValidation } from "../plugins/pluginPackage.js";
+import type { AgentProfile } from "../profile/agentProfile.js";
+import {
+  validateReleaseWorkflow,
+  type ReleaseStepStatus,
+  type ReleaseWorkflow
+} from "../release/releaseWorkflow.js";
+import type { HomeIdentity } from "../repository/homeIdentity.js";
+import type { Project, ProjectReferenceSummary } from "../repository/project.js";
+import type { EnvironmentPreparation, LocalResource } from "../resources/projectResource.js";
+import {
+  validateReviewConfig,
+  type ReviewConfig
+} from "../review/reviewConfig.js";
+import type { ReviewRound } from "../review/reviewRound.js";
+import type { GlobalRole, TaskRole } from "../role/role.js";
 import type { RuntimeOwner } from "../runtime/runtimeOwner.js";
 import {
   type RuntimeSessionCandidate,
   type RuntimeSessionCandidateQuery
 } from "../runtime/runtimeSessionCandidate.js";
 import type { SessionOwnerIdentity } from "../runtime/sessionOwnerIdentity.js";
-import {
-  validateReviewConfig,
-  type ReviewConfig
-} from "../review/reviewConfig.js";
-import type { ReviewRound } from "../review/reviewRound.js";
-import type { Project, ProjectReferenceSummary } from "../repository/project.js";
-import type { HomeIdentity } from "../repository/homeIdentity.js";
-import type { AgentProfile } from "../profile/agentProfile.js";
-import type { ChangeSet } from "../integration/changeSet.js";
-import type { IntegrationAttempt } from "../integration/integrationAttempt.js";
-import type { IntegrationQueueEntry } from "../integration/integrationQueueEntry.js";
-import type { DurableJob } from "../job/durableJob.js";
-import type { GlobalRole, TaskRole } from "../role/role.js";
 import type { LeaderFailure } from "../scheduler/leaderFailure.js";
 import type { PendingWakeup } from "../scheduler/pendingWakeup.js";
 import type { TaskWake } from "../scheduler/taskWake.js";
-import type { Task } from "../task/task.js";
-import type { LocalResource, EnvironmentPreparation } from "../resources/projectResource.js";
-import type { PluginValidation } from "../plugins/pluginPackage.js";
-import type { PluginIntent, PluginIntentFailure } from "../plugins/pluginIntent.js";
-import type { NextActionFacts } from "../task/nextAction.js";
 import type { CompletionReadinessFacts } from "../task/completionReadiness.js";
+import type { NextActionFacts } from "../task/nextAction.js";
+import {
+  validatePublicationReference,
+  type PublicationReference
+} from "../task/publicationReference.js";
+import type { Task } from "../task/task.js";
 import { validateTaskRecordReference } from "../task/taskRecordReference.js";
-import type { WorkItem } from "../workItem/workItem.js";
-import type { ManagedWorkspace, ManagedWorkspaceOwner } from "../worktree/managedWorkspace.js";
 import {
   type GateArtifact,
   type GateArtifactIdentity,
   type GateArtifactPruneOptions,
   type GateArtifactPruneResult
 } from "../verification/gateArtifact.js";
+import type { WorkItem } from "../workItem/workItem.js";
+import type { ManagedWorkspace, ManagedWorkspaceOwner } from "../worktree/managedWorkspace.js";
+import type { ContextRecordPage, ContextRecordQuery, ContextInputScope } from "./contextRecords.js";
 
 export const CURRENT_CONFIG_SCHEMA_VERSION = 6 as const;
 /** Current SQLite payload-family versions owned by this storage boundary. */
@@ -229,6 +230,13 @@ export type TaskStore = {
   listEnvironmentPreparations(taskId: string): EnvironmentPreparation[];
   rootDirectory(): string;
   transaction<T>(execute: (store: TaskStore) => T): T;
+  readTransaction<T>(execute: (store: TaskStore) => T): T;
+  queryContextRecords(taskId: string, query: ContextRecordQuery): ContextRecordPage;
+  latestEventSequence(taskId: string): number;
+  listEventsByType(taskId: string, types: readonly string[]): TaskEvent[];
+  listTaskRunWorkspaceBases(taskId: string): Pick<AgentRun, "id" | "createdAt" | "workspace">[];
+  contextInputReferences(taskId: string, scope: ContextInputScope): { messages: string[]; events: string[] };
+  listActiveRuns(taskId: string): AgentRun[];
   /**
    * Runs a Controller runtime-inbox fold as one aggregate transaction.  The
    * named seam lets the processor batch independent durable facts without

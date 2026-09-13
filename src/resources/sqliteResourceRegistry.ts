@@ -11,29 +11,28 @@
  * created by the current SQLite baseline.
  */
 
-import { existsSync, mkdirSync } from "node:fs";
+import { existsSync } from "node:fs";
 import { join } from "node:path";
+import { isDeepStrictEqual } from "node:util";
 
 import Database from "better-sqlite3";
 
+import { migrateSqliteSchema } from "../storage/sqliteSchema.js";
+import {
+  emptyResourceRegistry,
+  parseResourceRegistryState
+} from "./resourceRegistry.js";
 import {
   RESOURCE_REGISTRY_SCHEMA_VERSION,
   type ResourceRecord,
   type ResourceRegistryState
 } from "./resourceTypes.js";
-import {
-  emptyResourceRegistry,
-  parseResourceRegistryState
-} from "./resourceRegistry.js";
-import { migrateSqliteSchema } from "../storage/sqliteSchema.js";
 
 export const SQLITE_RESOURCE_REGISTRY_TABLE = "resource_registry";
 
 /**
- * A SQLite-backed resource registry store.  Each `save` is a single
- * transaction that upserts every record and removes rows that disappeared
- * from the in-memory state, so the on-disk table always matches the state
- * the GC engine computed.
+ * Each save applies only the caller's delta. Unrelated registrations survive;
+ * a changed same-record snapshot fails closed instead of overwriting ownership.
  */
 export class SqliteResourceRegistry {
   readonly #db: Database.Database;
@@ -44,10 +43,15 @@ export class SqliteResourceRegistry {
       throw new Error(`SQLite database not found at ${dbPath}`);
     }
     this.#db = new Database(dbPath);
-    this.#db.pragma("journal_mode = WAL");
-    this.#db.pragma("foreign_keys = ON");
-    this.#db.pragma("busy_timeout = 5000");
-    migrateSqliteSchema(this.#db, { mode: "validate" });
+    try {
+      this.#db.pragma("journal_mode = WAL");
+      this.#db.pragma("foreign_keys = ON");
+      this.#db.pragma("busy_timeout = 5000");
+      migrateSqliteSchema(this.#db, { mode: "validate" });
+    } catch (error) {
+      this.#db.close();
+      throw error;
+    }
   }
 
   load(): ResourceRegistryState {
@@ -81,7 +85,12 @@ export class SqliteResourceRegistry {
     });
   }
 
-  save(state: ResourceRegistryState): void {
+  save(state: ResourceRegistryState, previous: ResourceRegistryState): void {
+    const next = parseResourceRegistryState(state);
+    const before = parseResourceRegistryState(previous);
+    const ids = [...new Set([...Object.keys(before.records), ...Object.keys(next.records)])]
+      .filter(id => !isDeepStrictEqual(before.records[id], next.records[id]));
+    if (ids.length === 0) return;
     const upsert = this.#db.prepare(
       `INSERT INTO ${SQLITE_RESOURCE_REGISTRY_TABLE}
          (id, kind, path, disposition, task_id, payload, created_at, updated_at)
@@ -99,14 +108,24 @@ export class SqliteResourceRegistry {
       `DELETE FROM ${SQLITE_RESOURCE_REGISTRY_TABLE} WHERE id = ?`
     );
 
-    const existingRows = this.#db.prepare(
-      `SELECT id FROM ${SQLITE_RESOURCE_REGISTRY_TABLE}`
-    ).all() as Array<{ id: string }>;
-    const existingIds = new Set(existingRows.map((row) => row.id));
-    const currentIds = new Set(Object.keys(state.records));
-
     const tx = this.#db.transaction(() => {
-      for (const record of Object.values(state.records) as ResourceRecord[]) {
+      const read = this.#db.prepare(`SELECT payload FROM ${SQLITE_RESOURCE_REGISTRY_TABLE} WHERE id = ?`);
+      for (const id of ids) {
+        const row = read.get(id) as { payload: string } | undefined;
+        const current = row === undefined ? undefined : parseResourceRegistryState({
+          schemaVersion: RESOURCE_REGISTRY_SCHEMA_VERSION,
+          records: { [id]: JSON.parse(row.payload) }
+        }).records[id];
+        if (!isDeepStrictEqual(current, before.records[id])) {
+          throw new Error(`Resource registry record changed since inspection: ${id}. Inspect and retry.`);
+        }
+      }
+      for (const id of ids) {
+        const record = next.records[id];
+        if (record === undefined) {
+          remove.run(id);
+          continue;
+        }
         upsert.run({
           id: record.id,
           kind: record.kind,
@@ -118,21 +137,11 @@ export class SqliteResourceRegistry {
           updated_at: record.updatedAt
         });
       }
-      for (const id of existingIds) {
-        if (!currentIds.has(id)) remove.run(id);
-      }
     });
-    tx();
+    tx.immediate();
   }
 
   close(): void {
     this.#db.close();
   }
-}
-
-/**
- * Detect whether a Home uses SQLite storage (yui.db exists).
- */
-export function isSqliteHome(home: string): boolean {
-  return existsSync(join(home, "yui.db"));
 }

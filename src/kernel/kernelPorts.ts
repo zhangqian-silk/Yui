@@ -1,10 +1,10 @@
-import { createDurableJobControl, type DurableJobControlPort } from "../controller/jobControl.js";
-import { JOB_RUNNER_IMPLEMENTATION, type DurableJob } from "../job/durableJob.js";
-import type { JobSupervisorProcessPort } from "../controller/jobSupervisor.js";
-import type { TaskStore } from "../storage/taskStore.js";
-import { InstanceHost } from "./instanceHost.js";
-import { createBuiltinCapabilities } from "./builtinCapabilities.js";
 import type { ContextObservationProvider } from "../context/taskContext.js";
+import { createDurableJobControl, type DurableJobControlPort } from "../controller/jobControl.js";
+import type { JobSupervisorProcessPort } from "../controller/jobSupervisor.js";
+import { JOB_RUNNER_IMPLEMENTATION } from "../job/durableJob.js";
+import type { TaskStore } from "../storage/taskStore.js";
+import { createBuiltinCapabilities } from "./builtinCapabilities.js";
+import { InstanceHost } from "./instanceHost.js";
 
 /** Called once by the existing Controller root. Does not open a Store, start
  * another Controller, or provide arbitrary persistence to plugin code.
@@ -39,22 +39,5 @@ export function createKernelPorts(
       await runnerHandle.release();
       await drain;
     }
-  };
-}
-
-/** A read model over the one Job, never separately persisted.
- * confirmed means the selected runner was observed, not that every action
- * performed by an arbitrary command succeeded. Inspect original step receipts.
- */
-export function inspectJobOperation(job: DurableJob) {
-  return {
-    operationRef: { taskId: job.taskId, jobId: job.id },
-    ...job.operation,
-    state: job.status === "queued" ? "pending"
-      : job.status === "running" ? "running"
-      : job.status === "unknown-needs-attention" ? "unknown" : "finished",
-    outcome: job.result?.outcome,
-    result: job.result,
-    checkpoint: job.checkpoint
   };
 }

@@ -16,7 +16,6 @@ import type { ManagedWorkspace } from "../worktree/managedWorkspace.js";
 import {
   applyResourceGc,
   planResourceGc,
-  type GcResult
 } from "./resourceGc.js";
 import {
   resolveResourcesGcAutoQuarantine,
@@ -73,55 +72,6 @@ export function createResourceAutoGc(options: {
       restored: result.restored.length
     };
   };
-}
-
-export type AutoGcResult = Readonly<{
-  ran: boolean;
-  result?: GcResult;
-  reason?: string;
-}>;
-
-/**
- * Run one automatic GC pass. Returns `ran: false` when auto-GC is disabled or
- * the GC mode is not `quarantine`. The pass never purges: permanent deletion
- * is always manual.
- */
-export async function runAutoResourceGc(
-  store: TaskStore,
-  options: { now?: Date } = {}
-): Promise<AutoGcResult> {
-  const config = store.getConfig();
-  const autoQuarantine = resolveResourcesGcAutoQuarantine(config.resourcesGcAutoQuarantine);
-  if (!autoQuarantine) {
-    return { ran: false, reason: "auto-quarantine is disabled" };
-  }
-  const gcMode = resolveResourcesGcMode(config.resourcesGcMode);
-  if (gcMode !== "quarantine") {
-    return { ran: false, reason: "resources.gcMode is not quarantine" };
-  }
-
-  const now = options.now ?? new Date();
-  const home = store.rootDirectory();
-  const projects = store.listProjects();
-  const managedWorkspaces = collectManagedWorkspaces(store);
-  const taskStatusById = collectTaskStatuses(store);
-
-  const input = {
-    home,
-    projects,
-    managedWorkspaces,
-    taskStatusById,
-    mode: "quarantine" as const,
-    now,
-    quarantineTtlHours: resolveResourcesQuarantineTtlHours(
-      config.resourcesQuarantineTtlHours
-    ),
-    activeWorkspaceOwnerPaths: collectActiveWorkspaceOwnerPaths(store)
-  };
-
-  const plan = await planResourceGc(input);
-  const result = await applyResourceGc(input, plan);
-  return { ran: true, result };
 }
 
 function collectManagedWorkspaces(store: TaskStore): ManagedWorkspace[] {

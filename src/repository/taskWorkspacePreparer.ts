@@ -1,8 +1,8 @@
 import {
   lstat,
   mkdir,
-  readlink,
   readdir,
+  readlink,
   rm,
   rmdir,
   symlink,
@@ -18,25 +18,31 @@ import {
 import { isDeepStrictEqual } from "node:util";
 import { recordArchiveCleanup } from "../task/archiveDiagnostics.js";
 
+import type { AgentRun } from "../agentRun/agentRun.js";
+import { enqueueWork } from "../coordination/workMailboxQueue.js";
+import { createTaskEvent } from "../event/taskEvent.js";
 import {
   retireTaskRoleSessionsForWorkspace,
   updateRoleAgentSessionStatus
 } from "../executor/agentExecutor.js";
 import { formatWorkspacePreflightError } from "../executor/workspacePreflightClassification.js";
-import { updateRole, type TaskRole } from "../role/role.js";
-import { taskRoleRuntimeIdentity } from "../runtime/managedCaller.js";
-import {
-  hasRuntimeCleanupObligation,
-  runtimeLifecycleTarget,
-  RUNTIME_HOST_DETACH_REQUIRED_REASON
-} from "../runtime/lifecycleReservation.js";
-import { taskLocalActor } from "../commands/taskActor.js";
+import { createProjectResources } from "../resources/projectResourceService.js";
+import { ResourceRegistrar } from "../resources/resourceRegistrar.js";
 import {
   attachReviewRoundWorkspace,
   recordReviewWorkspaceDisposition,
   type ReviewRound
 } from "../review/reviewRound.js";
+import { updateRole, type TaskRole } from "../role/role.js";
+import {
+  hasRuntimeCleanupObligation,
+  RUNTIME_HOST_DETACH_REQUIRED_REASON,
+  runtimeLifecycleTarget
+} from "../runtime/lifecycleReservation.js";
+import { taskRoleRuntimeIdentity } from "../runtime/managedCaller.js";
+import { managedTaskRoot } from "../storage/homeLayout.js";
 import { StorageConflictError, type TaskStore } from "../storage/taskStore.js";
+import { validateDraftTaskForActivation } from "../task/draftPlan.js";
 import {
   activateTask,
   bindTaskProjectCommits,
@@ -45,28 +51,25 @@ import {
   taskOwnsManagedWorkspace,
   type Task
 } from "../task/task.js";
+import type { TaskActivationRequest } from "../task/taskActivation.js";
 import {
   admitStoredTaskActivation,
   adoptTaskActivationResources,
-  recordFailedTaskActivation,
-  recordAdoptedTaskActivation
+  recordAdoptedTaskActivation,
+  recordFailedTaskActivation
 } from "../task/taskActivationService.js";
-import type { TaskActivationRequest } from "../task/taskActivation.js";
-import { validateDraftTaskForActivation } from "../task/draftPlan.js";
-import { createProjectResources } from "../resources/projectResourceService.js";
-import { createTaskEvent } from "../event/taskEvent.js";
-import { enqueueWork } from "../coordination/workMailboxQueue.js";
+import { taskLocalActor } from "../task/taskAuthority.js";
 import {
   createCandidateGitSnapshot,
   createDirectTaskMainSnapshot,
-  currentWorkItemExecutionGroup,
-  workItemExecutionGroupById,
   recordWorkItemWorkspaceDisposition,
+  workItemExecutionGroupById,
   type CandidateGitSnapshot,
   type DirectTaskMainSnapshot,
   type WorkItem,
   type WorkItemWorkspaceDisposition
 } from "../workItem/workItem.js";
+import { CleanupInspectionError, type CleanupCheck } from "../workspace/cleanupInspection.js";
 import {
   createManagedWorkspace,
   isTaskOwnedWorkspace,
@@ -77,7 +80,6 @@ import {
   type WorkspaceProjectEntry
 } from "../worktree/managedWorkspace.js";
 import type { ExecutionLaneGitSnapshot } from "./executionLaneGitSnapshot.js";
-import type { AgentRun } from "../agentRun/agentRun.js";
 import {
   NodeGitWorkspace,
   worktreeIdentity,
@@ -89,25 +91,22 @@ import {
 import type { Project } from "./project.js";
 import {
   acquireProjectMaintenanceLocks,
-  ProjectMaintenanceLockedError,
   ProjectMaintenanceLockCancelledError,
+  ProjectMaintenanceLockedError,
   type ProjectMaintenanceLockOptions
 } from "./projectMaintenanceLock.js";
+import {
+  captureTaskBaseProvenance,
+  recordTaskBaseProvenanceEvents,
+  type TaskBaseProvenance
+} from "./taskBaseFreshness.js";
 import {
   generateTaskWorkspaceIdentity,
   taskWorkspaceRefSegment,
   validateTaskWorkspaceIdentity,
   type TaskWorkspaceIdentity
 } from "./taskWorkspaceIdentity.js";
-import { ResourceRegistrar } from "../resources/resourceRegistrar.js";
-import {
-  captureTaskBaseProvenance,
-  recordTaskBaseProvenanceEvents,
-  type TaskBaseProvenance
-} from "./taskBaseFreshness.js";
-import { managedTaskRoot } from "../storage/homeLayout.js";
 import { inspectWorkspaceCleanup } from "./workspaceCleanupInspection.js";
-import { CleanupInspectionError, type CleanupCheck } from "../workspace/cleanupInspection.js";
 
 const MAIN_WORKTREE = "main";
 const LEADER_ROLE = "leader";

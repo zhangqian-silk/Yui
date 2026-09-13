@@ -1,15 +1,11 @@
 /**
  * Persistent Resource registry (Issue 10).
  *
- * The registry is GC's own state.  When the Home is SQLite-backed it lives in
- * the `resource_registry` table inside `yui.db`; otherwise it falls back to a
- * JSON file at `$YUI_HOME/runtime/resource-registry/registry.json`.
+ * The registry lives only in `resource_registry` inside the current `yui.db`.
+ * This module owns its value validation and quarantine paths, not persistence.
  */
 
-import type { ResourceRegistryStore } from "./resourceRegistryStore.js";
-
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
-import { dirname, join, resolve } from "node:path";
+import { join, resolve } from "node:path";
 
 import {
   RESOURCE_REGISTRY_SCHEMA_VERSION,
@@ -18,17 +14,7 @@ import {
 } from "./resourceTypes.js";
 
 export const RESOURCE_REGISTRY_DIRECTORY = "resource-registry";
-export const RESOURCE_REGISTRY_FILE = "registry.json";
 export const RESOURCE_QUARANTINE_DIRECTORY = "quarantine";
-
-export function resourceRegistryPath(home: string): string {
-  return join(
-    resolve(home),
-    "runtime",
-    RESOURCE_REGISTRY_DIRECTORY,
-    RESOURCE_REGISTRY_FILE
-  );
-}
 
 export function resourceQuarantineRoot(home: string): string {
   return join(
@@ -51,40 +37,6 @@ export function emptyResourceRegistry(): ResourceRegistryState {
     schemaVersion: RESOURCE_REGISTRY_SCHEMA_VERSION,
     records: Object.freeze({})
   });
-}
-
-/**
- * Load the registry. A missing registry is an empty Home. A corrupt or
- * unreadable registry fails closed: GC must never invent ownership from a
- * corrupt registry, and silently dropping quarantine receipts could let a
- * resource be released twice.
- */
-export function loadResourceRegistry(home: string): ResourceRegistryState {
-  const path = resourceRegistryPath(home);
-  if (!existsSync(path)) return emptyResourceRegistry();
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(readFileSync(path, "utf8"));
-  } catch (error) {
-    throw new Error(
-      `Resource registry is corrupt or unreadable at ${path}: `
-        + `${error instanceof Error ? error.message : "unknown error"}. `
-        + "Fix or remove the registry file before running GC.",
-      { cause: error }
-    );
-  }
-  return parseResourceRegistryState(parsed);
-}
-
-export function saveResourceRegistry(
-  home: string,
-  state: ResourceRegistryState
-): void {
-  const path = resourceRegistryPath(home);
-  mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
-  const temporary = `${path}.tmp-${process.pid}`;
-  writeFileSync(temporary, `${JSON.stringify(state, null, 2)}\n`, { mode: 0o600 });
-  renameSync(temporary, path);
 }
 
 export function upsertResourceRecord(

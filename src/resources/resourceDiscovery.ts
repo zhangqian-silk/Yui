@@ -439,16 +439,6 @@ function readTaskRuntimeMarker(
   }
 }
 
-function readJsonFile(path: string): Record<string, unknown> | undefined {
-  try {
-    const value = JSON.parse(readFileSync(path, "utf8"));
-    return typeof value === "object" && value !== null
-      ? value as Record<string, unknown>
-      : undefined;
-  } catch {
-    return undefined;
-  }
-}
 
 function safeReaddir(path: string): readonly import("node:fs").Dirent[] {
   try {

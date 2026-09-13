@@ -10,10 +10,7 @@ import {
   resolveAgentExecutionComponent,
   type AgentExecutionComponentId
 } from "../agent/executionComponents.js";
-import type { WorkerAccess } from "../profile/agentProfile.js";
 import type {
-  ClaudeRoleAgentConfig,
-  CodexRoleAgentConfig,
   RoleAgentConfig
 } from "../executor/agentAdapter.js";
 import {
@@ -26,6 +23,7 @@ import {
   type RoleSessionSet,
   type TaskRoleSessionSet
 } from "../executor/agentExecutor.js";
+import type { WorkerAccess } from "../profile/agentProfile.js";
 
 export type {
   ClaudeRoleAgentConfig,

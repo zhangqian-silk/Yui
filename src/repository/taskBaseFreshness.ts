@@ -2,7 +2,7 @@ import { usageError } from "../errors/cliError.js";
 import { createTaskEvent, type TaskEvent, type TaskEventPayload } from "../event/taskEvent.js";
 import type { TaskStore } from "../storage/taskStore.js";
 import type { Task, TaskProjectBinding } from "../task/task.js";
-import { workspaceProjectEntry, type ManagedWorkspace } from "../worktree/managedWorkspace.js";
+import { workspaceProjectEntry } from "../worktree/managedWorkspace.js";
 import { NodeGitWorkspace, type GitRemoteBaseline, type GitWorkspacePort } from "./gitWorkspace.js";
 import type { Project } from "./project.js";
 

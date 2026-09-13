@@ -1,149 +1,44 @@
 import { createHash, randomUUID } from "node:crypto";
-import { prepareMessageContinuations, interruptThenTerminalState } from "../message/messageContinuation.js";
-import { freezeRunContextSnapshot } from "../context/runContextPack.js";
-import { contextSnapshotRef } from "../context/contextSnapshot.js";
 import { isDeepStrictEqual } from "node:util";
-import { assertExecutionEnvironmentCurrent } from "../runtime/executionEnvironment.js";
-import { resolveAgentHostObservation, recordAgentHostConnection, AgentHostObservationDeferred } from "./agentHostObservation.js";
-import { RuntimeHookRunFenceError } from "./runtimeHookRunFence.js";
-import { admitOwnedProviderInput, ownedProviderInput } from "./providerRetryAdmission.js";
-import { recordProviderFailure, providerRetryPending, deferProviderRetry } from "../runtime/providerRetry.js";
+import { contextSnapshotRef } from "../context/contextSnapshot.js";
+import { freezeRunContextSnapshot } from "../context/runContextPack.js";
 import { settleGlobalRetryInput } from "../message/globalProviderRetry.js";
+import { interruptThenTerminalState, prepareMessageContinuations } from "../message/messageContinuation.js";
+import { assertExecutionEnvironmentCurrent } from "../runtime/executionEnvironment.js";
+import { deferProviderRetry, providerRetryPending, recordProviderFailure } from "../runtime/providerRetry.js";
+import {
+  AgentHostObservationDeferred,
+  recordAgentHostConnection,
+  resolveAgentHostObservation
+} from "./agentHostObservation.js";
+import { admitOwnedProviderInput, ownedProviderInput } from "./providerRetryAdmission.js";
 import type { RuntimeObservationInboxEvent } from "./runtimeEventInbox.js";
+import { RuntimeHookRunFenceError } from "./runtimeHookRunFence.js";
 
-import type { DurableJob } from "../job/durableJob.js";
 import type { MailboxEntityRef } from "../coordination/workMailbox.js";
+import type { DurableJob } from "../job/durableJob.js";
 import {
   type SchedulerTelemetry,
   type TelemetryProgressEntry
 } from "../telemetry/telemetryStore.js";
 
 import {
-  activeLiveRoleAgentSession,
-  bindTaskRoleProviderRuntime,
-  bindGlobalRoleProviderRuntime,
-  createRoleSessionSet,
-  recordRoleAgentSession,
-  replaceTaskRoleAgentSession,
-  recordTaskRoleNativeTurnBoundary,
-  rememberRoleAgentCompletedTurn,
-  detachRoleAgentSessionHost,
-  updateRoleAgentSessionStatus,
-  updateTaskRoleProviderRuntime,
-  updateGlobalRoleProviderRuntime,
-  selectNewTaskRoleSession,
-  taskRoleControlTarget,
-  type AgentSessionStatus,
-  type GlobalRoleSessionSet,
-  type RoleAgentSession,
-  type TaskRoleSessionSet
-} from "../executor/agentExecutor.js";
-import {
-  acceptProviderTurn,
-  cancelQuiescentProviderInput,
-  beginProviderTurn,
-  createProviderRuntimeBinding,
-  currentProviderConversation,
-  managedProviderTurnId,
-  clearProviderGoal,
-  settleProviderTurnSubmission,
-  settleProviderTurn,
-  transferProviderAuthority,
-  supersedeProviderConversation,
-  updateProviderConversationRecoverability,
-  updateProviderGoal
-} from "../runtime/providerRuntimeIdentity.js";
-import {
-  hasRecentTurnId
-} from "../runtime/recentTurnIds.js";
-import { createTaskEvent, type TaskEvent } from "../event/taskEvent.js";
-import { operationalTaskRecords } from "../task/taskRecordRetirement.js";
+  appendRunInput,
+  createRun,
+  runPurposeAdmitsTaskState,
+  withRunContextSnapshot,
+  type AgentRun
+} from "../agentRun/agentRun.js";
+import { createRunInput } from "../context/runInputContract.js";
 import {
   buildTaskWakeEnvelope,
   type WakeEnvelope
 } from "../context/wakeNotification.js";
-import { createTaskWake, fallbackWakeCursor, latestTaskWake, markTaskWakeConsumed } from "../scheduler/taskWake.js";
-import { answerInputRequest } from "../input/inputRequest.js";
-import { activeRoleAgentBinding } from "../role/role.js";
-import {
-  effectiveLaunchWithTaskMainWorkspace,
-  roleSessionMayContinue,
-  resolveEffectiveLaunch,
-  validateEffectiveLaunchSnapshot,
-  type EffectiveLaunchSnapshot
-} from "../executor/effectiveLaunch.js";
-import { SYSTEM_OPERATOR_ROLE } from "../role/systemRoles.js";
-import {
-  appendRunInput,
-  createRun,
-  withRunContextSnapshot,
-  runPurposeAdmitsTaskState,
-  type AgentRun
-} from "../agentRun/agentRun.js";
-import { transportAgentResult } from "../domain/agentResultTransport.js";
-import { createRunInput } from "../context/runInputContract.js";
-import { recordTaskMessageControlOutcome, markGlobalRoleMessageDelivered, markGlobalRoleMessageNotDelivered } from "../message/message.js";
-import {
-  classifyRuntimeProcessExit,
-  validateRuntimeProcessExitObservation
-} from "../runtime/processExitObservation.js";
-import { terminalizeExactTaskRun, cancelQuiescentRoleRuns } from "../lifecycle/exactRunTerminalization.js";
-import {
-  createCanonicalLifecycleEvent,
-  foldCanonicalLifecycleEvent,
-  type CanonicalIdentityFence,
-  type CanonicalRunExpectation
-} from "../lifecycle/canonicalLifecycleEvent.js";
-import type {
-  ProviderLifecycleObservation
-} from "./runtimeEventProcessor.js";
-import type {
-  DormantRuntimeOwnerCandidate,
-  RoleRunDeliveryFailurePersistence,
-  RoleRunDeliveryPersistence,
-  RoleRunDiagnosticPersistence,
-  RoleRunProgressPersistence,
-  RoleRunStallPersistence,
-  SchedulerRunProgress,
-  SchedulerRole,
-  SchedulerRoleSession,
-  SchedulerStorePort,
-  AgentRunProgressFacts
-} from "../scheduler/ports.js";
-import { recordLeaderFailure } from "../scheduler/leaderFailure.js";
-import {
-  recordLeaderAttentionRequired,
-  routeRoleEvent
-} from "../scheduler/operatorEvent.js";
-import { queueLeaderWakeup } from "../scheduler/wakeupQueue.js";
-import { wakeReason } from "../scheduler/wakeReason.js";
-import {
-  foldRunProgressFacts,
-  latestRunDurableProgressAt,
-  latestRunEventTime,
-  latestStallEvidenceKey,
-  isRoleRunStalled,
-  RUN_PROGRESS_EVENT,
-  RUN_DIAGNOSTIC_FINISHED_EVENT,
-  RUN_RECOVERED_EVENT,
-  RUN_STALLED_EVENT
-} from "../scheduler/roleRunStall.js";
-import { pendingWakeupProjection, type TaskStore } from "../storage/taskStore.js";
-import type {
-  RuntimeSessionCandidate,
-  RuntimeSessionCandidateQuery
-} from "../runtime/runtimeSessionCandidate.js";
-import { projectProviderContinuations } from "../runtime/runtimeContinuationProjection.js";
-import { providerContinuationKey } from "../runtime/providerContinuation.js";
-import {
-  formatRunReceiptId
-} from "../task/taskRecordReference.js";
 import {
   bindExecution,
   claimPending,
   completeProcessing,
   consumePendingBatch,
-  mailboxHasPending,
   mailboxHasWork,
   releaseProcessing,
   type MailboxTarget,
@@ -151,10 +46,58 @@ import {
 } from "../coordination/workMailbox.js";
 import {
   enqueueWork,
-  enqueueRoleRunDispatch,
   settleRoleRunDispatch as settleRoleRunDispatchMailbox
 } from "../coordination/workMailboxQueue.js";
-import type { SchedulerMailboxClaimInput, SchedulerMailboxClaimResult } from "../scheduler/ports.js";
+import { transportAgentResult } from "../domain/agentResultTransport.js";
+import { createTaskEvent, type TaskEvent } from "../event/taskEvent.js";
+import {
+  activeLiveRoleAgentSession,
+  bindGlobalRoleProviderRuntime,
+  bindTaskRoleProviderRuntime,
+  createRoleSessionSet,
+  detachRoleAgentSessionHost,
+  recordRoleAgentSession,
+  recordTaskRoleNativeTurnBoundary,
+  rememberRoleAgentCompletedTurn,
+  replaceTaskRoleAgentSession,
+  selectNewTaskRoleSession,
+  taskRoleControlTarget,
+  updateGlobalRoleProviderRuntime,
+  updateRoleAgentSessionStatus,
+  updateTaskRoleProviderRuntime,
+  type AgentSessionStatus,
+  type GlobalRoleSessionSet,
+  type RoleAgentSession,
+  type TaskRoleSessionSet
+} from "../executor/agentExecutor.js";
+import {
+  effectiveLaunchWithTaskMainWorkspace,
+  resolveEffectiveLaunch,
+  roleSessionMayContinue,
+  validateEffectiveLaunchSnapshot,
+  type EffectiveLaunchSnapshot
+} from "../executor/effectiveLaunch.js";
+import { answerInputRequest } from "../input/inputRequest.js";
+import {
+  createCanonicalLifecycleEvent,
+  foldCanonicalLifecycleEvent,
+  type CanonicalIdentityFence,
+  type CanonicalRunExpectation
+} from "../lifecycle/canonicalLifecycleEvent.js";
+import { cancelQuiescentRoleRuns, terminalizeExactTaskRun } from "../lifecycle/exactRunTerminalization.js";
+import {
+  markGlobalRoleMessageDelivered,
+  markGlobalRoleMessageNotDelivered,
+  recordTaskMessageControlOutcome
+} from "../message/message.js";
+import { snapshotExecutionLaneWorkspaceSync } from "../repository/executionLaneGitSnapshot.js";
+import { activeRoleAgentBinding } from "../role/role.js";
+import { SYSTEM_OPERATOR_ROLE } from "../role/systemRoles.js";
+import type { AgentDriverRegistry } from "../runtime/agentDriver.js";
+import { standardAgentError } from "../runtime/agentError.js";
+import {
+  builtinAgentDriverRegistry
+} from "../runtime/builtinAgentDrivers.js";
 import {
   RUNTIME_CLEANUP_REQUIRED_REASON,
   RUNTIME_HOST_DETACH_REQUIRED_REASON,
@@ -168,10 +111,26 @@ import {
   type RuntimeRoleOwner
 } from "../runtime/lifecycleReservation.js";
 import {
-  builtinAgentDriverRegistry
-} from "../runtime/builtinAgentDrivers.js";
-import type { AgentDriverRegistry } from "../runtime/agentDriver.js";
-import { standardAgentError } from "../runtime/agentError.js";
+  classifyRuntimeProcessExit,
+  validateRuntimeProcessExitObservation
+} from "../runtime/processExitObservation.js";
+import { providerContinuationKey } from "../runtime/providerContinuation.js";
+import {
+  acceptProviderTurn,
+  beginProviderTurn,
+  cancelQuiescentProviderInput,
+  clearProviderGoal,
+  createProviderRuntimeBinding,
+  currentProviderConversation,
+  managedProviderTurnId,
+  settleProviderTurn,
+  settleProviderTurnSubmission,
+  supersedeProviderConversation,
+  transferProviderAuthority,
+  updateProviderConversationRecoverability,
+  updateProviderGoal
+} from "../runtime/providerRuntimeIdentity.js";
+import { projectProviderContinuations } from "../runtime/runtimeContinuationProjection.js";
 import {
   RUNTIME_OBSERVATION_TASK_EVENT,
   createRuntimeObservation,
@@ -182,8 +141,52 @@ import {
   runtimeObservationTaskEventPayload,
   type RuntimeObservation
 } from "../runtime/runtimeObservation.js";
-import { snapshotExecutionLaneWorkspaceSync } from "../repository/executionLaneGitSnapshot.js";
-import type { RuntimeRunTerminalOutcome, RuntimeLifecycleEvent } from "./runtimeEventInbox.js";
+import type {
+  RuntimeSessionCandidate,
+  RuntimeSessionCandidateQuery
+} from "../runtime/runtimeSessionCandidate.js";
+import { recordLeaderFailure } from "../scheduler/leaderFailure.js";
+import {
+  recordLeaderAttentionRequired,
+  routeRoleEvent
+} from "../scheduler/operatorEvent.js";
+import type {
+  AgentRunProgressFacts,
+  DormantRuntimeOwnerCandidate,
+  RoleRunDeliveryFailurePersistence,
+  RoleRunDeliveryPersistence,
+  RoleRunDiagnosticPersistence,
+  RoleRunProgressPersistence,
+  RoleRunStallPersistence,
+  SchedulerMailboxClaimInput, SchedulerMailboxClaimResult,
+  SchedulerRole,
+  SchedulerRoleSession,
+  SchedulerRunProgress,
+  SchedulerStorePort
+} from "../scheduler/ports.js";
+import {
+  RUN_DIAGNOSTIC_FINISHED_EVENT,
+  RUN_PROGRESS_EVENT,
+  RUN_RECOVERED_EVENT,
+  RUN_STALLED_EVENT,
+  foldRunProgressFacts,
+  isRoleRunStalled,
+  latestRunDurableProgressAt,
+  latestRunEventTime,
+  latestStallEvidenceKey
+} from "../scheduler/roleRunStall.js";
+import { createTaskWake, fallbackWakeCursor, latestTaskWake, markTaskWakeConsumed } from "../scheduler/taskWake.js";
+import { wakeReason } from "../scheduler/wakeReason.js";
+import { queueLeaderWakeup } from "../scheduler/wakeupQueue.js";
+import { pendingWakeupProjection, type TaskStore } from "../storage/taskStore.js";
+import {
+  formatRunReceiptId
+} from "../task/taskRecordReference.js";
+import { operationalTaskRecords } from "../task/taskRecordRetirement.js";
+import type { RuntimeLifecycleEvent, RuntimeRunTerminalOutcome } from "./runtimeEventInbox.js";
+import type {
+  ProviderLifecycleObservation
+} from "./runtimeEventProcessor.js";
 
 /**
  * One durable revision's read-only facts for one Task. A scheduler pass reads
@@ -2794,12 +2797,6 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
           now
         );
       const canonicalRunId = input.nativeTurnId ?? resolved.nativeTurnId;
-      const existing = sessions.sessions[input.agentId];
-      const owner = {
-        scope: "task" as const,
-        taskId: input.taskId,
-        roleName: input.roleName
-      };
       assertConsistentTerminal(store, input, observedRun);
       // A historical operation failure stays failed. The immutable terminal
       // observation retains the late report for explicit Leader adoption.
@@ -4264,20 +4261,6 @@ function requireRole(store: TaskStore, taskId: string, roleName: string) {
   return role;
 }
 
-function runLaunchEventPayload(run: AgentRun): Record<string, string> {
-  return {
-    runId: run.id,
-    role: run.roleName,
-    purpose: run.purpose,
-    mode: run.mode,
-    agent: `${run.effective.agentId}/${run.effective.adapterId}`,
-    component: run.effective.component,
-    effectiveRevision: String(run.effective.sourceDesiredRevision),
-    profileAccess: run.effective.profileAccess,
-    effectivePermission: run.effective.permission.strategy,
-    writeProjectIds: run.effective.writeProjectIds.join(",") || "none"
-  };
-}
 
 /**
  * Keeps only the fields the caller actually knew. Event payloads are a

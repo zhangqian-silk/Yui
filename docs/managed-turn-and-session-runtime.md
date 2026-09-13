@@ -147,12 +147,12 @@ uncertainty cannot.
 
 Global Roles use the same three actions with their own owner and Session,
 without inventing a Task or Run. The local-user Web surface exposes them through
-the shared Global Role handler. There is a current CLI availability gap:
-`src/cli.ts` implements `yui role message queue|steer` and `yui role interrupt`,
-but `src/cli/commandCatalog.ts` does not register the top-level `role` command,
-so public CLI routing rejects these paths as unknown. They are not usable CLI
-examples; report this gap rather than fabricating a Task/Run or borrowing the
-browser's user authority. New controlled Global Sessions use the Host console.
+the shared Global Role handler. The public CLI exposes
+`yui role message queue|steer <role> <text>` and `yui role interrupt <role>`.
+Queue/steer require `--request-id`; steer/interrupt require `--expected-target`.
+These commands retain the caller's existing Session authority; do not fabricate
+a Task/Run or borrow the browser's user authority. Configuration remains under
+`config role`, lifecycle under `session`. New controlled Global Sessions use the Host console.
 A live unmanaged Session is not silently adopted; an explicit Session lifecycle
 action is needed first.
 
@@ -188,7 +188,7 @@ preserve execution history; external edits notify the Leader, while its own
 planning edits do not create a self-wake.
 
 New Draft Roles use a Task-specific planning directory under
-`<YUI_HOME>.task-runtimes/planning`, outside the control Home and delivery trees.
+`<YUI_HOME>/runtime/task-runtimes/planning`, separate from durable control data and delivery trees.
 A planning Run can use `task activation request` to persist intent and return an
 `afterPlanningRun` reference immediately. Its terminal releases the request for
 Controller admission; cancelled intent is not resurrected.

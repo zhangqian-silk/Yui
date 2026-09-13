@@ -64,7 +64,7 @@ import {
 } from "../../dist/runtime/ports.js";
 import { RuntimeLaunchCoordinator } from "../../dist/controller/runtimeLaunchCoordinator.js";
 import { resolveManagedTaskCaller } from "../../dist/runtime/managedCaller.js";
-import { taskLocalActor } from "../../dist/commands/taskActor.js";
+import { taskLocalActor } from "../../dist/task/taskAuthority.js";
 import { buildRunContextPack } from "../../dist/context/runContextPack.js";
 import {
   buildTaskWakeEnvelope,

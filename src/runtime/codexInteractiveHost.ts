@@ -3,11 +3,8 @@ import { randomBytes } from "node:crypto";
 import { once } from "node:events";
 import type { IncomingMessage } from "node:http";
 import WebSocket, { WebSocketServer } from "ws";
-import {
-  AGENT_HOST_CONTROL_PROTOCOL,
-  openAgentHostControl,
-  type AgentHostSnapshot
-} from "./agentHost.js";
+import type { AgentHostSnapshot, openAgentHostControl as OpenAgentHostControl } from "./agentHost.js";
+import { AGENT_HOST_CONTROL_PROTOCOL } from "./agentHostProtocol.js";
 import type { AgentHostLaunchPayload } from "./launchBroker.js";
 import { openCodexInteractiveConnection } from "./structuredProviderHost.js";
 
@@ -22,7 +19,8 @@ import { openCodexInteractiveConnection } from "./structuredProviderHost.js";
  */
 export async function runCodexInteractiveHost(
   home: string,
-  payload: AgentHostLaunchPayload
+  payload: AgentHostLaunchPayload,
+  openAgentHostControl: typeof OpenAgentHostControl
 ): Promise<number> {
   const environment = payload.environment;
   if (environment.YUI_SESSION_SCOPE !== "global" || environment.YUI_ADAPTER_ID !== "codex"

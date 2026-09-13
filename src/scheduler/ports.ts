@@ -1,12 +1,6 @@
+import type { AgentAdapterId } from "../agent/adapterCatalog.js";
+import type { AgentRun, AgentRunFailureReason, AgentRunPurpose } from "../agentRun/agentRun.js";
 import type { TaskBrief } from "../brief/taskBrief.js";
-import type { Decision } from "../decision/decision.js";
-import type { InputRequest } from "../input/inputRequest.js";
-import type { Milestone } from "../milestone/milestone.js";
-import type { LeaderFailure } from "./leaderFailure.js";
-import type { PendingWakeup } from "./pendingWakeup.js";
-import type { AgentRun } from "../agentRun/agentRun.js";
-import type { AgentRunFailureReason, AgentRunPurpose } from "../agentRun/agentRun.js";
-import type { AgentRunInput } from "../context/runInputContract.js";
 import type {
   MailboxEntityRef,
   MailboxTarget,
@@ -17,16 +11,12 @@ import type {
   RoleRunDispatchSettlement,
   RoleRunDispatchToken
 } from "../coordination/workMailboxQueue.js";
-import type {
-  RuntimeLifecycleTarget,
-  RuntimeRoleOwner
-} from "../runtime/lifecycleReservation.js";
-import type { AgentAdapterId } from "../agent/adapterCatalog.js";
-import type { Task } from "../task/task.js";
+import type { Decision } from "../decision/decision.js";
 import type { TaskEvent } from "../event/taskEvent.js";
-import type { EffectiveLaunchSnapshot } from "../executor/effectiveLaunch.js";
 import type { AgentSessionStatus } from "../executor/agentExecutor.js";
-import type { RuntimeLaunchPreStart } from "../runtime/ports.js";
+import type { EffectiveLaunchSnapshot } from "../executor/effectiveLaunch.js";
+import type { InputRequest } from "../input/inputRequest.js";
+import type { Milestone } from "../milestone/milestone.js";
 import type {
   AgentErrorInputDisposition,
   AgentErrorPhase,
@@ -35,16 +25,24 @@ import type {
   AgentErrorSource,
   ProviderDeliveryFailure
 } from "../runtime/agentError.js";
-import {
-  isTaskOwnedWorkspace,
-  type ManagedWorkspace
-} from "../worktree/managedWorkspace.js";
-import { taskOwnsManagedWorkspace } from "../task/task.js";
-import type { TaskRuntimeLaunchPolicy } from "../runtime/taskRuntimeIsolation.js";
+import type {
+  RuntimeLifecycleTarget,
+  RuntimeRoleOwner
+} from "../runtime/lifecycleReservation.js";
+import type { RuntimeLaunchPreStart } from "../runtime/ports.js";
 import type {
   RuntimeSessionCandidate,
   RuntimeSessionCandidateQuery
 } from "../runtime/runtimeSessionCandidate.js";
+import type { TaskRuntimeLaunchPolicy } from "../runtime/taskRuntimeIsolation.js";
+import type { Task } from "../task/task.js";
+import { taskOwnsManagedWorkspace } from "../task/task.js";
+import {
+  isTaskOwnedWorkspace,
+  type ManagedWorkspace
+} from "../worktree/managedWorkspace.js";
+import type { LeaderFailure } from "./leaderFailure.js";
+import type { PendingWakeup } from "./pendingWakeup.js";
 
 export type { RuntimeSessionCandidate } from "../runtime/runtimeSessionCandidate.js";
 

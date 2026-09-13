@@ -1,6 +1,14 @@
 import { mkdirSync, realpathSync } from "node:fs";
 import { isAbsolute, relative, resolve } from "node:path";
-import { usageError } from "../errors/cliError.js";
+import {
+  CONFIG_DEFINITIONS,
+  CONFIG_KEYS,
+  configDefinition,
+  configDefinitionsForDomain,
+  type ConfigDomain,
+  type ConfigKey
+} from "../config/configCatalog.js";
+import { resolveTimeZone } from "../config/timeZone.js";
 import {
   DEFAULT_AGENT_LAUNCH_INACTIVITY_TIMEOUT_SECONDS,
   DEFAULT_CONTROLLER_TASK_CONCURRENCY,
@@ -29,21 +37,13 @@ import {
   resolveTmuxHistoryLimit,
   type LeaderNextActionMode
 } from "../config/yuiConfig.js";
-import {
-  CONFIG_DEFINITIONS,
-  CONFIG_KEYS,
-  configDefinition,
-  configDefinitionsForDomain,
-  type ConfigDomain,
-  type ConfigKey
-} from "../config/configCatalog.js";
-import { resolveTimeZone } from "../output/timePresentation.js";
+import { usageError } from "../errors/cliError.js";
 import { defaultTableWidth, renderTable } from "../output/table.js";
-import type { YuiConfig } from "../storage/taskStore.js";
 import {
   REVIEW_TRIGGERS,
   type ReviewTrigger
 } from "../review/reviewConfig.js";
+import type { YuiConfig } from "../storage/taskStore.js";
 
 /**
  * `output` is the rendered text shown to humans. `data` carries the same

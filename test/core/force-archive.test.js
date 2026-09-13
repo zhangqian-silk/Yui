@@ -28,7 +28,7 @@ import { resolveEffectiveLaunch } from "../../dist/executor/effectiveLaunch.js";
 import { createRun } from "../../dist/agentRun/agentRun.js";
 import { createRunInput } from "../../dist/context/runInputContract.js";
 import { createDurableJob } from "../../dist/job/durableJob.js";
-import { createTaskRemoteDeliveryProof } from "../../dist/commands/taskRemoteDeliveryCommand.js";
+import { createTaskRemoteDeliveryProof } from "../../dist/task/remoteDeliveryService.js";
 import { buildWebDashboardSnapshot } from "../../dist/web/webSnapshot.js";
 
 const now = new Date("2026-09-12T00:00:00Z");

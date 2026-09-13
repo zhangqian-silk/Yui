@@ -1,16 +1,16 @@
 import { createHash } from "node:crypto";
 import { isDeepStrictEqual } from "node:util";
+import { parseRepeatable } from "../cli/parseRepeatable.js";
 import { contextContentDigest } from "../context/contextSnapshot.js";
-import { createTaskEvent } from "../event/taskEvent.js";
 import { usageError } from "../errors/cliError.js";
+import { createTaskEvent } from "../event/taskEvent.js";
 import { NodeGitWorkspace, type GitWorkspacePort } from "../repository/gitWorkspace.js";
 import type { TaskStore } from "../storage/taskStore.js";
 import { PUBLICATION_ADOPTED_EVENT, publicationAdoption } from "../task/publicationAdoption.js";
 import { publicationExternalKey } from "../task/publicationReference.js";
 import { commitMap, completionEvent } from "../task/remoteDelivery.js";
 import { resolveTaskRecordReference } from "../task/taskRecordReference.js";
-import { assertTaskDeliveryAuthority, taskActor } from "./taskActor.js";
-import { parseRepeatable } from "./taskIntegrationCommands.js";
+import { assertTaskDeliveryAuthority, taskActor } from "../task/taskAuthority.js";
 
 type Options = Readonly<{
   git?: GitWorkspacePort;

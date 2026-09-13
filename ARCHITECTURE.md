@@ -93,8 +93,9 @@ meaning of the report. See [result consumption](docs/agent-result-consumption.md
 ## Planning, workspaces and resources
 
 Draft contains planning facts and Project bindings, not an adopted delivery
-workspace. Its private planning directory is outside the control Home and
-delivery trees. Planning Sessions capture `planning` authority. The Leader can
+workspace. Its private planning directory is under
+`<YUI_HOME>/runtime/task-runtimes/planning`, separate from durable control data
+and delivery trees. Planning Sessions capture `planning` authority. The Leader can
 persist an activation request during a Run or ordinary discussion and return;
 native quiescence releases the intent for current-authority and resource checks.
 

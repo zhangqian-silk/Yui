@@ -123,7 +123,7 @@ unifying the root does not weaken control-data or cross-owner isolation.
 **not** a second authority for internal managed paths, and is intentionally not
 an input to `homeLayout.ts`. A Yui-auto-created Global Role that carries no
 user-chosen cwd no longer falls back to it (or to `process.cwd()`): `yui setup`'s
-built-in Operator/Leader and `yui role add` without `--workspace` now default to
+built-in Operator/Leader and `yui config role add` without `--workspace` now default to
 the Home-internal `managedGlobalRoleWorkspace(home)` (`<home>/workspaces/global`),
 and `setup` no longer fabricates an external Home-sibling `workspace/` — a
 `default-workspace` is persisted only if the user configured one. A user who

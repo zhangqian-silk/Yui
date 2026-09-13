@@ -1168,7 +1168,7 @@ test("the Web surface queues through the shared primitive and never reaches the 
   const host = fakeWebHostControl();
   const surface = createWebTaskSurface(store, { yuiHome: home }, [], host.port);
   const receipt = await surface.control("task-1", {
-    action: "queue", body: "Continue when free", requestId: "wq-1", to: "worker", workItem: "work-item-1" });
+    action: "queue", body: "--literal text, not a CLI option", requestId: "wq-1", to: "worker", workItem: "work-item-1" });
   // A queue is a durable save: it produced a real Message with a queued delivery
   // and touched no live edge, exactly like the CLI queue path.
   assert.equal(receipt.action, "queue");
@@ -1179,6 +1179,7 @@ test("the Web surface queues through the shared primitive and never reaches the 
   const saved = store.listMessages("task-1").find(m => m.inputControl?.requestId === "wq-1");
   assert.ok(saved, "the queue persisted a real Message");
   assert.equal(saved.inputControl.action, "queue");
+  assert.equal(saved.body, "--literal text, not a CLI option");
 });
 
 test("the Web surface steer records pending then performs the one live Host steer (gap F)", async t => {
@@ -1321,11 +1322,12 @@ test("Global Web inputs use the authenticated shared primitive and state reads n
   const headers = { "content-type": "application/json", "x-yui-web-token": "global-web-token" };
   assert.equal((await fetch(url)).status, 403);
   const response = await fetch(url, { method: "POST", headers,
-    body: JSON.stringify({ action: "queue", body: "Global input", requestId: "global-web-1" }) });
+    body: JSON.stringify({ action: "queue", body: "--literal global input", requestId: "global-web-1" }) });
   assert.equal(response.status, 200);
   const receipt = await response.json();
   assert.equal(receipt.delivery.state, "queued");
   assert.equal(receipt.message.roleName, "assistant");
+  assert.equal(receipt.message.body, "--literal global input");
   const before = store.listGlobalRoleMessages("assistant");
   const state = await (await fetch(url, { headers })).json();
   assert.equal(state.messages[0].id, before[0].id);

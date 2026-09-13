@@ -415,8 +415,7 @@ export function buildRunContextPack(store: TaskStore, taskId: string, runId: str
 
 /** Reads the Task's current in-flight execution, outside the frozen contract. */
 function readLiveTaskState(store: TaskStore, taskId: string): AgentRunContextLiveTaskState {
-  const activeRuns = store.listRuns(taskId)
-    .filter((run) => run.status === "active")
+  const activeRuns = store.listActiveRuns(taskId)
     .map((run) => Object.freeze({
       runId: run.id,
       roleName: run.roleName,

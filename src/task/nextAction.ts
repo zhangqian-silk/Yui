@@ -1,21 +1,23 @@
 import { createHash } from "node:crypto";
 
-import type { InputRequest } from "../input/inputRequest.js";
-import type { IntegrationAttempt } from "../integration/integrationAttempt.js";
-import type { ChangeSet } from "../integration/changeSet.js";
-import type { IntegrationQueueEntry } from "../integration/integrationQueueEntry.js";
-import {
-  governingWorkItemDeliveries,
-  workItemDeliverySettled
-} from "../integration/deliveryObligation.js";
 import type { AgentRun } from "../agentRun/agentRun.js";
-import type { ReviewRound, TaskReviewCandidate } from "../review/reviewRound.js";
-import { isCompletedTaskReviewEvidenceFromRuns } from "../review/reviewAcceptance.js";
 import {
   actionableExecutionLaneRecoveries,
   type ActionableExecutionLaneRecovery,
   type ExecutionGroupHealthSummary
 } from "../execution/executionHealth.js";
+import type { InputRequest } from "../input/inputRequest.js";
+import type { ChangeSet } from "../integration/changeSet.js";
+import {
+  governingWorkItemDeliveries,
+  workItemDeliverySettled
+} from "../integration/deliveryObligation.js";
+import type { IntegrationAttempt } from "../integration/integrationAttempt.js";
+import type { IntegrationQueueEntry } from "../integration/integrationQueueEntry.js";
+import type { DurableJob } from "../job/durableJob.js";
+import { isCompletedTaskReviewEvidenceFromRuns } from "../review/reviewAcceptance.js";
+import type { ReviewConfig } from "../review/reviewConfig.js";
+import type { ReviewRound, TaskReviewCandidate } from "../review/reviewRound.js";
 import {
   sameTaskFinalReviewContract,
   type TaskFinalReviewContract
@@ -24,16 +26,14 @@ import {
   resolveRecordedTaskFinalReviewContract,
   type TaskFinalReviewContractResolution
 } from "../review/taskFinalReviewContractResolution.js";
-import type { ReviewConfig } from "../review/reviewConfig.js";
-import type { Task } from "./task.js";
-import type { DurableJob } from "../job/durableJob.js";
-import { draftWorkItemDependencyIssue } from "./draftPlan.js";
 import {
   currentWorkItemCandidate,
   currentWorkItemExecutionGroup,
   governingWorkItemCandidate,
   type WorkItem
 } from "../workItem/workItem.js";
+import { draftWorkItemDependencyIssue } from "./draftPlan.js";
+import type { Task } from "./task.js";
 
 /**
  * Issue 07 (Leader convergence): a read-only decision-support projection for
@@ -1062,14 +1062,6 @@ function ref(kind: string, id: string): NextActionRef {
   return { kind, id };
 }
 
-function latestFailedReviewFor(
-  rounds: readonly ReviewRound[],
-  workItemId: string
-): ReviewRound | undefined {
-  return [...rounds]
-    .reverse()
-    .find((round) => round.workItemId === workItemId && round.status === "failed");
-}
 
 function latestTaskFinalReview(
   rounds: readonly ReviewRound[],

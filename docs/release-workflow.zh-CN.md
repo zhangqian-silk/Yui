@@ -15,10 +15,10 @@ Agent 选择一个预先声明的计划，设施从持久状态驱动该计划�
 - **ReleaseWorkflow**（`release-workflow-N`）——计划及其进展：一个确切来源（仓库 +
   钉住的 commit，可选一个 artifact）、一份不可变的有序步骤计划，以及每步一条持久记录。
 
-引擎（`src/release/releaseWorkflowEngine.ts`）是一个纯库；`yui task workflow` 和
+引擎（`src/release/releaseWorkflowEngine.ts`）负责持久状态转换和工作流锁；`yui task workflow` 和
 `yui task grant` 命令驱动它。每个外部系统都位于 `ReleaseWorkflowPorts`
-（`src/release/releaseWorkflowPorts.ts`）之后，因此整个工作流可以用确定性的 fake
-测试，不产生任何真实的 GitHub、npm、git、Controller 或进程副作用。
+（`src/release/releaseWorkflowPorts.ts`）之后。可用临时 SQLite 和确定性的外部端口测试
+恢复逻辑，无需真实 GitHub、npm、git、Controller 或模型效果。
 
 ## 授权模型
 
@@ -165,8 +165,9 @@ kind、可选 params，以及一个可选的不可逆级别（`none` | `reversib
 
 该键被传给该步骤的每一次 `executeStep` 调用，包括在一次确认为 absent 的超时之后的
 重试。端口合同要求 `executeStep` 在同一键下是幂等的：一次重试尝试不得产生第二次
-副作用。引擎侧的合同更严格——它绝不为一个已标记 `unknown` 的步骤调用 `executeStep`,
-而是按记录的身份重新查询。fake 记录每一个键，因此测试套件直接证明至多一次执行。
+副作用。引擎不会盲目为 `unknown` 步骤调用 `executeStep`，而是先按记录的身份查询。
+核心测试用真实 SQLite 和确定性端口检查不确定效果查询、已确认步骤复用和 grant 次数耗尽。
+这证明这些引擎边界，不代表真实外部服务或所有发布适配器的幂等性已被验证。
 
 ## Operator 指南
 

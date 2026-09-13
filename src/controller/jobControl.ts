@@ -12,6 +12,7 @@ import { createHash } from "node:crypto";
 import { resolve, sep } from "node:path";
 
 import type { JsonValue } from "../core/protocol.js";
+import { activeLiveRoleAgentSession } from "../executor/agentExecutor.js";
 import {
   acknowledgeUnknownDurableJob,
   createDurableJob,
@@ -23,12 +24,11 @@ import {
   type DurableJobOwner,
   type DurableJobStep
 } from "../job/durableJob.js";
-import type { TaskStore } from "../storage/taskStore.js";
-import type { ManagedWorkspace } from "../worktree/managedWorkspace.js";
-import { activeLiveRoleAgentSession } from "../executor/agentExecutor.js";
 import { CallAuthority } from "../kernel/callAuthority.js";
 import { redactLaunchText } from "../runtime/launchDiagnostics.js";
 import { requireManagedTaskCaller } from "../runtime/managedCaller.js";
+import type { TaskStore } from "../storage/taskStore.js";
+import type { ManagedWorkspace } from "../worktree/managedWorkspace.js";
 
 /**
  * rr8: The caller identity a `job.start`/`job.cancel` request is bound to.
@@ -457,7 +457,7 @@ function validateJobTarget(store: TaskStore, params: Omit<DurableJobStartParams,
 function assertCallerAuthorized(
   store: Pick<
     TaskStore,
-    "getRun" | "getActiveRun" | "getRole" | "getTaskRoleSessionSet" | "listEvents"
+    "getRun" | "getActiveRun" | "getRole" | "getTaskRoleSessionSet" | "listEventsByType"
       | "getGlobalRole" | "getGlobalRoleSessionSet"
   >,
   caller: DurableJobCaller,
@@ -713,7 +713,7 @@ function parseSteps(value: JsonValue | undefined): readonly DurableJobStep[] {
       throw jobControlError("INVALID_PARAMS", "job.start steps are invalid.");
     }
     const record = entry as Readonly<Record<string, JsonValue>>;
-    const allowed = new Set(["name", "command", "timeoutMs"]);
+    const allowed = new Set(["name", "command", "argv", "cwd", "env", "timeoutMs"]);
     for (const key of Object.keys(record)) {
       if (!allowed.has(key)) {
         throw jobControlError("INVALID_PARAMS", "job.start steps are invalid.");
@@ -721,6 +721,15 @@ function parseSteps(value: JsonValue | undefined): readonly DurableJobStep[] {
     }
     const name = requiredId(record.name, "job.start step name");
     const command = requiredId(record.command, "job.start step command");
+    const argv = record.argv === undefined ? undefined : record.argv;
+    if (argv !== undefined && (!Array.isArray(argv) || argv.length === 0
+      || argv.some(value => typeof value !== "string" || value.length === 0 || value.includes("\0")))) {
+      throw jobControlError("INVALID_PARAMS", `job.start step argv is invalid: ${name}.`);
+    }
+    const cwd = record.cwd === undefined ? undefined : requiredId(record.cwd, "job.start step cwd");
+    if (cwd !== undefined && !cwd.startsWith("/")) {
+      throw jobControlError("INVALID_PARAMS", `job.start step cwd must be absolute: ${name}.`);
+    }
     if (names.has(name)) {
       throw jobControlError("INVALID_PARAMS", `job.start step names must be unique: ${name}.`);
     }
@@ -738,6 +747,9 @@ function parseSteps(value: JsonValue | undefined): readonly DurableJobStep[] {
     const step: DurableJobStep = {
       name,
       command,
+      ...(argv === undefined ? {} : { argv: argv as string[] }),
+      ...(cwd === undefined ? {} : { cwd }),
+      ...(record.env === undefined ? {} : { env: parseStringMap(record.env, "job.start step env") }),
       ...(record.timeoutMs === undefined ? {} : { timeoutMs: record.timeoutMs })
     };
     steps.push(step);

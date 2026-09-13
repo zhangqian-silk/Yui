@@ -1,8 +1,10 @@
-import type { TaskRoleSessionSet } from "../executor/agentExecutor.js";
 import type { AgentRun } from "../agentRun/agentRun.js";
+import { synthesisSourceRunIds } from "../context/runContextPack.js";
+import type { TaskRoleSessionSet } from "../executor/agentExecutor.js";
+import type { TaskStore } from "../storage/taskStore.js";
 import {
-  governingWorkItemCandidate,
   currentWorkItemExecutionGroup,
+  governingWorkItemCandidate,
   type WorkItem,
   type WorkItemCandidate
 } from "../workItem/workItem.js";
@@ -10,8 +12,6 @@ import type {
   WorkItemExecutionGroup,
   WorkItemExecutionLane
 } from "./workItemExecution.js";
-import type { TaskStore } from "../storage/taskStore.js";
-import { synthesisSourceRunIds } from "../context/runContextPack.js";
 
 export type WorkItemLaneProjectedStatus =
   | "running"
@@ -299,7 +299,7 @@ function projectMainRun(
 
 function projectSynthesis(
   group: WorkItemExecutionGroup | undefined,
-  lanes: readonly WorkItemLaneProjection[],
+  _lanes: readonly WorkItemLaneProjection[],
   mainRun: WorkItemMainRunProjection
 ): WorkItemExecutionProjection["synthesis"] {
   if (group === undefined) {

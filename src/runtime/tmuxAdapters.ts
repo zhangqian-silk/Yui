@@ -1,20 +1,26 @@
 import { randomUUID } from "node:crypto";
-import { fileURLToPath } from "node:url";
 import { resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 
+import type { EffectiveLaunchSnapshot } from "../executor/effectiveLaunch.js";
 import {
-  createRuntimeBinding,
-  type RuntimeBinding
-} from "./runtimeBinding.js";
+  providerDeliveryFailureFrom,
+  type AgentErrorPhase
+} from "./agentError.js";
 import {
-  normalizeRuntimeOwner,
-  type RuntimeOwner
-} from "./runtimeOwner.js";
-import type {
-  NewSessionLaunchRequest,
-  ResumeSessionLaunchRequest,
-  SessionLaunchRequest
-} from "./sessionLaunchRequest.js";
+  AGENT_HOST_CONTROL_PROTOCOL,
+  sendAgentHostLaunchControl,
+  sendAgentHostRunControl,
+  sendAgentHostSteerControl,
+  waitForAgentHostLaunchAck,
+  type AgentHostControlResult,
+  type AgentHostSnapshot
+} from "./agentHost.js";
+import { launchBrokerForHome, type AgentHostLaunchPayload } from "./launchBroker.js";
+import {
+  toRuntimeLaunchFailure,
+  type RuntimeLaunchDiagnosticContext
+} from "./launchDiagnostics.js";
 import {
   RuntimeHostContentionError,
   RuntimeHostUnavailableError,
@@ -28,27 +34,20 @@ import {
   type SessionInspection
 } from "./ports.js";
 import {
-  providerDeliveryFailureFrom,
-  type AgentErrorPhase,
-  type ProviderDeliveryFailure
-} from "./agentError.js";
+  createRuntimeBinding,
+  type RuntimeBinding
+} from "./runtimeBinding.js";
 import {
-  toRuntimeLaunchFailure,
-  type RuntimeLaunchDiagnosticContext
-} from "./launchDiagnostics.js";
-import { requireSafeIdentity } from "./validation.js";
-import type { EffectiveLaunchSnapshot } from "../executor/effectiveLaunch.js";
+  normalizeRuntimeOwner,
+  type RuntimeOwner
+} from "./runtimeOwner.js";
+import type {
+  NewSessionLaunchRequest,
+  ResumeSessionLaunchRequest,
+  SessionLaunchRequest
+} from "./sessionLaunchRequest.js";
 import type { TaskRuntimeIsolationDescriptor } from "./taskRuntimeIsolation.js";
-import { launchBrokerForHome, type AgentHostLaunchPayload } from "./launchBroker.js";
-import {
-  AGENT_HOST_CONTROL_PROTOCOL,
-  sendAgentHostLaunchControl,
-  sendAgentHostRunControl,
-  sendAgentHostSteerControl,
-  waitForAgentHostLaunchAck,
-  type AgentHostControlResult,
-  type AgentHostSnapshot
-} from "./agentHost.js";
+import { requireSafeIdentity } from "./validation.js";
 
 export type RuntimeTmuxRole = Readonly<{
   name: string;

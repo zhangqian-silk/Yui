@@ -1,4 +1,3 @@
-import { isDeepStrictEqual } from "node:util";
 import { usageError } from "../errors/cliError.js";
 import {
   GitIntegrationService,
@@ -9,15 +8,15 @@ import {
 } from "../integration/integrationAttempt.js";
 import {
   NodeGitWorkspace,
-  type GitWorkspacePort,
-  type GitRemoteHead
+  type GitRemoteHead,
+  type GitWorkspacePort
 } from "../repository/gitWorkspace.js";
 import type { Project } from "../repository/project.js";
-import type { Task } from "../task/task.js";
-import { publicationExternalKey } from "../task/publicationReference.js";
-import type { TaskStore } from "../storage/taskStore.js";
-import type { ReviewRound, TaskReviewCandidate } from "../review/reviewRound.js";
 import { isCompletedTaskReviewEvidence } from "../review/reviewAcceptance.js";
+import type { ReviewRound, TaskReviewCandidate } from "../review/reviewRound.js";
+import type { TaskStore } from "../storage/taskStore.js";
+import { publicationExternalKey } from "../task/publicationReference.js";
+import type { Task } from "../task/task.js";
 import {
   workspaceProjectEntry,
   type ManagedWorkspace,

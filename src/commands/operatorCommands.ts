@@ -1,25 +1,21 @@
-import { usageError } from "../errors/cliError.js";
 import { agentAdapterLabel as adapterLabel } from "../agent/adapterCatalog.js";
+import { usageError } from "../errors/cliError.js";
 import {
   createRoleSessionSet,
   type GlobalRoleSessionSet
 } from "../executor/agentExecutor.js";
+import { TASK_SUBMISSION_INTENTS, type TaskSubmissionIntent } from "../message/message.js";
 import {
   listOperatorSessions,
-  projectOperatorStatus,
   prepareOperatorNewSession,
-  prepareOperatorResumeSession
+  prepareOperatorResumeSession,
+  projectOperatorStatus
 } from "../operator/operatorSessionHistory.js";
 import { defaultTableWidth, renderTable } from "../output/table.js";
 import { formatRelativeTimestamp } from "../output/timePresentation.js";
 import { updateGlobalRole, type GlobalRole } from "../role/role.js";
-import { TASK_SUBMISSION_INTENTS, type TaskSubmissionIntent } from "../message/message.js";
-import {
-  submitOperatorMessage,
-  type TaskCommandExecution,
-  type TaskCommandOptions,
-  type TaskWorkflowStore
-} from "./taskCommands.js";
+import { submitOperatorMessage } from "./taskCommands.js";
+import { type TaskCommandExecution, type TaskCommandOptions, type TaskWorkflowStore } from "./taskCommandTypes.js";
 import { readCommandText } from "./textInput.js";
 
 export type OperatorSessionControl =

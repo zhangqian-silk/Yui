@@ -88,7 +88,7 @@ function isCommandPath(
 
 function isContractPath(
   lowerPath: string,
-  segments: readonly string[],
+  _segments: readonly string[],
   lowerFile: string
 ): boolean {
   return lowerFile === "index.ts"
@@ -102,7 +102,7 @@ function isContractPath(
 }
 
 function isTestPath(
-  lowerPath: string,
+  _lowerPath: string,
   segments: readonly string[],
   lowerFile: string
 ): boolean {

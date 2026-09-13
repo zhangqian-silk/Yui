@@ -1,30 +1,34 @@
-import { updateTaskMetadataCommand, sendTaskMessageCommand } from "../commands/taskCommands.js";
-import { runConfigCommand } from "../commands/configCommands.js";
-import type { TaskSubmissionIntent } from "../message/message.js";
 import {
-  readTaskContext, readTaskContextDelta, inspectTaskContext, withContextObservations,
+  listArtifactsCapability,
+  readArtifactCapability,
+  saveArtifactCapability
+} from "../artifacts/artifactCapability.js";
+import { runConfigCommand } from "../commands/configCommands.js";
+import { sendTaskMessageCommand, updateTaskMetadataCommand } from "../commands/taskCommands.js";
+import { CONFIG_DOMAINS, type ConfigDomain } from "../config/configCatalog.js";
+import {
+  inspectTaskContext,
+  readTaskContext, readTaskContextDelta,
+  withContextObservations,
   type ContextObservationProvider
 } from "../context/taskContext.js";
-import { CONFIG_DOMAINS, type ConfigDomain } from "../config/configCatalog.js";
 import {
   createJobCallAuthority, parseDurableJobStartParams,
   type DurableJobCaller, type DurableJobControlPort
 } from "../controller/jobControl.js";
 import type { JsonValue } from "../core/protocol.js";
+import { inspectJobOperation } from "../job/jobOperation.js";
+import type { TaskSubmissionIntent } from "../message/message.js";
+import { createPluginService } from "../plugins/pluginService.js";
+import { createProjectResources, type EnvironmentPlan } from "../resources/projectResourceService.js";
 import type { TaskStore } from "../storage/taskStore.js";
 import type { TaskMetadataUpdate } from "../task/task.js";
 import type { TrustedCallContext } from "./callAuthority.js";
-import type { InstanceHost } from "./instanceHost.js";
-import { inspectJobOperation } from "./kernelPorts.js";
 import {
   CapabilityRegistry, type CapabilityDescriptor, type CapabilityImplementation,
 } from "./capabilityRegistry.js";
 import type { CapabilitySchema } from "./capabilitySchema.js";
-import { createProjectResources, type EnvironmentPlan } from "../resources/projectResourceService.js";
-import {
-  saveArtifactCapability, readArtifactCapability, listArtifactsCapability
-} from "../artifacts/artifactCapability.js";
-import { createPluginService } from "../plugins/pluginService.js";
+import type { InstanceHost } from "./instanceHost.js";
 
 const text: CapabilitySchema = { type: "string", minLength: 1 };
 const strings: CapabilitySchema = { type: "object", additionalProperties: { type: "string" } };
@@ -190,7 +194,8 @@ const definitions: readonly Omit<CapabilityDescriptor, "contractVersion" | "prov
       ] },
       env: strings,
       steps: { type: "array", minItems: 1, items: object({
-        name: text, command: text, timeoutMs: { type: "integer" }
+        name: text, command: text, timeoutMs: { type: "integer" },
+        argv: { type: "array", minItems: 1, items: text }, cwd: text, env: strings
       }, ["name", "command"]) },
       retryOf: text
     }, ["taskId", "projectId", "head", "workspace", "owner", "env", "steps"]),

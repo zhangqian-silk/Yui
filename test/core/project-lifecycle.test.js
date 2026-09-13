@@ -7,7 +7,7 @@ import test from "node:test";
 
 import { runProjectCommand } from "../../dist/commands/projectCommands.js";
 import { runTaskCommand } from "../../dist/commands/taskCommands.js";
-import { createTaskRemoteDeliveryProof } from "../../dist/commands/taskRemoteDeliveryCommand.js";
+import { createTaskRemoteDeliveryProof } from "../../dist/task/remoteDeliveryService.js";
 import { runTaskUpstreamCommand } from "../../dist/commands/taskUpstreamCommands.js";
 import { GitIntegrationService } from "../../dist/integration/gitIntegrationService.js";
 import {

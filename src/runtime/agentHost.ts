@@ -1,51 +1,38 @@
 import { createHash, randomUUID } from "node:crypto";
 import { chmodSync, mkdirSync, rmSync } from "node:fs";
-import { tmpdir, homedir } from "node:os";
-import { dirname, join, resolve } from "node:path";
 import { createConnection, createServer, type Server } from "node:net";
+import { homedir, tmpdir } from "node:os";
+import { dirname, join, resolve } from "node:path";
 import { createInterface } from "node:readline";
 import { withSessionContextPointer } from "../context/sessionBootstrapManifest.js";
 
-import { builtinAgentDriverRegistry } from "./builtinAgentDrivers.js";
 
+import type { AgentAdapterId } from "../agent/adapterCatalog.js";
+import {
+  publishStructuredConversationRecoverability,
+  publishStructuredProviderAccepted,
+  publishStructuredProviderActivity,
+  publishStructuredProviderAttachmentExit,
+  publishStructuredProviderConnection,
+  publishStructuredProviderGoal,
+  publishStructuredProviderInputObserved,
+  publishStructuredProviderInputSettlement,
+  publishStructuredProviderOpened,
+  publishStructuredProviderStarted,
+  publishStructuredProviderTerminal,
+  structuredProviderEventDelivery
+} from "../controller/structuredProviderObservation.js";
 import {
   callController,
   controllerCallMayHaveApplied,
   ControllerClientError
 } from "../core/controllerClient.js";
 import { readHomeFilesystemId } from "../core/homeFilesystemIdentity.js";
-import type { AgentAdapterId } from "../agent/adapterCatalog.js";
+import { FILE_TASK_CONTROLLER_PROTOCOL_VERSION, type JsonValue } from "../core/protocol.js";
+import type { ImplementationRef } from "../kernel/instanceHost.js";
 import { isForeignHandoverLockHeld } from "../release/runtimeRelease.js";
-import {
-  publishStructuredProviderAccepted,
-  publishStructuredProviderAttachmentExit,
-  publishStructuredProviderActivity,
-  publishStructuredProviderInputSettlement,
-  publishStructuredProviderInputObserved,
-  publishStructuredProviderGoal,
-  publishStructuredConversationRecoverability,
-  publishStructuredProviderOpened,
-  publishStructuredProviderStarted,
-  publishStructuredProviderTerminal,
-  publishStructuredProviderConnection,
-  structuredProviderEventDelivery
-} from "../controller/structuredProviderObservation.js";
-import {
-  validateAgentHostLaunchPayload,
-  type AgentHostLaunchPayload
-} from "./launchBroker.js";
-import {
-  ProviderDeliveryUnknownError,
-  ProviderConversationMissingError,
-  ProviderTurnBusyError,
-  ProviderTurnRejectedError,
-  type StructuredProviderGoal,
-  type StructuredProviderActivity,
-  type StructuredProviderTurnReceipt,
-  type StructuredProviderTurnStarted,
-  type StructuredProviderTurnInput,
-  type StructuredProviderTurnTerminal
-} from "./structuredProviderHost.js";
+import { yuiTmuxServerName, yuiTmuxSessionName } from "../tmux/tmuxManager.js";
+import { tmuxSocketDirectory } from "../tmux/tmuxSocketEndpoint.js";
 import {
   type AgentEndpoint,
   type AgentEndpointCancellation,
@@ -56,10 +43,27 @@ import {
   type AgentEndpointLease
 } from "./agentEndpointOwnership.js";
 import {
-  sameProviderAuthorityFence,
-  validateProviderAuthorityFence,
-  type ProviderAuthorityFence
-} from "./providerAuthorityFence.js";
+  providerDeliveryFailure,
+  providerDeliveryFailureFrom,
+  redactAgentErrorText,
+  serializeAgentErrorRaw,
+  type AgentErrorPhase,
+  type ProviderDeliveryFailure
+} from "./agentError.js";
+import type { AgentHostCompatibility, AgentHostEventDelivery } from "./agentHostProtocol.js";
+import { AGENT_HOST_CONTROL_PROTOCOL, AGENT_HOST_EVENT_PROTOCOL } from "./agentHostProtocol.js";
+import {
+  readAgentRunConfigurationObservation,
+  unknownAgentRunConfiguration,
+  type AgentRunConfigurationObservation
+} from "./agentRunConfiguration.js";
+import { CodexPreSubmissionError } from "./codexAppServerRuntime.js";
+import { runCodexInteractiveHost } from "./codexInteractiveHost.js";
+import {
+  validateAgentHostLaunchPayload,
+  type AgentHostLaunchPayload
+} from "./launchBroker.js";
+import type { PromptPushOutcome } from "./ports.js";
 import {
   validateRuntimeProcessExitObservation,
   type RuntimeProcessExitObservation
@@ -69,35 +73,32 @@ import {
   replayRuntimeProcessExitOutbox
 } from "./processExitOutbox.js";
 import {
+  sameProviderAuthorityFence,
+  validateProviderAuthorityFence,
+  type ProviderAuthorityFence
+} from "./providerAuthorityFence.js";
+import {
+  ProviderConversationMissingError,
+  ProviderDeliveryUnknownError,
+  ProviderTurnBusyError,
+  ProviderTurnRejectedError
+} from "./providerErrors.js";
+import {
   AGENT_HOST_CLIENT_EXIT_GRACE_MS,
   AGENT_HOST_CONTROL_TIMEOUT_MS,
   AGENT_HOST_READY_TIMEOUT_MS,
   ENDPOINT_DRAIN_TIMEOUT_MS,
   PROVIDER_ACCEPT_TIMEOUT_MS
 } from "./runtimeDeadlines.js";
-import {
-  providerDeliveryFailure,
-  providerDeliveryFailureFrom,
-  redactAgentErrorText,
-  serializeAgentErrorRaw,
-  type AgentErrorPhase,
-  type ProviderDeliveryFailure
-} from "./agentError.js";
-import { runCodexInteractiveHost } from "./codexInteractiveHost.js";
-import { CodexPreSubmissionError } from "./codexAppServerRuntime.js";
-import {
-  readAgentRunConfigurationObservation,
-  unknownAgentRunConfiguration,
-  type AgentRunConfigurationObservation
-} from "./agentRunConfiguration.js";
-import type { ImplementationRef } from "../kernel/instanceHost.js";
-import type { PromptPushOutcome } from "./ports.js";
 import { createSessionOwnerIdentity, readLinuxProcessIdentity } from "./sessionOwnerIdentity.js";
-import { yuiTmuxServerName, yuiTmuxSessionName } from "../tmux/tmuxManager.js";
-import { tmuxSocketDirectory } from "../tmux/tmuxSocketEndpoint.js";
-import { AGENT_HOST_CONTROL_PROTOCOL, AGENT_HOST_EVENT_PROTOCOL } from "./agentHostProtocol.js";
-import type { AgentHostCompatibility, AgentHostEventDelivery } from "./agentHostProtocol.js";
-import { FILE_TASK_CONTROLLER_PROTOCOL_VERSION, type JsonValue } from "../core/protocol.js";
+import {
+  type StructuredProviderActivity,
+  type StructuredProviderGoal,
+  type StructuredProviderTurnInput,
+  type StructuredProviderTurnReceipt,
+  type StructuredProviderTurnStarted,
+  type StructuredProviderTurnTerminal
+} from "./structuredProviderHost.js";
 export { AGENT_HOST_CONTROL_PROTOCOL } from "./agentHostProtocol.js";
 
 const HOST_CONTROL_MAX_BYTES = 32 * 1024;
@@ -309,7 +310,7 @@ export async function runAgentHost(input: Readonly<{
   if (payload.environment.YUI_SESSION_SCOPE === "global"
     && payload.environment.YUI_ADAPTER_ID === "codex"
     && payload.providerControl === undefined) {
-    return runCodexInteractiveHost(input.home, payload);
+    return runCodexInteractiveHost(input.home, payload, openAgentHostControl);
   }
   let session: AgentEndpoint | undefined;
   // This process really holds the Endpoint code its Session runs on. The lease

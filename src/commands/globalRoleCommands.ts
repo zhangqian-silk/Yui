@@ -19,6 +19,7 @@ import {
 import {
   resolveGlobalInputControl,
   type InputControlResolution,
+  type InputControlRequest,
   type ResolvedInputTarget
 } from "../message/inputControlResolution.js";
 import { readCommandText } from "./textInput.js";
@@ -135,33 +136,52 @@ export type GlobalRoleCommandResult =
   | GlobalRoleInputSteer
   | GlobalRoleInputInterrupt;
 
+export type GlobalInputResult = GlobalRoleInputSteer | GlobalRoleInputInterrupt
+  | Readonly<{ kind: "output"; output: string; data: Readonly<Record<string, unknown>> }>;
+
+export function applyGlobalInputControl(
+  name: string, input: InputControlRequest, store: GlobalRoleStore, options: GlobalRoleCommandOptions = {}
+): GlobalInputResult {
+  assertGlobalInputAuthority(store, options, name);
+  return input.action === "interrupt"
+    ? interruptGlobalInput(name, input, store)
+    : messageGlobalInput(name, input, store, options);
+}
+
+function inputOutput(output: string, data: Readonly<Record<string, unknown>>): GlobalInputResult {
+  return { kind: "output", output, data };
+}
+
+function renderGlobalInput(result: GlobalInputResult, options: GlobalRoleCommandOptions): GlobalRoleCommandResult {
+  return result.kind === "output" ? jsonOrText(options, result.output, result.data) : result;
+}
+
+function assertGlobalInputAuthority(store: GlobalRoleStore, options: GlobalRoleCommandOptions, target: string | undefined): void {
+  const env = options.env ?? process.env;
+  if (env.YUI_SESSION_SCOPE !== undefined && env.YUI_SESSION_SCOPE !== "global"
+    || env.YUI_SESSION_SCOPE === "global" && env.YUI_ROLE !== "operator" && env.YUI_ROLE !== target) {
+    throw usageError("Global input mutation is outside the exact Session authority.");
+  }
+  if (env.YUI_SESSION_SCOPE === "global") {
+    const caller = store.getGlobalRoleSessionSet(env.YUI_ROLE ?? "");
+    const session = caller?.sessions[caller.activeAgentId];
+    if (session === undefined || session.status !== "active" || env.YUI_AGENT_ID !== session.agentId
+      || env.YUI_ADAPTER_ID !== session.adapterId
+      || (env.CODEX_THREAD_ID ?? env.YUI_NATIVE_SESSION_ID) !== session.nativeSessionId) {
+      throw usageError("Global input mutation requires the current native caller Session.");
+    }
+  } else if (env.YUI_ROLE !== undefined || env.YUI_AGENT_ID !== undefined || env.YUI_NATIVE_SESSION_ID !== undefined) {
+    throw usageError("Incomplete managed identity cannot acquire user authority.");
+  }
+}
+
 export function runGlobalRoleCommand(
   args: string[],
   store: GlobalRoleStore,
   options: GlobalRoleCommandOptions = {}
 ): GlobalRoleCommandResult {
   const [command, ...rest] = args;
-  if (command === "message" || command === "interrupt" || command === "session" && rest[0] === "retry") {
-    const env = options.env ?? process.env;
-    const target = command === "message" || command === "session" ? rest[1] : rest[0];
-    if (env.YUI_SESSION_SCOPE !== undefined && env.YUI_SESSION_SCOPE !== "global"
-      || env.YUI_SESSION_SCOPE === "global" && env.YUI_ROLE !== "operator"
-        && env.YUI_ROLE !== target) {
-      throw usageError("Global input mutation is outside the exact Session authority.");
-    }
-    if (env.YUI_SESSION_SCOPE === "global") {
-      const caller = store.getGlobalRoleSessionSet(env.YUI_ROLE ?? "");
-      const session = caller?.sessions[caller.activeAgentId];
-      if (session === undefined || session.status !== "active" || env.YUI_AGENT_ID !== session.agentId
-        || env.YUI_ADAPTER_ID !== session.adapterId
-        || (env.CODEX_THREAD_ID ?? env.YUI_NATIVE_SESSION_ID) !== session.nativeSessionId) {
-        throw usageError("Global input mutation requires the current native caller Session.");
-      }
-    } else if (env.YUI_ROLE !== undefined || env.YUI_AGENT_ID !== undefined
-      || env.YUI_NATIVE_SESSION_ID !== undefined) {
-      throw usageError("Incomplete managed identity cannot acquire user authority.");
-    }
-  }
+  if (command === "session" && rest[0] === "retry") assertGlobalInputAuthority(store, options, rest[1]);
   switch (command) {
     case "add": return addRole(rest, store, options);
     case "list": return listRoles(rest, store);
@@ -744,6 +764,17 @@ function globalRoleMessage(
   const expectedTarget = action === "steer"
     ? required(parsed.one("--expected-target"), "--expected-target")
     : undefined;
+  return renderGlobalInput(applyGlobalInputControl(name, action === "steer"
+    ? { action, body, requestId, expectedTarget: expectedTarget!, to: name }
+    : { action, body, requestId }, store, options), options);
+}
+
+function messageGlobalInput(
+  name: string, input: Exclude<InputControlRequest, { action: "interrupt" }>,
+  store: GlobalRoleStore, options: GlobalRoleCommandOptions
+): GlobalInputResult {
+  const { action, body, requestId } = input;
+  const expectedTarget = input.action === "steer" ? input.expectedTarget : undefined;
   const now = new Date();
   // The durable Global input is authored as an operator input: a Global Role has
   // no Task Leader, and the operator is the human authority over Global Roles.
@@ -757,16 +788,16 @@ function globalRoleMessage(
   });
   if (action === "queue") {
     const state = persisted.idempotentReplay ? "idempotent-replay" : "queued";
-    return jsonOrText(options, `Queued Global message ${persisted.message.id} to ${name} (${state}).\n`,
+    return inputOutput(`Queued Global message ${persisted.message.id} to ${name} (${state}).\n`,
       { roleName: name, message: persisted.message, delivery: { state } });
   }
   if (persisted.idempotentReplay) {
-    return jsonOrText(options, `Steer Global message ${persisted.message.id} already recorded (idempotent-replay).\n`,
+    return inputOutput(`Steer Global message ${persisted.message.id} already recorded (idempotent-replay).\n`,
       { roleName: name, message: persisted.message, steer: { state: "idempotent-replay" } });
   }
   const resolution = resolveGlobalInputControl(store, name, "steer", expectedTarget!);
   if (resolution.outcome !== "ready") {
-    return jsonOrText(options,
+    return inputOutput(
       `Steer Global message ${persisted.message.id} saved but not delivered (${resolution.code}: ${resolution.detail}).\n`,
       { roleName: name, message: persisted.message,
         steer: { state: "not-steered", code: resolution.code, detail: resolution.detail } });
@@ -799,7 +830,6 @@ function globalRoleInterrupt(
   store: GlobalRoleStore,
   options: GlobalRoleCommandOptions
 ): GlobalRoleCommandResult {
-  const usage = "Role interrupt usage: yui role interrupt <role> --expected-target <turn> [--then-message <global-message-id>] [--request-id <id>].";
   const [rawName, ...tail] = args;
   const name = roleName(rawName);
   const parsed = parseOptions(tail, new Map<string, OptionKind>([
@@ -810,11 +840,21 @@ function globalRoleInterrupt(
   const expectedTarget = required(parsed.one("--expected-target"), "--expected-target");
   const thenMessageId = trimmed(parsed.one("--then-message"));
   const requestId = trimmed(parsed.one("--request-id")) ?? `cancel:${encodeURIComponent(expectedTarget)}`;
+  return renderGlobalInput(applyGlobalInputControl(name, {
+    action: "interrupt", role: name, expectedTarget, thenMessage: thenMessageId, requestId
+  }, store, options), options);
+}
+
+function interruptGlobalInput(
+  name: string, input: Extract<InputControlRequest, { action: "interrupt" }>, store: GlobalRoleStore
+): GlobalInputResult {
+  const { expectedTarget, thenMessage: thenMessageId } = input;
+  const requestId = input.requestId ?? `cancel:${encodeURIComponent(expectedTarget)}`;
   const fingerprint = JSON.stringify({ expectedTarget, thenMessageId });
   const prior = store.getGlobalRoleSessionSet(name)?.interrupts?.[requestId];
   if (prior !== undefined) {
     if (prior.fingerprint !== fingerprint) throw usageError("Interrupt requestId already names another control.");
-    return jsonOrText(options, `Interrupt ${requestId} already recorded; no native control repeated.\n`,
+    return inputOutput(`Interrupt ${requestId} already recorded; no native control repeated.\n`,
       { roleName: name, interrupt: prior.receipt ?? { state: "interrupt-unknown" }, idempotentReplay: true });
   }
   const resolved = store.transaction((tx): InputControlResolution | Readonly<{
@@ -850,12 +890,12 @@ function globalRoleInterrupt(
     return resolution;
   });
   if (resolved.outcome === "then-conflict") {
-    return jsonOrText(options,
+    return inputOutput(
       `Interrupt not delivered (${resolved.code}: ${resolved.detail}).\n`,
       { roleName: name, interrupt: { state: "not-interrupted", code: resolved.code, detail: resolved.detail } });
   }
   if (resolved.outcome !== "ready") {
-    return jsonOrText(options,
+    return inputOutput(
       `Interrupt not delivered (${resolved.code}: ${resolved.detail}).\n`,
       { roleName: name, interrupt: { state: "not-interrupted", code: resolved.code, detail: resolved.detail } });
   }

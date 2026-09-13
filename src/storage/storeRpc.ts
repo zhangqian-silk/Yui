@@ -8,7 +8,8 @@
  *
  *   - {@link AsyncTaskStore} ........ the async counterpart to `TaskStore`
  *     (design §6): every method returns a promise; the worker owns the
- *     `SqliteTaskStore` connection, the main thread never touches the db.
+ *     worker-side connection. The Controller's separate synchronous scheduler
+ *     connection is not routed through this interface.
  *   - {@link AsyncTaskStoreClient} .. the client: serializes requests, applies
  *     the storage idempotency/dialect rules on top of the shared bounded RPC
  *     (outbox §5.4, `AbortSignal` cancellation §3.1, restart + replay §3.1).
@@ -16,8 +17,8 @@
  *     `transactionAsync` ships an ordered batch that the worker runs inside one
  *     `BEGIN IMMEDIATE … COMMIT` (§3.2).
  *
- * SQLite is the only product Store. `YUI_STORE_WORKER` controls whether its
- * connection lives in a Worker Thread; it does not select another authority.
+ * SQLite is the only product Store. `YUI_STORE_WORKER` selects the observer
+ * execution boundary; it does not select another authority.
  */
 import {
   BoundedRpcClient,
@@ -25,6 +26,7 @@ import {
   type BoundedRpcProtocol,
   type SerializedError
 } from "../core/boundedRpc.js";
+import type { TelemetryProgressEntry } from "../telemetry/telemetryStore.js";
 import {
   StorageCancelledError,
   StorageConflictError,
@@ -39,10 +41,10 @@ export type { SerializedError };
 
 /** A single command in a `transactionAsync` batch (one variant per TaskStore op). */
 export type StoreCommand = {
-  [K in Exclude<keyof TaskStore, "transaction">]: TaskStore[K] extends (...args: infer A) => infer _R
+  [K in Exclude<keyof TaskStore, "transaction" | "readTransaction">]: TaskStore[K] extends (...args: infer A) => infer _R
     ? { op: K; args: A }
     : never;
-}[Exclude<keyof TaskStore, "transaction">];
+}[Exclude<keyof TaskStore, "transaction" | "readTransaction">];
 
 /** Requests sent main -> worker. */
 export type WorkerRequest =
@@ -56,6 +58,7 @@ export type WorkerRequest =
   | { kind: "call"; requestId: string; method: string; args: unknown[]; readOnly: boolean }
   | { kind: "transaction"; requestId: string; commands: ReadonlyArray<{ op: string; args: unknown[] }>; expectedRevision?: number }
   | { kind: "observer"; requestId: string; method: string; args: unknown[] }
+  | { kind: "telemetry"; requestId: string; entries: readonly TelemetryProgressEntry[]; runCap: number }
   | { kind: "cancel"; requestId: string }
   | { kind: "shutdown" };
 
@@ -91,7 +94,7 @@ export type TransactionAsyncOptions = RpcCallOptions & {
  * promise; the closure-based `transaction` is replaced by {@link transactionAsync}.
  */
 export type AsyncTaskStore = {
-  [K in Exclude<keyof TaskStore, "transaction">]: TaskStore[K] extends (...args: infer A) => infer R
+  [K in Exclude<keyof TaskStore, "transaction" | "readTransaction">]: TaskStore[K] extends (...args: infer A) => infer R
     ? (...args: [...A, options?: RpcCallOptions]) => Promise<Awaited<R>>
     : TaskStore[K];
 } & {
@@ -156,6 +159,12 @@ const READ_ONLY_STORE_METHODS: ReadonlySet<string> = new Set([
   "getTask",
   "readNextActionFacts",
   "readCompletionReadinessFacts",
+  "queryContextRecords",
+  "latestEventSequence",
+  "listEventsByType",
+  "listTaskRunWorkspaceBases",
+  "contextInputReferences",
+  "listActiveRuns",
   "listActiveTaskIds",
   "listPlanningDraftTaskIds",
   "listPendingActivationRequestTaskIds",
@@ -283,13 +292,9 @@ function storageProtocol(
  * RPCs) plus {@link transactionAsync}, {@link invokeObserver}, and {@link close}.
  */
 export class AsyncTaskStoreClient {
-  readonly #home: string;
-  readonly #options: RpcOptions;
   readonly #rpc: BoundedRpcClient<WorkerRequest, WorkerResponse>;
 
   constructor(home: string, options: RpcOptions = {}) {
-    this.#home = home;
-    this.#options = options;
     this.#rpc = new BoundedRpcClient(storageProtocol(home, options), {
       maxInFlight: options.maxInFlight,
       maxQueue: options.maxQueue,
@@ -352,6 +357,12 @@ export class AsyncTaskStoreClient {
   /** Close the worker and release its connections. */
   close(): Promise<void> {
     return this.#rpc.close();
+  }
+
+  /** Best-effort diagnostic batch on this worker, without a Task outbox entry. */
+  async flushTelemetry(entries: readonly TelemetryProgressEntry[], runCap: number): Promise<void> {
+    const requestId = nextRequestId();
+    await this.#rpc.send(requestId, { kind: "telemetry", requestId, entries, runCap });
   }
 
   /** Currently in-flight requests (metrics/tests). */

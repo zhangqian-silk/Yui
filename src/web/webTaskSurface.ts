@@ -1,26 +1,31 @@
-import type { TaskStore } from "../storage/taskStore.js";
-import { recordTaskInterruptResult } from "../message/taskInterrupt.js";
-import { recordGlobalInterruptResult, recordGlobalSteerResult } from "../message/globalInterrupt.js";
-import { runGlobalRoleCommand } from "../commands/globalRoleCommands.js";
+import { applyGlobalInputControl } from "../commands/globalRoleCommands.js";
+import { applyTaskInputControl, sendTaskMessageCommand, updateTaskMetadataCommand } from "../commands/taskCommands.js";
+import { type TaskCommandExecution, type TaskCommandOptions } from "../commands/taskCommandTypes.js";
+import { runTaskInputCommand } from "../commands/taskInputCommands.js";
 import {
-  readTaskContext, readTaskContextDelta, inspectTaskContext, withContextObservations,
+  inspectTaskContext,
+  readTaskContext, readTaskContextDelta,
+  withContextObservations,
   type ContextObservationProvider
 } from "../context/taskContext.js";
 import { BUILTIN_CAPABILITIES } from "../kernel/builtinCapabilities.js";
 import { capabilitySchemaError } from "../kernel/capabilitySchema.js";
-import {
-  updateTaskMetadataCommand, sendTaskMessageCommand, runTaskCommand,
-  type TaskCommandOptions, type TaskCommandExecution
-} from "../commands/taskCommands.js";
-import type { TaskMetadataUpdate } from "../task/task.js";
+import { recordGlobalInterruptResult, recordGlobalSteerResult } from "../message/globalInterrupt.js";
 import type { TaskSubmissionIntent } from "../message/message.js";
-import { webLocalMutation, WebRequestRejected } from "./webMutation.js";
-import { runTaskInputCommand } from "../commands/taskInputCommands.js";
+import type { InputControlRequest } from "../message/inputControlResolution.js";
+import { recordTaskInterruptResult } from "../message/taskInterrupt.js";
 import {
-  sendAgentHostSteerControl, sendAgentHostCancelControl, AGENT_HOST_CONTROL_PROTOCOL,
-  foldSteerLiveReceipt, foldInterruptLiveReceipt,
-  type AgentHostControlResult, type AgentHostSteerRunControl, type AgentHostCancelControl
+  AGENT_HOST_CONTROL_PROTOCOL,
+  foldInterruptLiveReceipt,
+  foldSteerLiveReceipt,
+  sendAgentHostCancelControl,
+  sendAgentHostSteerControl,
+  type AgentHostCancelControl,
+  type AgentHostControlResult, type AgentHostSteerRunControl
 } from "../runtime/agentHost.js";
+import type { TaskStore } from "../storage/taskStore.js";
+import type { TaskMetadataUpdate } from "../task/task.js";
+import { webLocalMutation, WebRequestRejected } from "./webMutation.js";
 import type { WebInputAnswer } from "./webServer.js";
 
 /**
@@ -29,13 +34,7 @@ import type { WebInputAnswer } from "./webServer.js";
  * surface is a local-human ingress; it never carries a caller Role, so its
  * authority is the local user (see {@link assertTaskInputControlAuthority}).
  */
-export type WebControlInput =
-  | Readonly<{ action: "queue"; body: string; requestId: string;
-      to?: string; workItem?: string; reviewRound?: string }>
-  | Readonly<{ action: "steer"; body: string; requestId: string; expectedTarget: string;
-      to: string; workItem?: string; reviewRound?: string }>
-  | Readonly<{ action: "interrupt"; requestId: string; expectedTarget: string;
-      role: string; thenMessage?: string }>;
+export type WebControlInput = InputControlRequest & Readonly<{ requestId: string }>;
 
 /**
  * The single live Agent Host edge for a resolved steer/interrupt. It is a socket
@@ -54,27 +53,6 @@ const DEFAULT_WEB_HOST_CONTROL: WebHostControlPort = {
   steer: sendAgentHostSteerControl,
   cancel: sendAgentHostCancelControl
 };
-
-/** The store-only CLI argv for the shared application-layer primitive
- * (decision-3 §7). The Web surface never re-implements the queue/steer/interrupt
- * decisions; it drives the exact same command the CLI drives. */
-function controlArgv(taskId: string, input: WebControlInput): string[] {
-  if (input.action === "queue") {
-    return ["message", "queue", taskId, input.body, "--request-id", input.requestId,
-      ...(input.to === undefined ? [] : ["--to", input.to]),
-      ...(input.workItem === undefined ? [] : ["--work-item", input.workItem]),
-      ...(input.reviewRound === undefined ? [] : ["--review-round", input.reviewRound])];
-  }
-  if (input.action === "steer") {
-    return ["message", "steer", taskId, input.body, "--request-id", input.requestId,
-      "--expected-target", input.expectedTarget, "--to", input.to,
-      ...(input.workItem === undefined ? [] : ["--work-item", input.workItem]),
-      ...(input.reviewRound === undefined ? [] : ["--review-round", input.reviewRound])];
-  }
-  return ["role", "interrupt", taskId, input.role, "--expected-target", input.expectedTarget,
-    ...(input.thenMessage === undefined ? [] : ["--then-message", input.thenMessage]),
-    "--request-id", input.requestId];
-}
 
 /** A queue is delivered to the Leader mailbox only when it is unaddressed or
  * addressed to the Leader; an addressed Worker/Reviewer queue goes to the Task
@@ -127,19 +105,14 @@ export function createWebTaskSurface(
       };
     },
     globalControl: async (roleName: string, input: WebControlInput) => {
-      const argv = input.action === "interrupt"
-        ? ["interrupt", roleName, "--request-id", input.requestId, "--expected-target", input.expectedTarget,
-          ...(input.thenMessage === undefined ? [] : ["--then-message", input.thenMessage])]
-        : ["message", input.action, roleName, input.body, "--request-id", input.requestId,
-          ...(input.action === "steer" ? ["--expected-target", input.expectedTarget] : [])];
-      const result = webLocalMutation(store, tx => runGlobalRoleCommand(argv, tx, {
-        env: {}, yuiHome: options.yuiHome, jsonOutput: true
+      const result = webLocalMutation(store, tx => applyGlobalInputControl(roleName, input, tx, {
+        env: {}, yuiHome: options.yuiHome
       }));
-      if (typeof result === "string") {
+      if (result.kind === "output") {
         if (input.action === "queue") void options.runtime?.notifyMailboxChanged?.({
           kind: "global-role-runtime", roleName
         });
-        return { action: input.action, ...JSON.parse(result) };
+        return { action: input.action, ...result.data };
       }
       if (result.kind !== "input-steer" && result.kind !== "input-interrupt") {
         throw new WebRequestRejected("Global input cannot perform a Session lifecycle operation.");
@@ -194,7 +167,7 @@ export function createWebTaskSurface(
     /**
      * The decision-3 three-action input-control path for the local-user Web
      * surface. Its store-only phase is the identical shared application-layer
-     * primitive the CLI uses (`runTaskCommand`), run inside `webLocalMutation`
+     * typed primitive the CLI uses, run inside `webLocalMutation`
      * so a rejected input is provably not-submitted. A ready steer/interrupt
      * returns a live intent; the single Agent Host edge then runs OUTSIDE the
      * transaction exactly as cli.ts performs it — never a fallback, retarget, or
@@ -204,7 +177,7 @@ export function createWebTaskSurface(
      */
     control: async (taskId: string, input: WebControlInput) => {
       const execution: TaskCommandExecution = webLocalMutation(store, (tx) =>
-        runTaskCommand(controlArgv(taskId, input), tx, commandOptions));
+        applyTaskInputControl(taskId, input, tx, commandOptions));
       if (execution.kind === "output") {
         // A queue receipt, or a steer/interrupt that was saved-but-not-delivered
         // or an idempotent replay: fully durable, no live edge, exact disposition.

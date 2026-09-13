@@ -1,16 +1,14 @@
-import type { DurableJob } from "../job/durableJob.js";
-import type { IntegrationQueueEntry } from "../integration/integrationQueueEntry.js";
-import type { IntegrationAttempt } from "../integration/integrationAttempt.js";
 import {
   governingWorkItemDeliveries,
   integrationAttemptRequiresSettlement,
   workItemDeliverySettled
 } from "../integration/deliveryObligation.js";
-import type { ManagedWorkspace } from "../worktree/managedWorkspace.js";
-import type { WorkItem } from "../workItem/workItem.js";
-import type { NextActionFacts, NextActionRef } from "./nextAction.js";
-import type { TaskStore } from "../storage/taskStore.js";
+import type { IntegrationQueueEntry } from "../integration/integrationQueueEntry.js";
+import type { DurableJob } from "../job/durableJob.js";
 import type { TaskMessage } from "../message/message.js";
+import type { TaskStore } from "../storage/taskStore.js";
+import type { ManagedWorkspace } from "../worktree/managedWorkspace.js";
+import type { NextActionFacts, NextActionRef } from "./nextAction.js";
 import { operationalTaskRecords } from "./taskRecordRetirement.js";
 
 /**

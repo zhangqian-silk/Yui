@@ -2,143 +2,82 @@
 
 import { spawnSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { recordTaskInterruptResult } from "./message/taskInterrupt.js";
-import { agentAdapterLabel as adapterLabel } from "./agent/adapterCatalog.js";
 import { readFileSync } from "node:fs";
 import { resolve } from "node:path";
 import { createInterface } from "node:readline/promises";
 import { fileURLToPath } from "node:url";
 import { isDeepStrictEqual } from "node:util";
+import { agentAdapterLabel as adapterLabel } from "./agent/adapterCatalog.js";
+import { recordTaskInterruptResult } from "./message/taskInterrupt.js";
 
-import { renderCommandHelp } from "./cli/helpRenderer.js";
+import type { ConfiguredAgent } from "./agent/agent.js";
+import { nativeAgentEnvironmentNames } from "./agent/launchEnvironment.js";
+import {
+  listArtifactsCapability,
+  readArtifactCapability,
+  saveArtifactCapability
+} from "./artifacts/artifactCapability.js";
+import {
+  renderAgentConfigurationResolutionNotice
+} from "./cli/agentConfigurationPicker.js";
 import { describeCommandTree, findCommandNode } from "./cli/commandCatalog.js";
-import { routeInvocation } from "./cli/invocationRouter.js";
 import { renderCompletion, type CliIdentity } from "./cli/completion.js";
+import { runCompletionWizard } from "./cli/completionWizard.js";
 import { resolveCompletionCandidates } from "./cli/dynamicCompletion.js";
-import { recordGlobalInterruptResult, recordGlobalSteerResult } from "./message/globalInterrupt.js";
+import { renderCommandHelp } from "./cli/helpRenderer.js";
 import {
   allowsInteractiveSelection,
   resolveInteractiveArguments,
   type SelectionIo
 } from "./cli/interactiveSelection.js";
-import { runCompletionWizard } from "./cli/completionWizard.js";
-import {
-  renderAgentConfigurationResolutionNotice
-} from "./cli/agentConfigurationPicker.js";
+import { routeInvocation } from "./cli/invocationRouter.js";
+import { operatorOfflineCommand, taskDiagnosticTarget } from "./cli/managedDiagnostics.js";
+import { resolveOperatorWizardArguments } from "./cli/operatorWizard.js";
 import {
   resolveGlobalRoleAgentConfigurationArguments,
   resolveRoleWizardArguments
 } from "./cli/roleWizard.js";
-import { resolveOperatorWizardArguments } from "./cli/operatorWizard.js";
 import type { SelectionPorts } from "./cli/selectionPorts.js";
 import { runUpdateCommand } from "./cli/updateCommand.js";
+import { createUpdatePorts } from "./cli/updatePorts.js";
 import { runUpgradeCommand } from "./cli/upgradeCommand.js";
-import { formatTimestamp } from "./output/timePresentation.js";
-import { resolveTmuxBin, resolveTmuxHistoryLimit } from "./config/yuiConfig.js";
-import { renderAgentConfigurationCatalog } from "./output/agentConfigurationPresentation.js";
-import type { ConfiguredAgent } from "./agent/agent.js";
-import { nativeAgentEnvironmentNames } from "./agent/launchEnvironment.js";
 import {
   runAgentCommand,
   type AgentCommandStore
 } from "./commands/agentCommands.js";
-import {
-  runGlobalRoleCommand,
-  type GlobalRoleCommandOptions
-} from "./commands/globalRoleCommands.js";
-import { runConfigCommand } from "./commands/configCommands.js";
 import { runCapabilityCommand } from "./commands/capabilityCommands.js";
-import { CONFIG_DOMAINS, type ConfigDomain } from "./config/configCatalog.js";
+import { runConfigCommand } from "./commands/configCommands.js";
 import { runConfigOverview } from "./commands/configOverview.js";
 import {
   parseControllerCleanupOptions,
-  parseControllerStatusOptions,
   parseControllerRuntimeSnapshot,
+  parseControllerStatusOptions,
   renderControllerResourceStatus,
   renderRuntimeIdentitySection,
+  runInteractiveControllerCleanup,
   summarizeDurablePhysicalMismatch,
-  type ControllerRuntimeSnapshot,
-  runInteractiveControllerCleanup
+  type ControllerRuntimeSnapshot
 } from "./commands/controllerCommands.js";
+import { runDurableJobCommand } from "./commands/durableJobCommands.js";
 import {
   parseExecutionAuditOptions,
   runExecutionAuditCommand
 } from "./commands/executionAuditCommands.js";
 import {
-  parseSessionReconcileOptions,
-  parseSessionStopOptions,
-  runSessionReconcileCommand,
-  runSessionStopCommand
-} from "./commands/sessionCommands.js";
-import { SessionOwnerReconciliation } from "./controller/sessionOwnerReconciliation.js";
+  runGlobalRoleCommand,
+  type GlobalRoleCommandOptions
+} from "./commands/globalRoleCommands.js";
 import { runJobCommand } from "./commands/jobCommands.js";
-import { runDurableJobCommand } from "./commands/durableJobCommands.js";
-import { runTelemetryCommand } from "./commands/telemetryCommands.js";
-import { runResourcesCommand } from "./commands/resourcesCommands.js";
 import {
   applyOperatorSessionControl,
   runOperatorCommand,
   type OperatorSessionControl
 } from "./commands/operatorCommands.js";
-import { runProjectCommand } from "./commands/projectCommands.js";
 import {
   previewProfileAgentConfigurationMutation,
   runProfileCommand
 } from "./commands/profileCommands.js";
-import {
-  assertWorkItemDependenciesCompletedForCommand,
-  requireWorkItemAssignee,
-  dispatchPreparedReviewRound,
-  failPendingReviewRound,
-  preserveReviewRoundWorkspace,
-  parseTaskCompletionRequest,
-  previewTaskRoleAgentConfigurationMutation,
-  preflightTaskCompletion,
-  runTaskCommand,
-  planReplicatedWorkItemLanes,
-  validateTaskArchiveRequest,
-  parseTaskArchiveArguments
-} from "./commands/taskCommands.js";
-import {
-  assertTaskRemoteDeliveryIntegrated,
-  createTaskRemoteDeliveryProof,
-  type TaskRemoteDeliveryProof
-} from "./commands/taskRemoteDeliveryCommand.js";
-import { renderArchiveDiagnostics, taskArchiveDiagnostics } from "./task/archiveDiagnostics.js";
-import { inspectTaskArchive, renderTaskArchivePreflight } from "./task/archivePreflight.js";
-import { CleanupInspectionError } from "./workspace/cleanupInspection.js";
-import { runTaskPublicationVerifyCommand } from "./commands/taskPublicationVerifyCommand.js";
-import { runTaskPublicationAdoptCommand } from "./commands/taskPublicationAdoptCommand.js";
-import { createGitHubCliPublicationVerifier } from "./external/githubPublicationVerifier.js";
-import { createGitLabCliPublicationVerifier } from "./external/gitlabPublicationVerifier.js";
-import { taskLocalActor, assertTaskDeliveryAuthority } from "./commands/taskActor.js";
-import {
-  saveArtifactCapability, readArtifactCapability, listArtifactsCapability
-} from "./artifacts/artifactCapability.js";
-import {
-  parseTaskExecutionStartRequest,
-  parseTaskExecutionStopRequest,
-  finalizeStoppedTaskExecution,
-  startTaskExecutionCommand,
-  stopTaskExecutionCommand
-} from "./commands/taskExecutionCommands.js";
-import { runTaskIntegrationCommand } from "./commands/taskIntegrationCommands.js";
-import { runTaskChangeSetCommand } from "./commands/taskChangeSetCommands.js";
-import { runTaskOverlapCommand } from "./commands/taskOverlapCommands.js";
-import { createControllerIntegrationJobPort } from "./controller/jobClient.js";
-import { runTaskWorkspaceCommand } from "./commands/taskWorkspaceCommands.js";
-import { runWorkflowCommandAsync } from "./commands/workflowCommands.js";
-import { createUpdatePorts } from "./cli/updatePorts.js";
-import { createReleaseWorkflowPorts } from "./release/releaseWorkflowPorts.js";
-import {
-  acquireHandoverLock,
-  readRuntimeIdentity,
-  type RuntimeIdentityReceipt
-} from "./release/runtimeRelease.js";
-import {
-  assertCliHomeReleaseFence,
-  describeCliHomeInvocation
-} from "./release/cliHomeReleaseFence.js";
+import { runProjectCommand } from "./commands/projectCommands.js";
 import {
   renderReleaseActivateResult,
   renderReleaseInstallResult,
@@ -148,35 +87,77 @@ import {
   runReleaseInstall,
   runReleaseList
 } from "./commands/releaseCommands.js";
+import { runResourcesCommand } from "./commands/resourcesCommands.js";
+import {
+  parseSessionReconcileOptions,
+  parseSessionStopOptions,
+  runSessionReconcileCommand,
+  runSessionStopCommand
+} from "./commands/sessionCommands.js";
+import { assertTaskDeliveryAuthority, taskLocalActor } from "./task/taskAuthority.js";
+import { runTaskBaseStatusCommand } from "./commands/taskBaseCommands.js";
+import { runTaskChangeSetCommand } from "./commands/taskChangeSetCommands.js";
+import {
+  assertWorkItemDependenciesCompletedForCommand,
+  dispatchPreparedReviewRound,
+  failPendingReviewRound,
+  parseTaskArchiveArguments,
+  parseTaskCompletionRequest,
+  planReplicatedWorkItemLanes,
+  preflightTaskCompletion,
+  preserveReviewRoundWorkspace,
+  previewTaskRoleAgentConfigurationMutation,
+  requireWorkItemAssignee,
+  runTaskCommand,
+  validateTaskArchiveRequest
+} from "./commands/taskCommands.js";
 import {
   reconcileTaskRemoteBaselines,
   verifyTaskCompletionPublishedTree,
   type TaskCompletionPublishedTreeProof
 } from "./commands/taskCompletionGate.js";
-import { runTaskBaseStatusCommand } from "./commands/taskBaseCommands.js";
-import { runTaskUpstreamCommand } from "./commands/taskUpstreamCommands.js";
 import {
-  assertTaskBaseFreshnessForCompletion,
-  inspectTaskBaseFreshness
-} from "./repository/taskBaseFreshness.js";
+  finalizeStoppedTaskExecution,
+  parseTaskExecutionStartRequest,
+  parseTaskExecutionStopRequest,
+  startTaskExecutionCommand,
+  stopTaskExecutionCommand
+} from "./commands/taskExecutionCommands.js";
+import { runTaskIntegrationCommand } from "./commands/taskIntegrationCommands.js";
+import { runTaskOverlapCommand } from "./commands/taskOverlapCommands.js";
+import { runTaskPublicationAdoptCommand } from "./commands/taskPublicationAdoptCommand.js";
+import { runTaskPublicationVerifyCommand } from "./commands/taskPublicationVerifyCommand.js";
+import type { TaskRoleHostObservation } from "./commands/taskRoleRuntimeStatus.js";
+import { runTaskUpstreamCommand } from "./commands/taskUpstreamCommands.js";
+import { runTaskWorkspaceCommand } from "./commands/taskWorkspaceCommands.js";
+import { runTelemetryCommand } from "./commands/telemetryCommands.js";
+import { runWorkflowCommandAsync } from "./commands/workflowCommands.js";
 import { FileCompletionManager, resolveCliIdentity } from "./completion/fileCompletionManager.js";
+import { CONFIG_DOMAINS, type ConfigDomain } from "./config/configCatalog.js";
+import { resolveTmuxBin, resolveTmuxHistoryLimit } from "./config/yuiConfig.js";
+import {
+  readSessionBootstrapManifest,
+  refreshManagedSessionCliWrappers,
+  type SessionEntryPoint
+} from "./context/sessionBootstrapManifest.js";
 import {
   assertFileTaskControllerStorageCompatible,
   ensureFileTaskController,
   FileTaskWorkflowRuntime,
   refreshRunningFileTaskControllerConfiguration,
   refreshRunningFileTaskControllerEnvironment,
-  type RunningControllerRefreshResult,
   restartFileTaskController,
-  stopFileTaskController
+  stopFileTaskController,
+  type RunningControllerRefreshResult
 } from "./controller/clientRuntime.js";
-import { callController, ControllerClientError } from "./core/controllerClient.js";
 import { FileSchedulerStoreAdapter } from "./controller/fileSchedulerStoreAdapter.js";
+import { createControllerIntegrationJobPort } from "./controller/jobClient.js";
 import { cleanControllerResource } from "./controller/resourceCleanupLinux.js";
 import { scanControllerResourceInventory } from "./controller/resourceInventoryLinux.js";
-import { runSessionNotifyCommand } from "./controller/sessionNotify.js";
-import { openSchedulerTelemetry } from "./telemetry/telemetryWiring.js";
 import { runRuntimeObservationHookCommand } from "./controller/runtimeObservationHook.js";
+import { runSessionNotifyCommand } from "./controller/sessionNotify.js";
+import { SessionOwnerReconciliation } from "./controller/sessionOwnerReconciliation.js";
+import { callController, ControllerClientError } from "./core/controllerClient.js";
 import { buildDoctorReport, renderDoctor, runDoctorCommand } from "./doctor/doctor.js";
 import {
   agentNotFound,
@@ -184,25 +165,48 @@ import {
   runtimeError,
   usageError
 } from "./errors/cliError.js";
+import type { RoleAgentConfig } from "./executor/agentAdapter.js";
+import {
+  AgentConfigurationCatalogService,
+  validateAgentLaunchConfiguration
+} from "./executor/agentConfigurationCatalog.js";
 import { FileRoleLaunchPlanner } from "./executor/fileRoleLaunchPlanner.js";
+import { createGitHubCliPublicationVerifier } from "./external/githubPublicationVerifier.js";
+import { createGitLabCliPublicationVerifier } from "./external/gitlabPublicationVerifier.js";
+import { recordGlobalInterruptResult, recordGlobalSteerResult } from "./message/globalInterrupt.js";
 import {
-  AGENT_HOST_CONTROL_PROTOCOL,
-  inspectAgentHost,
-  runAgentHost,
-  sendAgentHostAuthorityControl,
-  sendAgentHostSteerControl,
-  sendAgentHostCancelControl,
-  foldSteerLiveReceipt,
-  foldInterruptLiveReceipt,
-  type AgentHostControlResult,
-  type SteerLiveReceipt,
-  type InterruptLiveReceipt
-} from "./runtime/agentHost.js";
+  collectRuntimeBuildIdentity,
+  collectStorageIdentity,
+  countDroppedInboxEvents,
+  createProductionRuntimeIdentityPorts,
+  evaluateStorageHealth,
+  resolveStatusIdentityEnabled
+} from "./observability/runtimeIdentity.js";
 import {
-  unknownAgentRunConfiguration,
-  type AgentRunConfigurationObservation
-} from "./runtime/agentRunConfiguration.js";
-import type { TaskRoleHostObservation } from "./commands/taskRoleRuntimeStatus.js";
+  listOperatorSessions,
+  operatorSessionRef
+} from "./operator/operatorSessionHistory.js";
+import { renderAgentConfigurationCatalog } from "./output/agentConfigurationPresentation.js";
+import { formatTimestamp } from "./output/timePresentation.js";
+import type { AgentProfile } from "./profile/agentProfile.js";
+import {
+  resolveAgentProfileView
+} from "./profile/agentProfileRuntime.js";
+import {
+  assertCliHomeReleaseFence,
+  describeCliHomeInvocation
+} from "./release/cliHomeReleaseFence.js";
+import { createReleaseWorkflowPorts } from "./release/releaseWorkflowPorts.js";
+import {
+  acquireHandoverLock,
+  readRuntimeIdentity,
+  type RuntimeIdentityReceipt
+} from "./release/runtimeRelease.js";
+import { NodeGitWorkspace } from "./repository/gitWorkspace.js";
+import {
+  assertTaskBaseFreshnessForCompletion,
+  inspectTaskBaseFreshness
+} from "./repository/taskBaseFreshness.js";
 import {
   TaskWorkspaceCoordinator,
   WorkspaceCleanupBlockedError
@@ -212,69 +216,67 @@ import {
   type TaskWorkspaceActivation
 } from "./repository/taskWorkspacePreparer.js";
 import { snapshotWorkItemCandidate } from "./repository/workItemCandidateSnapshot.js";
-import { inspectStorageSchema } from "./storage/storageSchema.js";
-import {
-  collectRuntimeBuildIdentity,
-  collectStorageIdentity,
-  countDroppedInboxEvents,
-  createProductionRuntimeIdentityPorts,
-  evaluateStorageHealth,
-  resolveStatusIdentityEnabled
-} from "./observability/runtimeIdentity.js";
-import { type TaskStore, resolveYuiHome } from "./storage/taskStore.js";
-import {
-  openCurrentTaskStore,
-  validateCurrentTaskStore
-} from "./storage/currentTaskStore.js";
-import { resolveTaskRecordReference } from "./task/taskRecordReference.js";
-import { runSetupCommand, validateSetupInvocation } from "./setup/setupCommand.js";
-import { NodeCommandExecutor } from "./tmux/commandExecutor.js";
-import { TmuxManager } from "./tmux/tmuxManager.js";
-import { WorkItemChangeSetManager } from "./workspace/workItemChangeSetManager.js";
-import { workspaceProjectEntry } from "./worktree/managedWorkspace.js";
-import { parseWebCommandOptions } from "./web/webServer.js";
-import {
-  AgentConfigurationCatalogService,
-  validateAgentLaunchConfiguration
-} from "./executor/agentConfigurationCatalog.js";
-import type { RoleAgentConfig } from "./executor/agentAdapter.js";
-import {
-  resolveAgentProfileView
-} from "./profile/agentProfileRuntime.js";
-import type { AgentProfile } from "./profile/agentProfile.js";
-import {
-  listOperatorSessions,
-  operatorSessionRef
-} from "./operator/operatorSessionHistory.js";
-import { YUI_VERSION, yuiVersionIdentity } from "./version.js";
-import { SqliteSchemaMigrationError } from "./storage/sqliteSchema.js";
-import {
-  assertRuntimeCoherence
-} from "./runtime/runtimeCoherence.js";
-import {
-  requireManagedTaskCaller,
-  resolveManagedTaskReader
-} from "./runtime/managedCaller.js";
-import { operatorOfflineCommand, taskDiagnosticTarget } from "./cli/managedDiagnostics.js";
-import {
-  readSessionBootstrapManifest,
-  refreshManagedSessionCliWrappers,
-  type SessionEntryPoint
-} from "./context/sessionBootstrapManifest.js";
+import { assessDeltaRecheck, type DeltaRecheckPreflight } from "./review/deltaRecheck.js";
+import { isCompletedTaskReviewEvidence } from "./review/reviewAcceptance.js";
+import type { TaskReviewCandidate } from "./review/reviewRound.js";
 import {
   createTaskFinalReviewContract,
   extractTaskFinalReviewRequest,
   type TaskFinalReviewContract
 } from "./review/taskFinalReviewContract.js";
 import { resolveRecordedTaskFinalReviewContract } from "./review/taskFinalReviewContractResolution.js";
-import type { TaskReviewCandidate } from "./review/reviewRound.js";
-import { assessDeltaRecheck, type DeltaRecheckPreflight } from "./review/deltaRecheck.js";
-import { isCompletedTaskReviewEvidence } from "./review/reviewAcceptance.js";
-import { NodeGitWorkspace } from "./repository/gitWorkspace.js";
+import {
+  AGENT_HOST_CONTROL_PROTOCOL,
+  foldInterruptLiveReceipt,
+  foldSteerLiveReceipt,
+  inspectAgentHost,
+  runAgentHost,
+  sendAgentHostAuthorityControl,
+  sendAgentHostCancelControl,
+  sendAgentHostSteerControl,
+  type AgentHostControlResult,
+  type InterruptLiveReceipt,
+  type SteerLiveReceipt
+} from "./runtime/agentHost.js";
+import {
+  unknownAgentRunConfiguration,
+  type AgentRunConfigurationObservation
+} from "./runtime/agentRunConfiguration.js";
+import {
+  requireManagedTaskCaller,
+  resolveManagedTaskReader
+} from "./runtime/managedCaller.js";
+import {
+  assertRuntimeCoherence
+} from "./runtime/runtimeCoherence.js";
+import { runSetupCommand, validateSetupInvocation } from "./setup/setupCommand.js";
+import {
+  openCurrentTaskStore,
+  validateCurrentTaskStore
+} from "./storage/currentTaskStore.js";
+import { SqliteSchemaMigrationError } from "./storage/sqliteSchema.js";
+import { inspectStorageSchema } from "./storage/storageSchema.js";
+import { resolveYuiHome, type TaskStore } from "./storage/taskStore.js";
+import { renderArchiveDiagnostics, taskArchiveDiagnostics } from "./task/archiveDiagnostics.js";
+import { inspectTaskArchive, renderTaskArchivePreflight } from "./task/archivePreflight.js";
+import {
+  assertTaskRemoteDeliveryIntegrated,
+  createTaskRemoteDeliveryProof,
+  type TaskRemoteDeliveryProof
+} from "./task/remoteDeliveryService.js";
+import { resolveTaskRecordReference } from "./task/taskRecordReference.js";
+import { openSchedulerTelemetry } from "./telemetry/telemetryWiring.js";
+import { NodeCommandExecutor } from "./tmux/commandExecutor.js";
+import { TmuxManager } from "./tmux/tmuxManager.js";
+import { YUI_VERSION, yuiVersionIdentity } from "./version.js";
+import { parseWebCommandOptions } from "./web/webServer.js";
 import {
   currentWorkItemExecutionGroup,
   type WorkItem
 } from "./workItem/workItem.js";
+import { CleanupInspectionError } from "./workspace/cleanupInspection.js";
+import { WorkItemChangeSetManager } from "./workspace/workItemChangeSetManager.js";
+import { workspaceProjectEntry } from "./worktree/managedWorkspace.js";
 
 const VERSION = YUI_VERSION;
 const taskFinalReviewInvocation = extractTaskFinalReviewRequest(process.argv.slice(2));
@@ -819,1311 +821,287 @@ export async function main(): Promise<void> {
       onWarning: (message) => process.stderr.write(`Warning: ${message}\n`)
     }
   );
-  const schedulerStore = new FileSchedulerStoreAdapter(
-    store,
-    openSchedulerTelemetry(home, store.getConfig())
-  );
-  const planner = new FileRoleLaunchPlanner(home, store, { environment: process.env });
-  const workspacePreparer = new FileTaskWorkspacePreparer(home, store);
-  const runtime = new FileTaskWorkflowRuntime(
-    home,
-    store,
-    schedulerStore,
-    planner,
-    tmux,
-    workspacePreparer,
-    {
-      environment: process.env,
-      onError: (error) => {
-        const message = error instanceof Error ? error.message : String(error);
-        process.stderr.write(`Controller runtime error: ${message}\n`);
-      }
-    }
-  );
-  const workspaceCoordinator = new TaskWorkspaceCoordinator(store, workspacePreparer, runtime);
-
-  if (resolved[0] === "web") {
-    if (managedInvocation || process.env.YUI_ROLE || process.env.YUI_NATIVE_SESSION_ID) {
-      throw usageError("The Web user ingress must be started from a local user terminal, not a managed Session.");
-    }
-    if (resolved.length === 2 && (resolved[1] === "--status" || resolved[1] === "--stop")) {
-      const status = await callController(home, "web.status", {}) as { id: string; url: string } | null;
-      if (resolved[1] === "--status") emit(status ? `Yui web control room: ${status.url}\n` : "Web is not running.\n", false, status);
-      else {
-        if (status) await callController(home, "web.stop", { id: status.id });
-        emit("Web listener stopped; Controller and Agents are unchanged.\n");
-      }
-      return;
-    }
-    if (jsonOutput) throw usageError("Web start does not support --json; use --status.");
-    const options = parseWebCommandOptions(resolved.slice(1));
-    const id = randomUUID();
-    await callController(home, "web.start", { ...options, id });
-    const displayHost = options.host === "::1" ? "[::1]" : options.host;
-    process.stdout.write(`Yui web control room: http://${displayHost}:${options.port}\n`);
-    await new Promise<void>((resolve) => {
-      const stop = () => {
-        process.off("SIGINT", stop);
-        process.off("SIGTERM", stop);
-        resolve();
-      };
-      process.once("SIGINT", stop);
-      process.once("SIGTERM", stop);
-    });
-    await callController(home, "web.stop", { id });
-    return;
-  }
-
-  if (resolved[0] === "config") {
-    const domain = resolved[1];
-    const roleOptions: GlobalRoleCommandOptions = {
-      yuiHome: home,
-      env: process.env
-    };
-    if (domain === "show") {
-      const result = runConfigOverview(
-        resolved.slice(2),
-        store,
-        process.env,
-        resolveCliIdentity(process.env),
-        roleOptions
-      );
-      emit(result.output, false, result.data);
-      return;
-    }
-    if ((CONFIG_DOMAINS as readonly string[]).includes(domain ?? "")) {
-      const configDomain = domain as ConfigDomain;
-      const domainArgs = resolved.slice(2);
-      const result = runConfigCommand(configDomain, domainArgs, store);
-      if (
-        domainArgs[0] === "set"
-        && domainArgs[1] === "reconciliation-interval-seconds"
-      ) {
-        const refresh = await refreshRunningFileTaskControllerConfiguration(
-          home,
-          { environment: process.env }
-        );
-        emit(withControllerRefreshWarning(result.output, refresh, "Controller configuration"));
-        return;
-      }
-      emit(result.output, false, result.data);
-      return;
-    }
-    if (domain === "agent") {
-      const agentArgs = resolved.slice(2);
-      if (agentArgs[0] === "capabilities") {
-        if (agentArgs.length !== 2) {
-          throw usageError("Agent capabilities usage: yui config agent capabilities <agent-id>");
+  const telemetry = openSchedulerTelemetry(home, store.getConfig());
+  try {
+    const schedulerStore = new FileSchedulerStoreAdapter(
+      store,
+      telemetry
+    );
+    const planner = new FileRoleLaunchPlanner(home, store, { environment: process.env });
+    const workspacePreparer = new FileTaskWorkspacePreparer(home, store);
+    const runtime = new FileTaskWorkflowRuntime(
+      home,
+      store,
+      schedulerStore,
+      planner,
+      tmux,
+      workspacePreparer,
+      {
+        environment: process.env,
+        onError: (error) => {
+          const message = error instanceof Error ? error.message : String(error);
+          process.stderr.write(`Controller runtime error: ${message}\n`);
         }
-        const agent = store.getConfiguredAgent(agentArgs[1] ?? "");
-        if (agent === null) throw agentNotFound(agentArgs[1] ?? "");
-        const result = await catalogs.resolve({
-          agent,
-          cwd: store.getConfig().defaultWorkspace ?? process.cwd()
-        });
-        emit(renderAgentConfigurationCatalog(result), false, result);
+      }
+    );
+    const workspaceCoordinator = new TaskWorkspaceCoordinator(store, workspacePreparer, runtime);
+
+    if (resolved[0] === "web") {
+      if (managedInvocation || process.env.YUI_ROLE || process.env.YUI_NATIVE_SESSION_ID) {
+        throw usageError("The Web user ingress must be started from a local user terminal, not a managed Session.");
+      }
+      if (resolved.length === 2 && (resolved[1] === "--status" || resolved[1] === "--stop")) {
+        const status = await callController(home, "web.status", {}) as { id: string; url: string } | null;
+        if (resolved[1] === "--status") emit(status ? `Yui web control room: ${status.url}\n` : "Web is not running.\n", false, status);
+        else {
+          if (status) await callController(home, "web.stop", { id: status.id });
+          emit("Web listener stopped; Controller and Agents are unchanged.\n");
+        }
         return;
       }
-      const affectedAgentId = agentArgs[1];
-      const previousAgent = typeof affectedAgentId === "string"
-        ? store.getConfiguredAgent(affectedAgentId)
-        : null;
-      const output = runAgentCommand(
-        agentArgs,
-        store as unknown as AgentCommandStore
-      );
-      if (
-        agentArgs[0] === "add"
-        || agentArgs[0] === "update"
-        || agentArgs[0] === "remove"
-      ) {
-        const currentAgent = typeof affectedAgentId === "string"
-          ? store.getConfiguredAgent(affectedAgentId)
-          : null;
-        const capabilityNotice = currentAgent !== null
-          && (agentArgs[0] === "add" || agentArgs[0] === "update")
-          ? renderAgentConfigurationResolutionNotice(await catalogs.resolve({
-              agent: currentAgent,
-              cwd: store.getConfig().defaultWorkspace ?? process.cwd()
-            }))
-          : "";
-        const scope = agentEnvironmentRefreshScope(
-          previousAgent,
-          currentAgent,
-          store.listConfiguredAgents()
-        );
-        const refresh = await refreshRunningFileTaskControllerEnvironment(
-          home,
+      if (jsonOutput) throw usageError("Web start does not support --json; use --status.");
+      const options = parseWebCommandOptions(resolved.slice(1));
+      const id = randomUUID();
+      await callController(home, "web.start", { ...options, id });
+      const displayHost = options.host === "::1" ? "[::1]" : options.host;
+      process.stdout.write(`Yui web control room: http://${displayHost}:${options.port}\n`);
+      await new Promise<void>((resolve) => {
+        const stop = () => {
+          process.off("SIGINT", stop);
+          process.off("SIGTERM", stop);
+          resolve();
+        };
+        process.once("SIGINT", stop);
+        process.once("SIGTERM", stop);
+      });
+      await callController(home, "web.stop", { id });
+      return;
+    }
+
+    if (resolved[0] === "config") {
+      const domain = resolved[1];
+      const roleOptions: GlobalRoleCommandOptions = {
+        yuiHome: home,
+        env: process.env
+      };
+      if (domain === "show") {
+        const result = runConfigOverview(
+          resolved.slice(2),
           store,
           process.env,
-          scope
+          resolveCliIdentity(process.env),
+          roleOptions
         );
-        emit(withControllerRefreshWarning(
-          `${output.trimEnd()}${capabilityNotice.length === 0 ? "\n" : `\n${capabilityNotice}`}`,
-          refresh,
-          "Agent environment"
-        ));
+        emit(result.output, false, result.data);
         return;
       }
-      emit(output);
-      return;
+      if ((CONFIG_DOMAINS as readonly string[]).includes(domain ?? "")) {
+        const configDomain = domain as ConfigDomain;
+        const domainArgs = resolved.slice(2);
+        const result = runConfigCommand(configDomain, domainArgs, store);
+        if (
+          domainArgs[0] === "set"
+          && domainArgs[1] === "reconciliation-interval-seconds"
+        ) {
+          const refresh = await refreshRunningFileTaskControllerConfiguration(
+            home,
+            { environment: process.env }
+          );
+          emit(withControllerRefreshWarning(result.output, refresh, "Controller configuration"));
+          return;
+        }
+        emit(result.output, false, result.data);
+        return;
+      }
+      if (domain === "agent") {
+        const agentArgs = resolved.slice(2);
+        if (agentArgs[0] === "capabilities") {
+          if (agentArgs.length !== 2) {
+            throw usageError("Agent capabilities usage: yui config agent capabilities <agent-id>");
+          }
+          const agent = store.getConfiguredAgent(agentArgs[1] ?? "");
+          if (agent === null) throw agentNotFound(agentArgs[1] ?? "");
+          const result = await catalogs.resolve({
+            agent,
+            cwd: store.getConfig().defaultWorkspace ?? process.cwd()
+          });
+          emit(renderAgentConfigurationCatalog(result), false, result);
+          return;
+        }
+        const affectedAgentId = agentArgs[1];
+        const previousAgent = typeof affectedAgentId === "string"
+          ? store.getConfiguredAgent(affectedAgentId)
+          : null;
+        const output = runAgentCommand(
+          agentArgs,
+          store as unknown as AgentCommandStore
+        );
+        if (
+          agentArgs[0] === "add"
+          || agentArgs[0] === "update"
+          || agentArgs[0] === "remove"
+        ) {
+          const currentAgent = typeof affectedAgentId === "string"
+            ? store.getConfiguredAgent(affectedAgentId)
+            : null;
+          const capabilityNotice = currentAgent !== null
+            && (agentArgs[0] === "add" || agentArgs[0] === "update")
+            ? renderAgentConfigurationResolutionNotice(await catalogs.resolve({
+                agent: currentAgent,
+                cwd: store.getConfig().defaultWorkspace ?? process.cwd()
+              }))
+            : "";
+          const scope = agentEnvironmentRefreshScope(
+            previousAgent,
+            currentAgent,
+            store.listConfiguredAgents()
+          );
+          const refresh = await refreshRunningFileTaskControllerEnvironment(
+            home,
+            store,
+            process.env,
+            scope
+          );
+          emit(withControllerRefreshWarning(
+            `${output.trimEnd()}${capabilityNotice.length === 0 ? "\n" : `\n${capabilityNotice}`}`,
+            refresh,
+            "Agent environment"
+          ));
+          return;
+        }
+        emit(output);
+        return;
+      }
+      if (domain === "profile") {
+        const result = runProfileCommand(
+          resolved.slice(2),
+          store,
+          () => new Date(),
+          validateAgentConfiguration === undefined ? {} : { validateAgentConfiguration }
+        );
+        emit(result.output, false, result.data);
+        return;
+      }
+      if (domain === "role") {
+        const result = runGlobalRoleCommand(
+          resolved.slice(2),
+          store as unknown as Parameters<typeof runGlobalRoleCommand>[1],
+          roleOptions
+        );
+        if (typeof result !== "string") {
+          throw new Error("Config Role commands cannot enter a runtime Session.");
+        }
+        emit(result);
+        return;
+      }
+      throw usageError(`Unknown configuration domain: ${domain ?? ""}.`);
     }
-    if (domain === "profile") {
-      const result = runProfileCommand(
-        resolved.slice(2),
-        store,
-        () => new Date(),
-        validateAgentConfiguration === undefined ? {} : { validateAgentConfiguration }
-      );
+    if (resolved[0] === "project") {
+      const result = await runProjectCommand(resolved.slice(1), store, { environment: process.env });
       emit(result.output, false, result.data);
       return;
     }
-    if (domain === "role") {
+    if (resolved[0] === "session") {
+      if (resolved[1] === "stop") {
+        const options = parseSessionStopOptions(resolved.slice(2));
+        const result = await runSessionStopCommand({
+          options,
+          runtime: {
+            beginMaintenance: () => acquireHandoverLock(home),
+            snapshot: () => ({
+              candidates: schedulerStore.listRuntimeSessionCandidates(),
+              dormant: schedulerStore.listDormantRuntimeOwners()
+            }),
+            drainController: () => runtime.drainController(),
+            stopController: () => stopFileTaskController(home, {
+              environment: process.env
+            }),
+            startController: async () => {
+              await ensureFileTaskController(home, { environment: process.env });
+            },
+            stopDormantSession: (candidate) => runtime.stopDormantSession(candidate)
+          },
+          environment: process.env
+        });
+        process.exitCode = result.exitCode;
+        emit(result.output, false, result.data);
+        return;
+      }
+      const roleOptions: GlobalRoleCommandOptions = {
+        yuiHome: home,
+        env: process.env,
+        jsonOutput
+      };
+      const sessionArgs = resolved[1] === "enter" || resolved[1] === "context"
+        ? [resolved[1], ...resolved.slice(2)]
+        : ["session", resolved[1] ?? "", ...resolved.slice(2)];
       const result = runGlobalRoleCommand(
-        resolved.slice(2),
+        sessionArgs,
         store as unknown as Parameters<typeof runGlobalRoleCommand>[1],
         roleOptions
       );
-      if (typeof result !== "string") {
-        throw new Error("Config Role commands cannot enter a runtime Session.");
-      }
-      emit(result);
-      return;
-    }
-    throw usageError(`Unknown configuration domain: ${domain ?? ""}.`);
-  }
-  if (resolved[0] === "project") {
-    const result = await runProjectCommand(resolved.slice(1), store, { environment: process.env });
-    emit(result.output, false, result.data);
-    return;
-  }
-  if (resolved[0] === "session") {
-    if (resolved[1] === "stop") {
-      const options = parseSessionStopOptions(resolved.slice(2));
-      const result = await runSessionStopCommand({
-        options,
-        runtime: {
-          beginMaintenance: () => acquireHandoverLock(home),
-          snapshot: () => ({
-            candidates: schedulerStore.listRuntimeSessionCandidates(),
-            dormant: schedulerStore.listDormantRuntimeOwners()
-          }),
-          drainController: () => runtime.drainController(),
-          stopController: () => stopFileTaskController(home, {
-            environment: process.env
-          }),
-          startController: async () => {
-            await ensureFileTaskController(home, { environment: process.env });
-          },
-          stopDormantSession: (candidate) => runtime.stopDormantSession(candidate)
-        },
-        environment: process.env
-      });
-      process.exitCode = result.exitCode;
-      emit(result.output, false, result.data);
-      return;
-    }
-    const roleOptions: GlobalRoleCommandOptions = {
-      yuiHome: home,
-      env: process.env,
-      jsonOutput
-    };
-    const sessionArgs = resolved[1] === "enter" || resolved[1] === "context"
-      ? [resolved[1], ...resolved.slice(2)]
-      : ["session", resolved[1] ?? "", ...resolved.slice(2)];
-    const result = runGlobalRoleCommand(
-      sessionArgs,
-      store as unknown as Parameters<typeof runGlobalRoleCommand>[1],
-      roleOptions
-    );
-    if (typeof result === "string") {
-      emit(result);
-      return;
-    }
-    // The session surface (record/replace/enter/context) only ever yields the
-    // enter control; the live input actions live under the top-level `role`
-    // command below, never here.
-    if (result.kind !== "enter") {
-      throw new Error("Session commands cannot perform a live input control.");
-    }
-    await ensureFileTaskController(home, { environment: process.env });
-    await runtime.prepareGlobalRoleEnter(result.role.name);
-    tmux.attachRole("operator", result.role.name, "auto");
-    return;
-  }
-  if (resolved[0] === "role") {
-    // decision-3 §7 CLI grammar: the durable Global input actions are top-level
-    // `role message queue|steer <global-role> …` and `role interrupt
-    // <global-role> …`, distinct from `config role …` (desired configuration)
-    // and `session …` (native session lifecycle). Core persists the durable
-    // Global-owned Message, proves owner/target/capability/writer-fence from
-    // durable state, and returns either a string disposition (queued,
-    // idempotent-replay, or an explicit not-steered/not-interrupted failure with
-    // its exact code) or a resolved live intent. The CLI performs at most one
-    // native edge with scope "global" and taskId omitted — the same shared
-    // resolver and transport as a Task Role, never a fabricated Task.
-    let globalInputFailure: Readonly<{ code: string; detail: string; data: unknown }> | undefined;
-    const roleOptions: GlobalRoleCommandOptions = {
-      yuiHome: home,
-      env: process.env,
-      jsonOutput,
-      onInputFailure: failure => { globalInputFailure = failure; }
-    };
-    const result = runGlobalRoleCommand(
-      resolved.slice(1),
-      store as unknown as Parameters<typeof runGlobalRoleCommand>[1],
-      roleOptions
-    );
-    if (resolved[1] === "message" && resolved[2] === "queue" && resolved[3] !== undefined) {
-      await callController(home, "scheduler.signal", {
-        key: `global-role:${encodeURIComponent(resolved[3])}`
-      }).catch(() => {});
-    }
-    if (typeof result === "string") {
-      if (globalInputFailure !== undefined) {
-        emitControlFailure(globalInputFailure.detail, globalInputFailure.code, globalInputFailure.data);
+      if (typeof result === "string") {
+        emit(result);
         return;
       }
-      emit(result);
-      return;
-    }
-    if (result.kind === "input-steer") {
-      // Core already persisted the durable Global Message and proved target +
-      // capability + writer fence from the Global Role's own Session set. This
-      // is the single live edge: one native steer of the exact current Turn,
-      // scope "global", no retarget and no fallback to interrupt or queue.
+      // The session surface (record/replace/enter/context) only ever yields the
+      // enter control; the live input actions live under the top-level `role`
+      // command below, never here.
+      if (result.kind !== "enter") {
+        throw new Error("Session commands cannot perform a live input control.");
+      }
       await ensureFileTaskController(home, { environment: process.env });
-      let control: AgentHostControlResult;
-      try {
-        control = await sendAgentHostSteerControl({
-          home,
-          scope: "global",
-          roleName: result.roleName,
-          control: {
-            protocol: AGENT_HOST_CONTROL_PROTOCOL,
-            type: "steer-turn",
-            nativeSessionId: result.target.nativeSessionId,
-            nativeTurnId: result.target.nativeTurnId ?? result.target.attemptId,
-            authority: result.target.authority,
-            run: { attemptId: result.receiptId, boundedText: result.text }
-          }
-        });
-      } catch (error) {
-        recordGlobalSteerResult(store, result.roleName, result.messageId, {
-          state: "steer-unknown", outcome: "pending",
-          detail: error instanceof Error ? error.message : String(error)
-        });
-        throw runtimeError(
-          `Steer message ${result.messageId} is saved but the native steer did not complete: `
-          + `${error instanceof Error ? error.message : String(error)}. `
-          + "The Message is retained and its outcome is recorded from the Host; whether the "
-          + "Provider accepted it may be delivery-unknown. Re-read the Session before acting; "
-          + "do not reissue the same input under a new requestId or a different action."
-        );
-      }
-      const steer = foldSteerLiveReceipt(control);
-      recordGlobalSteerResult(store, result.roleName, result.messageId, steer);
-      if (steer.state !== "steered") {
-        emitControlFailure(steerReceiptOutput(result.output, result.roleName, result.messageId, steer),
-          steer.state === "steer-unknown" ? "DELIVERY_UNKNOWN" : "STEER_NOT_DELIVERED",
-          { roleName: result.roleName, messageId: result.messageId, steer });
-        return;
-      }
-      emit(
-        steerReceiptOutput(result.output, result.roleName, result.messageId, steer),
-        false, {
-          roleName: result.roleName,
-          messageId: result.messageId, steer
-        });
+      await runtime.prepareGlobalRoleEnter(result.role.name);
+      tmux.attachRole("operator", result.role.name, "auto");
       return;
     }
-    if (result.kind === "input-interrupt") {
-      // The single live edge for a Global interrupt: one native cancel of the
-      // exact current Turn, scope "global". Never a kill/restart/detach. Any
-      // then-handoff was already claimed durably by Core (an existing Global
-      // Message owned by this Role) and is delivered once by the ordinary
-      // continuation path after this Turn reaches a proven terminal.
-      await ensureFileTaskController(home, { environment: process.env });
-      let control: AgentHostControlResult;
-      try {
-        control = await sendAgentHostCancelControl({
-          home,
-          scope: "global",
-          roleName: result.roleName,
-          control: {
-            protocol: AGENT_HOST_CONTROL_PROTOCOL,
-            type: "cancel",
-            nativeOnly: true,
-            nativeSessionId: result.target.nativeSessionId,
-            attemptId: result.target.attemptId,
-            authority: result.target.authority
-          }
-        });
-      } catch (error) {
-        recordGlobalInterruptResult(store, result.roleName, result.receiptId, {
-          state: "interrupt-unknown", outcome: "cancel-requested",
-          detail: error instanceof Error ? error.message : String(error)
-        });
-        throw runtimeError(
-          `Interrupt of global role ${result.roleName} did not complete: `
-          + `${error instanceof Error ? error.message : String(error)}. `
-          + "No process was killed; re-read the Session before retrying."
-        );
-      }
-      const interrupt = foldInterruptLiveReceipt(control);
-      recordGlobalInterruptResult(store, result.roleName, result.receiptId, interrupt);
-      if (interrupt.state !== "interrupt-requested") {
-        emitControlFailure(interruptReceiptOutput(result.output, result.roleName, interrupt),
-          interrupt.state === "interrupt-unknown" ? "DELIVERY_UNKNOWN" : "INTERRUPT_NOT_DELIVERED",
-          { roleName: result.roleName, interrupt });
-        return;
-      }
-      emit(
-        interruptReceiptOutput(result.output, result.roleName, interrupt),
-        false, {
-          roleName: result.roleName,
-          ...(result.thenMessageId === undefined ? {} : { thenMessageId: result.thenMessageId }),
-          interrupt
-        });
-      return;
-    }
-    if (result.kind !== "enter") {
-      throw new Error("Role command returned an invalid control result.");
-    }
-    // A top-level `role` command never enters a runtime Session; that is
-    // `session enter`.
-    throw usageError("Use 'yui session enter <role>' to attach to a Global Role.");
-  }
-  if (resolved[0] === "operator") {
-    if (resolved[1] === "enter") {
-      if (resolved.length !== 2) throw usageError("Operator enter usage: yui operator enter.");
-      await ensureFileTaskController(home, { environment: process.env });
-      await runtime.prepareGlobalRoleEnter("operator");
-      tmux.attachRole("operator", "operator", "auto");
-      return;
-    }
-    const result = runOperatorCommand(resolved.slice(1), store, { runtime, environment: process.env });
-    if (result.kind === "output") {
-      emit(result.output, false, result.data);
-      return;
-    }
-    if (result.kind !== "session") {
-      throw new Error("Operator command returned an invalid control result.");
-    }
-    await executeOperatorSessionControl(
-      result,
-      home,
-      store,
-      runtime,
-      tmux,
-      catalogs
-    );
-    return;
-  }
-  if (resolved[0] === "task") {
-    if (resolved[1] === "archive-preflight") {
-      const request = parseTaskArchiveArguments(resolved.slice(2), "archive-preflight");
-      if (process.env.YUI_SESSION_SCOPE === "task" && process.env.YUI_TASK_ID !== request.taskId) {
-        throw usageError("Archive inspection must remain within this Session's Task.");
-      }
-      const data = await inspectTaskArchive(workspaceCoordinator, request);
-      emit(renderTaskArchivePreflight(data), false, data);
-      return;
-    }
-    if (resolved[1] === "artifact") {
-      // File/directory artifacts live in the Task's local Git repository, so
-      // their save/read/list are asynchronous and handled here rather than in
-      // the synchronous runTaskCommand chain. Save commits exactly one path and
-      // returns a self-certifying commit-pinned reference; read pins to a commit
-      // for frozen evidence; list is an ordinary current read.
-      const action = resolved[2];
-      const taskId = resolved[3];
-      const usage = "Usage: yui task artifact list <task> | read <task> <relative-path> [<commit>] | "
-        + "save <task> <relative-path> <content> [--message <text>] [--expected-head <commit>]";
-      if (taskId === undefined || action === undefined || !["list", "read", "save"].includes(action)) {
-        throw usageError(usage);
-      }
-      if (process.env.YUI_SESSION_SCOPE === "task" && process.env.YUI_TASK_ID !== taskId) {
-        throw usageError("Artifact is outside the managed Task scope.");
-      }
-      if (store.getTask(taskId) === null) throw usageError(`Task not found: ${taskId}.`);
-      let data: unknown;
-      if (action === "list") {
-        if (resolved.length !== 4) throw usageError(usage);
-        data = await listArtifactsCapability(home, taskId);
-      } else if (action === "read") {
-        const relativePath = resolved[4];
-        const commit = resolved[5];
-        if (relativePath === undefined || resolved.length > 6) throw usageError(usage);
-        data = await readArtifactCapability(home, taskId, {
-          relativePath, ...(commit === undefined ? {} : { commit })
-        });
-      } else {
-        // save: a delivery-authoritative action; a managed Task caller must be the current Leader.
-        taskLocalActor(store, process.env, taskId);
-        const relativePath = resolved[4];
-        const content = resolved[5];
-        if (relativePath === undefined || content === undefined) throw usageError(usage);
-        const rest = resolved.slice(6);
-        let message: string | undefined;
-        let expectedHead: string | undefined;
-        for (let index = 0; index < rest.length; index += 1) {
-          const value = rest[index + 1];
-          if (rest[index] === "--message" && value !== undefined) { message = value; index += 1; continue; }
-          if (rest[index] === "--expected-head" && value !== undefined) { expectedHead = value; index += 1; continue; }
-          throw usageError(usage);
-        }
-        data = await saveArtifactCapability(home, taskId, {
-          relativePath, content,
-          ...(message === undefined ? {} : { message }),
-          ...(expectedHead === undefined ? {} : { expectedHead })
-        });
-      }
-      emit(JSON.stringify(data, null, 2), false, data);
-      return;
-    }
-    if (resolved[1] === "execution") {
-      if (resolved[2] === "stop") {
-        const request = parseTaskExecutionStopRequest(resolved.slice(3));
-        const result = stopTaskExecutionCommand(request, store, { environment: process.env });
-        try {
-          await ensureFileTaskController(home, { environment: process.env });
-          await runtime.stopTaskDurableJobs(result.taskId);
-          await runtime.stopTaskRoleSessions(result.taskId, result.roleNames);
-          await runtime.assertTaskPhysicalResourcesReleased(result.taskId);
-          finalizeStoppedTaskExecution(result.taskId, store);
-        } catch (error) {
-          const message = error instanceof Error ? error.message : String(error);
-          throw runtimeError(
-            `Task execution is stopped and durable progress is preserved, but physical runtime cleanup failed: ${message}`
-          );
-        }
-        emit(result.output, false, result);
-        return;
-      }
-      if (resolved[2] === "start") {
-        const taskId = parseTaskExecutionStartRequest(resolved.slice(3));
-        const task = store.getTask(taskId);
-        if (task === null) throw usageError(`Task not found: ${taskId}.`);
-        // Reject managed Task callers before inspecting or starting runtime resources.
-        if (taskLocalActor(store, process.env, taskId) === "leader") {
-          throw usageError("Task execution stop/start requires the global Operator or a human user.");
-        }
-        if (task.executionGate.state === "stopped") {
-          await runtime.assertTaskPhysicalResourcesReleased(taskId);
-        }
-        await ensureFileTaskController(home, { environment: process.env });
-        const result = startTaskExecutionCommand(taskId, store, { environment: process.env });
-        // Idempotent start is also a reliable kick: if an earlier caller
-        // committed the gate but lost its Controller acknowledgement, retrying
-        // start re-signals the same durable wake without creating another one.
-        await runtime.notifyMailboxChanged?.({ kind: "role", taskId, roleName: "leader" });
-        emit(result.output, false, result);
-        return;
-      }
-      throw usageError("Task execution usage: yui task execution <stop|start> ...");
-    }
-    if (resolved[1] === "integration") {
-      const result = await runTaskIntegrationCommand(
-        resolved.slice(2),
-        store,
-        home,
-        {
-          environment: process.env,
-          jobPort: createControllerIntegrationJobPort(home, { environment: process.env })
-        }
-      );
-      emit(result.output, false, result.data);
-      return;
-    }
-    if (resolved[1] === "change-set") {
-      const result = await runTaskChangeSetCommand(resolved.slice(2), store);
-      emit(result.output, false, result.data);
-      return;
-    }
-    if (resolved[1] === "publication" && (resolved[2] === "diff" || resolved[2] === "adopt")) {
-      const result = await runTaskPublicationAdoptCommand(resolved.slice(2), store, {
-        environment: process.env
-      });
-      emit(result.output, false, result.data);
-      return;
-    }
-    if (resolved[1] === "publication" && resolved[2] === "verify") {
-      const result = await runTaskPublicationVerifyCommand(
-        resolved.slice(3),
-        store,
-        {
-          verifiers: {
-            github: createGitHubCliPublicationVerifier({
-              environmentPath: process.env.PATH
-            }),
-            gitlab: createGitLabCliPublicationVerifier({
-              environmentPath: process.env.PATH
-            })
-          },
-          environment: process.env
-        }
-      );
-      emit(result.output, false, result.data);
-      return;
-    }
-    if (resolved[1] === "overlap") {
-      const result = await runTaskOverlapCommand(resolved.slice(2), store);
-      emit(result.output, false, result.data);
-      return;
-    }
-    if (resolved[1] === "workflow"
-      && (resolved[2] === "run" || resolved[2] === "resume")) {
-      const result = await runWorkflowCommandAsync(
-        resolved.slice(2),
-        store,
-        {
-          environment: process.env,
-          yuiHome: home,
-          ports: createReleaseWorkflowPorts({
-            home,
-            updatePorts: createUpdatePorts(process.env),
-            projectStore: store
-          })
-        }
-      );
-      if (result.kind !== "output") {
-        throw new Error(`Task workflow ${resolved[2]} returned an invalid control result.`);
-      }
-      emit(result.output, false, result.data);
-      return;
-    }
-    if (resolved[1] === "replace") {
-      const result = await runTaskWorkspaceCommand(
+    if (resolved[0] === "role") {
+      // decision-3 §7 CLI grammar: the durable Global input actions are top-level
+      // `role message queue|steer <global-role> …` and `role interrupt
+      // <global-role> …`, distinct from `config role …` (desired configuration)
+      // and `session …` (native session lifecycle). Core persists the durable
+      // Global-owned Message, proves owner/target/capability/writer-fence from
+      // durable state, and returns either a string disposition (queued,
+      // idempotent-replay, or an explicit not-steered/not-interrupted failure with
+      // its exact code) or a resolved live intent. The CLI performs at most one
+      // native edge with scope "global" and taskId omitted — the same shared
+      // resolver and transport as a Task Role, never a fabricated Task.
+      let globalInputFailure: Readonly<{ code: string; detail: string; data: unknown }> | undefined;
+      const roleOptions: GlobalRoleCommandOptions = {
+        yuiHome: home,
+        env: process.env,
+        jsonOutput,
+        onInputFailure: failure => { globalInputFailure = failure; }
+      };
+      const result = runGlobalRoleCommand(
         resolved.slice(1),
-        store,
-        workspacePreparer
+        store as unknown as Parameters<typeof runGlobalRoleCommand>[1],
+        roleOptions
       );
-      emit(result.output, false, result.data);
-      return;
-    }
-    if (resolved[1] === "work" && resolved[2] === "isolate") {
-      const workItemId = resolved[3];
-      if (workItemId === undefined || resolved.length !== 4) {
-        throw usageError("Task work isolate usage: yui task work isolate <task>/<work>.");
+      if (resolved[1] === "message" && resolved[2] === "queue" && resolved[3] !== undefined) {
+        await callController(home, "scheduler.signal", {
+          key: `global-role:${encodeURIComponent(resolved[3])}`
+        }).catch(() => {});
       }
-      const reference = cliWorkItemReference(workItemId, process.env);
-      const workspace = await workspaceCoordinator.isolateWorkItem(
-        reference.taskId,
-        reference.localId
-      );
-      emit(
-        `Created WorkItem workspace for ${reference.taskId}/${reference.localId}\nWorkspace: ${workspace.root}\n`,
-        false,
-        { workItemRef: reference, workspace }
-      );
-      return;
-    }
-    if (resolved[1] === "work" && resolved[2] === "review"
-      && resolved[3] === "cleanup") {
-      const reviewRoundId = resolved[4];
-      if (reviewRoundId === undefined || resolved.length !== 5) {
-        throw usageError(
-          "Task work review cleanup usage: yui task work review cleanup <task>/<review-round>."
-        );
-      }
-      const reference = cliTaskRecordReference(reviewRoundId, "reviewRound", process.env);
-      const removal = await workspaceCoordinator.cleanupReviewRound(
-        reference.taskId,
-        reference.localId
-      );
-      if (removal === "dirty") {
-        throw usageError(
-          `ReviewRound workspace is dirty and was retained: ${reference.taskId}/${reference.localId}.`
-        );
-      }
-      emit(
-        `Cleaned ReviewRound workspace ${reference.taskId}/${reference.localId} (${removal})\n`,
-        false,
-        { reviewRoundRef: reference, workspace: { removal } }
-      );
-      return;
-    }
-    if (resolved[1] === "work" && resolved[2] === "capture") {
-      const workItemId = resolved[3];
-      if (workItemId === undefined || resolved.length !== 4) {
-        throw usageError("Task work capture usage: yui task work capture <task>/<work>.");
-      }
-      const reference = cliWorkItemReference(workItemId, process.env);
-      assertTaskDeliveryAuthority(store, process.env, reference.taskId);
-      const changeSets = await new WorkItemChangeSetManager(store).capture(
-        reference.taskId,
-        reference.localId,
-        taskFinalReviewContract === undefined
-          ? {}
-          : { taskFinalReviewContract }
-      );
-      const qualified = `${reference.taskId}/${reference.localId}`;
-      emit(
-        changeSets.length === 0
-          ? `WorkItem workspace has no changes to capture: ${qualified}\n`
-          : `Captured ChangeSets ${changeSets.map(({ id }) => id).join(", ")} from ${
-              qualified
-            }\n`,
-        false,
-        { workItemRef: reference, changeSets }
-      );
-      return;
-    }
-    if (resolved[1] === "work" && resolved[2] === "cleanup") {
-      const workItemId = resolved[3];
-      const disposition = resolved[4];
-      if (workItemId === undefined
-        || !["--runtime-only", "--integrated", "--abandon"].includes(disposition ?? "")
-        || resolved.length !== 5) {
-        throw usageError(
-          "Task work cleanup usage: yui task work cleanup <task>/<work> "
-          + "(--runtime-only|--integrated|--abandon)."
-        );
-      }
-      const reference = cliWorkItemReference(workItemId, process.env);
-      const qualified = `${reference.taskId}/${reference.localId}`;
-      assertTaskDeliveryAuthority(store, process.env, reference.taskId);
-      if (disposition === "--runtime-only") {
-        let runtimeCleanup;
-        try {
-          runtimeCleanup = await workspaceCoordinator.cleanupWorkItemRuntime(
-            reference.taskId,
-            reference.localId
-          );
-        } catch (error) {
-          throw cleanupCliError(error, `work-item:${qualified}`);
-        }
-        emit(
-          `Released WorkItem runtime ${qualified}; retained its Session and worktree\n`,
-          false,
-          {
-            workItem: store.getWorkItem(reference.taskId, reference.localId),
-            runtime: { cleanup: runtimeCleanup },
-            worktree: { retained: true }
-          }
-        );
-        return;
-      }
-      const cleanedAs = disposition === "--integrated" ? "integrated" : "abandoned";
-      if (cleanedAs === "integrated") {
-        try {
-          await new WorkItemChangeSetManager(store).assertIntegrated(
-            reference.taskId,
-            reference.localId
-          );
-        } catch (error) {
-          throw cleanupCliError(error, `work-item:${qualified}`);
-        }
-      }
-      let removal;
-      try {
-        removal = await workspaceCoordinator.cleanupWorkItem(
-          reference.taskId,
-          reference.localId,
-          cleanedAs
-        );
-      } catch (error) {
-        throw cleanupCliError(error, `work-item:${qualified}`);
-      }
-      if (removal === "dirty") {
-        throw usageError(
-          `WorkItem worktree is dirty and was retained: ${qualified}.`,
-          undefined,
-          cleanupBlockedDetails("dirty-worktree", `work-item:${qualified}`, true)
-        );
-      }
-      emit(
-        `Cleaned WorkItem worktree ${qualified} (${cleanedAs})\n`,
-        false,
-        {
-          workItem: store.getWorkItem(reference.taskId, reference.localId),
-          worktree: { removal, disposition: cleanedAs }
-        }
-      );
-      return;
-    }
-    if (resolved[1] === "work" && resolved[2] === "review"
-      && resolved[3] === "cleanup") {
-      const reviewRef = resolved[4];
-      if (reviewRef === undefined || resolved.length !== 5) {
-        throw usageError(
-          "Task work review cleanup usage: yui task work review cleanup <task>/<review-round>."
-        );
-      }
-      const reference = cliTaskRecordReference(reviewRef, "reviewRound", process.env);
-      const removal = await workspaceCoordinator.cleanupReviewRound(
-        reference.taskId,
-        reference.localId
-      );
-      if (removal === "dirty") {
-        throw usageError(
-          `ReviewRound worktree is dirty and was retained: ${reference.taskId}/${reference.localId}.`
-        );
-      }
-      emit(
-        `Cleaned ReviewRound worktree ${reference.taskId}/${reference.localId}\n`,
-        false,
-        {
-          reviewRound: store.getReviewRound(reference.taskId, reference.localId),
-          worktree: { removal }
-        }
-      );
-      return;
-    }
-    if (resolved[1] === "work" && resolved[2] === "review"
-      && resolved[3] === "preserve") {
-      const reviewRef = resolved[4];
-      if (reviewRef === undefined || resolved.length !== 5) {
-        throw usageError(
-          "Task work review preserve usage: yui task work review preserve <task>/<review-round>."
-        );
-      }
-      const reference = cliTaskRecordReference(reviewRef, "reviewRound", process.env);
-      const round = preserveReviewRoundWorkspace(
-        reference.taskId,
-        reference.localId,
-        store,
-        { runtime, environment: process.env, yuiHome: home }
-      );
-      emit(`Preserved ReviewRound worktree ${reference.taskId}/${reference.localId}\n`, false, {
-        reviewRound: round
-      });
-      return;
-    }
-    let archiveRemoteDeliveryProof: TaskRemoteDeliveryProof | undefined;
-    let archiveTaskReviewCandidate: TaskReviewCandidate | undefined;
-    if (resolved[1] === "archive") {
-      const { taskId, disposition, force } = validateTaskArchiveRequest(
-        resolved.slice(2),
-        store,
-        {
-          runtime,
-          environment: process.env,
-          yuiHome: home
-        }
-      );
-      const task = store.getTask(taskId);
-      if (task === null) throw new Error(`Task disappeared after archive validation: ${taskId}.`);
-      if (force || task.status === "archived") {
-        // Archive admission and mandatory audit commit before any fallible
-        // filesystem/provider work. Repeats report facts, never replay cleanup.
-        const admitted = runTaskCommand(resolved.slice(1), store, {
-          runtime, environment: process.env, yuiHome: home
-        });
-        if (force && admitted.kind === "output"
-          && (admitted.data as { changed: boolean }).changed) {
-          await workspaceCoordinator.cleanupArchivedTask(taskId, disposition);
-        }
-        const current = store.getTask(taskId)!;
-        const archive = taskArchiveDiagnostics(store, current);
-        emit(`Archived task ${taskId}\n${renderArchiveDiagnostics(archive)}`, false,
-          { task: current, ...archive });
-        return;
-      }
-      {
-        if (disposition === "integrated") {
-          archiveTaskReviewCandidate = await actualTaskReviewCandidateForTaskCommand(
-            resolved,
-            store,
-            workspacePreparer,
-            process.env
-          );
-          archiveRemoteDeliveryProof = createTaskRemoteDeliveryProof(
-            store,
-            task,
-            archiveTaskReviewCandidate ?? null
-          );
-          assertTaskRemoteDeliveryIntegrated(archiveRemoteDeliveryProof.delivery);
-        }
-        const workItemIds = store.listManagedWorkspaces(task.id)
-          .flatMap(({ owner }) => owner.type === "work-item" ? [owner.workItemId] : []);
-        for (const workItemId of workItemIds) {
-          const item = store.getWorkItem(task.id, workItemId);
-          if (item?.status !== "accepted" || disposition !== "integrated") continue;
-          try {
-            await new WorkItemChangeSetManager(store).assertIntegrated(task.id, item.id);
-          } catch (error) {
-            throw cleanupCliError(error, `work-item:${task.id}/${item.id}`);
-          }
-        }
-        const cleanup = await workspaceCoordinator.cleanupTaskForArchive(task.id, disposition);
-        if (cleanup.status === "retained-dirty") {
-          throw usageError(
-            cleanup.error ?? `Task ${task.id} has dirty managed worktrees and remains terminal.`,
-            undefined,
-            cleanupBlockedDetails(
-              cleanup.reason ?? "dirty-worktree",
-              cleanup.resource ?? `task:${task.id}`,
-              cleanup.retryable ?? true,
-              cleanup.checks
-            )
-          );
-        }
-        if (cleanup.status === "failed") {
-          throw usageError(
-            `Task ${task.id} worktree cleanup failed: ${cleanup.error ?? "unknown error"}.`,
-            undefined,
-            cleanupBlockedDetails(
-              cleanup.reason ?? "cleanup-failed",
-              cleanup.resource ?? `task:${task.id}`,
-              cleanup.retryable ?? true,
-              cleanup.checks
-            )
-          );
-        }
-      }
-    }
-    let taskRetirementProof;
-    if (resolved[1] === "retire") {
-      const taskId = resolved[2];
-      if (taskId !== undefined && !taskId.startsWith("--")) {
-        const task = store.getTask(taskId);
-        if (task?.status === "active" || task?.status === "draft") {
-          try {
-            taskRetirementProof = await new WorkItemChangeSetManager(store)
-              .assertRetirable(taskId);
-          } catch (error) {
-            throw usageError(error instanceof Error ? error.message : String(error));
-          }
-        }
-      }
-    }
-    assertWorkItemExecutionDependenciesForCommand(resolved, store, process.env);
-    if (resolved[1] === "work" && resolved[2] === "dispatch") {
-      const workItemId = resolved[3];
-      const reference = workItemId === undefined
-        ? null
-        : cliWorkItemReference(workItemId, process.env);
-      const item = reference === null
-        ? null
-        : store.getWorkItem(reference.taskId, reference.localId);
-      const task = item === null ? null : store.getTask(item.taskId);
-      if (item !== null && task !== null) {
-        // Authority and pure Lane-shape checks precede every physical or
-        // durable workspace preparation performed for dispatch.
-        assertTaskDeliveryAuthority(store, process.env, task.id);
-        requireWorkItemAssignee(item);
-        workItemDispatchLanePlan(resolved, store, item);
-      }
-      // A rejected Candidate starts a new execution iteration. Release every
-      // terminal Lane Role runtime before preparing the new Lane workspaces;
-      // durable AgentRuns, Groups, Candidates, and workspace owners remain intact.
-      if (item?.status === "open"
-        && currentWorkItemExecutionGroup(item)?.lanes.every(
-          ({ disposition }) => disposition !== "open"
-        )) {
-        await workspaceCoordinator.cleanupWorkItemRuntime(item.taskId, item.id);
-      }
-      // Every Task needs an authoritative runtime owner before dispatch. A
-      // Gitless Task uses an empty Task-owned view; Project-backed WorkItems
-      // additionally receive their isolated Develop owner below.
-      if (item !== null && task !== null) {
-        await workspacePreparer.prepareTaskWorkspace(task.id);
-      }
-      // A Project-backed Worker WorkItem gets an isolated Develop owner before
-      // its Lane is prepared. A Leader-owned WorkItem intentionally executes
-      // in the Task main worktree and must not enter this isolation path.
-      if (item !== null
-        && task !== null
-        && task.projectBindings.length > 0
-        && item.assignee !== "leader"
-        && store.getWorkItemWorkspace(task.id, item.id) === null) {
-        await workspaceCoordinator.isolateWorkItem(item.taskId, item.id);
-      }
-      if (item !== null && task !== null) {
-        // For a new Group the preparer has already created deterministic
-        // worktrees, but the owner record is adopted by dispatch's aggregate
-        // transaction once its exact Lane ids exist.
-      }
-    }
-    let executionLaneWorkspaces: ReadonlyMap<string, import("./worktree/managedWorkspace.js").ManagedWorkspace> | undefined;
-    // Held only for a new Group's dispatch: the per-Project maintenance fence
-    // spans Lane preparation and the adoption transaction, and projectPaths is
-    // the under-fence snapshot the adoption CAS revalidates.
-    let laneDispatchRelease: (() => void) | undefined;
-    let laneDispatchProjectPaths: ReadonlyMap<string, string> | undefined;
-    let workItemIntegrationProof;
-    if (resolved[1] === "work" && resolved[2] === "accept") {
-      const workItemId = resolved[3];
-      if (workItemId !== undefined && !workItemId.startsWith("--")) {
-        try {
-          const reference = cliWorkItemReference(workItemId, process.env);
-          workItemIntegrationProof = await new WorkItemChangeSetManager(store)
-            .assertIntegrated(reference.taskId, reference.localId,
-              optionValue(resolved, "--candidate")) ?? undefined;
-        } catch (error) {
-          throw usageError(error instanceof Error ? error.message : String(error));
-        }
-      }
-    }
-    let completionSummary: string | undefined;
-    let completionPublishedTreeProof: TaskCompletionPublishedTreeProof | undefined;
-    if (resolved[1] === "base" && resolved[2] === "status") {
-      const result = await runTaskBaseStatusCommand(resolved.slice(3), store);
-      emit(result.output, false, result.data);
-      return;
-    }
-    if (resolved[1] === "upstream") {
-      const result = await runTaskUpstreamCommand(resolved.slice(2), store, home, {
-        environment: process.env
-      });
-      emit(result.output, false, result.data);
-      return;
-    }
-    if (resolved[1] === "complete" && resolved[2] !== undefined) {
-      const completionRequest = parseTaskCompletionRequest(resolved.slice(2));
-      completionSummary = completionRequest.summary;
-      const refreshRemote = resolved.includes("--refresh-remote");
-      const completion = preflightTaskCompletion(resolved[2], store, {
-        environment: process.env,
-        ...(taskFinalReviewContract === undefined
-          ? {}
-          : { taskFinalReviewContract })
-      }, completionRequest);
-      if (!completion.completed && !completion.activeTaskReview) {
-        // An explicit refresh must fetch the remote object graph before the
-        // Publication proof resolves its exact commit. Without the flag the
-        // command remains offline and preserves the existing proof-first path.
-        const refreshedFreshness = refreshRemote
-          ? await inspectTaskBaseFreshness(resolved[2], store, { refresh: true })
-          : undefined;
-        if (completionRequest.acceptedPublishedTreePublicationId !== undefined) {
-          completionPublishedTreeProof = await verifyTaskCompletionPublishedTree(
-            completionRequest.taskId,
-            completionRequest.acceptedPublishedTreePublicationId,
-            store
-          );
-        }
-        const freshness = refreshedFreshness
-          ?? await inspectTaskBaseFreshness(resolved[2], store);
-        for (const warning of assertTaskBaseFreshnessForCompletion(freshness, {
-          ...(completionPublishedTreeProof === undefined
-            ? {}
-            : {
-                acceptedPublishedTreeProjectId: completionPublishedTreeProof.projectId
-              })
-        })) {
-          process.stderr.write(`Warning: ${warning}\n`);
-        }
-        // Keep completion offline by default. An explicit refresh is the only
-        // path that may fetch and reconcile a moved remote baseline.
-        if (refreshRemote) {
-          const reconciled = await reconcileTaskRemoteBaselines(
-            resolved[2],
-            store,
-            home,
-            { environment: process.env, jobPort: createControllerIntegrationJobPort(home, { environment: process.env }) }
-          );
-          if (reconciled.length > 0) {
-            const updates = reconciled.map((entry) => (
-              `${entry.projectId}: ${entry.fromCommit} -> ${entry.toCommit} `
-              + `(Integration ${entry.integrationId})`
-            )).join("; ");
-            throw usageError(
-              `Remote baseline reconciliation advanced Task ${resolved[2]} (${updates}). `
-              + "The Task remains active so the Leader can inspect the new authoritative head, "
-              + "decide how prior Review evidence applies, and retry task complete."
-            );
-          }
-        }
-      }
-    }
-    let releaseReviewHandoverLock: (() => void) | undefined;
-    if ((resolved[1] === "review"
-        && ["request", "retry"].includes(resolved[2] ?? ""))
-      || resolved[1] === "complete") {
-      const handoverLock = acquireHandoverLock(home);
-      releaseReviewHandoverLock = handoverLock.release;
-    }
-    try {
-      const preparedLanes = await prepareExecutionLaneWorkspacesForCommand(
-        resolved,
-        store,
-        workspacePreparer,
-        process.env
-      );
-      if (preparedLanes !== undefined) {
-        executionLaneWorkspaces = preparedLanes.workspaces;
-        laneDispatchRelease = preparedLanes.release;
-        laneDispatchProjectPaths = preparedLanes.projectPaths;
-      }
-      const candidateSnapshots = await candidateSnapshotForTaskCommand(
-        resolved,
-        store,
-        workspacePreparer,
-        process.env,
-        taskFinalReviewContract
-      );
-      const actualTaskReviewCandidate = archiveRemoteDeliveryProof === undefined
-        ? await actualTaskReviewCandidateForTaskCommand(
-          resolved,
-          store,
-          workspacePreparer,
-          process.env
-        )
-        : archiveTaskReviewCandidate;
-      const deltaRecheckPreflight = await deltaRecheckPreflightForTaskCommand(
-        resolved.slice(1),
-        store,
-        actualTaskReviewCandidate
-      );
-      // Read-only Host evidence for Session inspect and Role status/list. The command stays
-      // synchronous over persisted state; this is the live reading it prints
-      // beside those facts, prepared here because the Host is reached over a
-      // socket.
-      const liveHostObservations = await liveHostObservationsForTaskCommand(
-        resolved,
-        store,
-        home
-      );
-      const liveRunConfiguration = runConfigurationForHostObservation(liveHostObservations?.[resolved[5] ?? ""]);
-      // Physical preparation may precede the durable write, but Task status,
-      // workspace identity/cwd, and ManagedWorkspace ownership are adopted by
-      // one transaction. A failed attempt therefore leaves the Task Draft and
-      // owning no writable workspace.
-      let taskWorkspaceActivation: TaskWorkspaceActivation | undefined;
-      if (resolved[1] === "activate" && resolved.length === 3) {
-        const taskId = resolved[2];
-        const task = taskId === undefined ? null : store.getTask(taskId);
-        if (task !== null && task.status === "draft") {
-          taskLocalActor(store, process.env, task.id);
-          taskWorkspaceActivation = await workspacePreparer.activateTaskWorkspace(task.id, process.env);
-        }
-      }
-      const result = runTaskCommand(
-        resolved.slice(1),
-        store,
-        {
-          runtime,
-          environment: process.env,
-          yuiHome: home,
-          ...(taskFinalReviewContract === undefined
-            ? {}
-            : { taskFinalReviewContract }),
-          ...(completionSummary === undefined ? {} : { completionSummary }),
-          ...(completionPublishedTreeProof === undefined
-            ? {}
-            : { completionPublishedTreeProof }),
-          ...(workItemIntegrationProof === undefined ? {} : { workItemIntegrationProof }),
-          ...candidateSnapshots,
-          ...(executionLaneWorkspaces === undefined ? {} : { executionLaneWorkspaces }),
-          ...(taskWorkspaceActivation === undefined ? {} : { taskWorkspaceActivation }),
-          ...(laneDispatchProjectPaths === undefined ? {} : { laneDispatchProjectPaths }),
-          ...(actualTaskReviewCandidate === undefined
-            ? {}
-            : { actualTaskReviewCandidate }),
-          ...(archiveRemoteDeliveryProof === undefined
-            ? {}
-            : { archiveRemoteDeliveryProof }),
-          ...(deltaRecheckPreflight === undefined
-            ? {}
-            : { deltaRecheckPreflight }),
-          ...(liveRunConfiguration === undefined
-            ? {}
-            : { liveRunConfiguration }),
-          ...(liveHostObservations === undefined ? {} : { liveHostObservations }),
-          ...(taskRetirementProof === undefined ? {} : { taskRetirementProof }),
-          ...(validateAgentConfiguration === undefined
-            ? {}
-            : { validateAgentConfiguration })
-        }
-      );
-      // The dispatch transaction has now adopted (or rejected) the prepared
-      // Lane workspaces. Release the held fence so later output/review
-      // handling can take the per-Project fence itself.
-      if (laneDispatchRelease !== undefined) {
-        laneDispatchRelease();
-        laneDispatchRelease = undefined;
-      }
-      if (result.kind === "output") {
-        const requestedRound = reviewRoundFromCommandData(result.data);
-        const persistedRequestedRound = requestedRound === undefined
-          ? null
-          : store.getReviewRound(requestedRound.taskId, requestedRound.id);
-        let reviewOutput = "";
-        let reviewData: unknown;
-        const resumesReviewDispatch = (resolved[1] === "review" && resolved[2] === "request")
-          || (resolved[1] === "work" && resolved[2] === "review")
-          || (resolved[1] === "run" && resolved[2] === "retry");
-        const reviewDispatchNeeded = requestedRound?.status === "pending"
-          || (requestedRound?.status === "running"
-            && resumesReviewDispatch
-            && persistedRequestedRound?.executionGroup?.lanes.some((lane) => (
-              lane.disposition === "open"
-              && (lane.currentRunId === undefined
-                || store.getRun(requestedRound.taskId, lane.currentRunId)?.status === "failed")
-            )) === true);
-        if (reviewDispatchNeeded) {
-          try {
-            const workspace = requestedRound.status === "running"
-              ? store.getReviewRoundWorkspace(requestedRound.taskId, requestedRound.id)
-              : await workspacePreparer.prepareReviewRoundWorkspace(
-                requestedRound.taskId,
-                requestedRound.id
-              );
-            if (workspace === null) {
-              throw new Error(`ReviewRound workspace is not ready: ${requestedRound.id}.`);
-            }
-            const reviewLaneWorkspaces = await prepareReviewLaneWorkspaces(
-              requestedRound.taskId,
-              requestedRound.id,
-              store,
-              workspacePreparer
-            );
-            if (reviewLaneWorkspaces !== undefined) {
-              executionLaneWorkspaces = reviewLaneWorkspaces;
-            }
-            const storedRound = store.getReviewRound(
-              requestedRound.taskId,
-              requestedRound.id
-            );
-            const freshTaskCandidate = (storedRound?.scope ?? "work-item") === "task"
-              ? await snapshotActualTaskReviewCandidate(
-                requestedRound.taskId,
-                store,
-                workspacePreparer
-              )
-              : undefined;
-            const run = dispatchPreparedReviewRound(
-              requestedRound.taskId,
-              requestedRound.id,
-              store,
-              {
-                runtime,
-                environment: process.env,
-                yuiHome: home,
-                ...(taskFinalReviewContract === undefined
-                  ? {}
-                  : { taskFinalReviewContract }),
-                ...(freshTaskCandidate === undefined
-                  ? {}
-                  : { actualTaskReviewCandidate: freshTaskCandidate }),
-                ...(executionLaneWorkspaces === undefined ? {} : { executionLaneWorkspaces }),
-                ...(storedRound?.deltaRecheck === undefined
-                  || deltaRecheckPreflight === undefined
-                  ? {}
-                  : {
-                      deltaRecheckDiff: deltaRecheckPreflight.diffByProject
-                    })
-              }
-            );
-            reviewOutput = run === null
-              ? `Review ${requestedRound.id} remains running\n`
-              : `Review queued as ${requestedRound.id} (${run.id})\n`;
-            reviewData = {
-              reviewRequest: run === null
-                ? {
-                    kind: "running",
-                    reviewerRoleName: requestedRound.reviewerRoleName,
-                    activeReviewRoundId: requestedRound.id,
-                    retryable: false
-                  }
-                : {
-                    kind: "started",
-                    reviewerRoleName: requestedRound.reviewerRoleName,
-                    reviewRoundId: requestedRound.id,
-                    runId: run.id
-                  },
-              reviewRound: store.getReviewRound(requestedRound.taskId, requestedRound.id),
-              ...(run === null ? {} : { reviewRun: run }),
-              workspace
-            };
-          } catch (error) {
-            const message = error instanceof Error ? error.message : String(error);
-            await workspacePreparer.discardUnadoptedExecutionLaneWorkspaces(
-              executionLaneWorkspaces
-            );
-            const failed = failPendingReviewRound(
-              requestedRound.taskId,
-              requestedRound.id,
-              message,
-              store,
-              {
-                runtime,
-                environment: process.env,
-                yuiHome: home
-              }
-            );
-            reviewOutput = `Review could not start: ${message}\n`
-              + "The failed ReviewRound was retained for Leader routing.\n";
-            reviewData = {
-              reviewRequest: {
-                kind: "unavailable",
-                reviewerRoleName: requestedRound.reviewerRoleName,
-                reviewRoundId: failed.id,
-                reason: message,
-                retryable: true
-              },
-              reviewRound: failed
-            };
-          }
-        }
-        if (resolved[1] === "project" && resolved[2] === "add") {
-          const taskId = resolved[3];
-          const task = taskId === undefined ? null : store.getTask(taskId);
-          if (task?.status === "active") {
-            await workspacePreparer.prepareTaskWorkspace(task.id);
-          }
-        }
-        const controlData = result.data as { steer?: { code?: string }; interrupt?: { code?: string } } | undefined;
-        const failureCode = controlData?.steer?.code ?? controlData?.interrupt?.code;
-        if (failureCode !== undefined) {
-          emitControlFailure(result.output, failureCode, result.data);
+      if (typeof result === "string") {
+        if (globalInputFailure !== undefined) {
+          emitControlFailure(globalInputFailure.detail, globalInputFailure.code, globalInputFailure.data);
           return;
         }
-        emit(`${result.output}${reviewOutput}`, false, reviewData === undefined
-          ? result.data
-          : { command: result.data, ...reviewData as object });
-        return;
-      }
-      if (jsonOutput && result.kind !== "session-stop"
-        && result.kind !== "input-steer" && result.kind !== "input-interrupt") {
-        throw usageError("Task Role view/takeover requires an interactive terminal.");
-      }
-      if (result.kind === "session-stop") {
-        await ensureFileTaskController(home, { environment: process.env });
-        try {
-          await runtime.stopExactTaskRoleSession({
-            taskId: result.taskId,
-            roleName: result.roleName,
-            agentId: result.agentId,
-            adapterId: result.adapterId,
-            nativeSessionId: result.nativeSessionId,
-            sessionUpdatedAt: result.sessionUpdatedAt
-          });
-        } catch (error) {
-          throw runtimeError(
-            `Session stop was requested but physical Host cleanup did not complete: ${
-              error instanceof Error ? error.message : String(error)
-            }`
-          );
-        }
-        emit(result.output, false, {
-          taskId: result.taskId,
-          roleName: result.roleName,
-          stopped: true,
-          reason: result.reason
-        });
-        return;
-      }
-      if (result.kind === "view") {
-        if (result.output !== undefined) emit(result.output);
-        tmux.attachRole(result.taskId, result.roleName, "read-only");
+        emit(result);
         return;
       }
       if (result.kind === "input-steer") {
-        // Core already persisted the Message and proved target + capability +
-        // writer fence. This is the single live edge: one native steer of the
-        // exact current Turn, with no retarget and no fallback to interrupt or
-        // queue. Its durable settlement flows through the steer receipt fold.
+        // Core already persisted the durable Global Message and proved target +
+        // capability + writer fence from the Global Role's own Session set. This
+        // is the single live edge: one native steer of the exact current Turn,
+        // scope "global", no retarget and no fallback to interrupt or queue.
         await ensureFileTaskController(home, { environment: process.env });
         let control: AgentHostControlResult;
         try {
           control = await sendAgentHostSteerControl({
             home,
-            scope: "task",
-            taskId: result.taskId,
+            scope: "global",
             roleName: result.roleName,
             control: {
               protocol: AGENT_HOST_CONTROL_PROTOCOL,
@@ -2135,6 +1113,10 @@ export async function main(): Promise<void> {
             }
           });
         } catch (error) {
+          recordGlobalSteerResult(store, result.roleName, result.messageId, {
+            state: "steer-unknown", outcome: "pending",
+            detail: error instanceof Error ? error.message : String(error)
+          });
           throw runtimeError(
             `Steer message ${result.messageId} is saved but the native steer did not complete: `
             + `${error instanceof Error ? error.message : String(error)}. `
@@ -2144,196 +1126,1221 @@ export async function main(): Promise<void> {
           );
         }
         const steer = foldSteerLiveReceipt(control);
+        recordGlobalSteerResult(store, result.roleName, result.messageId, steer);
         if (steer.state !== "steered") {
-          emitControlFailure(steerReceiptOutput(result.output, `${result.taskId}/${result.roleName}`, result.messageId, steer),
-            steer.state === "steer-unknown" ? "DELIVERY_UNKNOWN" : "STEER_REJECTED",
-            { taskId: result.taskId, roleName: result.roleName, messageId: result.messageId, steer });
+          emitControlFailure(steerReceiptOutput(result.output, result.roleName, result.messageId, steer),
+            steer.state === "steer-unknown" ? "DELIVERY_UNKNOWN" : "STEER_NOT_DELIVERED",
+            { roleName: result.roleName, messageId: result.messageId, steer });
           return;
         }
         emit(
-          steerReceiptOutput(result.output, `${result.taskId}/${result.roleName}`,
-            result.messageId, steer),
+          steerReceiptOutput(result.output, result.roleName, result.messageId, steer),
           false, {
-            taskId: result.taskId, roleName: result.roleName,
+            roleName: result.roleName,
             messageId: result.messageId, steer
           });
         return;
       }
       if (result.kind === "input-interrupt") {
-        // The single live edge for interrupt: one native cancel of the exact
-        // current Turn. Never a kill/restart/detach. Any then-handoff was
-        // already claimed durably by Core and is delivered once by the ordinary
+        // The single live edge for a Global interrupt: one native cancel of the
+        // exact current Turn, scope "global". Never a kill/restart/detach. Any
+        // then-handoff was already claimed durably by Core (an existing Global
+        // Message owned by this Role) and is delivered once by the ordinary
         // continuation path after this Turn reaches a proven terminal.
         await ensureFileTaskController(home, { environment: process.env });
         let control: AgentHostControlResult;
         try {
           control = await sendAgentHostCancelControl({
             home,
-            scope: "task",
-            taskId: result.taskId,
+            scope: "global",
             roleName: result.roleName,
             control: {
               protocol: AGENT_HOST_CONTROL_PROTOCOL,
               type: "cancel",
               nativeOnly: true,
               nativeSessionId: result.target.nativeSessionId,
-              // Native cancel names the exact original execution attempt it stops
-              // (Host matches request.attemptId === activeRunAttemptId). That is
-              // distinct from receiptId, the durable identity of this interrupt
-              // control operation — never send the operation id as the turn id.
               attemptId: result.target.attemptId,
               authority: result.target.authority
             }
           });
         } catch (error) {
-          recordTaskInterruptResult(store, result.taskId, result.receiptId,
-            { state: "interrupt-unknown", outcome: "cancel-requested" });
+          recordGlobalInterruptResult(store, result.roleName, result.receiptId, {
+            state: "interrupt-unknown", outcome: "cancel-requested",
+            detail: error instanceof Error ? error.message : String(error)
+          });
           throw runtimeError(
-            `Interrupt ${result.receiptId} of ${result.taskId}/${result.roleName} did not complete: `
+            `Interrupt of global role ${result.roleName} did not complete: `
             + `${error instanceof Error ? error.message : String(error)}. `
             + "No process was killed; re-read the Session before retrying."
           );
         }
         const interrupt = foldInterruptLiveReceipt(control);
-        recordTaskInterruptResult(store, result.taskId, result.receiptId, interrupt);
+        recordGlobalInterruptResult(store, result.roleName, result.receiptId, interrupt);
         if (interrupt.state !== "interrupt-requested") {
-          emitControlFailure(interruptReceiptOutput(result.output, `${result.taskId}/${result.roleName}`, interrupt),
-            interrupt.state === "interrupt-unknown" ? "DELIVERY_UNKNOWN"
-              : interrupt.state === "interrupt-not-active" ? "NO_ACTIVE_TURN" : "INTERRUPT_REJECTED",
-            { taskId: result.taskId, roleName: result.roleName, receiptId: result.receiptId, interrupt });
+          emitControlFailure(interruptReceiptOutput(result.output, result.roleName, interrupt),
+            interrupt.state === "interrupt-unknown" ? "DELIVERY_UNKNOWN" : "INTERRUPT_NOT_DELIVERED",
+            { roleName: result.roleName, interrupt });
           return;
         }
         emit(
-          interruptReceiptOutput(result.output, `${result.taskId}/${result.roleName}`, interrupt),
+          interruptReceiptOutput(result.output, result.roleName, interrupt),
           false, {
-            taskId: result.taskId, roleName: result.roleName,
+            roleName: result.roleName,
             ...(result.thenMessageId === undefined ? {} : { thenMessageId: result.thenMessageId }),
             interrupt
           });
         return;
       }
-      const syncAuthority = async (
-        authorityResult: Extract<typeof result, { kind: "authority" }>
-      ): Promise<AgentHostControlResult> => {
-        let control: AgentHostControlResult;
-        try {
-          control = await sendAgentHostAuthorityControl({
-            home,
-            scope: "task",
-            taskId: authorityResult.taskId,
-            roleName: authorityResult.roleName,
-            control: {
-              protocol: AGENT_HOST_CONTROL_PROTOCOL,
-              type: "set-authority",
-              nativeSessionId: authorityResult.nativeSessionId,
-              authority: authorityResult.authority
-            }
+      if (result.kind !== "enter") {
+        throw new Error("Role command returned an invalid control result.");
+      }
+      // A top-level `role` command never enters a runtime Session; that is
+      // `session enter`.
+      throw usageError("Use 'yui session enter <role>' to attach to a Global Role.");
+    }
+    if (resolved[0] === "operator") {
+      if (resolved[1] === "enter") {
+        if (resolved.length !== 2) throw usageError("Operator enter usage: yui operator enter.");
+        await ensureFileTaskController(home, { environment: process.env });
+        await runtime.prepareGlobalRoleEnter("operator");
+        tmux.attachRole("operator", "operator", "auto");
+        return;
+      }
+      const result = runOperatorCommand(resolved.slice(1), store, { runtime, environment: process.env });
+      if (result.kind === "output") {
+        emit(result.output, false, result.data);
+        return;
+      }
+      if (result.kind !== "session") {
+        throw new Error("Operator command returned an invalid control result.");
+      }
+      await executeOperatorSessionControl(
+        result,
+        home,
+        store,
+        runtime,
+        tmux,
+        catalogs
+      );
+      return;
+    }
+    if (resolved[0] === "task") {
+      if (resolved[1] === "archive-preflight") {
+        const request = parseTaskArchiveArguments(resolved.slice(2), "archive-preflight");
+        if (process.env.YUI_SESSION_SCOPE === "task" && process.env.YUI_TASK_ID !== request.taskId) {
+          throw usageError("Archive inspection must remain within this Session's Task.");
+        }
+        const data = await inspectTaskArchive(workspaceCoordinator, request);
+        emit(renderTaskArchivePreflight(data), false, data);
+        return;
+      }
+      if (resolved[1] === "artifact") {
+        // File/directory artifacts live in the Task's local Git repository, so
+        // their save/read/list are asynchronous and handled here rather than in
+        // the synchronous runTaskCommand chain. Save commits exactly one path and
+        // returns a self-certifying commit-pinned reference; read pins to a commit
+        // for frozen evidence; list is an ordinary current read.
+        const action = resolved[2];
+        const taskId = resolved[3];
+        const usage = "Usage: yui task artifact list <task> | read <task> <relative-path> [<commit>] | "
+          + "save <task> <relative-path> <content> [--message <text>] [--expected-head <commit>]";
+        if (taskId === undefined || action === undefined || !["list", "read", "save"].includes(action)) {
+          throw usageError(usage);
+        }
+        if (process.env.YUI_SESSION_SCOPE === "task" && process.env.YUI_TASK_ID !== taskId) {
+          throw usageError("Artifact is outside the managed Task scope.");
+        }
+        if (store.getTask(taskId) === null) throw usageError(`Task not found: ${taskId}.`);
+        let data: unknown;
+        if (action === "list") {
+          if (resolved.length !== 4) throw usageError(usage);
+          data = await listArtifactsCapability(home, taskId);
+        } else if (action === "read") {
+          const relativePath = resolved[4];
+          const commit = resolved[5];
+          if (relativePath === undefined || resolved.length > 6) throw usageError(usage);
+          data = await readArtifactCapability(home, taskId, {
+            relativePath, ...(commit === undefined ? {} : { commit })
           });
+        } else {
+          // save: a delivery-authoritative action; a managed Task caller must be the current Leader.
+          taskLocalActor(store, process.env, taskId);
+          const relativePath = resolved[4];
+          const content = resolved[5];
+          if (relativePath === undefined || content === undefined) throw usageError(usage);
+          const rest = resolved.slice(6);
+          let message: string | undefined;
+          let expectedHead: string | undefined;
+          for (let index = 0; index < rest.length; index += 1) {
+            const value = rest[index + 1];
+            if (rest[index] === "--message" && value !== undefined) { message = value; index += 1; continue; }
+            if (rest[index] === "--expected-head" && value !== undefined) { expectedHead = value; index += 1; continue; }
+            throw usageError(usage);
+          }
+          data = await saveArtifactCapability(home, taskId, {
+            relativePath, content,
+            ...(message === undefined ? {} : { message }),
+            ...(expectedHead === undefined ? {} : { expectedHead })
+          });
+        }
+        emit(JSON.stringify(data, null, 2), false, data);
+        return;
+      }
+      if (resolved[1] === "execution") {
+        if (resolved[2] === "stop") {
+          const request = parseTaskExecutionStopRequest(resolved.slice(3));
+          const result = stopTaskExecutionCommand(request, store, { environment: process.env });
+          try {
+            await ensureFileTaskController(home, { environment: process.env });
+            await runtime.stopTaskDurableJobs(result.taskId);
+            await runtime.stopTaskRoleSessions(result.taskId, result.roleNames);
+            await runtime.assertTaskPhysicalResourcesReleased(result.taskId);
+            finalizeStoppedTaskExecution(result.taskId, store);
+          } catch (error) {
+            const message = error instanceof Error ? error.message : String(error);
+            throw runtimeError(
+              `Task execution is stopped and durable progress is preserved, but physical runtime cleanup failed: ${message}`
+            );
+          }
+          emit(result.output, false, result);
+          return;
+        }
+        if (resolved[2] === "start") {
+          const taskId = parseTaskExecutionStartRequest(resolved.slice(3));
+          const task = store.getTask(taskId);
+          if (task === null) throw usageError(`Task not found: ${taskId}.`);
+          // Reject managed Task callers before inspecting or starting runtime resources.
+          if (taskLocalActor(store, process.env, taskId) === "leader") {
+            throw usageError("Task execution stop/start requires the global Operator or a human user.");
+          }
+          if (task.executionGate.state === "stopped") {
+            await runtime.assertTaskPhysicalResourcesReleased(taskId);
+          }
+          await ensureFileTaskController(home, { environment: process.env });
+          const result = startTaskExecutionCommand(taskId, store, { environment: process.env });
+          // Idempotent start is also a reliable kick: if an earlier caller
+          // committed the gate but lost its Controller acknowledgement, retrying
+          // start re-signals the same durable wake without creating another one.
+          await runtime.notifyMailboxChanged?.({ kind: "role", taskId, roleName: "leader" });
+          emit(result.output, false, result);
+          return;
+        }
+        throw usageError("Task execution usage: yui task execution <stop|start> ...");
+      }
+      if (resolved[1] === "integration") {
+        const result = await runTaskIntegrationCommand(
+          resolved.slice(2),
+          store,
+          home,
+          {
+            environment: process.env,
+            jobPort: createControllerIntegrationJobPort(home, { environment: process.env })
+          }
+        );
+        emit(result.output, false, result.data);
+        return;
+      }
+      if (resolved[1] === "change-set") {
+        const result = await runTaskChangeSetCommand(resolved.slice(2), store);
+        emit(result.output, false, result.data);
+        return;
+      }
+      if (resolved[1] === "publication" && (resolved[2] === "diff" || resolved[2] === "adopt")) {
+        const result = await runTaskPublicationAdoptCommand(resolved.slice(2), store, {
+          environment: process.env
+        });
+        emit(result.output, false, result.data);
+        return;
+      }
+      if (resolved[1] === "publication" && resolved[2] === "verify") {
+        const result = await runTaskPublicationVerifyCommand(
+          resolved.slice(3),
+          store,
+          {
+            verifiers: {
+              github: createGitHubCliPublicationVerifier({
+                environmentPath: process.env.PATH
+              }),
+              gitlab: createGitLabCliPublicationVerifier({
+                environmentPath: process.env.PATH
+              })
+            },
+            environment: process.env
+          }
+        );
+        emit(result.output, false, result.data);
+        return;
+      }
+      if (resolved[1] === "overlap") {
+        const result = await runTaskOverlapCommand(resolved.slice(2), store);
+        emit(result.output, false, result.data);
+        return;
+      }
+      if (resolved[1] === "workflow"
+        && (resolved[2] === "run" || resolved[2] === "resume")) {
+        const result = await runWorkflowCommandAsync(
+          resolved.slice(2),
+          store,
+          {
+            environment: process.env,
+            yuiHome: home,
+            ports: createReleaseWorkflowPorts({
+              home,
+              updatePorts: createUpdatePorts(process.env),
+              projectStore: store
+            })
+          }
+        );
+        if (result.kind !== "output") {
+          throw new Error(`Task workflow ${resolved[2]} returned an invalid control result.`);
+        }
+        emit(result.output, false, result.data);
+        return;
+      }
+      if (resolved[1] === "replace") {
+        const result = await runTaskWorkspaceCommand(
+          resolved.slice(1),
+          store,
+          workspacePreparer
+        );
+        emit(result.output, false, result.data);
+        return;
+      }
+      if (resolved[1] === "work" && resolved[2] === "isolate") {
+        const workItemId = resolved[3];
+        if (workItemId === undefined || resolved.length !== 4) {
+          throw usageError("Task work isolate usage: yui task work isolate <task>/<work>.");
+        }
+        const reference = cliWorkItemReference(workItemId, process.env);
+        const workspace = await workspaceCoordinator.isolateWorkItem(
+          reference.taskId,
+          reference.localId
+        );
+        emit(
+          `Created WorkItem workspace for ${reference.taskId}/${reference.localId}\nWorkspace: ${workspace.root}\n`,
+          false,
+          { workItemRef: reference, workspace }
+        );
+        return;
+      }
+      if (resolved[1] === "work" && resolved[2] === "review"
+        && resolved[3] === "cleanup") {
+        const reviewRoundId = resolved[4];
+        if (reviewRoundId === undefined || resolved.length !== 5) {
+          throw usageError(
+            "Task work review cleanup usage: yui task work review cleanup <task>/<review-round>."
+          );
+        }
+        const reference = cliTaskRecordReference(reviewRoundId, "reviewRound", process.env);
+        const removal = await workspaceCoordinator.cleanupReviewRound(
+          reference.taskId,
+          reference.localId
+        );
+        if (removal === "dirty") {
+          throw usageError(
+            `ReviewRound workspace is dirty and was retained: ${reference.taskId}/${reference.localId}.`
+          );
+        }
+        emit(
+          `Cleaned ReviewRound workspace ${reference.taskId}/${reference.localId} (${removal})\n`,
+          false,
+          { reviewRoundRef: reference, workspace: { removal } }
+        );
+        return;
+      }
+      if (resolved[1] === "work" && resolved[2] === "capture") {
+        const workItemId = resolved[3];
+        if (workItemId === undefined || resolved.length !== 4) {
+          throw usageError("Task work capture usage: yui task work capture <task>/<work>.");
+        }
+        const reference = cliWorkItemReference(workItemId, process.env);
+        assertTaskDeliveryAuthority(store, process.env, reference.taskId);
+        const changeSets = await new WorkItemChangeSetManager(store).capture(
+          reference.taskId,
+          reference.localId,
+          taskFinalReviewContract === undefined
+            ? {}
+            : { taskFinalReviewContract }
+        );
+        const qualified = `${reference.taskId}/${reference.localId}`;
+        emit(
+          changeSets.length === 0
+            ? `WorkItem workspace has no changes to capture: ${qualified}\n`
+            : `Captured ChangeSets ${changeSets.map(({ id }) => id).join(", ")} from ${
+                qualified
+              }\n`,
+          false,
+          { workItemRef: reference, changeSets }
+        );
+        return;
+      }
+      if (resolved[1] === "work" && resolved[2] === "cleanup") {
+        const workItemId = resolved[3];
+        const disposition = resolved[4];
+        if (workItemId === undefined
+          || !["--runtime-only", "--integrated", "--abandon"].includes(disposition ?? "")
+          || resolved.length !== 5) {
+          throw usageError(
+            "Task work cleanup usage: yui task work cleanup <task>/<work> "
+            + "(--runtime-only|--integrated|--abandon)."
+          );
+        }
+        const reference = cliWorkItemReference(workItemId, process.env);
+        const qualified = `${reference.taskId}/${reference.localId}`;
+        assertTaskDeliveryAuthority(store, process.env, reference.taskId);
+        if (disposition === "--runtime-only") {
+          let runtimeCleanup;
+          try {
+            runtimeCleanup = await workspaceCoordinator.cleanupWorkItemRuntime(
+              reference.taskId,
+              reference.localId
+            );
+          } catch (error) {
+            throw cleanupCliError(error, `work-item:${qualified}`);
+          }
+          emit(
+            `Released WorkItem runtime ${qualified}; retained its Session and worktree\n`,
+            false,
+            {
+              workItem: store.getWorkItem(reference.taskId, reference.localId),
+              runtime: { cleanup: runtimeCleanup },
+              worktree: { retained: true }
+            }
+          );
+          return;
+        }
+        const cleanedAs = disposition === "--integrated" ? "integrated" : "abandoned";
+        if (cleanedAs === "integrated") {
+          try {
+            await new WorkItemChangeSetManager(store).assertIntegrated(
+              reference.taskId,
+              reference.localId
+            );
+          } catch (error) {
+            throw cleanupCliError(error, `work-item:${qualified}`);
+          }
+        }
+        let removal;
+        try {
+          removal = await workspaceCoordinator.cleanupWorkItem(
+            reference.taskId,
+            reference.localId,
+            cleanedAs
+          );
         } catch (error) {
-          throw runtimeError(
-            `Agent Host authority synchronization failed at epoch ${authorityResult.authority.epoch}: `
-            + `${error instanceof Error ? error.message : String(error)}. `
-            + `Durable authority is ${authorityResult.authority.owner}-owned; retry `
-            + `'yui task role release ${authorityResult.taskId} ${authorityResult.roleName}' `
-            + "to reconcile the Host."
+          throw cleanupCliError(error, `work-item:${qualified}`);
+        }
+        if (removal === "dirty") {
+          throw usageError(
+            `WorkItem worktree is dirty and was retained: ${qualified}.`,
+            undefined,
+            cleanupBlockedDetails("dirty-worktree", `work-item:${qualified}`, true)
           );
         }
-        if (control.outcome !== "accepted"
-          || control.snapshot.nativeSessionId !== authorityResult.nativeSessionId
-          || control.snapshot.authorityEpoch !== authorityResult.authority.epoch
-          || control.snapshot.authorityOwner !== authorityResult.authority.owner
-          || control.snapshot.authorityHolderId !== authorityResult.authority.holderId) {
-          throw runtimeError(
-            `Agent Host did not accept Provider authority epoch ${authorityResult.authority.epoch}: `
-            + (control.snapshot.detail ?? control.outcome)
-            + `. Durable authority is ${authorityResult.authority.owner}-owned; `
-            + "retry 'yui task role release "
-            + `${authorityResult.taskId} ${authorityResult.roleName}' to reconcile the Host.`
+        emit(
+          `Cleaned WorkItem worktree ${qualified} (${cleanedAs})\n`,
+          false,
+          {
+            workItem: store.getWorkItem(reference.taskId, reference.localId),
+            worktree: { removal, disposition: cleanedAs }
+          }
+        );
+        return;
+      }
+      if (resolved[1] === "work" && resolved[2] === "review"
+        && resolved[3] === "cleanup") {
+        const reviewRef = resolved[4];
+        if (reviewRef === undefined || resolved.length !== 5) {
+          throw usageError(
+            "Task work review cleanup usage: yui task work review cleanup <task>/<review-round>."
           );
         }
-        return control;
-      };
-      await syncAuthority(result);
-      emit(result.output);
-      if (result.action === "release") {
-        runtime.notifyMailboxChanged({
-          kind: "role",
-          taskId: result.taskId,
-          roleName: result.roleName
+        const reference = cliTaskRecordReference(reviewRef, "reviewRound", process.env);
+        const removal = await workspaceCoordinator.cleanupReviewRound(
+          reference.taskId,
+          reference.localId
+        );
+        if (removal === "dirty") {
+          throw usageError(
+            `ReviewRound worktree is dirty and was retained: ${reference.taskId}/${reference.localId}.`
+          );
+        }
+        emit(
+          `Cleaned ReviewRound worktree ${reference.taskId}/${reference.localId}\n`,
+          false,
+          {
+            reviewRound: store.getReviewRound(reference.taskId, reference.localId),
+            worktree: { removal }
+          }
+        );
+        return;
+      }
+      if (resolved[1] === "work" && resolved[2] === "review"
+        && resolved[3] === "preserve") {
+        const reviewRef = resolved[4];
+        if (reviewRef === undefined || resolved.length !== 5) {
+          throw usageError(
+            "Task work review preserve usage: yui task work review preserve <task>/<review-round>."
+          );
+        }
+        const reference = cliTaskRecordReference(reviewRef, "reviewRound", process.env);
+        const round = preserveReviewRoundWorkspace(
+          reference.taskId,
+          reference.localId,
+          store,
+          { runtime, environment: process.env, yuiHome: home }
+        );
+        emit(`Preserved ReviewRound worktree ${reference.taskId}/${reference.localId}\n`, false, {
+          reviewRound: round
         });
         return;
       }
-      process.stdout.write(
-        "Provider input is now routed through the Agent Host PTY gateway. "
-        + "Use tmux detach (Ctrl-b d) to return authority to the Controller.\n"
-      );
-      try {
-        tmux.attachRole(result.taskId, result.roleName, "read-write");
-      } finally {
-        const currentTask = store.getTask(result.taskId);
-        // Completing or retiring the Task from inside the takeover AgentRun owns
-        // Provider shutdown and clears the live binding. Do not turn that
-        // successful terminal transition into a failing best-effort release.
-        if (currentTask?.status === "active") {
-          const released = runTaskCommand(
-            ["role", "release", result.taskId, result.roleName],
-            store,
-            { runtime, environment: process.env, yuiHome: home }
-          );
-          if (released.kind !== "authority" || released.action !== "release") {
-            throw runtimeError("Provider authority release returned an invalid result.");
+      let archiveRemoteDeliveryProof: TaskRemoteDeliveryProof | undefined;
+      let archiveTaskReviewCandidate: TaskReviewCandidate | undefined;
+      if (resolved[1] === "archive") {
+        const { taskId, disposition, force } = validateTaskArchiveRequest(
+          resolved.slice(2),
+          store,
+          {
+            runtime,
+            environment: process.env,
+            yuiHome: home
           }
-          await syncAuthority(released);
-          emit(released.output);
-          runtime.notifyMailboxChanged({
-            kind: "role",
-            taskId: released.taskId,
-            roleName: released.roleName
+        );
+        const task = store.getTask(taskId);
+        if (task === null) throw new Error(`Task disappeared after archive validation: ${taskId}.`);
+        if (force || task.status === "archived") {
+          // Archive admission and mandatory audit commit before any fallible
+          // filesystem/provider work. Repeats report facts, never replay cleanup.
+          const admitted = runTaskCommand(resolved.slice(1), store, {
+            runtime, environment: process.env, yuiHome: home
           });
+          if (force && admitted.kind === "output"
+            && (admitted.data as { changed: boolean }).changed) {
+            await workspaceCoordinator.cleanupArchivedTask(taskId, disposition);
+          }
+          const current = store.getTask(taskId)!;
+          const archive = taskArchiveDiagnostics(store, current);
+          emit(`Archived task ${taskId}\n${renderArchiveDiagnostics(archive)}`, false,
+            { task: current, ...archive });
+          return;
+        }
+        {
+          if (disposition === "integrated") {
+            archiveTaskReviewCandidate = await actualTaskReviewCandidateForTaskCommand(
+              resolved,
+              store,
+              workspacePreparer,
+              process.env
+            );
+            archiveRemoteDeliveryProof = createTaskRemoteDeliveryProof(
+              store,
+              task,
+              archiveTaskReviewCandidate ?? null
+            );
+            assertTaskRemoteDeliveryIntegrated(archiveRemoteDeliveryProof.delivery);
+          }
+          const workItemIds = store.listManagedWorkspaces(task.id)
+            .flatMap(({ owner }) => owner.type === "work-item" ? [owner.workItemId] : []);
+          for (const workItemId of workItemIds) {
+            const item = store.getWorkItem(task.id, workItemId);
+            if (item?.status !== "accepted" || disposition !== "integrated") continue;
+            try {
+              await new WorkItemChangeSetManager(store).assertIntegrated(task.id, item.id);
+            } catch (error) {
+              throw cleanupCliError(error, `work-item:${task.id}/${item.id}`);
+            }
+          }
+          const cleanup = await workspaceCoordinator.cleanupTaskForArchive(task.id, disposition);
+          if (cleanup.status === "retained-dirty") {
+            throw usageError(
+              cleanup.error ?? `Task ${task.id} has dirty managed worktrees and remains terminal.`,
+              undefined,
+              cleanupBlockedDetails(
+                cleanup.reason ?? "dirty-worktree",
+                cleanup.resource ?? `task:${task.id}`,
+                cleanup.retryable ?? true,
+                cleanup.checks
+              )
+            );
+          }
+          if (cleanup.status === "failed") {
+            throw usageError(
+              `Task ${task.id} worktree cleanup failed: ${cleanup.error ?? "unknown error"}.`,
+              undefined,
+              cleanupBlockedDetails(
+                cleanup.reason ?? "cleanup-failed",
+                cleanup.resource ?? `task:${task.id}`,
+                cleanup.retryable ?? true,
+                cleanup.checks
+              )
+            );
+          }
         }
       }
-      return;
-    } catch (error) {
-      await workspacePreparer.discardUnadoptedExecutionLaneWorkspaces(executionLaneWorkspaces);
-      if (laneDispatchRelease !== undefined) {
-        laneDispatchRelease();
-        laneDispatchRelease = undefined;
+      let taskRetirementProof;
+      if (resolved[1] === "retire") {
+        const taskId = resolved[2];
+        if (taskId !== undefined && !taskId.startsWith("--")) {
+          const task = store.getTask(taskId);
+          if (task?.status === "active" || task?.status === "draft") {
+            try {
+              taskRetirementProof = await new WorkItemChangeSetManager(store)
+                .assertRetirable(taskId);
+            } catch (error) {
+              throw usageError(error instanceof Error ? error.message : String(error));
+            }
+          }
+        }
       }
-      throw error;
-    } finally {
-      if (releaseReviewHandoverLock !== undefined) {
-        releaseReviewHandoverLock();
-        releaseReviewHandoverLock = undefined;
+      assertWorkItemExecutionDependenciesForCommand(resolved, store, process.env);
+      if (resolved[1] === "work" && resolved[2] === "dispatch") {
+        const workItemId = resolved[3];
+        const reference = workItemId === undefined
+          ? null
+          : cliWorkItemReference(workItemId, process.env);
+        const item = reference === null
+          ? null
+          : store.getWorkItem(reference.taskId, reference.localId);
+        const task = item === null ? null : store.getTask(item.taskId);
+        if (item !== null && task !== null) {
+          // Authority and pure Lane-shape checks precede every physical or
+          // durable workspace preparation performed for dispatch.
+          assertTaskDeliveryAuthority(store, process.env, task.id);
+          requireWorkItemAssignee(item);
+          workItemDispatchLanePlan(resolved, store, item);
+        }
+        // A rejected Candidate starts a new execution iteration. Release every
+        // terminal Lane Role runtime before preparing the new Lane workspaces;
+        // durable AgentRuns, Groups, Candidates, and workspace owners remain intact.
+        if (item?.status === "open"
+          && currentWorkItemExecutionGroup(item)?.lanes.every(
+            ({ disposition }) => disposition !== "open"
+          )) {
+          await workspaceCoordinator.cleanupWorkItemRuntime(item.taskId, item.id);
+        }
+        // Every Task needs an authoritative runtime owner before dispatch. A
+        // Gitless Task uses an empty Task-owned view; Project-backed WorkItems
+        // additionally receive their isolated Develop owner below.
+        if (item !== null && task !== null) {
+          await workspacePreparer.prepareTaskWorkspace(task.id);
+        }
+        // A Project-backed Worker WorkItem gets an isolated Develop owner before
+        // its Lane is prepared. A Leader-owned WorkItem intentionally executes
+        // in the Task main worktree and must not enter this isolation path.
+        if (item !== null
+          && task !== null
+          && task.projectBindings.length > 0
+          && item.assignee !== "leader"
+          && store.getWorkItemWorkspace(task.id, item.id) === null) {
+          await workspaceCoordinator.isolateWorkItem(item.taskId, item.id);
+        }
+        if (item !== null && task !== null) {
+          // For a new Group the preparer has already created deterministic
+          // worktrees, but the owner record is adopted by dispatch's aggregate
+          // transaction once its exact Lane ids exist.
+        }
+      }
+      let executionLaneWorkspaces: ReadonlyMap<string, import("./worktree/managedWorkspace.js").ManagedWorkspace> | undefined;
+      // Held only for a new Group's dispatch: the per-Project maintenance fence
+      // spans Lane preparation and the adoption transaction, and projectPaths is
+      // the under-fence snapshot the adoption CAS revalidates.
+      let laneDispatchRelease: (() => void) | undefined;
+      let laneDispatchProjectPaths: ReadonlyMap<string, string> | undefined;
+      let workItemIntegrationProof;
+      if (resolved[1] === "work" && resolved[2] === "accept") {
+        const workItemId = resolved[3];
+        if (workItemId !== undefined && !workItemId.startsWith("--")) {
+          try {
+            const reference = cliWorkItemReference(workItemId, process.env);
+            workItemIntegrationProof = await new WorkItemChangeSetManager(store)
+              .assertIntegrated(reference.taskId, reference.localId,
+                optionValue(resolved, "--candidate")) ?? undefined;
+          } catch (error) {
+            throw usageError(error instanceof Error ? error.message : String(error));
+          }
+        }
+      }
+      let completionSummary: string | undefined;
+      let completionPublishedTreeProof: TaskCompletionPublishedTreeProof | undefined;
+      if (resolved[1] === "base" && resolved[2] === "status") {
+        const result = await runTaskBaseStatusCommand(resolved.slice(3), store);
+        emit(result.output, false, result.data);
+        return;
+      }
+      if (resolved[1] === "upstream") {
+        const result = await runTaskUpstreamCommand(resolved.slice(2), store, home, {
+          environment: process.env
+        });
+        emit(result.output, false, result.data);
+        return;
+      }
+      if (resolved[1] === "complete" && resolved[2] !== undefined) {
+        const completionRequest = parseTaskCompletionRequest(resolved.slice(2));
+        completionSummary = completionRequest.summary;
+        const refreshRemote = resolved.includes("--refresh-remote");
+        const completion = preflightTaskCompletion(resolved[2], store, {
+          environment: process.env,
+          ...(taskFinalReviewContract === undefined
+            ? {}
+            : { taskFinalReviewContract })
+        }, completionRequest);
+        if (!completion.completed && !completion.activeTaskReview) {
+          // An explicit refresh must fetch the remote object graph before the
+          // Publication proof resolves its exact commit. Without the flag the
+          // command remains offline and preserves the existing proof-first path.
+          const refreshedFreshness = refreshRemote
+            ? await inspectTaskBaseFreshness(resolved[2], store, { refresh: true })
+            : undefined;
+          if (completionRequest.acceptedPublishedTreePublicationId !== undefined) {
+            completionPublishedTreeProof = await verifyTaskCompletionPublishedTree(
+              completionRequest.taskId,
+              completionRequest.acceptedPublishedTreePublicationId,
+              store
+            );
+          }
+          const freshness = refreshedFreshness
+            ?? await inspectTaskBaseFreshness(resolved[2], store);
+          for (const warning of assertTaskBaseFreshnessForCompletion(freshness, {
+            ...(completionPublishedTreeProof === undefined
+              ? {}
+              : {
+                  acceptedPublishedTreeProjectId: completionPublishedTreeProof.projectId
+                })
+          })) {
+            process.stderr.write(`Warning: ${warning}\n`);
+          }
+          // Keep completion offline by default. An explicit refresh is the only
+          // path that may fetch and reconcile a moved remote baseline.
+          if (refreshRemote) {
+            const reconciled = await reconcileTaskRemoteBaselines(
+              resolved[2],
+              store,
+              home,
+              { environment: process.env, jobPort: createControllerIntegrationJobPort(home, { environment: process.env }) }
+            );
+            if (reconciled.length > 0) {
+              const updates = reconciled.map((entry) => (
+                `${entry.projectId}: ${entry.fromCommit} -> ${entry.toCommit} `
+                + `(Integration ${entry.integrationId})`
+              )).join("; ");
+              throw usageError(
+                `Remote baseline reconciliation advanced Task ${resolved[2]} (${updates}). `
+                + "The Task remains active so the Leader can inspect the new authoritative head, "
+                + "decide how prior Review evidence applies, and retry task complete."
+              );
+            }
+          }
+        }
+      }
+      let releaseReviewHandoverLock: (() => void) | undefined;
+      if ((resolved[1] === "review"
+          && ["request", "retry"].includes(resolved[2] ?? ""))
+        || resolved[1] === "complete") {
+        const handoverLock = acquireHandoverLock(home);
+        releaseReviewHandoverLock = handoverLock.release;
+      }
+      try {
+        const preparedLanes = await prepareExecutionLaneWorkspacesForCommand(
+          resolved,
+          store,
+          workspacePreparer,
+          process.env
+        );
+        if (preparedLanes !== undefined) {
+          executionLaneWorkspaces = preparedLanes.workspaces;
+          laneDispatchRelease = preparedLanes.release;
+          laneDispatchProjectPaths = preparedLanes.projectPaths;
+        }
+        const candidateSnapshots = await candidateSnapshotForTaskCommand(
+          resolved,
+          store,
+          workspacePreparer,
+          process.env,
+          taskFinalReviewContract
+        );
+        const actualTaskReviewCandidate = archiveRemoteDeliveryProof === undefined
+          ? await actualTaskReviewCandidateForTaskCommand(
+            resolved,
+            store,
+            workspacePreparer,
+            process.env
+          )
+          : archiveTaskReviewCandidate;
+        const deltaRecheckPreflight = await deltaRecheckPreflightForTaskCommand(
+          resolved.slice(1),
+          store,
+          actualTaskReviewCandidate
+        );
+        // Read-only Host evidence for Session inspect and Role status/list. The command stays
+        // synchronous over persisted state; this is the live reading it prints
+        // beside those facts, prepared here because the Host is reached over a
+        // socket.
+        const liveHostObservations = await liveHostObservationsForTaskCommand(
+          resolved,
+          store,
+          home
+        );
+        const liveRunConfiguration = runConfigurationForHostObservation(liveHostObservations?.[resolved[5] ?? ""]);
+        // Physical preparation may precede the durable write, but Task status,
+        // workspace identity/cwd, and ManagedWorkspace ownership are adopted by
+        // one transaction. A failed attempt therefore leaves the Task Draft and
+        // owning no writable workspace.
+        let taskWorkspaceActivation: TaskWorkspaceActivation | undefined;
+        if (resolved[1] === "activate" && resolved.length === 3) {
+          const taskId = resolved[2];
+          const task = taskId === undefined ? null : store.getTask(taskId);
+          if (task !== null && task.status === "draft") {
+            taskLocalActor(store, process.env, task.id);
+            taskWorkspaceActivation = await workspacePreparer.activateTaskWorkspace(task.id, process.env);
+          }
+        }
+        const result = runTaskCommand(
+          resolved.slice(1),
+          store,
+          {
+            runtime,
+            environment: process.env,
+            yuiHome: home,
+            ...(taskFinalReviewContract === undefined
+              ? {}
+              : { taskFinalReviewContract }),
+            ...(completionSummary === undefined ? {} : { completionSummary }),
+            ...(completionPublishedTreeProof === undefined
+              ? {}
+              : { completionPublishedTreeProof }),
+            ...(workItemIntegrationProof === undefined ? {} : { workItemIntegrationProof }),
+            ...candidateSnapshots,
+            ...(executionLaneWorkspaces === undefined ? {} : { executionLaneWorkspaces }),
+            ...(taskWorkspaceActivation === undefined ? {} : { taskWorkspaceActivation }),
+            ...(laneDispatchProjectPaths === undefined ? {} : { laneDispatchProjectPaths }),
+            ...(actualTaskReviewCandidate === undefined
+              ? {}
+              : { actualTaskReviewCandidate }),
+            ...(archiveRemoteDeliveryProof === undefined
+              ? {}
+              : { archiveRemoteDeliveryProof }),
+            ...(deltaRecheckPreflight === undefined
+              ? {}
+              : { deltaRecheckPreflight }),
+            ...(liveRunConfiguration === undefined
+              ? {}
+              : { liveRunConfiguration }),
+            ...(liveHostObservations === undefined ? {} : { liveHostObservations }),
+            ...(taskRetirementProof === undefined ? {} : { taskRetirementProof }),
+            ...(validateAgentConfiguration === undefined
+              ? {}
+              : { validateAgentConfiguration })
+          }
+        );
+        // The dispatch transaction has now adopted (or rejected) the prepared
+        // Lane workspaces. Release the held fence so later output/review
+        // handling can take the per-Project fence itself.
+        if (laneDispatchRelease !== undefined) {
+          laneDispatchRelease();
+          laneDispatchRelease = undefined;
+        }
+        if (result.kind === "output") {
+          const requestedRound = reviewRoundFromCommandData(result.data);
+          const persistedRequestedRound = requestedRound === undefined
+            ? null
+            : store.getReviewRound(requestedRound.taskId, requestedRound.id);
+          let reviewOutput = "";
+          let reviewData: unknown;
+          const resumesReviewDispatch = (resolved[1] === "review" && resolved[2] === "request")
+            || (resolved[1] === "work" && resolved[2] === "review")
+            || (resolved[1] === "run" && resolved[2] === "retry");
+          const reviewDispatchNeeded = requestedRound?.status === "pending"
+            || (requestedRound?.status === "running"
+              && resumesReviewDispatch
+              && persistedRequestedRound?.executionGroup?.lanes.some((lane) => (
+                lane.disposition === "open"
+                && (lane.currentRunId === undefined
+                  || store.getRun(requestedRound.taskId, lane.currentRunId)?.status === "failed")
+              )) === true);
+          if (reviewDispatchNeeded) {
+            try {
+              const workspace = requestedRound.status === "running"
+                ? store.getReviewRoundWorkspace(requestedRound.taskId, requestedRound.id)
+                : await workspacePreparer.prepareReviewRoundWorkspace(
+                  requestedRound.taskId,
+                  requestedRound.id
+                );
+              if (workspace === null) {
+                throw new Error(`ReviewRound workspace is not ready: ${requestedRound.id}.`);
+              }
+              const reviewLaneWorkspaces = await prepareReviewLaneWorkspaces(
+                requestedRound.taskId,
+                requestedRound.id,
+                store,
+                workspacePreparer
+              );
+              if (reviewLaneWorkspaces !== undefined) {
+                executionLaneWorkspaces = reviewLaneWorkspaces;
+              }
+              const storedRound = store.getReviewRound(
+                requestedRound.taskId,
+                requestedRound.id
+              );
+              const freshTaskCandidate = (storedRound?.scope ?? "work-item") === "task"
+                ? await snapshotActualTaskReviewCandidate(
+                  requestedRound.taskId,
+                  store,
+                  workspacePreparer
+                )
+                : undefined;
+              const run = dispatchPreparedReviewRound(
+                requestedRound.taskId,
+                requestedRound.id,
+                store,
+                {
+                  runtime,
+                  environment: process.env,
+                  yuiHome: home,
+                  ...(taskFinalReviewContract === undefined
+                    ? {}
+                    : { taskFinalReviewContract }),
+                  ...(freshTaskCandidate === undefined
+                    ? {}
+                    : { actualTaskReviewCandidate: freshTaskCandidate }),
+                  ...(executionLaneWorkspaces === undefined ? {} : { executionLaneWorkspaces }),
+                  ...(storedRound?.deltaRecheck === undefined
+                    || deltaRecheckPreflight === undefined
+                    ? {}
+                    : {
+                        deltaRecheckDiff: deltaRecheckPreflight.diffByProject
+                      })
+                }
+              );
+              reviewOutput = run === null
+                ? `Review ${requestedRound.id} remains running\n`
+                : `Review queued as ${requestedRound.id} (${run.id})\n`;
+              reviewData = {
+                reviewRequest: run === null
+                  ? {
+                      kind: "running",
+                      reviewerRoleName: requestedRound.reviewerRoleName,
+                      activeReviewRoundId: requestedRound.id,
+                      retryable: false
+                    }
+                  : {
+                      kind: "started",
+                      reviewerRoleName: requestedRound.reviewerRoleName,
+                      reviewRoundId: requestedRound.id,
+                      runId: run.id
+                    },
+                reviewRound: store.getReviewRound(requestedRound.taskId, requestedRound.id),
+                ...(run === null ? {} : { reviewRun: run }),
+                workspace
+              };
+            } catch (error) {
+              const message = error instanceof Error ? error.message : String(error);
+              await workspacePreparer.discardUnadoptedExecutionLaneWorkspaces(
+                executionLaneWorkspaces
+              );
+              const failed = failPendingReviewRound(
+                requestedRound.taskId,
+                requestedRound.id,
+                message,
+                store,
+                {
+                  runtime,
+                  environment: process.env,
+                  yuiHome: home
+                }
+              );
+              reviewOutput = `Review could not start: ${message}\n`
+                + "The failed ReviewRound was retained for Leader routing.\n";
+              reviewData = {
+                reviewRequest: {
+                  kind: "unavailable",
+                  reviewerRoleName: requestedRound.reviewerRoleName,
+                  reviewRoundId: failed.id,
+                  reason: message,
+                  retryable: true
+                },
+                reviewRound: failed
+              };
+            }
+          }
+          if (resolved[1] === "project" && resolved[2] === "add") {
+            const taskId = resolved[3];
+            const task = taskId === undefined ? null : store.getTask(taskId);
+            if (task?.status === "active") {
+              await workspacePreparer.prepareTaskWorkspace(task.id);
+            }
+          }
+          const controlData = result.data as { steer?: { code?: string }; interrupt?: { code?: string } } | undefined;
+          const failureCode = controlData?.steer?.code ?? controlData?.interrupt?.code;
+          if (failureCode !== undefined) {
+            emitControlFailure(result.output, failureCode, result.data);
+            return;
+          }
+          emit(`${result.output}${reviewOutput}`, false, reviewData === undefined
+            ? result.data
+            : { command: result.data, ...reviewData as object });
+          return;
+        }
+        if (jsonOutput && result.kind !== "session-stop"
+          && result.kind !== "input-steer" && result.kind !== "input-interrupt") {
+          throw usageError("Task Role view/takeover requires an interactive terminal.");
+        }
+        if (result.kind === "session-stop") {
+          await ensureFileTaskController(home, { environment: process.env });
+          try {
+            await runtime.stopExactTaskRoleSession({
+              taskId: result.taskId,
+              roleName: result.roleName,
+              agentId: result.agentId,
+              adapterId: result.adapterId,
+              nativeSessionId: result.nativeSessionId,
+              sessionUpdatedAt: result.sessionUpdatedAt
+            });
+          } catch (error) {
+            throw runtimeError(
+              `Session stop was requested but physical Host cleanup did not complete: ${
+                error instanceof Error ? error.message : String(error)
+              }`
+            );
+          }
+          emit(result.output, false, {
+            taskId: result.taskId,
+            roleName: result.roleName,
+            stopped: true,
+            reason: result.reason
+          });
+          return;
+        }
+        if (result.kind === "view") {
+          if (result.output !== undefined) emit(result.output);
+          tmux.attachRole(result.taskId, result.roleName, "read-only");
+          return;
+        }
+        if (result.kind === "input-steer") {
+          // Core already persisted the Message and proved target + capability +
+          // writer fence. This is the single live edge: one native steer of the
+          // exact current Turn, with no retarget and no fallback to interrupt or
+          // queue. Its durable settlement flows through the steer receipt fold.
+          await ensureFileTaskController(home, { environment: process.env });
+          let control: AgentHostControlResult;
+          try {
+            control = await sendAgentHostSteerControl({
+              home,
+              scope: "task",
+              taskId: result.taskId,
+              roleName: result.roleName,
+              control: {
+                protocol: AGENT_HOST_CONTROL_PROTOCOL,
+                type: "steer-turn",
+                nativeSessionId: result.target.nativeSessionId,
+                nativeTurnId: result.target.nativeTurnId ?? result.target.attemptId,
+                authority: result.target.authority,
+                run: { attemptId: result.receiptId, boundedText: result.text }
+              }
+            });
+          } catch (error) {
+            throw runtimeError(
+              `Steer message ${result.messageId} is saved but the native steer did not complete: `
+              + `${error instanceof Error ? error.message : String(error)}. `
+              + "The Message is retained and its outcome is recorded from the Host; whether the "
+              + "Provider accepted it may be delivery-unknown. Re-read the Session before acting; "
+              + "do not reissue the same input under a new requestId or a different action."
+            );
+          }
+          const steer = foldSteerLiveReceipt(control);
+          if (steer.state !== "steered") {
+            emitControlFailure(steerReceiptOutput(result.output, `${result.taskId}/${result.roleName}`, result.messageId, steer),
+              steer.state === "steer-unknown" ? "DELIVERY_UNKNOWN" : "STEER_REJECTED",
+              { taskId: result.taskId, roleName: result.roleName, messageId: result.messageId, steer });
+            return;
+          }
+          emit(
+            steerReceiptOutput(result.output, `${result.taskId}/${result.roleName}`,
+              result.messageId, steer),
+            false, {
+              taskId: result.taskId, roleName: result.roleName,
+              messageId: result.messageId, steer
+            });
+          return;
+        }
+        if (result.kind === "input-interrupt") {
+          // The single live edge for interrupt: one native cancel of the exact
+          // current Turn. Never a kill/restart/detach. Any then-handoff was
+          // already claimed durably by Core and is delivered once by the ordinary
+          // continuation path after this Turn reaches a proven terminal.
+          await ensureFileTaskController(home, { environment: process.env });
+          let control: AgentHostControlResult;
+          try {
+            control = await sendAgentHostCancelControl({
+              home,
+              scope: "task",
+              taskId: result.taskId,
+              roleName: result.roleName,
+              control: {
+                protocol: AGENT_HOST_CONTROL_PROTOCOL,
+                type: "cancel",
+                nativeOnly: true,
+                nativeSessionId: result.target.nativeSessionId,
+                // Native cancel names the exact original execution attempt it stops
+                // (Host matches request.attemptId === activeRunAttemptId). That is
+                // distinct from receiptId, the durable identity of this interrupt
+                // control operation — never send the operation id as the turn id.
+                attemptId: result.target.attemptId,
+                authority: result.target.authority
+              }
+            });
+          } catch (error) {
+            recordTaskInterruptResult(store, result.taskId, result.receiptId,
+              { state: "interrupt-unknown", outcome: "cancel-requested" });
+            throw runtimeError(
+              `Interrupt ${result.receiptId} of ${result.taskId}/${result.roleName} did not complete: `
+              + `${error instanceof Error ? error.message : String(error)}. `
+              + "No process was killed; re-read the Session before retrying."
+            );
+          }
+          const interrupt = foldInterruptLiveReceipt(control);
+          recordTaskInterruptResult(store, result.taskId, result.receiptId, interrupt);
+          if (interrupt.state !== "interrupt-requested") {
+            emitControlFailure(interruptReceiptOutput(result.output, `${result.taskId}/${result.roleName}`, interrupt),
+              interrupt.state === "interrupt-unknown" ? "DELIVERY_UNKNOWN"
+                : interrupt.state === "interrupt-not-active" ? "NO_ACTIVE_TURN" : "INTERRUPT_REJECTED",
+              { taskId: result.taskId, roleName: result.roleName, receiptId: result.receiptId, interrupt });
+            return;
+          }
+          emit(
+            interruptReceiptOutput(result.output, `${result.taskId}/${result.roleName}`, interrupt),
+            false, {
+              taskId: result.taskId, roleName: result.roleName,
+              ...(result.thenMessageId === undefined ? {} : { thenMessageId: result.thenMessageId }),
+              interrupt
+            });
+          return;
+        }
+        const syncAuthority = async (
+          authorityResult: Extract<typeof result, { kind: "authority" }>
+        ): Promise<AgentHostControlResult> => {
+          let control: AgentHostControlResult;
+          try {
+            control = await sendAgentHostAuthorityControl({
+              home,
+              scope: "task",
+              taskId: authorityResult.taskId,
+              roleName: authorityResult.roleName,
+              control: {
+                protocol: AGENT_HOST_CONTROL_PROTOCOL,
+                type: "set-authority",
+                nativeSessionId: authorityResult.nativeSessionId,
+                authority: authorityResult.authority
+              }
+            });
+          } catch (error) {
+            throw runtimeError(
+              `Agent Host authority synchronization failed at epoch ${authorityResult.authority.epoch}: `
+              + `${error instanceof Error ? error.message : String(error)}. `
+              + `Durable authority is ${authorityResult.authority.owner}-owned; retry `
+              + `'yui task role release ${authorityResult.taskId} ${authorityResult.roleName}' `
+              + "to reconcile the Host."
+            );
+          }
+          if (control.outcome !== "accepted"
+            || control.snapshot.nativeSessionId !== authorityResult.nativeSessionId
+            || control.snapshot.authorityEpoch !== authorityResult.authority.epoch
+            || control.snapshot.authorityOwner !== authorityResult.authority.owner
+            || control.snapshot.authorityHolderId !== authorityResult.authority.holderId) {
+            throw runtimeError(
+              `Agent Host did not accept Provider authority epoch ${authorityResult.authority.epoch}: `
+              + (control.snapshot.detail ?? control.outcome)
+              + `. Durable authority is ${authorityResult.authority.owner}-owned; `
+              + "retry 'yui task role release "
+              + `${authorityResult.taskId} ${authorityResult.roleName}' to reconcile the Host.`
+            );
+          }
+          return control;
+        };
+        await syncAuthority(result);
+        emit(result.output);
+        if (result.action === "release") {
+          runtime.notifyMailboxChanged({
+            kind: "role",
+            taskId: result.taskId,
+            roleName: result.roleName
+          });
+          return;
+        }
+        process.stdout.write(
+          "Provider input is now routed through the Agent Host PTY gateway. "
+          + "Use tmux detach (Ctrl-b d) to return authority to the Controller.\n"
+        );
+        try {
+          tmux.attachRole(result.taskId, result.roleName, "read-write");
+        } finally {
+          const currentTask = store.getTask(result.taskId);
+          // Completing or retiring the Task from inside the takeover AgentRun owns
+          // Provider shutdown and clears the live binding. Do not turn that
+          // successful terminal transition into a failing best-effort release.
+          if (currentTask?.status === "active") {
+            const released = runTaskCommand(
+              ["role", "release", result.taskId, result.roleName],
+              store,
+              { runtime, environment: process.env, yuiHome: home }
+            );
+            if (released.kind !== "authority" || released.action !== "release") {
+              throw runtimeError("Provider authority release returned an invalid result.");
+            }
+            await syncAuthority(released);
+            emit(released.output);
+            runtime.notifyMailboxChanged({
+              kind: "role",
+              taskId: released.taskId,
+              roleName: released.roleName
+            });
+          }
+        }
+        return;
+      } catch (error) {
+        await workspacePreparer.discardUnadoptedExecutionLaneWorkspaces(executionLaneWorkspaces);
+        if (laneDispatchRelease !== undefined) {
+          laneDispatchRelease();
+          laneDispatchRelease = undefined;
+        }
+        throw error;
+      } finally {
+        if (releaseReviewHandoverLock !== undefined) {
+          releaseReviewHandoverLock();
+          releaseReviewHandoverLock = undefined;
+        }
       }
     }
-  }
-  if (resolved[0] === "jobs") {
-    emit(runJobCommand(resolved.slice(1), store, { runtime }));
-    return;
-  }
-  if (resolved[0] === "job") {
-    emit(await runDurableJobCommand(resolved.slice(1), {
-      home,
-      json: jsonOutput,
-      environment: process.env,
-      store
-    }));
-    return;
-  }
-  if (resolved[0] === "telemetry") {
-    emit(await runTelemetryCommand(resolved.slice(1), {
-      home,
-      json: jsonOutput,
-      environment: process.env,
-      store
-    }));
-    return;
-  }
+    if (resolved[0] === "jobs") {
+      emit(runJobCommand(resolved.slice(1), store, { runtime }));
+      return;
+    }
+    if (resolved[0] === "job") {
+      emit(await runDurableJobCommand(resolved.slice(1), {
+        home,
+        json: jsonOutput,
+        environment: process.env,
+        store
+      }));
+      return;
+    }
+    if (resolved[0] === "telemetry") {
+      emit(await runTelemetryCommand(resolved.slice(1), {
+        home,
+        json: jsonOutput,
+        environment: process.env,
+        store
+      }));
+      return;
+    }
 
-  throw usageError(
-    `Command is not connected to the current TaskStore command routing: ${resolved[0]}.`,
-    renderCommandHelp(invocation.node, VERSION)
-  );
+    throw usageError(
+      `Command is not connected to the current TaskStore command routing: ${resolved[0]}.`,
+      renderCommandHelp(invocation.node, VERSION)
+    );
+  } finally {
+    await telemetry?.sink.close();
+  }
 }
 
 function explicitReleaseActivationDriver(): string | null {
@@ -2380,7 +2387,7 @@ async function preflightManagedTaskControlPlane(): Promise<ManagedTaskControlPla
   const internalCallback = args[0] === "internal"
     && ["agent-host", "session-notify", "runtime-hook"].includes(args[1] ?? "");
   const home = resolveYuiHome(process.env);
-  const manifest = assertManagedSessionManifest(home, "task");
+  assertManagedSessionManifest(home, "task");
   const diagnosticTarget = taskDiagnosticTarget(args);
   const diagnostic = diagnosticTarget !== undefined
     && diagnosticTarget === process.env.YUI_TASK_ID;

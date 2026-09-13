@@ -14,18 +14,16 @@
 import { spawn } from "node:child_process";
 import {
   chmodSync,
+  closeSync,
   existsSync,
   mkdirSync,
   openSync,
-  closeSync,
   readFileSync,
-  statSync,
-  writeFileSync
+  statSync
 } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { writeTextFileAtomically } from "../storage/durableFile.js";
 import type { MailboxEntityRef } from "../coordination/workMailbox.js";
 import {
   cancelQueuedDurableJob,
@@ -43,9 +41,10 @@ import {
   type DurableJobSpec,
   type DurableJobStepResult
 } from "../job/durableJob.js";
-import { readLinuxProcessStartIdentity } from "./domainIdentity.js";
-import { wakeReason } from "../scheduler/wakeReason.js";
 import { recordOperationEvidence } from "../kernel/operationFacts.js";
+import { wakeReason } from "../scheduler/wakeReason.js";
+import { writeTextFileAtomically } from "../storage/durableFile.js";
+import { readLinuxProcessStartIdentity } from "./domainIdentity.js";
 
 const DEFAULT_STEP_TIMEOUT_MS = 30 * 60_000;
 const HEARTBEAT_STALE_MS = 2 * 60_000;

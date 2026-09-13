@@ -34,19 +34,17 @@
  * it performs the same cheap structural checks the file store relies on
  * (identity presence, taskId matching, referential lookups).
  */
+import Database from "better-sqlite3";
 import { existsSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { isDeepStrictEqual } from "node:util";
-import Database from "better-sqlite3";
-import { queryTaskCatalog, type TaskCatalogQuery } from "./taskCatalog.js";
-import { validatePluginValidation, type PluginValidation } from "../plugins/pluginPackage.js";
-import { validatePluginIntent, validatePluginIntentFailure, type PluginIntent, type PluginIntentFailure } from "../plugins/pluginIntent.js";
-import {
-  validateLocalResource, validateEnvironmentPreparation,
-  type LocalResource, type EnvironmentPreparation
-} from "../resources/projectResource.js";
 import { validateConfiguredAgent, type ConfiguredAgent } from "../agent/agent.js";
+import { runPurposeAdmitsTaskState, type AgentRun } from "../agentRun/agentRun.js";
 import { validateTaskBrief, type TaskBrief } from "../brief/taskBrief.js";
+import {
+  validateContextSnapshot,
+  type ContextSnapshot
+} from "../context/contextSnapshot.js";
 import type { MailboxTarget, WorkMailbox } from "../coordination/workMailbox.js";
 import {
   consumePendingBatch,
@@ -54,34 +52,10 @@ import {
   validateWorkMailbox
 } from "../coordination/workMailbox.js";
 import type { Decision } from "../decision/decision.js";
-import {
-  validateContextSnapshot,
-  type ContextSnapshot
-} from "../context/contextSnapshot.js";
 import type { TaskEvent } from "../event/taskEvent.js";
-import type { InputRequest } from "../input/inputRequest.js";
 import type { GlobalRoleSessionSet, RoleAgentSession, TaskRoleSessionSet } from "../executor/agentExecutor.js";
-import type { TaskMessage } from "../message/message.js";
-import { validateGlobalRoleMessage, type GlobalRoleMessage } from "../message/message.js";
-import type { Milestone } from "../milestone/milestone.js";
-import { runPurposeAdmitsTaskState, type AgentRun } from "../agentRun/agentRun.js";
-import type { RuntimeOwner } from "../runtime/runtimeOwner.js";
-import {
-  compareRuntimeSessionCandidates,
-  projectRuntimeSessionCandidate,
-  type RuntimeSessionCandidate,
-  type RuntimeSessionCandidateQuery
-} from "../runtime/runtimeSessionCandidate.js";
-import { sessionOwnerProcessKey, type SessionOwnerIdentity } from "../runtime/sessionOwnerIdentity.js";
-import type { ReviewConfig } from "../review/reviewConfig.js";
-import { validateReviewRound, type ReviewRound } from "../review/reviewRound.js";
-import { validateProject, type Project, type ProjectReferenceSummary } from "../repository/project.js";
-import {
-  generateHomeIdentity,
-  validateHomeIdentity,
-  type HomeIdentity
-} from "../repository/homeIdentity.js";
-import type { AgentProfile } from "../profile/agentProfile.js";
+import type { CapabilityGrant } from "../grant/capabilityGrant.js";
+import type { InputRequest } from "../input/inputRequest.js";
 import type { ChangeSet } from "../integration/changeSet.js";
 import type { IntegrationAttempt } from "../integration/integrationAttempt.js";
 import {
@@ -90,48 +64,60 @@ import {
   type IntegrationQueueStatus
 } from "../integration/integrationQueueEntry.js";
 import {
-  validDurableJobTransition,
   validateDurableJob,
+  validDurableJobTransition,
   type DurableJob
 } from "../job/durableJob.js";
+import type { TaskMessage } from "../message/message.js";
+import { validateGlobalRoleMessage, type GlobalRoleMessage } from "../message/message.js";
+import type { Milestone } from "../milestone/milestone.js";
+import {
+  validatePluginIntent,
+  validatePluginIntentFailure,
+  type PluginIntent,
+  type PluginIntentFailure
+} from "../plugins/pluginIntent.js";
+import { validatePluginValidation, type PluginValidation } from "../plugins/pluginPackage.js";
+import type { AgentProfile } from "../profile/agentProfile.js";
+import type { ReleaseWorkflow } from "../release/releaseWorkflow.js";
+import {
+  generateHomeIdentity,
+  validateHomeIdentity,
+  type HomeIdentity
+} from "../repository/homeIdentity.js";
+import { validateProject, type Project, type ProjectReferenceSummary } from "../repository/project.js";
+import {
+  validateEnvironmentPreparation,
+  validateLocalResource,
+  type EnvironmentPreparation,
+  type LocalResource
+} from "../resources/projectResource.js";
+import type { ReviewConfig } from "../review/reviewConfig.js";
+import { validateReviewRound, type ReviewRound } from "../review/reviewRound.js";
 import { validateGlobalRole, validateTaskRole, type GlobalRole, type TaskRole } from "../role/role.js";
+import type { RuntimeOwner } from "../runtime/runtimeOwner.js";
+import {
+  compareRuntimeSessionCandidates,
+  projectRuntimeSessionCandidate,
+  type RuntimeSessionCandidate,
+  type RuntimeSessionCandidateQuery
+} from "../runtime/runtimeSessionCandidate.js";
+import { sessionOwnerProcessKey, type SessionOwnerIdentity } from "../runtime/sessionOwnerIdentity.js";
 import type { LeaderFailure } from "../scheduler/leaderFailure.js";
 import type { PendingWakeup } from "../scheduler/pendingWakeup.js";
 import { validateTaskWake, type TaskWake } from "../scheduler/taskWake.js";
-import { validateTask, type Task } from "../task/task.js";
-import type { NextActionFacts } from "../task/nextAction.js";
 import { pendingCompletionMessages, type CompletionReadinessFacts } from "../task/completionReadiness.js";
+import type { NextActionFacts } from "../task/nextAction.js";
+import type { PublicationReference } from "../task/publicationReference.js";
+import { publicationExternalKey } from "../task/publicationReference.js";
+import { validateTask, type Task } from "../task/task.js";
+import { TASK_RECORD_ID_PREFIXES, type TaskRecordKind } from "../task/taskRecordReference.js";
 import {
   operationalTaskRecords,
   TASK_RECORD_RETIRED_EVENT
 } from "../task/taskRecordRetirement.js";
-import { TASK_RECORD_ID_PREFIXES, type TaskRecordKind } from "../task/taskRecordReference.js";
-import { validateWorkItem, type WorkItem } from "../workItem/workItem.js";
-import { managedWorkspaceKey, type ManagedWorkspace, type ManagedWorkspaceOwner } from "../worktree/managedWorkspace.js";
-import {
-  CURRENT_CONFIG_SCHEMA_VERSION,
-  CURRENT_WORK_MAILBOX_SCHEMA_VERSION,
-  executionLaneActiveRunKey,
-  executionLaneActiveRunKeyParts,
-  StorageConflictError,
-  StorageCancelledError,
-  StorageRecordError,
-  storedCapabilityGrant,
-  storedPublicationReference,
-  storedReleaseWorkflow,
-  isValidCapabilityGrantTransition,
-  isValidReleaseWorkflowTransition,
-  pendingWakeupProjection,
-  type ConfiguredAgentPatch,
-  type ConfiguredAgentUpdateResult,
-  type TaskStore,
-  type YuiConfig,
-  validateYuiConfig
-} from "./taskStore.js";
-import { publicationExternalKey } from "../task/publicationReference.js";
-import type { CapabilityGrant } from "../grant/capabilityGrant.js";
-import type { ReleaseWorkflow } from "../release/releaseWorkflow.js";
-import type { PublicationReference } from "../task/publicationReference.js";
+import { writeTelemetryBatch } from "../telemetry/sqliteTelemetryBatch.js";
+import type { TelemetryProgressEntry } from "../telemetry/telemetryStore.js";
 import {
   gateArtifactKey,
   validateGateArtifact,
@@ -140,6 +126,18 @@ import {
   type GateArtifactPruneOptions,
   type GateArtifactPruneResult
 } from "../verification/gateArtifact.js";
+import { validateWorkItem, type WorkItem } from "../workItem/workItem.js";
+import {
+  managedWorkspaceKey,
+  type ManagedWorkspace,
+  type ManagedWorkspaceOwner
+} from "../worktree/managedWorkspace.js";
+import {
+  contextInputReferences,
+  queryContextRecords,
+  type ContextInputScope,
+  type ContextRecordQuery
+} from "./contextRecords.js";
 import {
   inspectSqliteSchemaMigrations,
   migrateSqliteSchema,
@@ -148,6 +146,27 @@ import {
   TELEMETRY_RUN_CAP
 } from "./sqliteSchema.js";
 import { StorageSchemaError } from "./storageSchema.js";
+import { queryTaskCatalog, type TaskCatalogQuery } from "./taskCatalog.js";
+import {
+  CURRENT_CONFIG_SCHEMA_VERSION,
+  CURRENT_WORK_MAILBOX_SCHEMA_VERSION,
+  executionLaneActiveRunKey,
+  executionLaneActiveRunKeyParts,
+  isValidCapabilityGrantTransition,
+  isValidReleaseWorkflowTransition,
+  pendingWakeupProjection,
+  StorageCancelledError,
+  StorageConflictError,
+  StorageRecordError,
+  storedCapabilityGrant,
+  storedPublicationReference,
+  storedReleaseWorkflow,
+  validateYuiConfig,
+  type ConfiguredAgentPatch,
+  type ConfiguredAgentUpdateResult,
+  type TaskStore,
+  type YuiConfig
+} from "./taskStore.js";
 
 /** Options for {@link SqliteTaskStore}. */
 export type SqliteTaskStoreOptions = Readonly<{
@@ -360,6 +379,69 @@ export class SqliteTaskStore implements TaskStore {
   #now(): string { return new Date().toISOString(); }
   #json(value: unknown): string { return JSON.stringify(value); }
   #parse<T>(text: string): T { return JSON.parse(text) as T; }
+
+  queryContextRecords(taskId: string, query: ContextRecordQuery) {
+    return queryContextRecords(this.#db, taskId, query);
+  }
+
+  contextInputReferences(taskId: string, scope: ContextInputScope) {
+    return contextInputReferences(this.#db, taskId, scope);
+  }
+
+  listActiveRuns(taskId: string): AgentRun[] {
+    return this.#sortById(this.#listPayload<AgentRun>("turns", "task_id = ? AND status = 'active'", [taskId]), run => run.id);
+  }
+
+  latestEventSequence(taskId: string): number {
+    return (this.#db.prepare(
+      "SELECT COALESCE(MAX(CAST(substr(event_id, 7) AS INTEGER)), 0) AS seq FROM events WHERE task_id = ?"
+    ).get(taskId) as { seq: number }).seq;
+  }
+
+  listEventsByType(taskId: string, types: readonly string[]): TaskEvent[] {
+    return this.#sortById(this.#listPayload<TaskEvent>(
+      "events", "task_id = ? AND type IN (SELECT value FROM json_each(?))",
+      [taskId, JSON.stringify(types)]
+    ), event => event.id);
+  }
+
+  /** Delivery needs original workspace bases, never complete Run reports. */
+  listTaskRunWorkspaceBases(taskId: string): Pick<AgentRun, "id" | "createdAt" | "workspace">[] {
+    return (this.#db.prepare(`SELECT json_object(
+      'id', turn_id, 'createdAt', json_extract(payload, '$.createdAt'),
+      'workspace', json_extract(payload, '$.workspace')) AS payload
+      FROM turns WHERE task_id = ? AND json_extract(payload, '$.workspace.owner.type') = 'task'`
+    ).all(taskId) as { payload: string }[]).map(row => JSON.parse(row.payload));
+  }
+
+  /** A pinned read snapshot never reserves the database's single writer slot.
+   * Nested reads share an existing transaction; standalone reads also prohibit
+   * accidental writes at SQLite's boundary.
+   */
+  readTransaction<T>(execute: (store: TaskStore) => T): T {
+    if (this.#inTransaction) return execute(this);
+    const previous = this.#db.pragma("query_only", { simple: true });
+    this.#db.pragma("query_only = ON");
+    this.#db.exec("BEGIN");
+    this.#inTransaction = true;
+    try {
+      this.#prepareWrite();
+      const result = execute(this);
+      this.#commit();
+      return result;
+    } catch (error) {
+      this.#rollback();
+      throw error;
+    } finally {
+      this.#db.pragma(`query_only = ${previous === 1 ? "ON" : "OFF"}`);
+    }
+  }
+
+  /** Diagnostic worker write; deliberately outside Task revision/outbox state. */
+  flushTelemetry(entries: readonly TelemetryProgressEntry[], runCap: number): void {
+    this.#prepareWrite();
+    writeTelemetryBatch(this.#db, entries, runCap);
+  }
 
   #begin(): void {
     this.#db.exec("BEGIN IMMEDIATE");
@@ -3281,6 +3363,6 @@ export function resolveTaskStoreBackendForHome(
 export function openConfiguredTaskStore(
   home: string,
   options?: TaskStoreOptions
-): TaskStore {
+): SqliteTaskStore {
   return new SqliteTaskStore(home, options);
 }

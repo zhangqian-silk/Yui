@@ -1,8 +1,14 @@
-import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
-import { existsSync } from "node:fs";
 import { createHash } from "node:crypto";
+import { existsSync } from "node:fs";
+import { mkdir, writeFile } from "node:fs/promises";
 import { dirname, join } from "node:path";
 
+import { acquireArtifactCommitLock } from "./artifactCommitLock.js";
+import {
+  resolveContainedArtifactPath,
+  safeRelativeArtifactPath,
+  taskArtifactRepoPath
+} from "./artifactPaths.js";
 import {
   ManagedGitError,
   externalProgramConfigViolations,
@@ -11,12 +17,6 @@ import {
   managedGitSucceeds,
   requireCommitId
 } from "./managedGit.js";
-import { acquireArtifactCommitLock } from "./artifactCommitLock.js";
-import {
-  resolveContainedArtifactPath,
-  safeRelativeArtifactPath,
-  taskArtifactRepoPath
-} from "./artifactPaths.js";
 
 /**
  * Per-Task local-only Git artifact repository.

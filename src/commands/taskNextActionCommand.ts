@@ -1,33 +1,31 @@
 import { taskNotFound, usageError } from "../errors/cliError.js";
-import type { TaskStore } from "../storage/taskStore.js";
-import {
-  projectNextAction,
-  type NextAction,
-  type NextActionFacts
-} from "../task/nextAction.js";
-import {
-  projectCompletionReadiness,
-  type CompletionReadiness
-} from "../task/completionReadiness.js";
 import {
   projectTaskOrchestration,
   type OrchestrationAdvisory
 } from "../observability/orchestrationMetrics.js";
-import { operationalTaskRecords } from "../task/taskRecordRetirement.js";
-import {
-  buildTaskExecutionProjection,
-  type TaskExecutionProjection,
-  type TaskExecutionRun
-} from "../scheduler/taskExecutionProjection.js";
 import {
   projectReviewDecision,
   type ReviewDecisionProjection
 } from "../review/reviewDecision.js";
 import type { TaskReviewCandidate } from "../review/reviewRound.js";
 import {
-  projectTaskRemoteDeliveryFromStore,
-  renderTaskRemoteDelivery
-} from "./taskRemoteDeliveryCommand.js";
+  buildTaskExecutionProjection,
+  type TaskExecutionProjection,
+  type TaskExecutionRun
+} from "../scheduler/taskExecutionProjection.js";
+import type { TaskStore } from "../storage/taskStore.js";
+import {
+  projectCompletionReadiness,
+  type CompletionReadiness
+} from "../task/completionReadiness.js";
+import {
+  projectNextAction,
+  type NextAction,
+  type NextActionFacts
+} from "../task/nextAction.js";
+import { projectTaskRemoteDeliveryFromStore } from "../task/remoteDeliveryService.js";
+import { operationalTaskRecords } from "../task/taskRecordRetirement.js";
+import { renderTaskRemoteDelivery } from "./taskRemoteDeliveryCommand.js";
 
 type NextActionExecutionView = Readonly<Pick<
   TaskExecutionProjection,

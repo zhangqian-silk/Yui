@@ -1,3 +1,7 @@
+import {
+  isRuntimeTokenEvidence,
+  type RuntimeObservation
+} from "../runtime/runtimeObservation.js";
 import type { SchedulerTask } from "../scheduler/ports.js";
 import type {
   FileRuntimeEventInbox,
@@ -7,12 +11,6 @@ import type {
   RuntimeRunTerminalEvent,
   RuntimeRunTerminalOutcome
 } from "./runtimeEventInbox.js";
-import {
-  isRuntimeTokenEvidence,
-  type RuntimeObservation
-} from "../runtime/runtimeObservation.js";
-import type { AgentDriverRegistry } from "../runtime/agentDriver.js";
-import { builtinAgentDriverRegistry } from "../runtime/builtinAgentDrivers.js";
 
 export type ProviderLifecycleObservation = "applied" | "obsolete" | "deferred";
 
@@ -124,8 +122,6 @@ export interface AsyncRuntimeEventProcessorPort {
 }
 
 export type FileRuntimeEventProcessorOptions = Readonly<{
-  /** Runtime-observation Driver catalog used to resolve Driver/adapter identity. */
-  drivers?: AgentDriverRegistry;
   /** Maximum folded representatives in one state transaction. */
   maxEventsPerDrain?: number;
 }>;
@@ -152,16 +148,13 @@ const DEFAULT_MAX_RUNTIME_EVENTS_PER_DRAIN = 64;
 
 /** Folds immutable Hook facts in one bounded transaction before acknowledging them. */
 export class FileRuntimeEventProcessor implements RuntimeEventProcessorPort {
-  private readonly drivers: AgentDriverRegistry;
   private drainLaneCursor = 0;
 
   constructor(
     private readonly inbox: RuntimeEventInboxPort,
     private readonly observer: RuntimeRunEventObserver,
     private readonly options: FileRuntimeEventProcessorOptions = {}
-  ) {
-    this.drivers = options.drivers ?? builtinAgentDriverRegistry();
-  }
+  ) {}
 
   drain(now: Date): RuntimeEventDrainResult {
     const acknowledgedEventIds: string[] = [];
@@ -807,16 +800,13 @@ export function createAsyncRuntimeObserver(invoke: AsyncObserverInvoker): AsyncR
  * thread; only the db-touching folds are proxied to the worker.
  */
 export class AsyncRuntimeEventProcessor {
-  private readonly drivers: AgentDriverRegistry;
   private drainLaneCursor = 0;
 
   constructor(
     private readonly inbox: RuntimeEventInboxPort,
     private readonly observer: AsyncRuntimeRunEventObserver,
     private readonly options: FileRuntimeEventProcessorOptions = {}
-  ) {
-    this.drivers = options.drivers ?? builtinAgentDriverRegistry();
-  }
+  ) {}
 
   async drainAsync(now: Date): Promise<RuntimeEventDrainResult> {
     const acknowledgedEventIds: string[] = [];

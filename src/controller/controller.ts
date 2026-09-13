@@ -57,7 +57,11 @@ import {
   type ProcessingBatch,
   type WorkMailbox
 } from "../coordination/workMailbox.js";
-import { hasRuntimeCleanupObligation, type RuntimeLifecycleTarget, type RuntimeRoleOwner } from "../runtime/lifecycleReservation.js";
+import {
+  hasRuntimeCleanupObligation,
+  type RuntimeLifecycleTarget,
+  type RuntimeRoleOwner
+} from "../runtime/lifecycleReservation.js";
 import type { SessionHostPort } from "../runtime/ports.js";
 import { formatTaskRecordReference } from "../task/taskRecordReference.js";
 import { activationRequestIsControllerAdoptable } from "../task/taskActivation.js";
@@ -1052,7 +1056,6 @@ function mergeControllerSchedulerResults(
  * progress concurrently across different Tasks up to the configured bound.
  */
 export class FileTaskController {
-  readonly #startedAt: Date;
   #intervalMs: number;
   readonly #now: () => Date;
   readonly #onError: (error: unknown) => void;
@@ -1142,7 +1145,6 @@ export class FileTaskController {
       "Controller reconciliation interval"
     );
     this.#now = options.now ?? (() => new Date());
-    this.#startedAt = this.#now();
     this.#onError = options.onError ?? (() => {});
     const workspacePreparer = options.workspacePreparer;
     this.#workspacePreparer = workspacePreparer === undefined ? undefined : {

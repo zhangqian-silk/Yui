@@ -9,11 +9,16 @@
 
 import { resolve } from "node:path";
 
+import {
+  resolveResourcesGcMode,
+  resolveResourcesQuarantineTtlHours
+} from "../config/yuiConfig.js";
 import { usageError } from "../errors/cliError.js";
 import { defaultTableWidth, renderTable } from "../output/table.js";
-import type { Project } from "../repository/project.js";
-import type { TaskStore } from "../storage/taskStore.js";
-import type { ManagedWorkspace } from "../worktree/managedWorkspace.js";
+import {
+  resourceKindLabel,
+  resourceOwnerLabel
+} from "../resources/resourceDiscovery.js";
 import {
   applyResourceGc,
   planResourceGc,
@@ -23,16 +28,8 @@ import {
   type GcPlan,
   type GcResult
 } from "../resources/resourceGc.js";
-import { createResourceRegistryStore } from "../resources/resourceRegistryStore.js";
-import {
-  resourceKindLabel,
-  resourceOwnerLabel
-} from "../resources/resourceDiscovery.js";
-import {
-  resolveResourcesGcMode,
-  resolveResourcesQuarantineTtlHours
-} from "../config/yuiConfig.js";
-import type { ResourceRecord } from "../resources/resourceTypes.js";
+import type { TaskStore } from "../storage/taskStore.js";
+import type { ManagedWorkspace } from "../worktree/managedWorkspace.js";
 
 export type ResourcesCommandResult = Readonly<{
   output: string;
@@ -101,7 +98,6 @@ async function runGcCommand(
 
   const plan = await planResourceGc({
     home,
-    registryStore: createResourceRegistryStore(home),
     projects,
     managedWorkspaces,
     taskStatusById,
@@ -114,7 +110,6 @@ async function runGcCommand(
   if (action === "apply" && mode === "quarantine") {
     const result = await applyResourceGc({
       home,
-      registryStore: createResourceRegistryStore(home),
       projects,
       managedWorkspaces,
       taskStatusById,

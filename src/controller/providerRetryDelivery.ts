@@ -1,25 +1,28 @@
 import { performance } from "node:perf_hooks";
-import type { TaskStore } from "../storage/taskStore.js";
-import type { RoleSessionSet } from "../executor/agentExecutor.js";
 import type { AgentRun } from "../agentRun/agentRun.js";
-import type { TaskReviewCandidate } from "../review/reviewRound.js";
-import type { MailboxKey } from "./controller.js";
 import { runTaskCommand } from "../commands/taskCommands.js";
-import { retryIntentBlocker } from "./providerRetryAdmission.js";
+import { enqueueWork } from "../coordination/workMailboxQueue.js";
+import { createTaskEvent } from "../event/taskEvent.js";
+import type { RoleSessionSet } from "../executor/agentExecutor.js";
+import { settleGlobalRetryInput } from "../message/globalProviderRetry.js";
+import type { TaskReviewCandidate } from "../review/reviewRound.js";
+import { redactAgentErrorText } from "../runtime/agentError.js";
+import type { inspectAgentHost } from "../runtime/agentHost.js";
 import {
-  cancelProviderRetry, providerRetryAttemptId, providerRetryPending, providerRetryProjection,
+  AGENT_HOST_CONTROL_PROTOCOL,
+  agentHostControlSocketPath,
+  inspectAgentHostSocket,
+  sendAgentHostRunControl
+} from "../runtime/agentHost.js";
+import { hasRuntimeCleanupObligation, runtimeLifecycleTarget } from "../runtime/lifecycleReservation.js";
+import {
+  cancelProviderRetry, providerRetryAttemptId, providerRetryPending,
   type ProviderRetry
 } from "../runtime/providerRetry.js";
 import { currentProviderConversation } from "../runtime/providerRuntimeIdentity.js";
-import { runtimeLifecycleTarget, hasRuntimeCleanupObligation } from "../runtime/lifecycleReservation.js";
-import {
-  sendAgentHostRunControl, inspectAgentHostSocket, agentHostControlSocketPath, AGENT_HOST_CONTROL_PROTOCOL
-} from "../runtime/agentHost.js";
-import type { inspectAgentHost } from "../runtime/agentHost.js";
-import { redactAgentErrorText } from "../runtime/agentError.js";
-import { createTaskEvent } from "../event/taskEvent.js";
-import { enqueueWork } from "../coordination/workMailboxQueue.js";
-import { settleGlobalRetryInput } from "../message/globalProviderRetry.js";
+import type { TaskStore } from "../storage/taskStore.js";
+import type { MailboxKey } from "./controller.js";
+import { retryIntentBlocker } from "./providerRetryAdmission.js";
 
 type RetryDeliveryPorts = Readonly<{
   now?: () => Date;

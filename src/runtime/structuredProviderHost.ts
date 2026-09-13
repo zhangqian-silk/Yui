@@ -6,37 +6,43 @@ import { randomUUID } from "node:crypto";
 import type { Socket } from "node:net";
 import { Duplex } from "node:stream";
 import { fileURLToPath } from "node:url";
+import {
+  ProviderConversationMissingError,
+  ProviderDeliveryUnknownError,
+  ProviderTurnBusyError,
+  ProviderTurnRejectedError
+} from "./providerErrors.js";
 
 import WebSocket, { type RawData } from "ws";
 
-import {
-  CodexAppServerRequestError,
-  CodexAppServerRuntime,
-  codexClientInitialization,
-  codexGoalNotification,
-  codexAppServerErrorIsMissing,
-  codexTurnInput,
-  codexTurnOutput
-} from "./codexAppServerRuntime.js";
-import type {
-  AgentHostLaunchPayload,
-  AgentHostProviderControl
-} from "./launchBroker.js";
-import { serializeAgentErrorRaw } from "./agentError.js";
 import type { AgentAdapterId } from "../agent/adapterCatalog.js";
+import { YUI_VERSION } from "../version.js";
 import { AcpStructuredProviderSession } from "./acpSession.js";
 import { acpDesiredSessionConfiguration } from "./acpSessionConfiguration.js";
+import { serializeAgentErrorRaw } from "./agentError.js";
 import {
   unsupportedAgentRunConfiguration,
   type AgentRunConfigurationObservation
 } from "./agentRunConfiguration.js";
-import { YUI_VERSION } from "../version.js";
+import {
+  codexAppServerErrorIsMissing,
+  CodexAppServerRequestError,
+  CodexAppServerRuntime,
+  codexClientInitialization,
+  codexGoalNotification,
+  codexTurnInput,
+  codexTurnOutput
+} from "./codexAppServerRuntime.js";
 import {
   JsonLineChannel,
   PROVIDER_MESSAGE_MAX_BYTES,
   terminateProcessGroup,
   type JsonObject
 } from "./jsonLineChannel.js";
+import type {
+  AgentHostLaunchPayload,
+  AgentHostProviderControl
+} from "./launchBroker.js";
 import { PROVIDER_ACCEPT_TIMEOUT_MS } from "./runtimeDeadlines.js";
 
 const CODEX_PROXY_HANDSHAKE_TIMEOUT_MS = 10_000;
@@ -168,53 +174,6 @@ export interface StructuredProviderSession {
   cancelTurn(attemptId: string): Promise<"requested" | "not-active" | "unknown">;
   waitForExit(): Promise<StructuredProviderProcessExit>;
   terminate(signal: NodeJS.Signals): void;
-}
-
-export class ProviderDeliveryUnknownError extends Error {
-  readonly name = "ProviderDeliveryUnknownError";
-
-  constructor(
-    message: string,
-    readonly attemptId: string,
-    // Wrapping must not become the end of the causal chain: the original
-    // transport or Controller failure is the reason a reader needs.
-    options?: Readonly<{ cause?: unknown }>
-  ) {
-    super(message, options);
-  }
-}
-
-export class ProviderTurnRejectedError extends Error {
-  readonly name = "ProviderTurnRejectedError";
-
-  constructor(
-    message: string,
-    readonly attemptId: string,
-    options?: Readonly<{ cause?: unknown }>
-  ) {
-    super(message, options);
-  }
-}
-
-/** Another ordinary client currently owns the thread's active Turn. */
-export class ProviderTurnBusyError extends Error {
-  readonly name = "ProviderTurnBusyError";
-
-  constructor(
-    message: string,
-    readonly attemptId: string,
-    readonly activeTurnId?: string
-  ) {
-    super(message);
-  }
-}
-
-export class ProviderConversationMissingError extends Error {
-  readonly name = "ProviderConversationMissingError";
-
-  constructor(readonly conversationId: string, message: string) {
-    super(message);
-  }
 }
 
 export async function startStructuredProviderSession(

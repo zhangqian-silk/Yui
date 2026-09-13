@@ -127,11 +127,11 @@ request ID 若换正文或目标会产生冲突。`steer` 与 `interrupt` 不会
 可以显式选择新的控制；不确定性不允许重放。
 
 Global Role 使用同样的三种动作和自己的 owner、Session，不虚构 Task 或 Run。
-本地用户 Web Surface 通过共享 Global Role 处理器暴露这些动作。目前 CLI 存在可用性
-缺口：`src/cli.ts` 实现了 `yui role message queue|steer` 和 `yui role interrupt`，
-但 `src/cli/commandCatalog.ts` 没有注册顶层 `role`，因此公开 CLI 路由会拒绝这些路径，
-报告 unknown command。它们不是可用的 CLI 示例；应报告该缺口，不虚构 Task/Run 或
-借用浏览器用户权限。新的受控 Global Session 使用 Host console。活动的非受管 Session
+本地用户 Web Surface 通过共享 Global Role 处理器暴露这些动作。公开 CLI 提供
+`yui role message queue|steer <role> <text>` 和 `yui role interrupt <role>`。
+queue/steer 要求 `--request-id`，steer/interrupt 要求 `--expected-target`。
+这些命令保留调用者现有 Session 权限，不虚构 Task/Run 或借用浏览器用户权限。
+配置仍使用 `config role`，生命周期使用 `session`。新的受控 Global Session 使用 Host console。活动的非受管 Session
 不会被静默采用，需要先执行显式的 Session 生命周期操作。
 
 ## 精确结果
@@ -158,8 +158,8 @@ Candidate 和 ReviewRound 保留来源；Core 不从散文中推导语义接受�
 仍是通知。Operator 提交和直接的 Task 消息都能到达那个 Session。Draft 计划/WorkItem
 编辑保留执行历史；外部编辑通知 Leader，而它自己的规划编辑不创建自唤醒。
 
-新的 Draft Role 使用位于 `<YUI_HOME>.task-runtimes/planning` 下、专属于该 Task 的规划
-目录，在控制 Home 和交付树之外。一个 planning Run 可以用 `task activation request`
+新的 Draft Role 使用位于 `<YUI_HOME>/runtime/task-runtimes/planning` 下、专属于该 Task 的规划
+目录，与持久控制数据和交付树分开。一个 planning Run 可以用 `task activation request`
 持久化意图并立即返回一个 `afterPlanningRun` 引用。它的终态把该请求释放给 Controller
 准入；被取消的意图不会复活。Leader 也可以在普通讨论中请求激活而无需 AgentRun：一旦
 原生输入结算，Controller 就采用其持久意图。不需要合成 Run 或额外的用户“continue”。

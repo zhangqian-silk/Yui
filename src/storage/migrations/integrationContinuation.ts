@@ -1,15 +1,16 @@
 import type Database from "better-sqlite3";
 import { createHash } from "node:crypto";
 import { resolve } from "node:path";
-import { durableJobIdempotencyKey, type DurableJob } from "../../job/durableJob.js";
 import type { IntegrationAttempt } from "../../integration/integrationAttempt.js";
-import type { ManagedWorkspace } from "../../worktree/managedWorkspace.js";
-import type { Task } from "../../task/task.js";
+import { durableJobIdempotencyKey, type DurableJob } from "../../job/durableJob.js";
 import type { Project } from "../../repository/project.js";
+import type { Task } from "../../task/task.js";
+import { resolveProjectVerificationPlan } from "../../verification/verificationPlan.js";
+import type { ManagedWorkspace } from "../../worktree/managedWorkspace.js";
 import {
-  resolveProjectVerificationPlan, verificationPlanDigest,
-  planBootstrapJobSteps, planL2JobSteps
-} from "../../verification/verificationPlan.js";
+  historicalGateJobSteps,
+  historicalVerificationPlanDigest
+} from "./historicalVerificationPlan.js";
 
 /** Classify only known v19 Git conflicts. Manual strategy and CAS blockers
  * keep their meaning. Never synthesize candidate/Job success or edit history. */
@@ -81,8 +82,8 @@ function migrateBoundFastForward(db: Database.Database, attempt: IntegrationAtte
   }));
   if (attempt.gatePlanDigest !== undefined) {
     const plan = resolveProjectVerificationPlan(project);
-    if (plan === undefined || verificationPlanDigest(plan) !== attempt.gatePlanDigest) return;
-    steps = [...planBootstrapJobSteps(plan), ...planL2JobSteps(plan)].map(step => ({
+    if (plan === undefined || historicalVerificationPlanDigest(plan) !== attempt.gatePlanDigest) return;
+    steps = historicalGateJobSteps(plan).map(step => ({
       ...step, timeoutMs: 30 * 60_000
     }));
   }

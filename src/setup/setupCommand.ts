@@ -1,18 +1,17 @@
 import { existsSync, mkdirSync, realpathSync } from "node:fs";
-import { delimiter, dirname, isAbsolute, join, relative, resolve } from "node:path";
+import { delimiter, isAbsolute, join, relative, resolve } from "node:path";
 import { createInterface } from "node:readline/promises";
 import type { Readable, Writable } from "node:stream";
 
+import type { AgentAdapterId } from "../agent/adapterCatalog.js";
 import {
   configuredAgentToDefinition,
   createConfiguredAgent,
   type ConfiguredAgent
 } from "../agent/agent.js";
-import type { AgentAdapterId } from "../agent/adapterCatalog.js";
 import { assertRoleRuntimeMutationAllowed } from "../commands/roleRuntimeGuard.js";
 import { resolveTmuxBin } from "../config/yuiConfig.js";
 import { usageError } from "../errors/cliError.js";
-import { managedGlobalRoleWorkspace } from "../storage/homeLayout.js";
 import {
   createGlobalRole,
   createRoleAgentBinding,
@@ -21,6 +20,7 @@ import {
 } from "../role/role.js";
 import { SYSTEM_LEADER_ROLE, SYSTEM_OPERATOR_ROLE } from "../role/systemRoles.js";
 import { initializeCurrentTaskStore } from "../storage/currentTaskStore.js";
+import { managedGlobalRoleWorkspace } from "../storage/homeLayout.js";
 import {
   ensureYuiHome,
   resolveYuiHome,

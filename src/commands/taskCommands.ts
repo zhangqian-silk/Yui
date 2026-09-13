@@ -1,23 +1,48 @@
-import type { ConfiguredAgent } from "../agent/agent.js";
-import { controlProviderRetry, providerRetryProjection, renderProviderRetry } from "../runtime/providerRetry.js";
-import { roleLaunchEventPayload, saveTaskRoleUpdate } from "../role/taskRoleUpdate.js";
 import { createHash, randomUUID } from "node:crypto";
-import { archiveDeliveryWarnings, archiveRetainedResources, renderArchiveDiagnostics, taskArchiveDiagnostics } from "../task/archiveDiagnostics.js";
-import { archiveSettlementChecks } from "../task/archivePreflight.js";
-import { CleanupInspectionError } from "../workspace/cleanupInspection.js";
-import { join } from "node:path";
 import { isDeepStrictEqual } from "node:util";
-import { createRunInput } from "../context/runInputContract.js";
+import type { ConfiguredAgent } from "../agent/agent.js";
+import { agentExecutionComponentLabel } from "../agent/executionComponents.js";
 import {
-  buildRunContextPack,
+  createRun,
+  runExecutionObservation,
+  runPurposeAdmitsTaskState,
+  withRunContextSnapshot,
+  type AgentRun
+} from "../agentRun/agentRun.js";
+import {
+  isGitArtifactRefString,
+  parseGitArtifactRef,
+  type GitArtifactRef
+} from "../artifacts/gitArtifactRef.js";
+import { contextSnapshotRef } from "../context/contextSnapshot.js";
+import {
   buildRunContextDelta,
+  buildRunContextPack,
   contextSnapshotDeltaRefIds,
   expandRunContextRef,
-  freezeWorkItemExecutionAssignmentContextSnapshot,
   freezeReviewStageContextSnapshot,
-  freezeRunContextSnapshot
+  freezeRunContextSnapshot,
+  freezeWorkItemExecutionAssignmentContextSnapshot,
+  synthesisSourceRunIds
 } from "../context/runContextPack.js";
-import { contextSnapshotRef } from "../context/contextSnapshot.js";
+import { createRunInput } from "../context/runInputContract.js";
+import {
+  parseTaskCatalogOptions,
+  readTaskCatalog,
+  renderTaskCatalog,
+  taskCatalogScope
+} from "../context/taskCatalog.js";
+import { listContextMessages } from "../context/taskContext.js";
+import { referencedWakeRunIds } from "../context/wakeNotification.js";
+import {
+  completeProcessing,
+  type MailboxEntityRef
+} from "../coordination/workMailbox.js";
+import {
+  enqueueRoleRunDispatch,
+  enqueueWork,
+  settleExactWorkExecution
+} from "../coordination/workMailboxQueue.js";
 import {
   CliError,
   dataError,
@@ -26,230 +51,11 @@ import {
   taskNotFound,
   usageError
 } from "../errors/cliError.js";
-import { createTaskEvent, type TaskEvent, type TaskEventPayload } from "../event/taskEvent.js";
+import { type TaskEvent, type TaskEventPayload } from "../event/taskEvent.js";
 import {
-  createTaskRecordRetirement,
-  isTaskRecordRetired,
-  operationalTaskRecords,
-  taskRecordRetirement
-} from "../task/taskRecordRetirement.js";
-import { referencedWakeRunIds } from "../context/wakeNotification.js";
-import {
-  isRoleRunStalled,
-  RUN_PROGRESS_EVENT,
-  RUN_RECOVERED_EVENT
-} from "../scheduler/roleRunStall.js";
-import { readCommandText } from "./textInput.js";
-import {
-  assertTaskCompletionPublishedTreeProof,
-  type TaskCompletionPublishedTreeProof
-} from "./taskCompletionGate.js";
-import {
-  createRoleSessionSet,
-  roleAgentSessionResumeMode,
-  updateTaskRoleProviderRuntime,
-  taskRoleControlTarget,
-  type TaskRoleSessionSet
-} from "../executor/agentExecutor.js";
-import { transferProviderAuthority, currentProviderConversation } from "../runtime/providerRuntimeIdentity.js";
-import type { ProviderAuthorityFence } from "../runtime/providerAuthorityFence.js";
-import {
-  resolveEffectiveLaunch,
-  type EffectiveLaunchSnapshot
-} from "../executor/effectiveLaunch.js";
-import type { RoleAgentConfig } from "../executor/agentAdapter.js";
-import { defaultTableWidth, renderTable } from "../output/table.js";
-import { agentExecutionComponentLabel } from "../agent/executionComponents.js";
-import {
-  agentRunConfigurationLabel,
-  renderAgentRunConfiguration
-} from "../output/agentRunConfigurationPresentation.js";
-import type { AgentRunConfigurationObservation } from "../runtime/agentRunConfiguration.js";
-import { formatTimestamp } from "../output/timePresentation.js";
-import { renderRoleDetails, renderRoleLaunchComparison } from "../output/rolePresentation.js";
-import {
-  createTaskMessage,
-  expandTaskMessageResult,
-  recordTaskMessageControlOutcome,
-  taskMessageAuthorLabel,
-  taskMessageInputControlState,
-  updateDraftTaskMessage,
-  withSubmissionReceipt,
-  TASK_SUBMISSION_INTENTS,
-  type TaskMessage,
-  type TaskMessageAuthor,
-  type TaskMessageContext,
-  type TaskMessageInputAction,
-  type TaskMessageKind,
-  type TaskSubmissionIntent
-} from "../message/message.js";
-import {
-  assertDraftTaskExecutionFree,
-  validateDraftWorkItemEdit
-} from "../task/draftPlan.js";
-import {
-  TASK_PLANNING_ENTERED_EVENT,
-  decideSubmissionRouting,
-  describeSubmissionFeedback,
-  draftActivationState,
-  draftHasEnteredPlanning,
-  normalizeSubmissionIntent,
-  sameSubmissionTarget,
-  type SubmissionFeedback,
-  type SubmissionNextStep,
-  type SubmissionReceipt,
-  type SubmissionRouting,
-  type SubmissionTarget
-} from "../task/taskSubmission.js";
-import {
-  recordTaskActivationRequestInTransaction,
-  taskActivationOperationRef
-} from "../task/taskActivationService.js";
-import type {
-  TaskRetirementProof,
-  WorkItemIntegrationProof
-} from "../workspace/workItemChangeSetManager.js";
-import { cancelInputRequest } from "../input/inputRequest.js";
-import { builtinAgentDriverRegistry } from "../runtime/builtinAgentDrivers.js";
-import {
-  retireExactActiveRun,
-  terminalizeExactTaskRun,
-  validateExactRunReviewRound
-} from "../lifecycle/exactRunTerminalization.js";
-import {
-  copyGlobalRoleToTaskRole,
-  createRole,
-  createRoleAgentBinding,
-  switchActiveRoleAgent,
-  unbindRoleAgent,
-  updateRole,
-  type Role,
-  type RoleAgentBinding
-} from "../role/role.js";
-import {
-  createRun,
-  runPurposeAdmitsTaskState,
-  runExecutionObservation,
-  withRunContextSnapshot,
-  type AgentRun
-} from "../agentRun/agentRun.js";
-import {
-  createReviewRound,
-  createTaskReviewRound,
-  createTaskDeltaReviewRound,
-  attachReviewExecutionGroup,
-  finishReviewRound,
-  recordReviewWorkspaceDisposition,
-  retryReviewRound,
-  retryRunningReviewExecutionLane,
-  retryTaskReviewRound,
-  startReplicatedReviewRound,
-  startReviewRound,
-  updateReviewExecutionGroup,
-  validateTaskReviewCandidate,
-  type ReviewRound,
-  type TaskReviewCandidate,
-  type ReviewRequestSource
-} from "../review/reviewRound.js";
-import {
-  buildDeltaRecheckDispatchContext,
-  verifyDeltaRecheckDiff,
-  type DeltaRecheckPreflight
-} from "../review/deltaRecheck.js";
-import { isCompletedTaskReviewEvidence } from "../review/reviewAcceptance.js";
-import {
-  projectReviewerAvailability,
-  type ReviewerBusy
-} from "../review/reviewerAvailability.js";
-import { createTaskBrief, updateTaskBrief } from "../brief/taskBrief.js";
-import { createDecision, supersedeDecision } from "../decision/decision.js";
-import { createMilestone } from "../milestone/milestone.js";
-import { runPublicationCommand } from "./taskPublicationCommands.js";
-import { runTaskActivationCommand, nonLeaderActivationIdentity } from "./taskActivationCommands.js";
-import {
-  assertTaskRemoteDeliveryProof,
-  type TaskRemoteDeliveryProof,
-  projectTaskRemoteDeliveryFromStore,
-  renderTaskRemoteDelivery,
-  runTaskRemoteDeliveryCommand
-} from "./taskRemoteDeliveryCommand.js";
-import {
-  enqueueRoleRunDispatch,
-  enqueueWork,
-  settleExactWorkExecution
-} from "../coordination/workMailboxQueue.js";
-import {
-  completeProcessing,
-  mailboxHasWork as workMailboxHasWork,
-  type MailboxEntityRef,
-  type MailboxTarget
-} from "../coordination/workMailbox.js";
-import {
-  runtimeLifecycleTarget,
-  RUNTIME_SESSION_REPLACE_REQUIRED_REASON
-} from "../runtime/lifecycleReservation.js";
-import { projectProviderContinuations } from "../runtime/runtimeContinuationProjection.js";
-import { runtimeObservationFromTaskEvent } from "../runtime/runtimeObservation.js";
-import {
-  addTaskProjectBinding,
-  archiveTask,
-  completeTask,
-  createTask,
-  retireTask,
-  reopenTask,
-  taskOwnsManagedWorkspace,
-  updateTaskMetadata,
-  type TaskCompletedBy,
-  type Task,
-  type TaskMetadata,
-  type TaskMetadataUpdate,
-  type TaskProjectBinding,
-  type TaskPriority,
-  type TaskStatus
-} from "../task/task.js";
-import {
-  resolveTaskRecordReference
-} from "../task/taskRecordReference.js";
-import {
-  projectCompletionReadiness,
-  type CompletionAdvisory,
-  type CompletionBlocker
-} from "../task/completionReadiness.js";
-import type { TaskStore } from "../storage/taskStore.js";
-import { StorageConflictError } from "../storage/taskStore.js";
-import { planningRuntimeCwd } from "../storage/homeLayout.js";
-import type { AgentProfile } from "../profile/agentProfile.js";
-import {
-  requireResolvedAgentProfileRuntime,
-  type ResolvedAgentProfileRuntime
-} from "../profile/agentProfileRuntime.js";
-import { assertProjectActive, resolveProject, type Project } from "../repository/project.js";
-import type { TaskWorkspaceActivation } from "../repository/taskWorkspacePreparer.js";
-import type { TmuxRolePaneState } from "../tmux/tmuxManager.js";
-import {
-  currentWorkItemCandidate,
-  currentWorkItemExecutionGroup,
-  workItemExecutionGroupById,
-  createWorkItem,
-  editWorkItemDefinition,
-  attachWorkItemExecutionGroup,
-  updateWorkItemExecutionGroup,
-  retireWorkItem,
-  prepareWorkItemDispatch,
-  submitWorkItemCandidate,
-  updateWorkItemWriteProjects,
-  updateWorkItemStatus,
-  type WorkItem,
-  type WorkItemProjectBaseRef,
-  type CandidateGitSnapshot,
-  type DirectTaskMainSnapshot,
-  type WorkItemCandidate,
-  type WorkItemStatus
-} from "../workItem/workItem.js";
-import {
-  assertWorkItemDependenciesCompleted as assertWorkItemDependencyGate,
-  WorkItemDependencyGateError
-} from "../workItem/dependencyGate.js";
+  dispatchReviewSynthesis,
+  selectedReviewSynthesisProducers
+} from "../execution/reviewMainRun.js";
 import {
   createExecutionGroup,
   createReviewExecutionAssignment,
@@ -261,22 +67,99 @@ import {
   type WorkItemExecutionLaneWorkspace
 } from "../execution/workItemExecution.js";
 import {
-  dispatchWorkItemSynthesis,
-  selectedWorkItemSynthesisProducers
-} from "../execution/workItemMainRun.js";
-import {
-  dispatchReviewSynthesis,
-  selectedReviewSynthesisProducers
-} from "../execution/reviewMainRun.js";
-import { synthesisSourceRunIds } from "../context/runContextPack.js";
-import {
   projectWorkItemExecution,
   type WorkItemExecutionProjection
 } from "../execution/workItemExecutionProjection.js";
 import {
-  type ManagedWorkspace
-} from "../worktree/managedWorkspace.js";
+  dispatchWorkItemSynthesis,
+  selectedWorkItemSynthesisProducers
+} from "../execution/workItemMainRun.js";
+import {
+  createRoleSessionSet,
+  roleAgentSessionResumeMode,
+  taskRoleControlTarget,
+  updateTaskRoleProviderRuntime
+} from "../executor/agentExecutor.js";
+import {
+  resolveEffectiveLaunch,
+  type EffectiveLaunchSnapshot
+} from "../executor/effectiveLaunch.js";
+import { cancelInputRequest } from "../input/inputRequest.js";
+import {
+  retireExactActiveRun,
+  terminalizeExactTaskRun,
+  validateExactRunReviewRound
+} from "../lifecycle/exactRunTerminalization.js";
+import {
+  resolveTaskInputControl,
+  type ResolvedInputTarget,
+  type InputControlRequest
+} from "../message/inputControlResolution.js";
+import {
+  createTaskMessage,
+  expandTaskMessageResult,
+  recordTaskMessageControlOutcome,
+  TASK_SUBMISSION_INTENTS,
+  taskMessageAuthorLabel,
+  taskMessageInputControlState,
+  updateDraftTaskMessage,
+  withSubmissionReceipt,
+  type TaskMessage,
+  type TaskMessageAuthor,
+  type TaskMessageContext,
+  type TaskMessageInputAction,
+  type TaskMessageKind,
+  type TaskSubmissionIntent
+} from "../message/message.js";
+import { messageContinuationBlocker, resolveMessageRecipient } from "../message/messageContinuation.js";
+import {
+  findTaskInterrupt,
+  reserveTaskInterrupt,
+  taskInterruptReceipt,
+  taskInterruptWasRejected
+} from "../message/taskInterrupt.js";
+import {
+  agentRunConfigurationLabel,
+  renderAgentRunConfiguration
+} from "../output/agentRunConfigurationPresentation.js";
+import { renderRoleDetails, renderRoleLaunchComparison } from "../output/rolePresentation.js";
+import { defaultTableWidth, renderTable } from "../output/table.js";
+import type { AgentProfile } from "../profile/agentProfile.js";
+import {
+  requireResolvedAgentProfileRuntime,
+  type ResolvedAgentProfileRuntime
+} from "../profile/agentProfileRuntime.js";
+import { assertProjectActive, resolveProject, type Project } from "../repository/project.js";
+import { createProjectResources } from "../resources/projectResourceService.js";
+import {
+  buildDeltaRecheckDispatchContext,
+  verifyDeltaRecheckDiff,
+  type DeltaRecheckPreflight
+} from "../review/deltaRecheck.js";
+import { isCompletedTaskReviewEvidence } from "../review/reviewAcceptance.js";
 import type { ReviewConfig } from "../review/reviewConfig.js";
+import {
+  projectReviewerAvailability,
+  type ReviewerBusy
+} from "../review/reviewerAvailability.js";
+import {
+  attachReviewExecutionGroup,
+  createReviewRound,
+  createTaskDeltaReviewRound,
+  createTaskReviewRound,
+  finishReviewRound,
+  recordReviewWorkspaceDisposition,
+  retryReviewRound,
+  retryRunningReviewExecutionLane,
+  retryTaskReviewRound,
+  startReplicatedReviewRound,
+  startReviewRound,
+  updateReviewExecutionGroup,
+  validateTaskReviewCandidate,
+  type ReviewRequestSource,
+  type ReviewRound,
+  type TaskReviewCandidate
+} from "../review/reviewRound.js";
 import {
   sameTaskFinalReviewContract,
   taskFinalReviewConfig,
@@ -287,7 +170,136 @@ import {
   resolveRecordedTaskFinalReviewContract,
   type TaskFinalReviewContractResolution
 } from "../review/taskFinalReviewContractResolution.js";
-import { managedWorkspaceKey } from "../worktree/managedWorkspace.js";
+import {
+  copyGlobalRoleToTaskRole,
+  createRole,
+  createRoleAgentBinding,
+  switchActiveRoleAgent,
+  unbindRoleAgent,
+  updateRole,
+  type Role,
+  type RoleAgentBinding
+} from "../role/role.js";
+import { roleLaunchEventPayload, saveTaskRoleUpdate } from "../role/taskRoleUpdate.js";
+import {
+  RUNTIME_SESSION_REPLACE_REQUIRED_REASON,
+  runtimeLifecycleTarget
+} from "../runtime/lifecycleReservation.js";
+import { currentManagedRuntime, resolveManagedTaskReader } from "../runtime/managedCaller.js";
+import { controlProviderRetry, providerRetryProjection, renderProviderRetry } from "../runtime/providerRetry.js";
+import { currentProviderConversation, transferProviderAuthority } from "../runtime/providerRuntimeIdentity.js";
+import { projectProviderContinuations } from "../runtime/runtimeContinuationProjection.js";
+import { runtimeObservationFromTaskEvent } from "../runtime/runtimeObservation.js";
+import { enqueueOperatorEvent } from "../scheduler/operatorEvent.js";
+import {
+  isRoleRunStalled,
+  RUN_PROGRESS_EVENT,
+  RUN_RECOVERED_EVENT
+} from "../scheduler/roleRunStall.js";
+import { renderWakeReason, wakeReason } from "../scheduler/wakeReason.js";
+import { queueLeaderWakeup } from "../scheduler/wakeupQueue.js";
+import { planningRuntimeCwd } from "../storage/homeLayout.js";
+import { StorageConflictError } from "../storage/taskStore.js";
+import {
+  archiveDeliveryWarnings,
+  archiveRetainedResources,
+  renderArchiveDiagnostics,
+  taskArchiveDiagnostics
+} from "../task/archiveDiagnostics.js";
+import { archiveSettlementChecks } from "../task/archivePreflight.js";
+import {
+  projectCompletionReadiness,
+  type CompletionAdvisory,
+  type CompletionBlocker
+} from "../task/completionReadiness.js";
+import {
+  assertDraftTaskExecutionFree,
+  validateDraftWorkItemEdit
+} from "../task/draftPlan.js";
+import { assertTaskRemoteDeliveryProof, projectTaskRemoteDeliveryFromStore } from "../task/remoteDeliveryService.js";
+import {
+  addTaskProjectBinding,
+  archiveTask,
+  completeTask,
+  createTask,
+  reopenTask,
+  retireTask,
+  taskOwnsManagedWorkspace,
+  updateTaskMetadata,
+  type Task,
+  type TaskMetadata,
+  type TaskMetadataUpdate,
+  type TaskPriority,
+  type TaskProjectBinding,
+  type TaskStatus
+} from "../task/task.js";
+import {
+  recordTaskActivationRequestInTransaction,
+  taskActivationOperationRef
+} from "../task/taskActivationService.js";
+import {
+  assertTaskDeliveryAuthority,
+  assertTaskInputControlAuthority
+} from "../task/taskAuthority.js";
+import {
+  resolveTaskRecordReference
+} from "../task/taskRecordReference.js";
+import {
+  createTaskRecordRetirement,
+  isTaskRecordRetired,
+  operationalTaskRecords,
+  taskRecordRetirement
+} from "../task/taskRecordRetirement.js";
+import {
+  decideSubmissionRouting,
+  describeSubmissionFeedback,
+  draftActivationState,
+  draftHasEnteredPlanning,
+  normalizeSubmissionIntent,
+  sameSubmissionTarget,
+  TASK_PLANNING_ENTERED_EVENT,
+  type SubmissionFeedback,
+  type SubmissionNextStep,
+  type SubmissionReceipt,
+  type SubmissionRouting,
+  type SubmissionTarget
+} from "../task/taskSubmission.js";
+import {
+  assertWorkItemDependenciesCompleted as assertWorkItemDependencyGate,
+  WorkItemDependencyGateError
+} from "../workItem/dependencyGate.js";
+import {
+  attachWorkItemExecutionGroup,
+  createWorkItem,
+  currentWorkItemCandidate,
+  currentWorkItemExecutionGroup,
+  editWorkItemDefinition,
+  prepareWorkItemDispatch,
+  retireWorkItem,
+  submitWorkItemCandidate,
+  updateWorkItemExecutionGroup,
+  updateWorkItemStatus,
+  updateWorkItemWriteProjects,
+  workItemExecutionGroupById,
+  type WorkItem,
+  type WorkItemCandidate,
+  type WorkItemProjectBaseRef,
+  type WorkItemStatus
+} from "../workItem/workItem.js";
+import { CleanupInspectionError } from "../workspace/cleanupInspection.js";
+import type {
+  TaskRetirementProof,
+  WorkItemIntegrationProof
+} from "../workspace/workItemChangeSetManager.js";
+import {
+  managedWorkspaceKey,
+  type ManagedWorkspace
+} from "../worktree/managedWorkspace.js";
+import {
+  runDeliveryGuardPreflight,
+  withGuardWarnings
+} from "./deliveryGuardPreflight.js";
+import { runGrantCommand } from "./grantCommands.js";
 import {
   hasAgentConfigOptions,
   hasNoRoleMutation,
@@ -298,62 +310,75 @@ import {
   type ParsedRoleOptions
 } from "./roleConfiguration.js";
 import {
+  assertRoleRuntimeMutationAllowed
+} from "./roleRuntimeGuard.js";
+import {
   hasRoleLaunchContextOptions,
   validateConfiguredRoleSkills
 } from "./roleSkillValidation.js";
+import { nonLeaderActivationIdentity, runTaskActivationCommand } from "./taskActivationCommands.js";
 import {
-  assertRoleRuntimeMutationAllowed
-} from "./roleRuntimeGuard.js";
+  assertTaskOpen,
+  clock,
+  exactPositionals,
+  leaderActionEventPayload,
+  leaderMailbox,
+  notifyMailbox,
+  optionalNonEmptyOption,
+  output,
+  parseMultiValueTail,
+  parseTail,
+  presentTime,
+  recordTaskEvent,
+  recordTaskEventRecord,
+  requiredOption,
+  requiredText,
+  requireTask,
+  roleMailbox,
+  taskActor,
+  taskMailbox,
+  taskRef,
+  trimmed,
+  type ParsedMultiTail
+} from "./taskCommandSupport.js";
+import {
+  type TaskCommandExecution,
+  type TaskCommandOptions,
+  type TaskCompletionPreflight,
+  type TaskRoleAgentConfigurationMutation,
+  type TaskWorkflowRuntimePort,
+  type TaskWorkflowStore
+} from "./taskCommandTypes.js";
+import {
+  assertTaskCompletionPublishedTreeProof
+} from "./taskCompletionGate.js";
 import { runTaskContextCommand } from "./taskContextCommand.js";
-import { listContextMessages } from "../context/taskContext.js";
-import { createProjectResources, type EnvironmentPlan } from "../resources/projectResourceService.js";
+import { taskBriefCommand, taskDecisionCommand, taskEventCommand, taskMilestoneCommand } from "./taskFactCommands.js";
 import {
-  isGitArtifactRefString,
-  parseGitArtifactRef,
-  type GitArtifactRef
-} from "../artifacts/gitArtifactRef.js";
-import { runTaskNextActionCommand } from "./taskNextActionCommand.js";
-import {
-  runDeliveryGuardPreflight,
-  withGuardWarnings
-} from "./deliveryGuardPreflight.js";
-import {
-  inspectTaskRoleRuntimeStatuses,
-  renderTaskRoleRuntimeStatus,
-  taskRoleActiveWorkLabel,
-  taskRoleLastRunLabel,
-  taskRoleNativeSessionLabel,
-  taskRoleOpenInputLabel,
-  taskRoleTmuxLabel,
-  withTaskRoleHostObservation,
-  taskRoleHostDiagnostic,
-  type TaskRoleHostObservation
-} from "./taskRoleRuntimeStatus.js";
-import {
-  assertNoOpenInputRequests,
   openInputRequestCount,
   runTaskInputCommand
 } from "./taskInputCommands.js";
-import { runGrantCommand } from "./grantCommands.js";
-import { runWorkflowCommand } from "./workflowCommands.js";
-import {
-  taskLocalActor as resolveTaskLocalActor,
-  assertTaskDeliveryAuthority,
-  assertTaskInputControlAuthority
-} from "./taskActor.js";
-import { currentManagedRuntime, resolveManagedTaskReader } from "../runtime/managedCaller.js";
-import { parseTaskCatalogOptions, readTaskCatalog, renderTaskCatalog, taskCatalogScope } from "../context/taskCatalog.js";
-import { resolveMessageRecipient, messageContinuationBlocker } from "../message/messageContinuation.js";
-import { findTaskInterrupt, reserveTaskInterrupt, taskInterruptReceipt, taskInterruptWasRejected } from "../message/taskInterrupt.js";
-import { resolveTaskInputControl, type ResolvedInputTarget } from "../message/inputControlResolution.js";
-import { enqueueOperatorEvent } from "../scheduler/operatorEvent.js";
-import { queueLeaderWakeup } from "../scheduler/wakeupQueue.js";
-import { renderWakeReason, wakeReason } from "../scheduler/wakeReason.js";
+import { runTaskNextActionCommand } from "./taskNextActionCommand.js";
 import {
   buildTaskOverview,
   parseTaskListOptions,
   renderTaskOverview
 } from "./taskOverviewCommand.js";
+import { runPublicationCommand } from "./taskPublicationCommands.js";
+import { renderTaskRemoteDelivery, runTaskRemoteDeliveryCommand } from "./taskRemoteDeliveryCommand.js";
+import {
+  inspectTaskRoleRuntimeStatuses,
+  renderTaskRoleRuntimeStatus,
+  taskRoleActiveWorkLabel,
+  taskRoleHostDiagnostic,
+  taskRoleLastRunLabel,
+  taskRoleNativeSessionLabel,
+  taskRoleOpenInputLabel,
+  taskRoleTmuxLabel,
+  withTaskRoleHostObservation
+} from "./taskRoleRuntimeStatus.js";
+import { readCommandText } from "./textInput.js";
+import { runWorkflowCommand } from "./workflowCommands.js";
 
 const LEADER_ROLE = "leader";
 
@@ -450,149 +475,6 @@ function taskFinalReviewContractForMutation(
   return stored;
 }
 
-export type TaskCommandExecution =
-  | Readonly<{ kind: "output"; output: string; data?: unknown }>
-  | Readonly<{
-      kind: "session-stop";
-      taskId: string;
-      roleName: string;
-      agentId: string;
-      adapterId: string;
-      nativeSessionId: string;
-      sessionUpdatedAt: string;
-      reason: string;
-      output: string;
-    }>
-  | Readonly<{
-      kind: "view";
-      taskId: string;
-      roleName: string;
-      access: "read-only";
-      output?: string;
-    }>
-  | Readonly<{
-      kind: "authority";
-      action: "takeover" | "release";
-      taskId: string;
-      roleName: string;
-      nativeSessionId: string;
-      authority: ProviderAuthorityFence;
-      output: string;
-    }>
-  | Readonly<{
-      /**
-       * A resolved live steer against the exact current native Turn. Core has
-       * already persisted the Message and proven the target, capability, and
-       * writer fence from durable state; the CLI performs the one Agent Host
-       * steer call and never re-decides urgency, target, or fallback.
-       */
-      kind: "input-steer";
-      taskId: string;
-      roleName: string;
-      messageId: string;
-      target: ResolvedInputTarget;
-      /** Stable Provider request id for the steer; repeating it is idempotent. */
-      receiptId: string;
-      text: string;
-      output: string;
-    }>
-  | Readonly<{
-      /**
-       * A resolved live interrupt of the exact current native Turn, delivered
-       * only through the Provider's native cancel. Core has proven native
-       * interrupt capability and the exact target; the CLI performs the one
-       * Agent Host cancel and never kills, restarts, or detaches the process.
-       */
-      kind: "input-interrupt";
-      taskId: string;
-      roleName: string;
-      target: ResolvedInputTarget;
-      /** Stable Provider request id for the cancel; repeating it is idempotent. */
-      receiptId: string;
-      /** The claimed then-handoff Message to deliver once, when one was chosen. */
-      thenMessageId?: string;
-      output: string;
-    }>;
-
-/**
- * The command layer only persists intent. It never launches an Agent, writes
- * terminal bytes, or attaches a tmux client.
- */
-export type TaskWorkflowRuntimePort = Readonly<{
-  notifyStateChanged(taskId: string): void;
-  notifyMailboxChanged?(target: MailboxTarget): void | Promise<void>;
-  reconcileTask(taskId: string): void;
-  inspectTaskRolePanes?(taskId: string): readonly TmuxRolePaneState[];
-}>;
-
-export type TaskWorkflowStore = TaskStore;
-
-export type TaskRoleAgentConfigurationMutation = Readonly<{
-  agentId: string;
-  config: RoleAgentConfig;
-  cwd: string;
-}>;
-
-export type TaskCommandOptions = Readonly<{
-  /** Controller-only recovery identity; ordinary user retry uses the same CAS. */
-  providerRetryChainId?: string;
-  runtime?: TaskWorkflowRuntimePort;
-  now?: () => Date;
-  environment?: NodeJS.ProcessEnv;
-  yuiHome?: string;
-  /** Completion CLI parsing may read stdin/files before remote reconciliation. */
-  completionSummary?: string;
-  /** Explicit Git/publication proof prepared before completion mutation. */
-  completionPublishedTreeProof?: TaskCompletionPublishedTreeProof;
-  workItemIntegrationProof?: WorkItemIntegrationProof;
-  candidateGitSnapshot?: CandidateGitSnapshot;
-  /** CLI-verified clean Task-main snapshot for exact direct capture or safe delivery promotion. */
-  directTaskMainSnapshot?: DirectTaskMainSnapshot;
-  /** Prepared by the repository/workspace lifecycle before command mutation. */
-  executionLaneWorkspaces?: ReadonlyMap<string, ManagedWorkspace>;
-  /** Atomic Draft -> active plus Task-main workspace adoption completed by CLI preflight. */
-  taskWorkspaceActivation?: TaskWorkspaceActivation;
-  /**
-   * Under-fence Project path snapshot captured when a new Group's Lane
-   * workspaces were prepared. The dispatch aggregate CAS revalidates the Task
-   * binding set and exact Project paths against it, so a project migrate in
-   * the prepare/adopt gap fails closed instead of stranding a Lane on the
-   * external checkout. Undefined when no fence is held (existing Group).
-   */
-  laneDispatchProjectPaths?: ReadonlyMap<string, string>;
-  taskRetirementProof?: TaskRetirementProof;
-  /** Verified by exact CLI preflight; never reconstructed from process.env. */
-  taskFinalReviewContract?: TaskFinalReviewContract;
-  /** Verified under the release handover lock by the exact global Operator CLI. */
-  /** Physical Task-main heads verified by the CLI immediately before command execution. */
-  actualTaskReviewCandidate?: TaskReviewCandidate;
-  /** CLI-frozen remote merge coverage checked before destructive archive cleanup. */
-  archiveRemoteDeliveryProof?: TaskRemoteDeliveryProof;
-  /** Issue 07: CLI-verified delta-recheck assessment for `task review request --delta-recheck`. */
-  deltaRecheckPreflight?: DeltaRecheckPreflight;
-  /** Issue 07: per-Project diff text for a delta-recheck dispatch, digest-verified. */
-  deltaRecheckDiff?: Readonly<Record<string, string>>;
-  /**
-   * What the live Agent reported it is running under, read by the CLI before a
-   * Session inspect.
-   *
-   * Absent for every other command, and absent rather than empty when no Session
-   * has ever run — the inspect prints only persisted facts in that case. When
-   * present it is a reading, not a request: the Role's configuration remains the
-   * expectation, and this states what the Agent answered about it.
-   */
-  liveRunConfiguration?: AgentRunConfigurationObservation;
-  liveHostObservations?: Readonly<Record<string, TaskRoleHostObservation>>;
-  /** CLI-prepared capability validation; throws before a Role mutation persists. */
-  validateAgentConfiguration?: (
-    input: Readonly<{
-      agentId: string;
-      config: RoleAgentConfig;
-      cwd: string;
-    }>
-  ) => void;
-}>;
-
 /**
  * Resolve the exact Task Role binding a CLI command would write, without
  * mutating Task state. The CLI uses this to complete live/cache/fallback
@@ -681,18 +563,6 @@ export function previewTaskRoleAgentConfigurationMutation(
   return undefined;
 }
 
-export type TaskCompletionPreflight = Readonly<{
-  task: Task;
-  actor: TaskCompletedBy;
-  completed: boolean;
-  /** Existing Task-final ReviewRound must use the normal resume/block path. */
-  activeTaskReview: boolean;
-  taskFinalReviewContract?: TaskFinalReviewContract;
-}>;
-
-/** Normal scheduling result when a Reviewer slot is temporarily occupied. */
-export type ReviewRequestBusy = ReviewerBusy;
-
 export function parseTaskCompletionRequest(
   args: string[],
   summaryOverride?: string
@@ -749,7 +619,7 @@ export function preflightTaskCompletion(
   taskId: string,
   store: TaskWorkflowStore,
   options: TaskCommandOptions = {},
-  request: Readonly<{ acceptedPublishedTreePublicationId?: string }> = {}
+  _request: Readonly<{ acceptedPublishedTreePublicationId?: string }> = {}
 ): TaskCompletionPreflight {
   const task = requireTask(store, taskId);
   const actor = taskActor(store, options, task.id);
@@ -816,7 +686,7 @@ export function runTaskCommand(
   const delivery = command === "complete"
     || (command === "work" && ["dispatch", "synthesize", "review", "accept"].includes(rest[0] ?? ""))
     || (command === "review" && !["list", "show"].includes(rest[0] ?? ""))
-    || ((command === "run" || command === "run") && rest[0] === "retry");
+    || (command === "run" && rest[0] === "retry");
   if (delivery && options.environment?.YUI_SESSION_SCOPE === "task"
     && options.environment.YUI_TASK_ID !== undefined) {
     assertTaskDeliveryAuthority(store, options.environment, options.environment.YUI_TASK_ID);
@@ -866,7 +736,6 @@ export function runTaskCommand(
     case "role": return taskRoleCommand(rest, store, options);
     case "work": return taskWorkCommand(rest, store, options);
     case "review": return taskReviewCommand(rest, store, options);
-    case "run":
     case "run": return taskRunCommand(rest, store, options);
     case "brief": return taskBriefCommand(rest, store, options);
     case "decision": return taskDecisionCommand(rest, store, options);
@@ -2578,6 +2447,14 @@ function taskMessageCommand(
  * reusing the requestId with different content is a conflict, never a second
  * input (decision-3 §5/§6).
  */
+export function applyTaskInputControl(
+  taskId: string, input: InputControlRequest, store: TaskWorkflowStore, options: TaskCommandOptions
+): TaskCommandExecution {
+  if (input.action === "queue") return queueTaskInput(taskId, input, store, options);
+  if (input.action === "steer") return steerTaskInput(taskId, input, store, options);
+  return interruptTaskInput(taskId, input, store, options);
+}
+
 function queueTaskMessage(
   args: string[],
   store: TaskWorkflowStore,
@@ -2595,10 +2472,20 @@ function queueTaskMessage(
   const recipientRole = parsed.options.get("--to");
   const workItemId = parsed.options.get("--work-item");
   const reviewRoundId = parsed.options.get("--review-round");
+  return applyTaskInputControl(parsed.positionals[0]!, {
+    action: "queue", body, requestId, to: recipientRole, workItem: workItemId, reviewRound: reviewRoundId
+  }, store, options);
+}
+
+function queueTaskInput(
+  taskId: string, input: Extract<InputControlRequest, { action: "queue" }>,
+  store: TaskWorkflowStore, options: TaskCommandOptions
+): TaskCommandExecution {
+  const { body, requestId, to: recipientRole, workItem: workItemId, reviewRound: reviewRoundId } = input;
   if (recipientRole === undefined && (workItemId !== undefined || reviewRoundId !== undefined)) {
     throw usageError("--to is required for scoped Message delivery.");
   }
-  const result = sendTaskMessageCommand(store, parsed.positionals[0], body, undefined, options,
+  const result = sendTaskMessageCommand(store, taskId, body, undefined, options,
     recipientRole === undefined ? undefined : { roleName: recipientRole, workItemId, reviewRoundId },
     undefined, undefined, { action: "queue", requestId });
   const reason = result.message.continuation?.notDeliveredReason;
@@ -2640,6 +2527,17 @@ function steerTaskMessage(
   if (recipientRole === undefined) {
     throw usageError("steer requires --to <role>; it targets that Role's exact current Turn.");
   }
+  return applyTaskInputControl(parsed.positionals[0]!, {
+    action: "steer", body, requestId, expectedTarget, to: recipientRole,
+    workItem: workItemId, reviewRound: reviewRoundId
+  }, store, options);
+}
+
+function steerTaskInput(
+  taskId: string, input: Extract<InputControlRequest, { action: "steer" }>,
+  store: TaskWorkflowStore, options: TaskCommandOptions
+): TaskCommandExecution {
+  const { body, requestId, expectedTarget, to: recipientRole, workItem: workItemId, reviewRound: reviewRoundId } = input;
   // decision-3 §9: a Task Leader's current native turn (including a Draft's
   // planning turn) is a real turn but NOT an implicit AgentRun, so steering it
   // never establishes a Worker-style Assignment. It is persisted as an ordinary
@@ -2651,9 +2549,9 @@ function steerTaskMessage(
     throw usageError("Steering the Leader targets its current turn directly; it takes no --work-item/--review-round Assignment.");
   }
   const result = leaderTarget
-    ? sendTaskMessageCommand(store, parsed.positionals[0], body, "none", options,
+    ? sendTaskMessageCommand(store, taskId, body, "none", options,
         undefined, undefined, undefined, { action: "steer", requestId, expectedTarget })
-    : sendTaskMessageCommand(store, parsed.positionals[0], body, undefined, options,
+    : sendTaskMessageCommand(store, taskId, body, undefined, options,
         { roleName: recipientRole, workItemId, reviewRoundId }, undefined, undefined,
         { action: "steer", requestId, expectedTarget });
   const roleName = result.message.recipient?.roleName ?? recipientRole;
@@ -3108,9 +3006,19 @@ function interruptTaskRole(
   const expectedTarget = requiredOption(parsed.options, "--expected-target");
   const thenMessageRef = optionalNonEmptyOption(parsed.options, "--then-message");
   const requestId = optionalNonEmptyOption(parsed.options, "--request-id");
+  return applyTaskInputControl(parsed.positionals[0]!, {
+    action: "interrupt", expectedTarget, role: parsed.positionals[1]!, thenMessage: thenMessageRef, requestId
+  }, store, options);
+}
+
+function interruptTaskInput(
+  taskId: string, input: Extract<InputControlRequest, { action: "interrupt" }>,
+  store: TaskWorkflowStore, options: TaskCommandOptions
+): TaskCommandExecution {
+  const { expectedTarget, thenMessage: thenMessageRef, requestId } = input;
   const now = clock(options);
-  const task = requireTask(store, parsed.positionals[0]);
-  const role = requireRole(store, task.id, parsed.positionals[1]);
+  const task = requireTask(store, taskId);
+  const role = requireRole(store, task.id, input.role);
   const fingerprint = createHash("sha256").update(JSON.stringify({
     roleName: role.name, expectedTarget, thenMessageRef: thenMessageRef ?? null
   })).digest("hex");
@@ -6682,7 +6590,7 @@ function retryRunOperation(
 }
 
 function actualTaskReviewCandidateForMutation(
-  store: TaskWorkflowStore,
+  _store: TaskWorkflowStore,
   task: Task,
   options: TaskCommandOptions
 ): TaskReviewCandidate {
@@ -7032,9 +6940,9 @@ function resumablePendingFinalTaskReview(
   task: Task,
   round: ReviewRound,
   config: ReviewConfig,
-  taskCandidate: TaskReviewCandidate,
+  _taskCandidate: TaskReviewCandidate,
   taskFinalContract: TaskFinalReviewContract | undefined,
-  options: TaskCommandOptions
+  _options: TaskCommandOptions
 ): ReviewRound {
   if (taskFinalContract === undefined || round.taskFinalReviewContract === undefined) {
     throw usageError(`Final Task Review is still active: ${round.id}/${round.status}.`);
@@ -8450,39 +8358,6 @@ function appendMessage(
   return message;
 }
 
-function recordTaskEvent(
-  store: TaskWorkflowStore,
-  taskId: string,
-  type: string,
-  payload: TaskEventPayload,
-  now: Date
-): TaskEvent {
-  return recordTaskEventRecord(store, taskId, type, payload, now);
-}
-
-function leaderActionEventPayload(
-  store: TaskWorkflowStore,
-  taskId: string,
-  options: TaskCommandOptions
-): TaskEventPayload {
-  const caller = currentManagedRuntime(store, options.environment, taskId, "leader");
-  // A long-lived Session may be handling direct input while another request
-  // awaits admission. The Role's active pointer cannot prove command origin.
-  return caller === undefined ? {} : { leaderNativeSessionId: caller.nativeSessionId };
-}
-
-function recordTaskEventRecord(
-  store: TaskWorkflowStore,
-  taskId: string,
-  type: string,
-  payload: TaskEventPayload,
-  now: Date
-): TaskEvent {
-  const event = createTaskEvent(store.nextEventId(taskId), taskId, type, payload, now);
-  store.saveEvent(taskId, event);
-  return event;
-}
-
 /** Keeps a free-text AgentRun-fact note bounded so an event payload stays compact. */
 function truncateEventNote(note: string): string {
   const normalized = note.trim();
@@ -8517,13 +8392,6 @@ function runLaunchEventPayload(run: AgentRun): TaskEventPayload {
           reviewBaseCommit: run.effective.reviewBaseCommit ?? "none"
         })
   };
-}
-
-function requireTask(store: TaskWorkflowStore, taskId: string | undefined): Task {
-  const id = requiredText(taskId, "Task id");
-  const task = store.getTask(id);
-  if (task === null) throw taskNotFound(id);
-  return task;
 }
 
 function requireRole(store: TaskWorkflowStore, taskId: string, roleName: string | undefined): Role {
@@ -8592,23 +8460,6 @@ function activeRunPointer(store: TaskWorkflowStore, run: AgentRun): AgentRun | n
     : store.getActiveRun(run.taskId, run.roleName);
 }
 
-function requireReviewRound(
-  store: TaskWorkflowStore,
-  reviewRoundId: string | undefined,
-  options: TaskCommandOptions
-): ReviewRound {
-  const reference = taskRecordReference(
-    reviewRoundId,
-    "reviewRound",
-    "ReviewRound reference",
-    options
-  );
-  const round = store.getReviewRound(reference.taskId, reference.localId);
-  if (round === null) {
-    throw usageError(`ReviewRound not found: ${reference.taskId}/${reference.localId}.`);
-  }
-  return round;
-}
 
 function taskRecordReference(
   value: string | undefined,
@@ -8654,30 +8505,11 @@ function isTerminalWorkItemStatus(status: WorkItemStatus): boolean {
   return ["accepted", "retired"].includes(status);
 }
 
-function assertTaskOpen(task: Task): void {
-  if (task.status === "completed") {
-    throw usageError(`Task ${task.id} is completed; reopen it before continuing.`);
-  }
-  if (task.status === "archived") throw usageError(`Task is archived: ${task.id}.`);
-  if (task.status === "cancelled") throw usageError(`Task is retired: ${task.id}.`);
-}
-
 function assertTaskExecutionEnabled(task: Task, action: string): void {
   if (task.executionGate.state === "enabled") return;
   throw usageError(
     `Task execution is stopped: ${task.id}. Run "yui task execution start ${task.id}" before ${action}.`
   );
-}
-
-function taskActor(
-  store: Pick<
-    TaskWorkflowStore,
-    "getRole" | "getActiveRun" | "getTaskRoleSessionSet" | "listEvents"
-  >,
-  options: TaskCommandOptions,
-  taskId: string
-) {
-  return resolveTaskLocalActor(store, options.environment, taskId);
 }
 
 function inactiveTaskMessage(task: Task, action: string): string {
@@ -8845,357 +8677,11 @@ function parseIsoTimestamp(value: string, label: string): string {
   return timestamp.toISOString();
 }
 
-function taskBriefCommand(
-  args: string[],
-  store: TaskWorkflowStore,
-  options: TaskCommandOptions
-): TaskCommandExecution {
-  const [command, ...rest] = args;
-  if (command === "show") {
-    exactPositionals(rest, 1, "Task brief show usage: yui task brief show <task>.");
-    const task = requireTask(store, rest[0]);
-    const brief = store.getTaskBrief(task.id);
-    if (brief === null) {
-      return output(`Task ${task.id} has no brief.\n`, { taskId: task.id, brief: null });
-    }
-    const timeZone = store.getConfig().timeZone;
-    return output([
-      `Task: ${task.id}`,
-      `Objective: ${brief.objective}`,
-      `Boundaries:`,
-      ...(brief.boundaries.length === 0 ? ["  (none)"] : brief.boundaries.map((b) => `  - ${b}`)),
-      `Technical approach: ${brief.technicalApproach || "(not defined)"}`,
-      `Current focus: ${brief.currentFocus}`,
-      `Leader summary: ${brief.leaderSummary}`,
-      `Updated by: ${brief.updatedBy}`,
-      `Updated at: ${presentTime(brief.updatedAt, timeZone)}`
-    ].join("\n").concat("\n"), { taskId: task.id, brief });
-  }
-  if (command === "update") {
-    const usage = "Task brief update usage: yui task brief update <task> [--objective <text>] [--boundary <text> ...] [--approach <text>] [--focus <text>] [--leader-summary <text>].";
-    const parsed = parseMultiValueTail(
-      rest,
-      new Set(["--objective", "--approach", "--focus", "--leader-summary"]),
-      new Set(["--boundary"]),
-      usage
-    );
-    exactPositionals(parsed.positionals, 1, usage);
-    const hasObjective = parsed.options.has("--objective");
-    const hasApproach = parsed.options.has("--approach");
-    const hasFocus = parsed.options.has("--focus");
-    const hasSummary = parsed.options.has("--leader-summary");
-    const boundaries = parsed.multiOptions.get("--boundary") ?? [];
-    if (!hasObjective && !hasApproach && !hasFocus && !hasSummary && boundaries.length === 0) {
-      throw usageError("At least one brief field is required.", usage);
-    }
-    const now = clock(options);
-    const result = store.transaction((tx) => {
-      const task = requireTask(tx, parsed.positionals[0]);
-      assertTaskOpen(task);
-      const existing = tx.getTaskBrief(task.id);
-      const updatedBy = taskActor(tx, options, task.id);
-      const brief = existing === null
-        ? createTaskBrief({
-            objective: requiredText(parsed.options.get("--objective"), "--objective"),
-            boundaries,
-            ...(hasApproach
-              ? { technicalApproach: requiredText(
-                  parsed.options.get("--approach"),
-                  "--approach"
-                ) }
-              : {}),
-            currentFocus: requiredText(parsed.options.get("--focus"), "--focus"),
-            leaderSummary: requiredText(parsed.options.get("--leader-summary"), "--leader-summary"),
-            updatedBy
-          }, now)
-        : updateTaskBrief(existing, {
-            ...(hasObjective ? { objective: parsed.options.get("--objective") } : {}),
-            ...(boundaries.length > 0 ? { boundaries } : {}),
-            ...(hasApproach
-              ? { technicalApproach: parsed.options.get("--approach") }
-              : {}),
-            ...(hasFocus ? { currentFocus: parsed.options.get("--focus") } : {}),
-            ...(hasSummary ? { leaderSummary: parsed.options.get("--leader-summary") } : {})
-          }, updatedBy, now);
-      tx.saveTaskBrief(task.id, brief);
-      recordTaskEvent(tx, task.id, "brief.updated", {
-        updatedBy,
-        previous: JSON.stringify(existing), current: JSON.stringify(brief)
-      }, now);
-      enqueueWork(tx, taskMailbox(task.id), "brief-updated", now, [taskRef(task.id)]);
-      if (task.status === "active" && updatedBy !== "leader") {
-        enqueueWork(tx, leaderMailbox(task.id), "brief-updated", now, [taskRef(task.id)]);
-      }
-      return { task, brief };
-    });
-    notifyMailbox(options.runtime, taskMailbox(result.task.id), result.task.id);
-    if (result.task.status === "active") {
-      notifyMailbox(options.runtime, leaderMailbox(result.task.id), result.task.id);
-    }
-    return output(`Updated brief for ${result.task.id}\n`, { taskId: result.task.id, brief: result.brief });
-  }
-  throw usageError(command === undefined
-    ? "Task brief command is required."
-    : `Unknown command: task brief ${command}`);
-}
-
 /** Persist only edited fields, not another copy of aggregate execution history.
  * Null records an absent optional field so clearing it remains observable. */
 function editedFieldValues(record: object, fields: readonly string[]): string {
   const values = record as Record<string, unknown>;
   return JSON.stringify(Object.fromEntries(fields.map((field) => [field, values[field] ?? null])));
-}
-
-function taskDecisionCommand(
-  args: string[],
-  store: TaskWorkflowStore,
-  options: TaskCommandOptions
-): TaskCommandExecution {
-  const [command, ...rest] = args;
-  if (command === "record") {
-    const usage = "Task decision record usage: yui task decision record <task> --title <text> --rationale <text>.";
-    const parsed = parseTail(rest, new Set(["--title", "--rationale"]), usage);
-    exactPositionals(parsed.positionals, 1, usage);
-    const title = requiredOption(parsed.options, "--title");
-    const rationale = requiredOption(parsed.options, "--rationale");
-    const now = clock(options);
-    const result = store.transaction((tx) => {
-      const task = requireTask(tx, parsed.positionals[0]);
-      assertTaskOpen(task);
-      const actor = taskActor(tx, options, task.id);
-      const decision = createDecision(tx.nextDecisionId(task.id), task.id, title, rationale, now);
-      tx.saveDecision(task.id, decision);
-      recordTaskEvent(tx, task.id, "decision.recorded", {
-        decisionId: decision.id,
-        title,
-        ...leaderActionEventPayload(tx, task.id, options)
-      }, now);
-      enqueueWork(tx, taskMailbox(task.id), "decision-recorded", now, [taskRef(task.id)]);
-      if (task.status === "active" && actor !== "leader") {
-        enqueueWork(tx, leaderMailbox(task.id), "decision-recorded", now, [taskRef(task.id)]);
-      }
-      return { task, decision };
-    });
-    notifyMailbox(options.runtime, taskMailbox(result.task.id), result.task.id);
-    if (result.task.status === "active") notifyMailbox(options.runtime, leaderMailbox(result.task.id), result.task.id);
-    return output(`Recorded decision ${result.decision.id} for ${result.task.id}\n`);
-  }
-  if (command === "list") {
-    const usage = "Task decision list usage: yui task decision list <task> [--status active|superseded].";
-    const parsed = parseTail(rest, new Set(["--status"]), usage);
-    exactPositionals(parsed.positionals, 1, usage);
-    const task = requireTask(store, parsed.positionals[0]);
-    let decisions = store.listDecisions(task.id);
-    const status = parsed.options.get("--status");
-    if (status !== undefined) {
-      if (status !== "active" && status !== "superseded") {
-        throw usageError("--status must be active or superseded.", usage);
-      }
-      decisions = decisions.filter((d) => d.status === status);
-    }
-    if (decisions.length === 0) {
-      return output(`No decisions found for ${task.id}.\n`, { taskId: task.id, decisions: [] });
-    }
-    const timeZone = store.getConfig().timeZone;
-    return output(`${renderTable(
-      `Decisions: ${task.id}`,
-      [
-        { header: "Decision", minWidth: 8, maxWidth: 18 },
-        { header: "Status", minWidth: 6, maxWidth: 12 },
-        { header: "Title", minWidth: 8, maxWidth: 64 },
-        { header: "Created", minWidth: 10, maxWidth: 28 }
-      ],
-      decisions.map((d) => [d.id, d.status, d.title, presentTime(d.createdAt, timeZone)]),
-      defaultTableWidth()
-    )}\n`, { taskId: task.id, decisions });
-  }
-  if (command === "show") {
-    exactPositionals(rest, 2, "Task decision show usage: yui task decision show <task> <decision>.");
-    const task = requireTask(store, rest[0]);
-    const decision = store.getDecision(task.id, rest[1]);
-    if (decision === null) throw dataError(`Decision not found: ${rest[1]}.`);
-    const timeZone = store.getConfig().timeZone;
-    return output([
-      `Decision: ${decision.id}`,
-      `Task: ${task.id}`,
-      `Title: ${decision.title}`,
-      `Rationale: ${decision.rationale}`,
-      `Status: ${decision.status}`,
-      ...(decision.supersededReason === undefined ? [] : [`Superseded reason: ${decision.supersededReason}`]),
-      ...(decision.supersededAt === undefined ? [] : [`Superseded at: ${presentTime(decision.supersededAt, timeZone)}`]),
-      `Created: ${presentTime(decision.createdAt, timeZone)}`,
-      `Updated: ${presentTime(decision.updatedAt, timeZone)}`
-    ].join("\n").concat("\n"), { taskId: task.id, decision });
-  }
-  if (command === "supersede") {
-    const usage = "Task decision supersede usage: yui task decision supersede <task> <decision> --reason <text>.";
-    const parsed = parseTail(rest, new Set(["--reason"]), usage);
-    exactPositionals(parsed.positionals, 2, usage);
-    const reason = requiredOption(parsed.options, "--reason");
-    const now = clock(options);
-    const result = store.transaction((tx) => {
-      const task = requireTask(tx, parsed.positionals[0]);
-      assertTaskOpen(task);
-      const actor = taskActor(tx, options, task.id);
-      const existing = tx.getDecision(task.id, parsed.positionals[1]);
-      if (existing === null) throw dataError(`Decision not found: ${parsed.positionals[1]}.`);
-      const decision = supersedeDecision(existing, reason, now);
-      tx.saveDecision(task.id, decision);
-      recordTaskEvent(tx, task.id, "decision.superseded", {
-        decisionId: decision.id,
-        reason,
-        ...leaderActionEventPayload(tx, task.id, options)
-      }, now);
-      enqueueWork(tx, taskMailbox(task.id), "decision-superseded", now, [taskRef(task.id)]);
-      if (task.status === "active" && actor !== "leader") {
-        enqueueWork(tx, leaderMailbox(task.id), "decision-superseded", now, [taskRef(task.id)]);
-      }
-      return { task, decision };
-    });
-    notifyMailbox(options.runtime, taskMailbox(result.task.id), result.task.id);
-    if (result.task.status === "active") notifyMailbox(options.runtime, leaderMailbox(result.task.id), result.task.id);
-    return output(`Superseded decision ${result.decision.id} for ${result.task.id}\n`);
-  }
-  throw usageError(command === undefined
-    ? "Task decision command is required."
-    : `Unknown command: task decision ${command}`);
-}
-
-function taskMilestoneCommand(
-  args: string[],
-  store: TaskWorkflowStore,
-  options: TaskCommandOptions
-): TaskCommandExecution {
-  const [command, ...rest] = args;
-  if (command === "add") {
-    const usage = "Task milestone add usage: yui task milestone add <task> --title <text> --summary <text>.";
-    const parsed = parseTail(rest, new Set(["--title", "--summary"]), usage);
-    exactPositionals(parsed.positionals, 1, usage);
-    const title = requiredOption(parsed.options, "--title");
-    const summary = requiredOption(parsed.options, "--summary");
-    const now = clock(options);
-    const result = store.transaction((tx) => {
-      const task = requireTask(tx, parsed.positionals[0]);
-      assertTaskOpen(task);
-      const actor = taskActor(tx, options, task.id);
-      const milestone = createMilestone(
-        tx.nextMilestoneId(task.id),
-        task.id,
-        title,
-        summary,
-        actor,
-        now
-      );
-      tx.saveMilestone(task.id, milestone);
-      recordTaskEvent(tx, task.id, "milestone.added", {
-        milestoneId: milestone.id,
-        title,
-        ...leaderActionEventPayload(tx, task.id, options)
-      }, now);
-      enqueueWork(tx, taskMailbox(task.id), "milestone-added", now, [taskRef(task.id)]);
-      return { task, milestone };
-    });
-    notifyMailbox(options.runtime, taskMailbox(result.task.id), result.task.id);
-    return output(`Added milestone ${result.milestone.id} for ${result.task.id}\n`);
-  }
-  if (command === "list") {
-    exactPositionals(rest, 1, "Task milestone list usage: yui task milestone list <task>.");
-    const task = requireTask(store, rest[0]);
-    const milestones = store.listMilestones(task.id);
-    if (milestones.length === 0) {
-      return output(`No milestones found for ${task.id}.\n`, { taskId: task.id, milestones: [] });
-    }
-    const timeZone = store.getConfig().timeZone;
-    return output(`${renderTable(
-      `Milestones: ${task.id}`,
-      [
-        { header: "Milestone", minWidth: 9, maxWidth: 18 },
-        { header: "Title", minWidth: 8, maxWidth: 64 },
-        { header: "Created", minWidth: 10, maxWidth: 28 }
-      ],
-      milestones.map((m) => [m.id, m.title, presentTime(m.createdAt, timeZone)]),
-      defaultTableWidth()
-    )}\n`, { taskId: task.id, milestones });
-  }
-  if (command === "show") {
-    exactPositionals(rest, 2, "Task milestone show usage: yui task milestone show <task> <milestone>.");
-    const task = requireTask(store, rest[0]);
-    const milestone = store.getMilestone(task.id, rest[1]);
-    if (milestone === null) throw dataError(`Milestone not found: ${rest[1]}.`);
-    const timeZone = store.getConfig().timeZone;
-    return output([
-      `Milestone: ${milestone.id}`,
-      `Task: ${task.id}`,
-      `Title: ${milestone.title}`,
-      `Summary: ${milestone.summary}`,
-      `Created by: ${milestone.createdBy}`,
-      `Created: ${presentTime(milestone.createdAt, timeZone)}`
-    ].join("\n").concat("\n"), { taskId: task.id, milestone });
-  }
-  throw usageError(command === undefined
-    ? "Task milestone command is required."
-    : `Unknown command: task milestone ${command}`);
-}
-
-function taskEventCommand(
-  args: string[],
-  store: TaskWorkflowStore
-): TaskCommandExecution {
-  const [command, ...rest] = args;
-  if (command === "list") {
-    const eventListUsage = "Task event list usage: yui task event list <task> [--after <timestamp>] [--limit <n>].";
-    const parsed = parseTail(rest, new Set(["--after", "--limit"]), eventListUsage);
-    exactPositionals(parsed.positionals, 1, eventListUsage);
-    const task = requireTask(store, parsed.positionals[0]);
-    let events = store.listEvents(task.id);
-    const after = optionalNonEmptyOption(parsed.options, "--after");
-    if (after !== undefined) {
-      const afterMs = Date.parse(after);
-      if (!Number.isFinite(afterMs)) throw usageError("--after must be a valid timestamp.", eventListUsage);
-      events = events.filter((e) => Date.parse(e.createdAt) > afterMs);
-    }
-    const limit = optionalNonEmptyOption(parsed.options, "--limit");
-    if (limit !== undefined) {
-      const n = Number(limit);
-      if (!Number.isSafeInteger(n) || n <= 0) throw usageError("--limit must be a positive integer.", eventListUsage);
-      events = events.slice(-n);
-    }
-    if (events.length === 0) {
-      return output(`No events found for ${task.id}.\n`, { taskId: task.id, events: [] });
-    }
-    const timeZone = store.getConfig().timeZone;
-    return output(`${renderTable(
-      `Events: ${task.id}`,
-      [
-        { header: "Event", minWidth: 8, maxWidth: 18 },
-        { header: "Type", minWidth: 8, maxWidth: 28 },
-        { header: "Created", minWidth: 10, maxWidth: 28 }
-      ],
-      events.map((e) => [e.id, e.type, presentTime(e.createdAt, timeZone)]),
-      defaultTableWidth()
-    )}\n`, { taskId: task.id, events });
-  }
-  if (command === "show") {
-    exactPositionals(rest, 2, "Task event show usage: yui task event show <task> <event>.");
-    const task = requireTask(store, rest[0]);
-    const events = store.listEvents(task.id);
-    const event = events.find((e) => e.id === rest[1]) ?? null;
-    if (event === null) throw dataError(`Event not found: ${rest[1]}.`);
-    const timeZone = store.getConfig().timeZone;
-    return output([
-      `Event: ${event.id}`,
-      `Task: ${task.id}`,
-      `Type: ${event.type}`,
-      `Created: ${presentTime(event.createdAt, timeZone)}`,
-      `Payload:`,
-      ...(Object.keys(event.payload).length === 0
-        ? ["  (none)"]
-        : Object.entries(event.payload).map(([k, v]) => `  ${k}: ${v}`))
-    ].join("\n").concat("\n"), { taskId: task.id, event });
-  }
-  throw usageError(command === undefined
-    ? "Task event command is required."
-    : `Unknown command: task event ${command}`);
 }
 
 /**
@@ -9473,164 +8959,14 @@ function taskWakeInspectionCommand(
     : `Unknown command: task wake ${command}`);
 }
 
-type ParsedMultiTail = Readonly<{
-  positionals: string[];
-  options: ReadonlyMap<string, string>;
-  multiOptions: ReadonlyMap<string, string[]>;
-}>;
-
-function parseMultiValueTail(
-  args: string[],
-  valueOptions: ReadonlySet<string>,
-  repeatOptions: ReadonlySet<string>,
-  usage: string,
-  flagOptions: ReadonlySet<string> = new Set()
-): ParsedMultiTail {
-  const positionals: string[] = [];
-  const options = new Map<string, string>();
-  const multiOptions = new Map<string, string[]>();
-  for (let index = 0; index < args.length; index += 1) {
-    const value = args[index];
-    if (!value.startsWith("--")) {
-      positionals.push(value);
-      continue;
-    }
-    if (!valueOptions.has(value) && !repeatOptions.has(value) && !flagOptions.has(value)) {
-      throw usageError(`Unsupported option: ${value}.`, usage);
-    }
-    if (flagOptions.has(value)) {
-      if (options.has(value)) throw usageError(`Option may only be specified once: ${value}.`, usage);
-      options.set(value, "");
-      continue;
-    }
-    if (repeatOptions.has(value)) {
-      const optionValue = args[index + 1];
-      if (optionValue === undefined || optionValue.startsWith("--")) {
-        throw usageError(`${value} is required.`, usage);
-      }
-      const existing = multiOptions.get(value) ?? [];
-      multiOptions.set(value, [...existing, optionValue]);
-      index += 1;
-      continue;
-    }
-    if (options.has(value)) throw usageError(`Option may only be specified once: ${value}.`, usage);
-    const optionValue = args[index + 1];
-    if (optionValue === undefined || optionValue.startsWith("--")) {
-      throw usageError(`${value} is required.`, usage);
-    }
-    options.set(value, optionValue);
-    index += 1;
-  }
-  return { positionals, options, multiOptions };
-}
-
-type ParsedTail = Readonly<{
-  positionals: string[];
-  options: ReadonlyMap<string, string>;
-}>;
-
-function parseTail(
-  args: string[],
-  valueOptions: ReadonlySet<string>,
-  usage: string,
-  flagOptions: ReadonlySet<string> = new Set()
-): ParsedTail {
-  const positionals: string[] = [];
-  const options = new Map<string, string>();
-  for (let index = 0; index < args.length; index += 1) {
-    const value = args[index];
-    if (!value.startsWith("--")) {
-      positionals.push(value);
-      continue;
-    }
-    if (!valueOptions.has(value) && !flagOptions.has(value)) {
-      throw usageError(`Unsupported option: ${value}.`, usage);
-    }
-    if (options.has(value)) throw usageError(`Option may only be specified once: ${value}.`, usage);
-    if (flagOptions.has(value)) {
-      options.set(value, "");
-      continue;
-    }
-    const optionValue = args[index + 1];
-    if (optionValue === undefined || optionValue.startsWith("--")) {
-      throw usageError(`${value} is required.`, usage);
-    }
-    options.set(value, optionValue);
-    index += 1;
-  }
-  return { positionals, options };
-}
-
-function requiredOption(options: ReadonlyMap<string, string>, name: string): string {
-  return requiredText(options.get(name), name);
-}
-
-function optionalNonEmptyOption(
-  options: ReadonlyMap<string, string>,
-  name: string
-): string | undefined {
-  if (!options.has(name)) return undefined;
-  return requiredText(options.get(name), name);
-}
-
-function exactPositionals(values: readonly string[], count: number, usage: string): void {
-  if (values.length !== count || values.some((value) => value.trim().length === 0)) {
-    throw usageError(usage);
-  }
-}
-
-function assertNoArguments(args: readonly string[], usage: string): void {
-  if (args.length > 0) throw usageError(usage);
-}
-
-function requiredText(value: string | undefined, label: string): string {
-  const normalized = value?.trim();
-  if (normalized === undefined || normalized.length === 0) throw usageError(`${label} is required.`);
-  return normalized;
-}
-
-function trimmed(value: string | undefined): string | undefined {
-  const normalized = value?.trim();
-  return normalized === undefined || normalized.length === 0 ? undefined : normalized;
-}
 
 function titleFrom(body: string): string {
   const oneLine = requiredText(body, "Message body").replace(/\s+/g, " ");
   return oneLine.length <= 80 ? oneLine : `${oneLine.slice(0, 77)}...`;
 }
 
-function presentTime(value: string, timeZone: string | undefined): string {
-  return formatTimestamp(value, timeZone);
-}
-
-function output(value: string, data?: unknown): TaskCommandExecution {
-  return data === undefined
-    ? { kind: "output", output: value }
-    : { kind: "output", output: value, data };
-}
-
-function clock(options: TaskCommandOptions): Date {
-  return options.now?.() ?? new Date();
-}
-
 function messageOf(error: unknown): string {
   return error instanceof Error ? error.message : String(error);
-}
-
-function taskMailbox(taskId: string): MailboxTarget {
-  return { kind: "task", taskId };
-}
-
-function roleMailbox(taskId: string, roleName: string): MailboxTarget {
-  return { kind: "role", taskId, roleName };
-}
-
-function leaderMailbox(taskId: string): MailboxTarget {
-  return roleMailbox(taskId, LEADER_ROLE);
-}
-
-function taskRef(id: string): MailboxEntityRef {
-  return { type: "task", id };
 }
 
 function runRef(taskId: string, id: string): MailboxEntityRef {
@@ -9647,25 +8983,4 @@ function messageRef(taskId: string, id: string): MailboxEntityRef {
 
 function eventRef(taskId: string, id: string): MailboxEntityRef {
   return { type: "event", taskId, id };
-}
-
-function notifyMailbox(
-  runtime: TaskWorkflowRuntimePort | undefined,
-  target: MailboxTarget,
-  compatibilityTaskId: string
-): void {
-  if (runtime?.notifyMailboxChanged !== undefined) {
-    runtime.notifyMailboxChanged(target);
-  } else {
-    runtime?.notifyStateChanged(compatibilityTaskId);
-  }
-}
-
-function notifyReviewMailbox(
-  _options: TaskCommandOptions,
-  runtime: TaskWorkflowRuntimePort | undefined,
-  target: MailboxTarget,
-  compatibilityTaskId: string
-): void {
-  notifyMailbox(runtime, target, compatibilityTaskId);
 }

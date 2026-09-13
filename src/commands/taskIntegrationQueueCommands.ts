@@ -1,8 +1,6 @@
+import { parseRepeatable } from "../cli/parseRepeatable.js";
 import { usageError } from "../errors/cliError.js";
-import { defaultTableWidth, renderTable } from "../output/table.js";
-import { resolveProject } from "../repository/project.js";
-import { NodeGitWorkspace } from "../repository/gitWorkspace.js";
-import type { TaskStore } from "../storage/taskStore.js";
+import type { IntegrationQueueEntry } from "../integration/integrationQueueEntry.js";
 import {
   enqueueIntegrationQueueEntry,
   processIntegrationQueue,
@@ -11,9 +9,11 @@ import {
   supersedeIntegrationQueueEntry,
   type EnqueueIntegrationQueueResult
 } from "../integration/integrationQueueService.js";
-import type { IntegrationQueueEntry } from "../integration/integrationQueueEntry.js";
-import { assertTaskDeliveryAuthority as taskLocalActor } from "./taskActor.js";
-import { parseRepeatable } from "./taskIntegrationCommands.js";
+import { defaultTableWidth, renderTable } from "../output/table.js";
+import { NodeGitWorkspace } from "../repository/gitWorkspace.js";
+import { resolveProject } from "../repository/project.js";
+import type { TaskStore } from "../storage/taskStore.js";
+import { assertTaskDeliveryAuthority as taskLocalActor } from "../task/taskAuthority.js";
 import { resolveTaskRecordReference } from "../task/taskRecordReference.js";
 import type { TaskIntegrationCommandOptions } from "./taskIntegrationCommands.js";
 
@@ -300,7 +300,7 @@ function requireTaskControlActor(
   store: TaskStore,
   environment: NodeJS.ProcessEnv | undefined,
   taskId: string,
-  home?: string
+  _home?: string
 ) {
   return taskLocalActor(store, environment, taskId);
 }

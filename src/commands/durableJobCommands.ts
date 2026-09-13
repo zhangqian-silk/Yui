@@ -9,7 +9,7 @@ import {
 } from "../controller/jobClient.js";
 import type { DurableJobOwner, DurableJobStep } from "../job/durableJob.js";
 import type { TaskStore } from "../storage/taskStore.js";
-import { resolveJobCaller, taskLocalActor } from "./taskActor.js";
+import { resolveJobCaller, taskLocalActor } from "../task/taskAuthority.js";
 
 /**
  * The textual `--owner` forms accepted by `job start`. The public help text in
@@ -22,7 +22,7 @@ export type DurableJobCommandOptions = Readonly<{
   json?: boolean;
   environment?: NodeJS.ProcessEnv;
   /** Required for `job acknowledge` to validate Task-local control identity. */
-  store?: Pick<TaskStore, "getRole" | "getActiveRun" | "getTaskRoleSessionSet" | "listEvents">;
+  store?: Pick<TaskStore, "getRole" | "getActiveRun" | "getTaskRoleSessionSet" | "listEventsByType">;
 }>;
 
 /**

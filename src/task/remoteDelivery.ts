@@ -79,7 +79,7 @@ export type TaskRemoteDeliveryFacts = Readonly<{
   events: readonly TaskEvent[];
   publications: readonly PublicationReference[];
   managedWorkspaces: readonly ManagedWorkspace[];
-  runs: readonly AgentRun[];
+  runs: readonly Pick<AgentRun, "id" | "createdAt" | "workspace">[];
   integrations?: readonly IntegrationAttempt[];
   currentCandidate?: TaskRemoteDeliveryCandidate | null;
 }>;

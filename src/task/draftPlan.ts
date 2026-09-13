@@ -1,10 +1,8 @@
 import type { Project } from "../repository/project.js";
-import type { TaskEvent } from "../event/taskEvent.js";
-import { RUNTIME_OBSERVATION_TASK_EVENT } from "../runtime/runtimeObservation.js";
 import { SYSTEM_LEADER_ROLE } from "../role/systemRoles.js";
 import type { TaskStore } from "../storage/taskStore.js";
-import type { Task } from "./task.js";
 import type { WorkItem } from "../workItem/workItem.js";
+import type { Task } from "./task.js";
 
 /**
  * Runtime Task-event types that are emitted with a Role but no Turn in their
@@ -114,7 +112,6 @@ export function draftWorkItemDependencyIssue(
   }
   return undefined;
 }
-
 function draftPlanFacts(
   store: TaskStore,
   task: Task,
@@ -209,37 +206,4 @@ function firstDraftExecutionFact(store: TaskStore, task: Task): string | undefin
   // Runtime observations support planning; they are not a competing source
   // of delivery authority. The domain records above own delivery facts.
   return undefined;
-}
-
-/**
- * Whether one runtime/Turn Task event belongs to this Draft's own planning
- * conversation.
- *
- * The binding the event carries decides this, never its type prefix:
- *
- * - it names a Turn → that Turn must exist on this Task and be `planning`;
- * - it names no Turn → its exact type must be Role-scoped by construction and
- *   its `roleName` must be the Leader, the only Role a Draft may run.
- *
- * Everything else stays disqualifying, so an unrecognized type, a foreign Role
- * or a Turn reference that cannot be resolved fails closed.
- */
-function isDraftPlanningEvent(store: TaskStore, task: Task, event: TaskEvent): boolean {
-  // Several emitters write an absent Turn as an empty string, so only a
-  // non-empty id counts as a reference worth resolving.
-  const runId = event.payload["runId"];
-  if (typeof runId === "string" && runId !== "") {
-    return store.getRun(task.id, runId)?.purpose === "planning";
-  }
-  // A canonical runtime observation is the event normal delivery writes for
-  // session.started/conversation.observed/turn.accepted and every terminal. It
-  // names its Turn in the same payload field as everything else and was
-  // resolved above; only an unfenced host-level observation reaches here, where
-  // the Role still has to prove it. Admitting this one type by its own binding
-  // is not the same as admitting the `runtime.` prefix.
-  if (event.type !== RUNTIME_OBSERVATION_TASK_EVENT
-    && !PLANNING_ROLE_EVENT_TYPES.has(event.type)) {
-    return false;
-  }
-  return event.payload["roleName"] === SYSTEM_LEADER_ROLE;
 }

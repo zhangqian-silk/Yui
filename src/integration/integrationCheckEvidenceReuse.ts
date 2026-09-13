@@ -69,7 +69,7 @@ export function findReusableIntegrationCheckEvidence(input: Readonly<{
       ))) {
       continue;
     }
-    const checks: CheckResult[] = resultSteps.map((step, index) => ({
+    const checks: CheckResult[] = resultSteps.map((_step, index) => ({
       name: input.checkCommands[index]!,
       outcome: "passed",
       details: `Reused successful check evidence from ${attempt.id}/${job.id}.`,

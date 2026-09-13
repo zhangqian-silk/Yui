@@ -1,6 +1,5 @@
 import { isDeepStrictEqual } from "node:util";
 
-import { taskActor } from "./taskActor.js";
 import { dataError, taskNotFound, usageError } from "../errors/cliError.js";
 import { createTaskEvent, type TaskEventPayload } from "../event/taskEvent.js";
 import { defaultTableWidth, renderTable } from "../output/table.js";
@@ -8,21 +7,18 @@ import { formatTimestamp } from "../output/timePresentation.js";
 import { resolveProject } from "../repository/project.js";
 import {
   createPublicationReference,
-  type PublicationReference,
-  type PublicationReferenceInput,
   type PublicationExternalKind,
   type PublicationProvider,
   type PublicationRecordedBy,
+  type PublicationReference,
+  type PublicationReferenceInput,
   type PublicationState,
   type PublicationVerification
 } from "../task/publicationReference.js";
 import type { Task } from "../task/task.js";
 import { resolveTaskRecordReference } from "../task/taskRecordReference.js";
-import type {
-  TaskCommandExecution,
-  TaskCommandOptions,
-  TaskWorkflowStore
-} from "./taskCommands.js";
+import { taskActor } from "../task/taskAuthority.js";
+import type { TaskCommandExecution, TaskCommandOptions, TaskWorkflowStore } from "./taskCommandTypes.js";
 
 const PROVIDERS = new Set(["github", "gitlab"]);
 const EXTERNAL_KINDS = new Set(["pull-request", "merge-request"]);

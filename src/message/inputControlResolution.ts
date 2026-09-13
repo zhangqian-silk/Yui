@@ -3,6 +3,15 @@ import type { GlobalRoleSessionSet, RoleSessionSet } from "../executor/agentExec
 import { builtinAgentDriverRegistry } from "../runtime/builtinAgentDrivers.js";
 import type { ProviderAuthorityFence } from "../runtime/providerAuthorityFence.js";
 
+/** Shared application input; CLI and Web parse their own transport into this. */
+export type InputControlRequest =
+  | Readonly<{ action: "queue"; body: string; requestId: string;
+      to?: string; workItem?: string; reviewRound?: string }>
+  | Readonly<{ action: "steer"; body: string; requestId: string; expectedTarget: string;
+      to: string; workItem?: string; reviewRound?: string }>
+  | Readonly<{ action: "interrupt"; requestId?: string; expectedTarget: string;
+      role: string; thenMessage?: string }>;
+
 /** The minimal read a Global input-control resolution needs: a Global Role's own
  * Session set, keyed by Role name and never by a Task (decision-3 §9). Narrower
  * than {@link TaskStore} so a Global command's transaction store satisfies it

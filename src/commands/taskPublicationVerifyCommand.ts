@@ -1,6 +1,6 @@
 import { isDeepStrictEqual } from "node:util";
 
-import { taskActor } from "./taskActor.js";
+import { taskActor } from "../task/taskAuthority.js";
 import { upsertTaskPublication } from "./taskPublicationCommands.js";
 import {
   dataError,

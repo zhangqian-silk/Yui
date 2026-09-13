@@ -72,8 +72,9 @@ Reviewer 输出留在那个 Run 上。审查策略和显式的 Task-final 合同
 
 ## 规划、工作区与资源
 
-Draft 包含规划事实和 Project 绑定，而不是一个已采用的交付工作区。它私有的规划目录在
-控制 Home 和交付树之外。规划 Session 捕获 `planning` 权限。Leader 可以在一个 Run 或
+Draft 包含规划事实和 Project 绑定，而不是一个已采用的交付工作区。它私有的规划目录位于
+`<YUI_HOME>/runtime/task-runtimes/planning`，与持久控制数据和交付树分开。
+规划 Session 捕获 `planning` 权限。Leader 可以在一个 Run 或
 普通讨论中持久化一个激活请求并返回；原生静止会把该意图释放出来，进行当前权限和资源
 检查。
 

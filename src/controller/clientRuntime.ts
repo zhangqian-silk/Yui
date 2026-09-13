@@ -8,6 +8,15 @@ import {
 import { readHomeFilesystemId } from "../core/homeFilesystemIdentity.js";
 
 import {
+  AGENT_OPERATIONAL_ENVIRONMENT_NAMES,
+  nativeAgentEnvironmentNames,
+  operationalAgentEnvironment,
+  selectEnvironment,
+  YUI_MANAGED_RUNTIME_ENVIRONMENT_NAMES
+} from "../agent/launchEnvironment.js";
+import type { TaskWorkflowRuntimePort } from "../commands/taskCommandTypes.js";
+import type { MailboxTarget } from "../coordination/workMailbox.js";
+import {
   callController,
   ControllerClientError,
   readControllerDiscovery,
@@ -18,32 +27,23 @@ import {
   type JsonValue
 } from "../core/protocol.js";
 import type { FileRoleLaunchPlanner } from "../executor/fileRoleLaunchPlanner.js";
-import type { TaskWorkflowRuntimePort } from "../commands/taskCommands.js";
-import {
-  AGENT_OPERATIONAL_ENVIRONMENT_NAMES,
-  nativeAgentEnvironmentNames,
-  operationalAgentEnvironment,
-  selectEnvironment,
-  YUI_MANAGED_RUNTIME_ENVIRONMENT_NAMES
-} from "../agent/launchEnvironment.js";
-import type { TaskStore } from "../storage/taskStore.js";
-import { openCurrentTaskStore } from "../storage/currentTaskStore.js";
-import { type TmuxManager } from "../tmux/tmuxManager.js";
-import type { FileSchedulerStoreAdapter } from "./fileSchedulerStoreAdapter.js";
-import type { DormantRuntimeOwnerCandidate } from "../scheduler/ports.js";
+import { isForeignHandoverLockHeld } from "../release/runtimeRelease.js";
 import type { TaskWorkspacePreparer } from "../repository/taskWorkspacePreparer.js";
-import type { MailboxTarget } from "../coordination/workMailbox.js";
+import { WorkspaceCleanupBlockedError } from "../repository/taskWorkspacePreparer.js";
 import { hasRuntimeLifecycleWork } from "../runtime/lifecycleReservation.js";
 import { assertControllerStatusIdentity } from "../runtime/runtimeCoherence.js";
-import { EPHEMERAL_DOMAIN_ENVIRONMENT_NAMES } from "./domainIdentity.js";
-import { yuiVersionIdentity } from "../version.js";
-import { SessionOwnerReconciliation } from "./sessionOwnerReconciliation.js";
-import { WorkspaceCleanupBlockedError } from "../repository/taskWorkspacePreparer.js";
 import {
   CONTROLLER_SHUTDOWN_TIMEOUT_MS,
   LIFECYCLE_REQUEST_TIMEOUT_MS
 } from "../runtime/runtimeDeadlines.js";
-import { isForeignHandoverLockHeld } from "../release/runtimeRelease.js";
+import type { DormantRuntimeOwnerCandidate } from "../scheduler/ports.js";
+import { openCurrentTaskStore } from "../storage/currentTaskStore.js";
+import type { TaskStore } from "../storage/taskStore.js";
+import { type TmuxManager } from "../tmux/tmuxManager.js";
+import { yuiVersionIdentity } from "../version.js";
+import { EPHEMERAL_DOMAIN_ENVIRONMENT_NAMES } from "./domainIdentity.js";
+import type { FileSchedulerStoreAdapter } from "./fileSchedulerStoreAdapter.js";
+import { SessionOwnerReconciliation } from "./sessionOwnerReconciliation.js";
 
 const STARTUP_TIMEOUT_MS = 5_000;
 const POLL_INTERVAL_MS = 50;
@@ -277,7 +277,7 @@ function assertCompatibleControllerStatus(
 }
 
 function spawnDetachedFileTaskController(
-  home: string,
+  _home: string,
   environment: NodeJS.ProcessEnv
 ): number | undefined {
   const child = spawn(

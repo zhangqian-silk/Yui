@@ -112,6 +112,18 @@ is required.
 20. explicit cleanup releases retained terminals without affecting other Tasks
     or claiming that live resources are gone; Controller replacement waits for
     the old process to exit.
+21. structured verification preserves argv, explicit shell failure, environment
+    and workspace-relative cwd through the actual RPC parser and both local
+    executors. Corrected execution semantics invalidate old gate reuse without
+    rewriting historical artifacts or migrations.
+22. concurrent resource registration preserves unrelated rows and rejects
+    stale same-record writes; GC closes owned connections on success/failure.
+23. Context counts, exact inspection and bounded event deltas work without
+    materializing complete history or acquiring a writer lock. Telemetry
+    ingestion yields to the event loop and drains its worker on close.
+24. Release resume re-queries uncertain effects, retains confirmed work and
+    refuses exhausted grants, using disposable SQLite and fake external ports.
+    These checks do not claim validation of real release services.
 
 Keep the test phase seconds-scale; measure TypeScript build separately. Record
 incremental runtime when adding a critical regression. The seven recovery boundary
