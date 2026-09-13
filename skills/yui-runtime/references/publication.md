@@ -41,7 +41,7 @@ the exact Task, checks archive eligibility, then uses `--integrated` for verifie
 merged delivery or `--abandon` for deliberate non-delivery. General archive
 approval never implies `--force` authority. Preserve the Task record.
 
-With explicit force authorization for a completed or retired Task, use
+With explicit force authorization for a completed or cancelled (retired) Task, use
 `yui task archive <task> (--integrated|--abandon) --force`. Force commits the
 archive and stops new Task scheduling before attempting safe foreground cleanup.
 Missing/stale delivery evidence, unresolved execution and cleanup errors become
@@ -54,9 +54,11 @@ Publication/completion evidence. Unverified local commits and resources that
 cannot be safely released stay owned and traceable. Late runtime events remain
 source evidence, not authority to resume or settle unknown input.
 
-Read `task show <task> --json` for `archive.warnings`, `retainedResources` and
-cleanup events; `task context` also retains the original records/events. A
-successful archive exit means `archived=true`, not that cleanup fully succeeded.
+Read `task show <task> --json` for `data.archive.warnings`,
+`data.archive.retainedResources` and `data.archive.cleanupEvents`;
+`task context` also retains the original records/events. A successful archive
+exit means `archived=true`, not that cleanup fully succeeded. `cleanupFinished`
+means the foreground pass finished, not that every resource was removed.
 If cleanup was interrupted, the Task stays archived. Repeating archive only
 reports current facts; use explicit, exact-owner resource operations after
 inspection instead of re-running broad cleanup. No background retry is implied.

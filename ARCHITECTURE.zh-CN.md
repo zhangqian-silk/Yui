@@ -132,7 +132,8 @@ Registry 暴露 context、消息、artifact、环境、插件以及部分 Task/J
 由 Operator 签发的 grant。插件验证不是安全认证。
 
 CLI 贡献和受控的 Web 面板是 Registry 的投影。Web 仅本地回环、由 Controller 拥有；浏览器
-凭据不会变成 Operator 权限。参见[插件 SDK](docs/plugin-sdk.zh-CN.md)和
+凭据认证本地用户控制，这些控制复用 CLI 领域操作；查询面板仍只读，不能借用该用户权限
+执行修改或插件管理。参见[插件 SDK](docs/plugin-sdk.zh-CN.md)和
 [能力与资源](docs/architecture/capabilities-and-resources.zh-CN.md)。
 
 ## 持久化、完成与运维
@@ -141,7 +142,9 @@ Home 有一条只追加的存储迁移链。普通运行时只接受当前记录
 有效 Home；畸形状态被诊断，而不是自动修复。
 
 完成会冻结交付结果，并检查适用的验收、集成和审查合同。它区别于发布、已验证的远程合并、
-物理静止和归档。归档要求工作已了结、受管资源干净可移除，保留 Task 历史，且不可重开。
+物理静止和归档。普通归档要求工作已了结、受管资源干净可移除。明确授权的 force 归档
+可以保留未解决证据与不安全资源，但不宣称交付或物理静止。两者都保留 Task 历史且不可
+重开。参见[Task 交付与归档](docs/task-delivery.zh-CN.md#归档)。
 
 运行时健康度和成本是观察，而不是语义判定。Agent 读取精确的故障和当前意图，以选择重试、
 修复或放弃。Yui 不会自动创建救援 Worker 或选择另一个模型。
