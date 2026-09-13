@@ -15,6 +15,7 @@ import {
   recordResolutionDecision
 } from "../../dist/integration/integrationAttempt.js";
 import { createProject } from "../../dist/repository/project.js";
+import { NodeGitWorkspace } from "../../dist/repository/gitWorkspace.js";
 import { TaskWorkspaceCoordinator } from "../../dist/repository/taskWorkspaceCoordinator.js";
 import { FileTaskWorkspacePreparer } from "../../dist/repository/taskWorkspacePreparer.js";
 import { inspectStorageSchema } from "../../dist/storage/storageSchema.js";
@@ -94,7 +95,7 @@ function registerManagedProject(store, projectId, checkout, remote) {
   return project;
 }
 
-test("Task activation clones the remote branch into an independent Task repository", async (t) => {
+test("competing Task activations each clone the remote exactly once into independent repositories", async (t) => {
   const home = newHome(t);
   const store = newStore(t, home);
   const workspaceRoot = mkdtempSync(join(tmpdir(), "yui-task-workspace-"));
@@ -110,9 +111,46 @@ test("Task activation clones the remote branch into an independent Task reposito
     projectBindings: [{ projectId: "project-1", directory: "app", baseRef: "master" }]
   });
   store.saveTask(task);
-
-  const activated = await new FileTaskWorkspacePreparer(home, store)
-    .activateTaskWorkspace(task.id);
+  const secondTask = createTask(store.nextTaskId(), "Competing Task clone", now, {
+    projectBindings: task.projectBindings
+  });
+  store.saveTask(secondTask);
+  const workspaceGit = new NodeGitWorkspace();
+  const clone = workspaceGit.clone.bind(workspaceGit);
+  let notifyEntered;
+  let resumeClone;
+  const entered = new Promise(resolve => { notifyEntered = resolve; });
+  const resume = new Promise(resolve => { resumeClone = resolve; });
+  const destinations = [];
+  workspaceGit.clone = async options => {
+    destinations.push(options.destination);
+    if (destinations.length === 1) {
+      notifyEntered();
+      await resume;
+    }
+    return clone(options);
+  };
+  let waits = 0;
+  const preparer = new FileTaskWorkspacePreparer(home, store, workspaceGit, () => now, {
+    wait: async () => {
+      waits++;
+      resumeClone();
+      await firstActivation;
+    }
+  });
+  const firstActivation = preparer.activateTaskWorkspace(task.id);
+  // Stop at a real in-flight Git boundary so contention is deterministic.
+  await entered;
+  const [activated, secondActivated] = await Promise.all([
+    firstActivation, preparer.activateTaskWorkspace(secondTask.id)
+  ]);
+  assert.equal(waits, 1);
+  assert.equal(secondActivated.status, "ready");
+  assert.equal(new Set(destinations).size, 2);
+  assert.equal(destinations.length, 2);
+  assert.equal(store.getTask(secondTask.id).status, "active");
+  assert.equal(store.listEvents(secondTask.id).some(event =>
+    event.type === "task.activation-failed" || event.type === "task.planning-entered"), false);
   const persisted = store.getTask(task.id);
   const taskWorkspace = store.getTaskWorkspace(task.id);
   const taskEntry = taskWorkspace.entries[0];

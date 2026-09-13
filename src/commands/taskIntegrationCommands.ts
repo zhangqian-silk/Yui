@@ -95,7 +95,9 @@ async function cleanupIntegration(
       + "Cancel or acknowledge it before cleanup."
     );
   }
-  const result = await new GitIntegrationService(home, store).cleanup(integration);
+  const result = await new GitIntegrationService(home, store).cleanup(integration, {
+    authorize: () => taskLocalActor(store, environment, integration.taskId)
+  });
   if (result === "dirty") {
     throw usageError(
       `Integration worktree contains unresolved or uncommitted changes: ${

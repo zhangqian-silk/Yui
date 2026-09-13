@@ -70,6 +70,7 @@ export type ProjectCommandOptions = Readonly<{
   >;
   now?: () => Date;
   environment?: NodeJS.ProcessEnv;
+  signal?: AbortSignal;
 }>;
 
 export type ProjectCommandExecution = Readonly<{ output: string; data?: unknown }>;
@@ -181,14 +182,15 @@ async function refreshProject(
   // RFC Phase 1: hold the per-Project maintenance fence for the whole refresh
   // so Task workspace preparation and other maintenance cannot interleave
   // with the canonical branch/working-tree move.
-  const releaseMaintenance = acquireProjectMaintenanceLock(store.rootDirectory(), project.id);
+  const releaseMaintenance = await acquireProjectMaintenanceLock(store.rootDirectory(), project.id, { signal: options.signal });
   try {
+    const current = requireUnchangedMaintenanceProject(store, project, "refresh");
     const refreshed = await (options.git ?? new NodeGitWorkspace()).refresh({
-      repositoryPath: project.path,
-      remoteUrl: project.remoteUrl,
-      stableRef: project.stableBranch
+      repositoryPath: current.path,
+      remoteUrl: current.remoteUrl!,
+      stableRef: current.stableBranch
     });
-    return { project, ...refreshed };
+    return { project: current, ...refreshed };
   } finally {
     releaseMaintenance();
   }
@@ -215,8 +217,9 @@ async function diagnoseProject(
     };
   }
   const git = options.git ?? new NodeGitWorkspace();
-  const releaseMaintenance = acquireProjectMaintenanceLock(store.rootDirectory(), project.id);
+  const releaseMaintenance = await acquireProjectMaintenanceLock(store.rootDirectory(), project.id, { signal: options.signal });
   try {
+    requireUnchangedMaintenanceProject(store, project, "diagnose");
     const current = await git.inspect(project.path, "HEAD");
     const remote = await git.resolveRemoteBaseline({
       repositoryPath: project.path,
@@ -434,13 +437,14 @@ async function migrateProject(
   // Migration rewrites the Project's Git repository: hold the per-Project
   // maintenance fence so no rebuild/archive/cleanup (or a second migrate)
   // interleaves, and the Controller defers worktree preparation meanwhile.
-  const releaseMaintenance = acquireProjectMaintenanceLock(store.rootDirectory(), project.id);
+  const releaseMaintenance = await acquireProjectMaintenanceLock(store.rootDirectory(), project.id, { signal: options.signal });
   try {
     // Re-read the Project under the fence. A concurrent migration may have
     // completed and switched the catalog to the Home-managed repo since the
     // record was resolved above; the stale snapshot must not drive any Git
     // effect (in particular it must not delete the now-canonical repo).
     const current = requireProject(store, project.id);
+    assertProjectActive(current, "migrate");
     if (current.ownership === "managed") {
       throw usageError(`Project is already Home-managed: ${project.id}.`);
     }
@@ -766,7 +770,7 @@ async function resetProject(
     );
   }
   const git = options.git ?? new NodeGitWorkspace();
-  const releaseMaintenance = acquireProjectMaintenanceLock(store.rootDirectory(), project.id);
+  const releaseMaintenance = await acquireProjectMaintenanceLock(store.rootDirectory(), project.id, { signal: options.signal });
   try {
     // Re-read under the fence so a concurrent catalog change can never drive
     // a destructive Git effect from a stale snapshot.
@@ -905,7 +909,7 @@ async function replaceProject(
     );
   }
   const git = options.git ?? new NodeGitWorkspace();
-  const releaseMaintenance = acquireProjectMaintenanceLock(store.rootDirectory(), project.id);
+  const releaseMaintenance = await acquireProjectMaintenanceLock(store.rootDirectory(), project.id, { signal: options.signal });
   try {
     const current = requireProject(store, project.id);
     assertProjectActive(current, "replace");
@@ -1136,8 +1140,9 @@ async function deleteProjectCommand(
   // every failure restores it, so the catalog never loses its recoverable
   // entry while a live checkout (or its failure) is still in play.
   const tombstone = join(store.rootDirectory(), "projects", `.delete-${project.id}`);
-  const releaseMaintenance = acquireProjectMaintenanceLock(store.rootDirectory(), project.id);
+  const releaseMaintenance = await acquireProjectMaintenanceLock(store.rootDirectory(), project.id, { signal: options.signal });
   try {
+    requireUnchangedMaintenanceProject(store, project, "delete");
     // Heal a crashed earlier attempt before the prechecks turn.
     await healCheckoutSwap({ currentPath: project.path, backupPath: tombstone });
     if (existsSync(project.path)) {
@@ -1551,6 +1556,24 @@ function projectKnowledge(
   throw usageError(command === undefined
     ? "Project knowledge command is required."
     : `Unknown command: project knowledge ${command}`);
+}
+
+/** Waiting yields to catalog writers too; never apply stale Git/lifecycle inputs. */
+function requireUnchangedMaintenanceProject(
+  store: ProjectCommandStore,
+  expected: Project,
+  action: string
+): Project {
+  const current = requireProject(store, expected.id);
+  if (current.path !== expected.path
+    || current.remoteUrl !== expected.remoteUrl
+    || current.stableBranch !== expected.stableBranch
+    || current.developmentBranch !== expected.developmentBranch
+    || current.ownership !== expected.ownership
+    || current.status !== expected.status) {
+    throw new Error(`Project changed while waiting to ${action}: ${expected.id}; read current state before retrying.`);
+  }
+  return current;
 }
 
 function requireProject(store: ProjectCommandStore, reference: string): Project {
