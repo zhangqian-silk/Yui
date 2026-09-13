@@ -17,6 +17,7 @@ import {
 import type { ContextSnapshotRef } from "../context/contextSnapshot.js";
 import type { ExecutionLaneGitSnapshot } from "../repository/executionLaneGitSnapshot.js";
 import type { ProviderRuntimeBinding } from "../runtime/providerRuntimeIdentity.js";
+import { providerRetryProjection } from "../runtime/providerRetry.js";
 import {
   boundedRunFailureDiagnostic,
   MAX_RUN_FAILURE_DIAGNOSTIC_BYTES,
@@ -48,6 +49,8 @@ export function runExecutionObservation(run: AgentRun, binding: ProviderRuntimeB
   return {
     recordStatus: run.status,
     delivery,
+    retry: binding?.retry?.previousRunId === run.id || binding?.retry?.successorRunId === run.id
+      ? providerRetryProjection(binding) : null,
     ...(current === undefined ? {} : {
       attemptId: current.attemptId, observedAt: current.updatedAt,
       ...(current.nativeTurnId === undefined ? {} : { nativeTurnId: current.nativeTurnId })

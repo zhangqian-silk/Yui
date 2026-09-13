@@ -9,6 +9,7 @@ import { managedWorkspaceKey } from "../worktree/managedWorkspace.js";
 import { runExecutionObservation, type AgentRun } from "../agentRun/agentRun.js";
 import { isGitArtifactRefString, parseGitArtifactRef } from "../artifacts/gitArtifactRef.js";
 import { projectTaskRemoteDeliveryFromStore } from "../commands/taskRemoteDeliveryCommand.js";
+import { providerRetryProjection } from "../runtime/providerRetry.js";
 
 const MAX_RECORDS = 256;
 const MAX_VALUE_BYTES = 4096;
@@ -57,6 +58,9 @@ export function readTaskContext(
       const record = { ...content, ...(entry.ref.store === "run" ? {
         execution: runExecutionObservation(entry.value as AgentRun,
           reader.getTaskRoleSessionSet(taskId, (entry.value as AgentRun).roleName)?.providerBinding, runtimeEvents)
+      } : {}), ...(entry.ref.store === "role" ? {
+        providerRetry: providerRetryProjection(reader.getTaskRoleSessionSet(taskId,
+          (entry.value as { name: string }).name)?.providerBinding)
       } : {}) };
       const size = Buffer.byteLength(JSON.stringify(record));
       if (records.length >= MAX_RECORDS || bytes + size > MAX_PAGE_BYTES) break;

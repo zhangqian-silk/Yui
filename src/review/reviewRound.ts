@@ -263,7 +263,7 @@ export function finishReviewRound(
  */
 export function retryReviewRound(
   round: ReviewRound,
-  requestedBy: TaskCompletedBy,
+  requestedBy: ReviewRequestSource,
   now: Date
 ): ReviewRound {
   validateReviewRound(round);

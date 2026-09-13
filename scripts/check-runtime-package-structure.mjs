@@ -17,6 +17,7 @@ const required = [
   "docs/project-refresh.zh-CN.md",
   "docs/task-discovery.md",
   "docs/task-discovery.zh-CN.md",
+  "docs/provider-retry.md",
   "skills/yui-leader/SKILL.md",
   "skills/yui-worker/SKILL.md",
   "skills/yui-operator/SKILL.md",

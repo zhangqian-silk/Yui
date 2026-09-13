@@ -1,4 +1,5 @@
 import { YUI_VERSION } from "../version.js";
+import { serializeAgentErrorRaw } from "./agentError.js";
 import type {
   ProviderContinuationMetadataPort,
   ProviderContinuationQueryResult
@@ -67,6 +68,7 @@ export type CodexThreadTurnSnapshot = Readonly<{
   status?: "completed" | "interrupted" | "failed" | "inProgress";
   output?: string;
   error?: string;
+  rawError?: string;
 }>;
 
 export type CodexTurnAcceptance =
@@ -174,11 +176,17 @@ export class CodexAppServerRuntime implements
     attemptId: string;
     text: string;
     expectedNoActiveTurn: boolean;
+    expectedFailedNativeTurnId?: string;
+    requireQuiescent?: boolean;
   }>): Promise<ProviderTurnAcceptance> {
     return this.startTurn({
       conversationId: input.conversationId,
       text: input.text,
       expectedNoActiveTurn: input.expectedNoActiveTurn,
+      ...(input.requireQuiescent ? { requireQuiescent: true } : {}),
+      ...(input.expectedFailedNativeTurnId === undefined ? {} : {
+        expectedFailedNativeTurnId: input.expectedFailedNativeTurnId
+      }),
       clientUserMessageId: input.attemptId
     });
   }
@@ -188,15 +196,19 @@ export class CodexAppServerRuntime implements
     text: string;
     expectedNoActiveTurn: boolean;
     clientUserMessageId?: string;
+    expectedFailedNativeTurnId?: string;
+    requireQuiescent?: boolean;
   }>): Promise<CodexTurnAcceptance> {
     const requestedThreadId = text(input.conversationId, "Codex thread id");
     let threadId = requestedThreadId;
     try {
+      const expectedFailedTurn = input.expectedFailedNativeTurnId === undefined ? undefined
+        : text(input.expectedFailedNativeTurnId, "Expected failed Codex Turn id");
       // Submission needs current availability, not historical Turns. Some
       // App Server transports expose status without supporting history reads.
       const snapshot = await this.readConversation(requestedThreadId, { includeTurns: false });
       threadId = snapshot.threadId;
-      if (input.expectedNoActiveTurn
+      if ((input.expectedNoActiveTurn || expectedFailedTurn !== undefined || input.requireQuiescent)
         && (snapshot.status === "active" || snapshot.activeTurnId !== undefined)) {
         return {
           status: "busy",
@@ -206,8 +218,29 @@ export class CodexAppServerRuntime implements
             : `active-turn:${snapshot.activeTurnId}`
         };
       }
-      if (snapshot.status !== "idle" && snapshot.status !== "active") {
+      if (snapshot.status !== "idle" && snapshot.status !== "active"
+        && !(snapshot.status === "systemError" && expectedFailedTurn !== undefined)) {
         throw new Error(`Codex Session availability is ${snapshot.status}; no input was submitted.`);
+      }
+      if (expectedFailedTurn !== undefined) {
+        // systemError alone proves neither terminal execution nor permission
+        // to replay. Only the exact latest failed Turn permits this recovery.
+        const page = await this.transport.request("thread/turns/list", {
+          threadId, limit: 1, sortDirection: "desc", itemsView: "notLoaded"
+        });
+        const latest = object(arrayMember(page, "data")[0]);
+        if (latest?.id !== expectedFailedTurn || latest.status !== "failed") {
+          throw new Error("Codex retry has no exact failed latest Turn proof; no input was submitted.");
+        }
+      }
+      if (expectedFailedTurn !== undefined || input.requireQuiescent) {
+        const backgrounds = await this.transport.request("thread/backgroundTerminals/list", {
+          threadId, limit: 1
+        });
+        if (!Array.isArray(backgrounds.data) || backgrounds.data.length !== 0
+          || backgrounds.nextCursor !== null) {
+          throw new Error("Codex retry background execution is not proven empty; no input was submitted.");
+        }
       }
     } catch (error) {
       throw new CodexPreSubmissionError("Codex Session inspection failed before input submission.", { cause: error });
@@ -424,7 +457,10 @@ function parseThreadSnapshot(
       turnId,
       ...(status === undefined ? {} : { status }),
       ...(output === undefined ? {} : { output }),
-      ...(error === undefined ? {} : { error })
+      ...(error === undefined ? {} : { error }),
+      ...(turn.error === undefined || turn.error === null ? {} : {
+        rawError: serializeAgentErrorRaw(turn.error)
+      })
     }];
   });
   return {

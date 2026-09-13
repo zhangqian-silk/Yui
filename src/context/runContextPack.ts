@@ -1,4 +1,5 @@
 import type { AgentRun } from "../agentRun/agentRun.js";
+import { providerRetryProjection } from "../runtime/providerRetry.js";
 import type { TaskStore } from "../storage/taskStore.js";
 import { operationalTaskRecords } from "../task/taskRecordRetirement.js";
 import { TASK_COMPLETION_PUBLISHED_TREE_AUTHORIZED_EVENT } from "../task/publicationReference.js";
@@ -85,6 +86,10 @@ export type AgentRunContextPack = Readonly<{
  * the frozen refs and must not move just because the world moved.
  */
 export type AgentRunContextLiveTaskState = Readonly<{
+  providerRetries: readonly Readonly<{
+    roleName: string;
+    retry: ReturnType<typeof import("../runtime/providerRetry.js").providerRetryProjection>;
+  }>[];
   activeRuns: readonly Readonly<{
     runId: string;
     roleName: string;
@@ -430,6 +435,8 @@ function readLiveTaskState(store: TaskStore, taskId: string): AgentRunContextLiv
       status: round.status as "pending" | "running"
     }));
   return Object.freeze({
+    providerRetries: Object.freeze(store.listRoleSessionSets(taskId).flatMap(set => set.providerBinding?.retry === undefined
+      ? [] : [{ roleName: set.owner.roleName, retry: providerRetryProjection(set.providerBinding) }])),
     activeRuns: Object.freeze(activeRuns),
     activeTaskReviews: Object.freeze(activeTaskReviews)
   });

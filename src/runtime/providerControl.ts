@@ -30,6 +30,8 @@ export interface ProviderControlAdapter {
     attemptId: string;
     text: string;
     expectedNoActiveTurn: boolean;
+    expectedFailedNativeTurnId?: string;
+    requireQuiescent?: boolean;
   }>): Promise<ProviderTurnAcceptance>;
   interruptTurn(input: Readonly<{
     conversationId: string;
@@ -57,13 +59,19 @@ export class FencedProviderControl {
     attemptId: string;
     text: string;
     expectedNoActiveTurn?: boolean;
+    expectedFailedNativeTurnId?: string;
+    requireQuiescent?: boolean;
   }>): Promise<ProviderTurnAcceptance> {
     this.#assertWriter(input.binding, input.fence);
     return this.adapter.submitTurn({
       conversationId: input.fence.conversationId,
       attemptId: identity(input.attemptId, "Provider input attempt id"),
       text: text(input.text, "Provider Turn input"),
-      expectedNoActiveTurn: input.expectedNoActiveTurn ?? true
+      expectedNoActiveTurn: input.expectedNoActiveTurn ?? true,
+      ...(input.requireQuiescent ? { requireQuiescent: true } : {}),
+      ...(input.expectedFailedNativeTurnId === undefined ? {} : {
+        expectedFailedNativeTurnId: identity(input.expectedFailedNativeTurnId, "Expected failed Provider Turn id")
+      })
     });
   }
 

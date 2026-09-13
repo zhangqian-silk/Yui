@@ -181,6 +181,14 @@ runtime identity and workspace progress; never edit Run status or substitute
 a native Session behind Yui's back. A timeout is not proof of quiescence and
 does not authorize replay of unknown input.
 
+Qualifying transient Provider failures have bounded Controller-owned recovery.
+Read the current `providerRetry`/`retry` projection before dispatching a manual
+successor. `waiting` and `in-flight` mean infrastructure recovery is already
+owned; do not add a private retry loop or resend the input. Only a proven native
+success resets that chain, and it never accepts a WorkItem or completes a Task.
+After recovery, inspect existing work and external receipts before continuing;
+the system's recovery instruction supplies no new user authority.
+
 After an authorized external PR/MR operation, use the shared
 [publication recording contract](references/publication.md). Recording delivery
 facts does not authorize the external operation, imply acceptance, or grant

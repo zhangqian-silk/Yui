@@ -1,4 +1,5 @@
 import type { ConfiguredAgent } from "../agent/agent.js";
+import { controlProviderRetry, providerRetryProjection, renderProviderRetry } from "../runtime/providerRetry.js";
 import { roleLaunchEventPayload, saveTaskRoleUpdate } from "../role/taskRoleUpdate.js";
 import { createHash, randomUUID } from "node:crypto";
 import { archiveDeliveryWarnings, archiveRetainedResources, renderArchiveDiagnostics, taskArchiveDiagnostics } from "../task/archiveDiagnostics.js";
@@ -533,6 +534,8 @@ export type TaskRoleAgentConfigurationMutation = Readonly<{
 }>;
 
 export type TaskCommandOptions = Readonly<{
+  /** Controller-only recovery identity; ordinary user retry uses the same CAS. */
+  providerRetryChainId?: string;
   runtime?: TaskWorkflowRuntimePort;
   now?: () => Date;
   environment?: NodeJS.ProcessEnv;
@@ -3308,6 +3311,35 @@ function taskRoleSessionCommand(
   options: TaskCommandOptions
 ): TaskCommandExecution {
   const [command, ...rest] = args;
+  if (command === "retry") {
+    const [taskId, roleName, action = "show", ...extra] = rest;
+    if (extra.length > 0 || !["show", "cancel", "disable", "enable"].includes(action)) {
+      throw usageError("Usage: yui task role session retry <task> <role> [show|cancel|disable|enable]");
+    }
+    return store.transaction(tx => {
+      const task = requireTask(tx, taskId);
+      const role = requireRole(tx, task.id, roleName);
+      if (action !== "show") taskActor(tx, options, task.id);
+      else {
+        const reader = resolveManagedTaskReader(tx, options.environment);
+        if (reader === undefined) taskActor(tx, options, task.id);
+        else if (reader.taskId !== task.id || reader.roleName !== "leader" && reader.roleName !== role.name) {
+          throw usageError("Provider retry read is outside the caller's Task/Role.");
+        }
+      }
+      const sessions = tx.getTaskRoleSessionSet(task.id, role.name);
+      let binding = sessions?.providerBinding ?? null;
+      if (action !== "show") {
+        if (task.status === "archived" || sessions === null || binding === null) throw usageError("No writable Provider Session.");
+        binding = controlProviderRetry(binding, action as "cancel" | "disable" | "enable", clock(options).getTime());
+        tx.saveTaskRoleSessionSet({ ...sessions, providerBinding: binding });
+        recordTaskEvent(tx, task.id, "provider.retry-control", { roleName: role.name, action }, clock(options));
+      }
+      return output(`${renderProviderRetry(binding)}\n`, {
+        roleName: role.name, retry: providerRetryProjection(binding), disabled: binding?.retryDisabled ?? false
+      });
+    });
+  }
   if (command === "inspect") {
     exactPositionals(
       rest,
@@ -3345,6 +3377,7 @@ function taskRoleSessionCommand(
             `Native id: ${active.nativeSessionId}`,
             `Session: ${active.status}${active.endReason === undefined ? "" : `/${active.endReason}`}`,
             `AgentRun: ${binding?.run?.status ?? "none"}`,
+            renderProviderRetry(binding),
             ...(host === undefined ? [] : [`Host reporting: ${taskRoleHostDiagnostic(host)}`]),
             `Run configuration: ${agentRunConfigurationLabel(runConfiguration)}`
           ].join("\n") + "\n"
@@ -3355,6 +3388,7 @@ function taskRoleSessionCommand(
         role,
         session: active,
         providerBinding: binding,
+        retry: providerRetryProjection(binding),
         ...(host === undefined ? {} : { host }),
         ...(runConfiguration === undefined ? {} : { runConfiguration })
       }
@@ -6297,6 +6331,49 @@ function settleStaleFinalReviewRun(
 }
 
 function retryRun(
+  args: string[], store: TaskWorkflowStore, options: TaskCommandOptions
+): TaskCommandExecution {
+  return store.transaction(tx => {
+    const previous = requireRun(tx, args[0], options);
+    const existing = tx.listEvents(previous.taskId).find(event => event.type === "run.retried"
+      && event.payload.previousRunId === previous.id);
+    if (existing !== undefined) {
+      return output(`Retry already recorded as ${existing.payload.runId}; retry that exact successor if needed.\n`);
+    }
+    const sessions = tx.getTaskRoleSessionSet(previous.taskId, previous.roleName);
+    const retry = sessions?.providerBinding?.retry;
+    if (options.providerRetryChainId !== undefined
+      && (retry?.chainId !== options.providerRetryChainId || retry.status !== "waiting"
+        || retry.previousRunId !== previous.id || clock(options).getTime() < Date.parse(retry.nextEligibleAt)
+        || clock(options).getTime() >= Date.parse(retry.deadline))) {
+      throw usageError("Provider recovery intent is no longer eligible.");
+    }
+    const result = retryRunOperation(args, tx, options);
+    if (retry !== undefined && retry.status !== "recovered" && retry.previousRunId === previous.id && sessions?.providerBinding != null) {
+      const successor = tx.getActiveRun(previous.taskId, previous.roleName);
+      tx.saveTaskRoleSessionSet({
+        ...sessions, providerBinding: {
+          ...sessions.providerBinding, retry: {
+            ...retry, status: "waiting", successorAutomatic: options.providerRetryChainId !== undefined,
+            ...(options.providerRetryChainId === undefined ? {
+              intentAt: clock(options).toISOString(),
+              // An explicit manual attempt does not inherit automatic jitter,
+              // but cannot shorten a trusted server minimum.
+              nextEligibleAt: new Date(Math.max(clock(options).getTime(),
+                retry.error.retryAfterMs === undefined ? 0
+                  : Date.parse(sessions.providerBinding.run!.updatedAt) + retry.error.retryAfterMs + 1)).toISOString()
+            } : {}),
+            ...(successor === null ? {} : { successorRunId: successor.id }),
+            ...(previous.reviewRoundId === undefined ? {} : { successorReviewRoundId: previous.reviewRoundId })
+          }
+        }
+      });
+    }
+    return result;
+  });
+}
+
+function retryRunOperation(
   args: string[],
   store: TaskWorkflowStore,
   options: TaskCommandOptions
@@ -7051,7 +7128,7 @@ function retryFailedReviewRun(
     }
     const task = requireTask(tx, run.taskId);
     if (task.status !== "active") throw usageError(`Task is not active: ${task.id}.`);
-    const requestedBy = taskActor(tx, options, task.id);
+    const requestedBy = options.providerRetryChainId === undefined ? taskActor(tx, options, task.id) : "policy";
     const round = tx.getReviewRound(task.id, run.reviewRoundId);
     if (round === null) {
       throw dataError(`ReviewRound not found for run ${run.id}: ${run.reviewRoundId}.`);

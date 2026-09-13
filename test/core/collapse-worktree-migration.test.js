@@ -56,6 +56,9 @@ function openV19Home(t, prefix) {
   const db = new Database(join(home, "yui.db"));
   t.after(() => db.close());
   db.prepare("DELETE FROM schema_migrations WHERE version > ?").run(V19);
+  // This fixture synthesizes an old Home from the current schema. Remove the
+  // later physical objects too; a deleted ledger alone is not a valid old Home.
+  db.exec("DROP INDEX idx_task_provider_retry; DROP INDEX idx_global_provider_retry;");
   const head = db.prepare("SELECT MAX(version) AS version FROM schema_migrations").get();
   assert.equal(head.version, V19, "ledger truncated to v19");
   return { home, db };

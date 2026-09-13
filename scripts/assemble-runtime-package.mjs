@@ -43,6 +43,7 @@ const RUNTIME_DOCUMENTS = [
   "docs/observability/README.zh-CN.md",
   "docs/provider-runtime.md",
   "docs/provider-runtime.zh-CN.md",
+  "docs/provider-retry.md",
   "docs/project-refresh.md",
   "docs/project-refresh.zh-CN.md",
   "docs/release-workflow.md",

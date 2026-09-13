@@ -177,6 +177,7 @@ const READ_ONLY_STORE_METHODS: ReadonlySet<string> = new Set([
   "getRoleSessionSet",
   "getTaskRoleSessionSet",
   "listRoleSessionSets",
+  "listProviderRetrySessions",
   "listRuntimeSessionCandidates",
   "getRoleSession",
   "getWorkItem",

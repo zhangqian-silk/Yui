@@ -6,6 +6,9 @@ import { isDeepStrictEqual } from "node:util";
 import { assertExecutionEnvironmentCurrent } from "../runtime/executionEnvironment.js";
 import { resolveAgentHostObservation, recordAgentHostConnection, AgentHostObservationDeferred } from "./agentHostObservation.js";
 import { RuntimeHookRunFenceError } from "./runtimeHookRunFence.js";
+import { admitOwnedProviderInput, ownedProviderInput } from "./providerRetryAdmission.js";
+import { recordProviderFailure, providerRetryPending, deferProviderRetry } from "../runtime/providerRetry.js";
+import { settleGlobalRetryInput } from "../message/globalProviderRetry.js";
 import type { RuntimeObservationInboxEvent } from "./runtimeEventInbox.js";
 
 import type { DurableJob } from "../job/durableJob.js";
@@ -590,7 +593,9 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
             nativeTurnId: fence.nativeTurnId, acceptedAt: at });
         } else if (binding.run?.status !== "accepted") return "applied";
         const message = store.listGlobalRoleMessages(fence.roleName).find(entry =>
-          receipt === `global-input:${fence.roleName}/${entry.id}`);
+          receipt === `global-input:${fence.roleName}/${entry.id}`
+          || binding?.retry?.currentAttemptId === receipt && binding.retry.input.kind === "message"
+            && binding.retry.input.messageId === entry.id);
         if (message !== undefined) store.updateGlobalRoleMessage(markGlobalRoleMessageDelivered(message, new Date(at)));
       } else if (["turn.completed", "turn.cancelled", "turn.failed"].includes(input.kind)) {
         if (!matches || input.authority !== "provider-structured") return "obsolete";
@@ -601,7 +606,9 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
           && ["submitting", "delivery-unknown"].includes(binding.run.status)) {
           binding = acceptProviderTurn(binding, { attemptId: receipt!, nativeTurnId: fence.nativeTurnId, acceptedAt: at });
           const message = store.listGlobalRoleMessages(fence.roleName).find(entry =>
-            receipt === `global-input:${fence.roleName}/${entry.id}`);
+            receipt === `global-input:${fence.roleName}/${entry.id}`
+            || binding?.retry?.currentAttemptId === receipt && binding.retry.input.kind === "message"
+              && binding.retry.input.messageId === entry.id);
           if (message !== undefined) store.updateGlobalRoleMessage(markGlobalRoleMessageDelivered(message, new Date(at)));
         }
         if (binding.run?.status !== "accepted") return binding.run != null
@@ -629,7 +636,13 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
       } else if (input.kind === "conversation.observed" && input.payload.recoverability !== undefined) {
         binding = updateProviderConversationRecoverability(binding, input.payload.recoverability);
       }
+      if (input.kind === "turn.failed" && matches && input.payload.failure !== undefined) {
+        binding = recordProviderFailure(binding, {
+          error: input.payload.failure.error, failureRef: input.eventId, at: now.getTime()
+        });
+      }
       store.saveGlobalRoleSessionSet(updateGlobalRoleProviderRuntime(sessions, binding, now));
+      settleGlobalRetryInput(store, fence.roleName, binding, now);
       return "applied";
     });
   }
@@ -995,7 +1008,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
           now
         );
         store.saveEvent(taskId, errorEvent);
-        routeRoleEvent(
+        if (!providerRetryPending(store.getTaskRoleSessionSet(taskId, input.fence.roleName)?.providerBinding)) routeRoleEvent(
           store,
           errorEvent,
           input.fence.roleName,
@@ -1473,6 +1486,8 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
     authorityOwner: "controller" | "human";
     holderId: string;
     now: Date;
+    boundedText?: string;
+    retrySupported?: boolean;
   }>): void {
     if (input.taskId === undefined) {
       this.store.transaction((store) => {
@@ -1481,7 +1496,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
           throw new AgentHostProviderTurnFenceError("Global Session admission is stopped.");
         }
         const sessions = store.getGlobalRoleSessionSet(input.roleName);
-        const binding = sessions?.providerBinding;
+        let binding = sessions?.providerBinding;
         const session = sessions?.sessions[input.agentId];
         if (sessions === null || binding == null || session === undefined
           || sessions.activeAgentId !== input.agentId || session.status !== "active"
@@ -1493,7 +1508,10 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
           throw new AgentHostProviderTurnFenceError("Global input carries a stale Session or writer fence.");
         }
         const turn = binding.run;
-        if (turn?.attemptId === input.attemptId && turn.status === "submitting") return;
+        if (turn?.attemptId === input.attemptId && turn.status === "submitting") {
+          admitOwnedProviderInput(store, binding, input);
+          return;
+        }
         if (turn != null && ["submitting", "accepted", "delivery-unknown"].includes(turn.status)) {
           throw new AgentHostProviderSessionBusyError("Global Conversation has an unsettled input.");
         }
@@ -1529,8 +1547,11 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
             receiptId: input.attemptId, outcome: "pending", observedAt: input.now.toISOString()
           } });
         }
+        binding = admitOwnedProviderInput(store, binding, input);
         store.saveGlobalRoleSessionSet(updateGlobalRoleProviderRuntime(sessions,
           beginProviderTurn(binding, { attemptId: input.attemptId,
+            input: binding.retry?.currentAttemptId === input.attemptId ? binding.retry.input : ownedProviderInput(input),
+            retrySupported: input.retrySupported,
             authorityEpoch: input.authorityEpoch, submittedAt: input.now.toISOString() }), input.now));
       });
       return;
@@ -1542,6 +1563,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
     taskId: string; roleName: string; runId?: string; agentId: string;
     nativeSessionId: string; attemptId: string; authorityEpoch: number;
     authorityOwner: "controller" | "human"; holderId: string; now: Date;
+    boundedText?: string; retrySupported?: boolean;
   }>): void {
     this.store.transaction((store) => {
       const task = store.getTask(input.taskId);
@@ -1553,7 +1575,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
       }
       const sessions = store.getTaskRoleSessionSet(input.taskId, input.roleName);
       const session = sessions?.sessions[input.agentId];
-      const binding = sessions?.providerBinding;
+      let binding = sessions?.providerBinding;
       const active = store.getActiveRun(input.taskId, input.roleName);
       if (sessions === null || sessions === undefined || binding === null || binding === undefined || (input.runId !== undefined && (active?.id !== input.runId || active.effective.agentId !== input.agentId)) || session === undefined || session.nativeSessionId !== input.nativeSessionId || currentProviderConversation(binding).conversationId !== input.nativeSessionId || binding.authority.owner !== input.authorityOwner || binding.authority.epoch !== input.authorityEpoch || binding.authority.holderId !== input.holderId) {
         throw new AgentHostProviderTurnFenceError(
@@ -1612,13 +1634,16 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
           }
         }
       }
+      binding = admitOwnedProviderInput(store, binding, input);
       store.saveTaskRoleSessionSet(updateTaskRoleProviderRuntime(
         sessions,
         beginProviderTurn(binding, {
           ...(input.runId === undefined ? {} : { runId: input.runId }),
           attemptId: input.attemptId,
           authorityEpoch: input.authorityEpoch,
-          submittedAt: input.now.toISOString()
+          submittedAt: input.now.toISOString(),
+          input: binding.retry?.currentAttemptId === input.attemptId ? binding.retry.input : ownedProviderInput(input),
+          retrySupported: input.retrySupported
         }),
         input.now
       ));
@@ -1634,6 +1659,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
     reason: string;
     raw: string;
     now: Date;
+    noProviderWrite?: boolean;
   }>): void {
     if (input.taskId === undefined) {
       this.store.transaction((store) => {
@@ -1642,9 +1668,11 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
         if (input.runId !== undefined || sessions == null || binding?.run?.attemptId !== input.attemptId) {
           throw new Error("Global input submission is no longer current.");
         }
-        store.saveGlobalRoleSessionSet(updateGlobalRoleProviderRuntime(sessions,
-          settleProviderTurnSubmission(binding, { attemptId: input.attemptId, status: input.status,
-            reason: input.reason, resolvedAt: input.now.toISOString() }), input.now));
+        let resolved = settleProviderTurnSubmission(binding, { attemptId: input.attemptId, status: input.status,
+          reason: input.reason, resolvedAt: input.now.toISOString() });
+        resolved = this.retrySubmissionResolution(resolved, input, sessions.sessions[sessions.activeAgentId]?.adapterId);
+        store.saveGlobalRoleSessionSet(updateGlobalRoleProviderRuntime(sessions, resolved, input.now));
+        settleGlobalRetryInput(store, input.roleName, resolved, input.now);
         const message = store.listGlobalRoleMessages(input.roleName).find(entry =>
           input.attemptId === `global-input:${input.roleName}/${entry.id}`);
         if (message !== undefined && message.delivery?.via !== "provider") {
@@ -1653,7 +1681,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
             requestId: message.inputControl?.requestId ?? message.interruptThen!.requestId,
             receiptId: input.attemptId, outcome, observedAt: input.now.toISOString()
           } } as typeof message;
-          store.updateGlobalRoleMessage(input.status === "rejected" && updated.delivery === undefined
+          store.updateGlobalRoleMessage(input.status === "rejected" && updated.delivery === undefined && !providerRetryPending(resolved)
             ? markGlobalRoleMessageNotDelivered(updated, input.reason, input.now) : updated);
         }
       });
@@ -1665,6 +1693,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
   private resolveTaskAgentHostProviderTurnSubmission(input: Readonly<{
     taskId: string; roleName: string; runId?: string; attemptId: string;
     status: "rejected" | "deferred" | "delivery-unknown"; reason: string; raw: string; now: Date;
+    noProviderWrite?: boolean;
   }>): void {
     this.store.transaction((store) => {
       const sessions = store.getTaskRoleSessionSet(input.taskId, input.roleName);
@@ -1675,19 +1704,18 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
         || binding.run?.attemptId !== input.attemptId) {
         throw new Error("Agent Host Provider Turn submission is no longer current.");
       }
-      const updated = settleProviderTurnSubmission(binding, {
+      let updated = settleProviderTurnSubmission(binding, {
         attemptId: input.attemptId,
         status: input.status,
         reason: input.reason,
         resolvedAt: input.now.toISOString()
       });
+      updated = this.retrySubmissionResolution(updated, input, sessions.sessions[sessions.activeAgentId]?.adapterId);
       store.saveTaskRoleSessionSet(updateTaskRoleProviderRuntime(sessions, updated, input.now));
-      if (input.runId === undefined) return;
-      const run = store.getRun(input.taskId, input.runId);
+      const run = input.runId === undefined ? null : store.getRun(input.taskId, input.runId);
       const session = sessions.sessions[sessions.activeAgentId];
-      const driver = run === null
-        ? null
-        : this.drivers.findByAdapterId(run.effective.adapterId);
+      const adapterId = run?.effective.adapterId ?? session?.adapterId;
+      const driver = adapterId === undefined ? null : this.drivers.findByAdapterId(adapterId);
       const error = standardAgentError({
         source: "driver",
         phase: "turn-submit",
@@ -1705,7 +1733,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
         "runtime.agent-error",
         {
           sourceEventId: input.attemptId,
-          runId: input.runId,
+          runId: input.runId ?? "",
           roleName: input.roleName,
           agentId: run?.effective.agentId ?? sessions.activeAgentId,
           adapterId: run?.effective.adapterId ?? session?.adapterId ?? "unknown",
@@ -1729,7 +1757,7 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
         input.now
       );
       store.saveEvent(input.taskId, errorEvent);
-      if (input.status === "deferred") return;
+      if (input.status === "deferred" || providerRetryPending(updated)) return;
       const route = input.roleName === "leader"
         ? { kind: "operator" } as const
         : { kind: "role", taskId: input.taskId, roleName: "leader" } as const;
@@ -1746,6 +1774,34 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
           dedupeKey: `agent-error:${input.taskId}:${input.attemptId}`
         }
       );
+    });
+  }
+
+  private retrySubmissionResolution(
+    binding: import("../runtime/providerRuntimeIdentity.js").ProviderRuntimeBinding,
+    input: Readonly<{ status: string; reason: string; raw: string; attemptId: string; now: Date; noProviderWrite?: boolean }>,
+    adapterId: string | undefined
+  ) {
+    if (input.status === "deferred") return deferProviderRetry(binding, input.now.getTime());
+    const driver = adapterId === undefined ? null : this.drivers.findByAdapterId(adapterId);
+    const classification = driver?.runtime.mapError({ message: input.reason, raw: input.raw });
+    const error = standardAgentError({
+      source: "driver", phase: "turn-submit", classification,
+      message: input.reason, raw: input.raw,
+      inputDisposition: input.status === "delivery-unknown" ? "unknown" : "not-accepted"
+    });
+    // Native preflight issued no mutation. Transient metadata failures may
+    // cool down within the same deadline; unavailable proof needs an Agent.
+    const noProviderWrite = input.status === "rejected" && input.noProviderWrite === true;
+    if (noProviderWrite && classification?.retryable !== true) {
+      const recorded = binding.run === null ? binding : {
+        ...binding, run: { ...binding.run, failure: { error, ref: input.attemptId } }
+      };
+      return deferProviderRetry(recorded, input.now.getTime(), input.reason);
+    }
+    return recordProviderFailure(binding, {
+      error,
+      failureRef: input.attemptId, at: input.now.getTime(), noProviderWrite
     });
   }
 
@@ -2800,6 +2856,12 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
         sessions = updateTaskRoleProviderRuntime(sessions,
           updateProviderConversationRecoverability(sessions.providerBinding, "unrecoverable"), now);
       }
+      if (input.observation?.kind === "turn.failed" && input.observation.payload.failure !== undefined
+        && sessions.providerBinding !== null) {
+        sessions = updateTaskRoleProviderRuntime(sessions, recordProviderFailure(sessions.providerBinding, {
+          error: input.observation.payload.failure.error, failureRef: input.observation.eventId, at: now.getTime()
+        }), now);
+      }
       store.saveTaskRoleSessionSet(sessions);
       let terminalRun: AgentRun | undefined;
       if (recordedProviderTurn && observedRun?.status === "active") {
@@ -3227,6 +3289,14 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
             input,
             now
           ));
+          const retry = binding.retry;
+          if (retry?.currentAttemptId === ordinaryAttemptId && retry.input.kind === "wake") {
+            const originalWakeId = retry.input.wakeId;
+            const original = store.listTaskWakes(input.fence.taskId!).find(w => w.id === originalWakeId);
+            if (original !== undefined && original.status !== "consumed") {
+              store.saveTaskWake(input.fence.taskId!, markTaskWakeConsumed(original, now));
+            }
+          }
           return "applied";
         }
       }

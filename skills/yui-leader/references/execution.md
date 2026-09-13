@@ -327,8 +327,9 @@ reachable issues to the original execution owner. Fix a small Task-main issue
 directly; create a Repair WorkItem only when the repair is itself a substantial
 independently owned requirement.
 
-A failed ReviewRound is an execution failure, not an automatic retry or repair
-wave. Inspect its exact Round, AgentRun, candidate, Core failure, and
+A failed ReviewRound is an execution failure, not a repair wave. First read
+its Provider retry projection: bounded infrastructure recovery may already own
+the successor. Otherwise inspect its exact Round, AgentRun, candidate, Core failure, and
 `task next-action` facts, then choose the smallest recovery that preserves the
 frozen boundary. Do not invent a retry loop or silently replace the Reviewer
 Session. For replicated execution, choose whether to retry a failed Producer,

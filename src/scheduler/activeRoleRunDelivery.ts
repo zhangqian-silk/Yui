@@ -108,6 +108,19 @@ async function deliverActiveRun(
   });
   const sessionSet = store.getTaskRoleSessionSet?.(task.id, role.name) ?? null;
   const binding = sessionSet?.providerBinding ?? null;
+  if (binding?.retry !== undefined && (binding.retry.successorRunId === run.id
+      || binding.retry.successorReviewRoundId !== undefined && binding.retry.successorReviewRoundId === run.reviewRoundId)
+    && ["cancelled", "exhausted", "needs-attention"].includes(binding.retry.status)
+    && binding.run?.runId !== run.id) {
+    return failRunDelivery(store, run, now, "runtime-failed",
+      `Scheduled Provider retry ${binding.retry.status}: ${binding.retry.reason ?? "not admitted"}`);
+  }
+  if (binding?.retry?.status === "waiting"
+    && (binding.retry.successorRunId === run.id || binding.retry.successorReviewRoundId !== undefined
+      && binding.retry.successorReviewRoundId === run.reviewRoundId)
+    && now.getTime() < Date.parse(binding.retry.nextEligibleAt)) {
+    return { ...base, status: "skipped", reason: "not-ready" };
+  }
   const observedRun = binding?.run ?? null;
   const initialAttemptId = formatRunReceiptId(task.id, run.id);
   const currentProviderTurn = managedProviderTurnId(observedRun) === run.id ? observedRun : null;

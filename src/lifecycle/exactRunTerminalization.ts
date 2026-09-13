@@ -1,5 +1,6 @@
 import { isDeepStrictEqual } from "node:util";
 import { createTaskMessage } from "../message/message.js";
+import { providerRetryPending } from "../runtime/providerRetry.js";
 
 import {
   captureRoleRunDispatch,
@@ -565,9 +566,11 @@ export function terminalizeExactTaskRun(
         ? {} : { workItemId: terminal.workItemId }) }
     );
     store.saveMessage(terminal.taskId, message);
-    enqueueWork(store, { kind: "role", taskId: terminal.taskId, roleName: "leader" },
+    if (!providerRetryPending(store.getTaskRoleSessionSet(terminal.taskId, terminal.roleName)?.providerBinding)) {
+      enqueueWork(store, { kind: "role", taskId: terminal.taskId, roleName: "leader" },
       "role-result", now, [{ type: "message", taskId: terminal.taskId, id: message.id }],
       { source: "task-event", dedupeKey: `result:${terminal.taskId}/${terminal.id}` });
+    }
   }
   const dispatchIdentity = {
     taskId: terminal.taskId,
