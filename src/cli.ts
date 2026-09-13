@@ -2618,9 +2618,20 @@ async function prepareExecutionLaneWorkspacesForCommand(
       throw usageError(`${item.taskId}/${roleName} already has an active turn.`);
     }
   }
-  const held = preparer.acquireTaskProjectMaintenanceLocks(item.taskId);
+  const held = await preparer.acquireTaskProjectMaintenanceLocks(item.taskId);
   const map = new Map<string, import("./worktree/managedWorkspace.js").ManagedWorkspace>();
   try {
+    assertTaskDeliveryAuthority(store, environment, item.taskId);
+    const currentItem = store.getWorkItem(item.taskId, item.id);
+    if (currentItem?.revision !== item.revision
+      || JSON.stringify(workItemDispatchLanePlan(args, store, currentItem)) !== JSON.stringify(plan)) {
+      throw new Error(`Work item dispatch changed while waiting for Project maintenance: ${item.id}.`);
+    }
+    if (held.current.status !== "active" || held.current.executionGate.state !== "enabled"
+      || plan.roles.some(roleName => store.getRole(item.taskId, roleName) === null
+        || store.getActiveRun(item.taskId, roleName) !== null)) {
+      throw new Error(`Task/Role dispatch state changed while waiting for Project maintenance: ${item.taskId}.`);
+    }
     const projectPaths = new Map<string, string>();
     for (const { projectId } of held.current.projectBindings) {
       const project = store.getProject(projectId);
