@@ -299,6 +299,11 @@ const globalSessionChildren: readonly NodeInput[] = [
     summary: "Reconcile durable Session owners with native sessions.",
     usage: "yui session reconcile [--report] [--cleanup]",
     options: ["--report", "--cleanup"]
+  },
+  {
+    name: "retry",
+    summary: "Inspect or control bounded Provider recovery for this Global Session.",
+    usage: "yui session retry <role> [show|cancel|disable|enable]"
   }
 ];
 
@@ -773,8 +778,13 @@ const taskChildren: readonly NodeInput[] = [
         name: "session",
         summary: "Inspect, stop or explicitly select a new Task Role Session.",
         executable: true,
-        sections: [{ id: "manage", title: "Commands", entries: ["inspect", "stop", "new"] }],
+        sections: [{ id: "manage", title: "Commands", entries: ["inspect", "retry", "stop", "new"] }],
         children: [
+          {
+            name: "retry",
+            summary: "Inspect or control Provider recovery without stopping an admitted Turn.",
+            usage: "yui task role session retry <task> <role> [show|cancel|disable|enable]"
+          },
           {
             name: "inspect",
             summary: "Read the current Session, Host process, and AgentRun facts.",
@@ -1587,7 +1597,7 @@ export const ROOT_COMMAND = buildNode({
       sections: [
         { id: "global", title: "Global Role sessions", entries: ["context", "enter", "record", "replace"] },
         { id: "maintenance", title: "Maintenance", entries: ["stop"] },
-        { id: "recovery", title: "Recovery", entries: ["reconcile"] }
+        { id: "recovery", title: "Recovery", entries: ["reconcile", "retry"] }
       ],
       children: globalSessionChildren
     },

@@ -3,6 +3,8 @@ import { sendAgentHostRunControl, AGENT_HOST_CONTROL_PROTOCOL } from "../runtime
 import { currentProviderConversation } from "../runtime/providerRuntimeIdentity.js";
 import { hasRuntimeCleanupObligation, runtimeLifecycleTarget } from "../runtime/lifecycleReservation.js";
 import { markGlobalRoleMessageNotDelivered, type GlobalRoleMessage } from "../message/message.js";
+import { providerRetryPending } from "../runtime/providerRetry.js";
+import { settleGlobalRetryInput } from "../message/globalProviderRetry.js";
 
 /** Messages are the only queue. Host's atomic begin arbitrates native writers. */
 export async function deliverGlobalInputs(
@@ -19,6 +21,15 @@ export async function deliverGlobalInputs(
       if (pending.length === 0 || hasRuntimeCleanupObligation(store.getWorkMailbox(
         runtimeLifecycleTarget({ scope: "global", roleName: role.name })))) continue;
       let sessions = store.getGlobalRoleSessionSet(role.name);
+      if (sessions?.providerBinding?.retry !== undefined && !providerRetryPending(sessions.providerBinding)) {
+        store.transaction(tx => settleGlobalRetryInput(tx, role.name,
+          tx.getGlobalRoleSessionSet(role.name)?.providerBinding, new Date()));
+        pending = store.listGlobalRoleMessages(role.name).filter(message =>
+          message.delivery === undefined && message.notDelivered === undefined
+          && (message.inputControl?.action === "queue" || message.interruptThen !== undefined));
+        if (pending.length === 0) continue;
+      }
+      if (providerRetryPending(sessions?.providerBinding)) continue;
       const current = sessions?.providerBinding?.run;
       const obsolete = pending.filter(message => {
         const claim = message.interruptThen;
@@ -97,6 +108,7 @@ export async function deliverGlobalInputs(
           const latest = tx.listGlobalRoleMessages(role.name).find(message => message.id === next!.id);
           if (latest === undefined || latest.delivery !== undefined || latest.notDelivered !== undefined) return;
           const turn = tx.getGlobalRoleSessionSet(role.name)?.providerBinding?.run;
+          if (providerRetryPending(tx.getGlobalRoleSessionSet(role.name)?.providerBinding)) return;
           // A later canonical acceptance wins over transport diagnostics.
           if (turn?.attemptId === attemptId && ["accepted", "completed", "failed", "cancelled"].includes(turn.status)) return;
           const unknown = result.failure?.inputDisposition === "unknown" || result.snapshot.state === "delivery-unknown";

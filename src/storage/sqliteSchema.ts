@@ -1315,6 +1315,24 @@ UPDATE review_rounds SET payload = json_set(payload, '$.executionGroup.lanes', j
     // No stored delivery index and no inferred adoption or verification:
     // valid old Publication, completion and archive payloads remain byte-identical.
     sql: "SELECT 1; -- fixed acceptance-to-publication evidence; preserve all historical facts"
+  },
+  {
+    version: 27,
+    name: "bounded-provider-input-retry",
+    introducedIn: "0.16.0",
+    // Optional owned input/recovery records on the existing Provider binding;
+    // positive Driver transient evidence on StandardAgentError. No historical
+    // failures are scanned, scheduled, reclassified or replayed by upgrading.
+    sql: `
+-- ProviderTurn.input/retrySupported/failure; ProviderRuntimeBinding.retry/retryHistory/retryDisabled;
+-- optional error retryable and retryAfterMs facts. Index existing records only.
+CREATE INDEX idx_task_provider_retry ON role_session_sets(
+  json_extract(payload, '$.providerBinding.retry.status')
+) WHERE json_extract(payload, '$.providerBinding.retry.status') IN ('waiting', 'in-flight');
+CREATE INDEX idx_global_provider_retry ON global_role_session_sets(
+  json_extract(payload, '$.providerBinding.retry.status')
+) WHERE json_extract(payload, '$.providerBinding.retry.status') IN ('waiting', 'in-flight');
+`
   }
 ]);
 

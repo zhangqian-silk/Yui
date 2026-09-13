@@ -4,6 +4,7 @@ import type { InputRequest } from "../input/inputRequest.js";
 import type { AgentRun } from "../agentRun/agentRun.js";
 import { runtimeObservationFromTaskEvent } from "../runtime/runtimeObservation.js";
 import type { ProviderTurnStatus } from "../runtime/providerRuntimeIdentity.js";
+import { providerRetryProjection } from "../runtime/providerRetry.js";
 import type { Role } from "../role/role.js";
 import { taskOwnsManagedWorkspace, type Task, type TaskStatus } from "../task/task.js";
 import type { TaskBrief } from "../brief/taskBrief.js";
@@ -174,6 +175,7 @@ type TaskExecutionTask = Readonly<Pick<
 >>;
 
 export type TaskExecutionFacts = Readonly<{
+  providerRetries?: readonly NonNullable<ReturnType<typeof providerRetryProjection>>[];
   task: TaskExecutionTask;
   roles: readonly Readonly<{
     name: string;
@@ -245,6 +247,10 @@ export function buildTaskExecutionProjection(
     roles,
     runs,
     usageRuns,
+    providerRetries: roles.flatMap(role => {
+      const retry = providerRetryProjection(store.getTaskRoleSessionSet?.(taskId, role.name)?.providerBinding);
+      return retry === null ? [] : [retry];
+    }),
     runDelivery: Object.fromEntries(runs.map((run) => {
       const observed = store.getTaskRoleSessionSet?.(taskId, run.roleName)?.providerBinding?.run;
       return [run.id, observed?.runId === run.id ? observed.status : "unobserved"];
@@ -453,8 +459,14 @@ export function projectTaskExecution(
     leaderMailbox,
     leaderFailure
   );
-  const failedWork = workItems.some((item) => item.status === "open"
-    && runs.filter((run) => run.workItemId === item.id).at(-1)?.status === "failed");
+  const providerRecoveries = (facts.providerRetries ?? []).filter(retry =>
+    retry.status === "waiting" || retry.status === "in-flight");
+  const recoveringRunIds = new Set(providerRecoveries.flatMap(retry =>
+    [retry.previousRunId, retry.successorRunId].filter((id): id is string => id !== undefined)));
+  const failedWork = workItems.some((item) => {
+    const last = runs.filter((run) => run.workItemId === item.id).at(-1);
+    return item.status === "open" && last?.status === "failed" && !recoveringRunIds.has(last.id);
+  });
   const candidateReady = workItems.some((item) => (item.status === "open" && item.currentCandidateId !== undefined));
   const blockedIntegration = integrations.some((attempt) => attempt.status === "blocked");
   const conflictedIntegration = integrations.find((attempt) => attempt.status === "conflicted");
@@ -507,7 +519,7 @@ export function projectTaskExecution(
       pendingWakeup
     });
   }
-  if (laneRecovery !== undefined) {
+  if (laneRecovery !== undefined && (laneRecovery.runId === undefined || !recoveringRunIds.has(laneRecovery.runId))) {
     return render({
       task,
       status: laneRecovery.runtimeHealth === "confirmed-dead"
@@ -553,6 +565,14 @@ export function projectTaskExecution(
       attention,
       blockers,
       pendingWakeup
+    });
+  }
+  if (providerRecoveries.length > 0 && healthyActiveRuns.length === 0) {
+    return render({
+      task, status: "recovering", owner: "none", action: "none",
+      summary: `${providerRecoveries.length} Provider recovery chain(s) are cooling down or awaiting their exact result; existing work is preserved. Do not dispatch a duplicate.`,
+      reason: "provider-recovery", monitoring, failClosed: false,
+      activeRuns: activeRunViews, attention, blockers, pendingWakeup
     });
   }
   if (recoveryPending) {

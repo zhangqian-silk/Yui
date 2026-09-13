@@ -61,6 +61,9 @@ export type AgentErrorClassification = Readonly<{
   code: string;
   inputDisposition?: AgentErrorInputDisposition;
   sessionDisposition?: AgentErrorSessionDisposition;
+  /** Positive Driver evidence of a transient error; absent never grants replay. */
+  retryable?: boolean;
+  retryAfterMs?: number;
 }>;
 
 export type StandardAgentError = Readonly<{
@@ -73,6 +76,7 @@ export type StandardAgentError = Readonly<{
   inputDisposition: AgentErrorInputDisposition;
   sessionDisposition: AgentErrorSessionDisposition;
   retryAfterMs?: number;
+  retryable?: boolean;
 }>;
 
 export function standardAgentError(input: Readonly<{
@@ -86,7 +90,7 @@ export function standardAgentError(input: Readonly<{
   retryAfterMs?: number;
 }>): StandardAgentError {
   const classification = input.classification ?? UNKNOWN_AGENT_ERROR_CLASSIFICATION;
-  const retryAfterMs = input.retryAfterMs;
+  const retryAfterMs = input.retryAfterMs ?? classification.retryAfterMs;
   if (retryAfterMs !== undefined
     && (!Number.isSafeInteger(retryAfterMs) || retryAfterMs < 0)) {
     throw new Error("Agent error retryAfterMs must be a non-negative safe integer.");
@@ -111,7 +115,8 @@ export function standardAgentError(input: Readonly<{
     sessionDisposition: input.sessionDisposition
       ?? classification.sessionDisposition
       ?? "unknown",
-    ...(retryAfterMs === undefined ? {} : { retryAfterMs })
+    ...(retryAfterMs === undefined ? {} : { retryAfterMs }),
+    ...(classification.retryable === undefined ? {} : { retryable: classification.retryable })
   });
 }
 
@@ -309,7 +314,8 @@ export function isStandardAgentError(value: unknown): value is StandardAgentErro
       error.sessionDisposition ?? ""
     )
     && (error.retryAfterMs === undefined
-      || (Number.isSafeInteger(error.retryAfterMs) && error.retryAfterMs >= 0));
+      || (Number.isSafeInteger(error.retryAfterMs) && error.retryAfterMs >= 0))
+    && (error.retryable === undefined || typeof error.retryable === "boolean");
 }
 
 /**

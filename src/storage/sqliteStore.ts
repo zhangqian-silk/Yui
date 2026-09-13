@@ -1790,6 +1790,14 @@ export class SqliteTaskStore implements TaskStore {
     );
   }
 
+  listProviderRetrySessions(): (TaskRoleSessionSet | GlobalRoleSessionSet)[] {
+    const pending = "json_extract(payload, '$.providerBinding.retry.status') IN ('waiting', 'in-flight')";
+    return [
+      ...this.#listPayload<TaskRoleSessionSet>("role_session_sets", pending, []),
+      ...this.#listPayload<GlobalRoleSessionSet>("global_role_session_sets", pending, [])
+    ];
+  }
+
   listRuntimeSessionCandidates(query: RuntimeSessionCandidateQuery = {}): RuntimeSessionCandidate[] {
     const taskIds = query.taskIds === undefined
       ? undefined

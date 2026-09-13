@@ -1,4 +1,5 @@
 import type { TaskStore } from "../storage/taskStore.js";
+import { providerRetryProjection } from "../runtime/providerRetry.js";
 import { readTaskCatalog, type TaskCatalogOptions } from "../context/taskCatalog.js";
 import type { InputRequest } from "../input/inputRequest.js";
 import { type Task, type TaskStatus } from "../task/task.js";
@@ -195,10 +196,13 @@ export function buildWebTaskDetail(
       const activeSession = sessions?.sessions[activeRun?.effective.agentId ?? sessions.activeAgentId];
       const effectiveLaunch = activeRun?.effective ?? activeSession?.effective ?? null;
       const delivery = sessions?.providerBinding?.run?.status;
+      const providerRetry = providerRetryProjection(sessions?.providerBinding);
       return {
         ...role,
+        providerRetry,
         // An open record is not proof that its Agent is running.
-        status: delivery === "accepted" ? "running"
+        status: providerRetry?.status === "waiting" ? "waiting"
+          : delivery === "accepted" ? "running"
           : delivery === "submitting" || delivery === "deferred" ? "waiting"
           : activeSession === undefined && activeRun === undefined ? "idle" : "unknown",
         sessionTokens: projectSessionTokenMetrics(

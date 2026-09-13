@@ -60,6 +60,10 @@ binding fails before review begins:
   explicitly so the Leader can judge what remains useful. Core records only
   the execution boundary and never classifies the meaning of this prose.
 
+If the current retry projection says infrastructure recovery is already
+waiting or in flight, report that fact without recommending another dispatch.
+Do not manage the retry yourself or reinterpret its preserved candidate.
+
 The Review scope remains the current AgentRun's frozen candidate even if the Leader
 handles new user input or advances Task main while this Review is running. Do
 not switch to the newer head, cancel the current inspection, or claim the

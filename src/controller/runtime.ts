@@ -131,6 +131,8 @@ import {
 import { replayRuntimeProcessExitOutbox } from "../runtime/processExitOutbox.js";
 import { appendGlobalProcessExitObservation } from "../runtime/globalProcessExitStore.js";
 import { deliverGlobalInputs } from "./globalInputDelivery.js";
+import { providerRetryPrompt } from "../runtime/providerRetry.js";
+import { createProviderRetryHooks } from "./providerRetryDelivery.js";
 import { createGlobalRoleMessage } from "../message/message.js";
 import { builtinAgentDriverRegistry } from "../runtime/builtinAgentDrivers.js";
 import {
@@ -644,6 +646,25 @@ export async function startFileTaskControllerRuntime(
         now: options.now,
         onError: options.onError,
         lifecycleHost,
+        providerRetry: createProviderRetryHooks(home, store, {
+          now: options.now,
+          onError: options.onError,
+          snapshotTaskCandidate: async (run) => {
+            if (run.purpose !== "review" || run.reviewRoundId === undefined) return undefined;
+            const round = store.getReviewRound(run.taskId, run.reviewRoundId);
+            if (round?.scope !== "task") return undefined;
+            const task = store.getTask(run.taskId);
+            const workspace = store.getTaskWorkspace(run.taskId);
+            if (task === null || workspace === null || !(workspacePreparer instanceof FileTaskWorkspacePreparer)) {
+              throw new Error("Task-final retry requires an observable authoritative Task workspace.");
+            }
+            const snapshot = await workspacePreparer.snapshotDirectTaskMain(
+              workspace, task.projectBindings.map(p => p.projectId));
+            return { schemaVersion: 1, projects: snapshot.projects.map(p => ({
+              projectId: p.projectId, commit: p.headCommit
+            })) };
+          }
+        }),
         jobSupervisor,
         globalInputDelivery: () => deliverGlobalInputs(home, store, async (roleName) => {
           await lifecycleDispatcher("runtime.ensure-role-session", { scope: "global", roleName });
@@ -810,6 +831,8 @@ export function createRuntimeLifecycleDispatcher(
           authorityEpoch: value.authorityEpoch,
           authorityOwner: value.authorityOwner,
           holderId: value.holderId,
+          boundedText: value.boundedText,
+          retrySupported: value.retrySupported,
           now: value.now
         });
       } catch (error) {
@@ -819,7 +842,15 @@ export function createRuntimeLifecycleDispatcher(
         }
         throw error;
       }
-      return { recorded: true };
+      const binding = (value.taskId === undefined
+        ? store.getGlobalRoleSessionSet(value.roleName)
+        : store.getTaskRoleSessionSet(value.taskId, value.roleName))?.providerBinding;
+      const retry = binding?.retry;
+      return { recorded: true, ...(retry?.currentAttemptId === value.attemptId && value.boundedText !== undefined
+        ? { retryInput: {
+            text: providerRetryPrompt(retry, value.boundedText),
+            ...(retry.failedNativeTurnId === undefined ? {} : { expectedFailedNativeTurnId: retry.failedNativeTurnId })
+          } } : {}) };
     }
     if (method === "runtime.provider-turn-submission-resolve") {
       const value = providerTurnControlParams(params);
@@ -839,6 +870,7 @@ export function createRuntimeLifecycleDispatcher(
         status,
         reason,
         raw,
+        noProviderWrite: (params as Record<string, unknown>).providerWrite === "not-issued",
         now: value.now
       });
       return { recorded: true };
@@ -1563,6 +1595,8 @@ function providerTurnControlParams(params: JsonValue): Readonly<{
   authorityOwner: "controller" | "human";
   holderId: string;
   now: Date;
+  boundedText?: string;
+  retrySupported?: boolean;
 }> {
   if (typeof params !== "object" || params === null || Array.isArray(params)) {
     throw applicationError("INVALID_PARAMS", "Provider Turn control params are invalid.");
@@ -1586,6 +1620,8 @@ function providerTurnControlParams(params: JsonValue): Readonly<{
     authorityEpoch: authorityEpoch as number,
     authorityOwner,
     holderId: requiredParam(value.holderId),
+    ...(value.boundedText === undefined ? {} : { boundedText: requiredParam(value.boundedText) }),
+    ...(value.retrySupport === undefined ? {} : { retrySupported: value.retrySupport === "codex-failed-turn-v1" }),
     now: new Date(observedAt)
   };
 }

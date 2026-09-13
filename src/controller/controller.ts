@@ -167,6 +167,10 @@ export type ControllerRuntimeOptions = Readonly<{
    */
   jobSupervisor?: Readonly<{ reconcile(now: Date): void }>;
   globalInputDelivery?: () => Promise<void>;
+  providerRetry?: Readonly<{
+    reconcile(): Promise<void>;
+    deadlines(): readonly { key: MailboxKey; at: number }[];
+  }>;
   /** Metadata-only reconciliation of already-known detached provider work. */
   continuationReconciler?: Readonly<{
     reconcile(now: Date): Promise<readonly string[]>;
@@ -1109,6 +1113,7 @@ export class FileTaskController {
   readonly #leaderWakeFence: (() => boolean) | undefined;
   readonly #jobSupervisor: ControllerRuntimeOptions["jobSupervisor"];
   readonly #globalInputDelivery: ControllerRuntimeOptions["globalInputDelivery"];
+  readonly #providerRetry: ControllerRuntimeOptions["providerRetry"];
   readonly #continuationReconciler: ControllerRuntimeOptions["continuationReconciler"];
   #current: Promise<ControllerSchedulerResult> | undefined;
   #operatorCurrent: Promise<void> | undefined;
@@ -1206,6 +1211,7 @@ export class FileTaskController {
     this.#jobSupervisor = options.jobSupervisor;
     this.#continuationReconciler = options.continuationReconciler;
     this.#globalInputDelivery = options.globalInputDelivery;
+    this.#providerRetry = options.providerRetry;
     this.#signalScheduler = new MailboxScheduler(
       async (keys) => { await this.#requestPass({ kind: "dirty", keys }); },
       {
@@ -1456,6 +1462,7 @@ export class FileTaskController {
             }
           }
           const firstRuntimeDrain = await this.#drainRuntimeEvents();
+          await this.#providerRetry?.reconcile();
           await this.#globalInputDelivery?.();
           for (const taskId of runtimeTaskFailureIds(firstRuntimeDrain)) {
             runtimeFailedTaskIds.add(taskId);
@@ -1895,7 +1902,7 @@ export class FileTaskController {
             at: Date.parse(request.policy.timeoutAt)
           }]
         : []);
-    const nearest = nearestDeadlineBatch(deadlines);
+    const nearest = nearestDeadlineBatch([...deadlines, ...(this.#providerRetry?.deadlines() ?? [])]);
     if (nearest === null) return;
     const now = this.#now().getTime();
     // Preserve an upcoming semantic deadline even while another pass backs

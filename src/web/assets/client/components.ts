@@ -760,6 +760,30 @@ export function roleCard(role, task, t, locale, actions) {
     card.append(eff);
   }
 
+  if (role.providerRetry) {
+    const retry = role.providerRetry;
+    const retryMeta = node("p", "record-meta");
+    const zh = locale.startsWith("zh");
+    const labels = zh ? {
+      waiting: "等待 Provider 重试", "in-flight": "Provider 重试已提交",
+      recovered: "Provider 已恢复", cancelled: "自动重试已取消",
+      exhausted: "自动重试预算耗尽", "needs-attention": "需要检查 Provider",
+      "delivery-unknown": "投递结果未知，禁止重放"
+    } : {
+      waiting: "Waiting for Provider retry", "in-flight": "Provider retry submitted",
+      recovered: "Provider recovered", cancelled: "Automatic retry cancelled",
+      exhausted: "Automatic retry budget exhausted", "needs-attention": "Provider needs attention",
+      "delivery-unknown": "Delivery unknown; no replay"
+    };
+    retryMeta.textContent = (labels[retry.status] || retry.status) + " · "
+      + (zh && retry.category === "rate-limit" ? "临时限流" : retry.category) + " · "
+      + retry.attempts + "/" + retry.limit
+      + (retry.status === "waiting" ? " · " + new Date(retry.nextEligibleAt).toLocaleString(locale) : "")
+      + " · " + (zh ? "原成果保留" : "Existing work preserved")
+      + (retry.reason ? " · " + retry.reason : "");
+    card.append(retryMeta);
+  }
+
   if (role.sessionTokens) {
     const tokenMeta = node("div", "record-meta");
     const cumulative = role.sessionTokens.cumulativeTotal || {};

@@ -84,6 +84,7 @@ import {
   type ProviderDeliveryFailure
 } from "./agentError.js";
 import { runCodexInteractiveHost } from "./codexInteractiveHost.js";
+import { CodexPreSubmissionError } from "./codexAppServerRuntime.js";
 import {
   readAgentRunConfigurationObservation,
   unknownAgentRunConfiguration,
@@ -96,7 +97,7 @@ import { yuiTmuxServerName, yuiTmuxSessionName } from "../tmux/tmuxManager.js";
 import { tmuxSocketDirectory } from "../tmux/tmuxSocketEndpoint.js";
 import { AGENT_HOST_CONTROL_PROTOCOL, AGENT_HOST_EVENT_PROTOCOL } from "./agentHostProtocol.js";
 import type { AgentHostCompatibility, AgentHostEventDelivery } from "./agentHostProtocol.js";
-import { FILE_TASK_CONTROLLER_PROTOCOL_VERSION } from "../core/protocol.js";
+import { FILE_TASK_CONTROLLER_PROTOCOL_VERSION, type JsonValue } from "../core/protocol.js";
 export { AGENT_HOST_CONTROL_PROTOCOL } from "./agentHostProtocol.js";
 
 const HOST_CONTROL_MAX_BYTES = 32 * 1024;
@@ -999,19 +1000,31 @@ export async function runAgentHost(input: Readonly<{
       attemptId: request.run.attemptId,
       ...authorityFields()
     }));
-    const durableRun = hostRunControlParams(
+    const durableRun = { ...hostRunControlParams(
       sessionPayload,
       session.nativeSessionId,
       request.authority,
       request.run.attemptId,
       request.runId
-    );
+    ), boundedText: request.run.boundedText,
+      retrySupport: session.adapterId === "codex" ? "codex-failed-turn-v1" : "unsupported" };
+    let recoveryInput: { text: string; expectedFailedNativeTurnId?: string } | undefined;
     // Registration precedes the Provider write, so its failure modes are not
     // the Provider's. A definite failure means the Provider never saw this
     // input and the occupancy must be released; anything unconfirmed leaves
     // durable state ambiguous and keeps it held.
     try {
-      await beginDurableProviderTurn(input.home, durableRun);
+      const admitted = await beginDurableProviderTurn(input.home, durableRun);
+      if (admitted !== null && typeof admitted === "object" && !Array.isArray(admitted)) {
+        const retry = (admitted as Readonly<Record<string, JsonValue>>).retryInput as
+          Readonly<{ text?: JsonValue; expectedFailedNativeTurnId?: JsonValue }> | undefined;
+        if (retry !== null && typeof retry === "object" && !Array.isArray(retry)
+          && typeof retry.text === "string") recoveryInput = {
+          text: retry.text,
+          ...(typeof retry.expectedFailedNativeTurnId === "string"
+            ? { expectedFailedNativeTurnId: retry.expectedFailedNativeTurnId } : {})
+        };
+      }
     } catch (error) {
       // Registration ends in one of three states and they are not
       // interchangeable. A definite refusal committed nothing. A lost
@@ -1070,7 +1083,11 @@ export async function runAgentHost(input: Readonly<{
       // authority and Session identity before this native write.
       const receipt = endpointReceipt(await session.submit({
         ...request.run,
-        boundedText: withSessionContextPointer(request.run.boundedText, activeRunPayload.environment),
+        boundedText: withSessionContextPointer(recoveryInput?.text ?? request.run.boundedText, activeRunPayload.environment),
+        ...(recoveryInput === undefined ? {} : { requireQuiescent: true }),
+        ...(recoveryInput?.expectedFailedNativeTurnId === undefined ? {} : {
+          expectedFailedNativeTurnId: recoveryInput.expectedFailedNativeTurnId
+        }),
         inputRef: request.runId ?? request.run.attemptId
       }), request.run.attemptId);
       transportAccepted = true;
@@ -2246,9 +2263,9 @@ function hostRunControlParams(
 async function beginDurableProviderTurn(
   home: string,
   durableRun: Readonly<Record<string, string | number>>
-): Promise<void> {
+): Promise<JsonValue> {
   try {
-    await callControllerIdempotently(home, "runtime.provider-turn-begin", durableRun);
+    return await callControllerIdempotently(home, "runtime.provider-turn-begin", durableRun);
   } catch (error) {
     if (error instanceof ControllerClientError && error.code === "SESSION_BUSY") {
       throw new ProviderTurnBusyError(error.message, String(durableRun.attemptId));
@@ -2260,7 +2277,8 @@ async function beginDurableProviderTurn(
       new Error(
         `Provider Turn intent acknowledgement failed before Provider write: ${errorText(error)}`,
         { cause: error }
-      )
+      ),
+      true
     );
     // The resolve is fenced on this exact attempt id, so its success proves
     // the registration did commit and is now settled with nothing written to
@@ -2278,9 +2296,9 @@ async function callControllerIdempotently(
   home: string,
   method: string,
   request: Readonly<Record<string, string | number>>
-): Promise<void> {
+): Promise<JsonValue> {
   try {
-    await callAgentController(home, method, request);
+    return await callAgentController(home, method, request);
   } catch (error) {
     if (!(error instanceof ControllerClientError)
       || (error.code !== "INTERNAL_ERROR" && !controllerCallMayHaveApplied(error))) {
@@ -2290,7 +2308,7 @@ async function callControllerIdempotently(
     // These methods carry exact attempt, launch, and authority fences. A
     // bounded replay confirms a commit whose acknowledgement may have been lost.
     try {
-      await callAgentController(home, method, request);
+      return await callAgentController(home, method, request);
     } catch (replayError) {
       if (firstCallMayHaveApplied || controllerCallMayHaveApplied(replayError)) {
         throw new ControllerAcknowledgementUnknownError(
@@ -2325,7 +2343,8 @@ class ProviderTurnRegistrationSettledError extends Error {
 async function resolveProviderTurnSubmission(
   home: string,
   durableRun: Readonly<Record<string, string | number>>,
-  error: unknown
+  error: unknown,
+  noProviderWrite = false
 ): Promise<void> {
   const attemptId = durableRun.attemptId;
   if (typeof attemptId !== "string") {
@@ -2338,6 +2357,7 @@ async function resolveProviderTurnSubmission(
       : error instanceof ProviderTurnBusyError ? "deferred" : "rejected",
     reason: errorText(error),
     raw: serializeAgentErrorRaw(error),
+    ...(noProviderWrite || error instanceof CodexPreSubmissionError ? { providerWrite: "not-issued" } : {}),
     observedAt: new Date().toISOString()
   } as const;
   try {
@@ -2373,10 +2393,9 @@ async function callAgentController(
   home: string,
   method: string,
   params: Readonly<Record<string, string | number>>
-): Promise<void> {
+): Promise<JsonValue> {
   try {
-    await callController(home, method, params);
-    return;
+    return await callController(home, method, params);
   } catch (error) {
     if (!isControllerUnavailable(error) || !isForeignHandoverLockHeld(home)) {
       throw error;
@@ -2386,7 +2405,7 @@ async function callAgentController(
   while (isForeignHandoverLockHeld(home) && Date.now() < deadline) await delay(50);
   // The pinned Host can rediscover a replacement, but must never start a
   // Controller using its own old implementation or open the Home's database.
-  await callController(home, method, params);
+  return await callController(home, method, params);
 }
 
 function isControllerUnavailable(error: unknown): boolean {

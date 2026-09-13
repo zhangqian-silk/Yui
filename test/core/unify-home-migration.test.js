@@ -76,6 +76,7 @@ function openPriorVersionHome(t, prefix) {
   const db = new Database(join(home, "yui.db"));
   t.after(() => db.close());
   db.prepare("DELETE FROM schema_migrations WHERE version > ?").run(PRIOR_VERSION);
+  db.exec("DROP INDEX idx_task_provider_retry; DROP INDEX idx_global_provider_retry;");
   const head = db
     .prepare("SELECT MAX(version) AS version FROM schema_migrations")
     .get();
@@ -569,6 +570,7 @@ function openPriorVersionStore(t, prefix) {
 function rewindLedgerToPriorVersion(store) {
   const db = store.databaseHandle();
   db.prepare("DELETE FROM schema_migrations WHERE version > ?").run(PRIOR_VERSION);
+  db.exec("DROP INDEX idx_task_provider_retry; DROP INDEX idx_global_provider_retry;");
   const head = db.prepare("SELECT MAX(version) AS version FROM schema_migrations").get();
   assert.equal(head.version, PRIOR_VERSION, "ledger rewound to the prior version");
 }

@@ -1,3 +1,9 @@
+import {
+  cancelProviderRetry, completeProviderRetry, validateProviderInput, validateProviderRetry,
+  type ProviderInput, type ProviderRetry
+} from "./providerRetry.js";
+import { isStandardAgentError, type StandardAgentError } from "./agentError.js";
+
 export type ProviderConversationRecoverability = "unknown" | "recoverable" | "unrecoverable";
 export type ProviderConversationStatus = "current" | "superseded";
 export type ProviderAuthorityOwner = "controller" | "human" | "none" | "unknown";
@@ -59,6 +65,9 @@ export type ProviderTurn = Readonly<{
   updatedAt: string;
   nativeTurnId?: string;
   terminalReason?: string;
+  input?: ProviderInput;
+  retrySupported?: boolean;
+  failure?: Readonly<{ error: StandardAgentError; ref: string }>;
 }>;
 
 export type ProviderRuntimeBinding = Readonly<{
@@ -70,6 +79,10 @@ export type ProviderRuntimeBinding = Readonly<{
   authority: ProviderAuthority;
   run: ProviderTurn | null;
   goal: ProviderGoal | null;
+  retry?: ProviderRetry;
+  /** Terminal audit, never an additional scheduling source. */
+  retryHistory?: readonly ProviderRetry[];
+  retryDisabled?: boolean;
 }>;
 
 export function createProviderRuntimeBinding(input: Readonly<{
@@ -193,9 +206,11 @@ export function beginProviderTurn(
     attemptId: string;
     authorityEpoch: number;
     submittedAt: string;
+    input?: ProviderInput;
+    retrySupported?: boolean;
   }>
 ): ProviderRuntimeBinding {
-  const binding = validateProviderRuntimeBinding(raw);
+  let binding = validateProviderRuntimeBinding(raw);
   const attemptId = identity(input.attemptId, "Provider input attempt id");
   const runId = input.runId === undefined ? undefined : identity(input.runId, "AgentRun id");
   const currentRun = binding.run;
@@ -215,6 +230,9 @@ export function beginProviderTurn(
     throw new Error("Provider Conversation already has an unsettled AgentRun.");
   }
   const submittedAt = timestamp(input.submittedAt, "Provider Turn submittedAt");
+  if (binding.retry?.currentAttemptId !== attemptId) {
+    binding = cancelProviderRetry(binding, "superseded-by-explicit-input", Date.parse(submittedAt));
+  }
   return validateProviderRuntimeBinding({
     ...binding,
     run: {
@@ -222,6 +240,8 @@ export function beginProviderTurn(
       attemptId,
       authorityEpoch: input.authorityEpoch,
       status: "submitting",
+      ...(input.input === undefined ? {} : { input: input.input }),
+      ...(input.retrySupported === undefined ? {} : { retrySupported: input.retrySupported }),
       submittedAt,
       updatedAt: submittedAt
     }
@@ -364,7 +384,7 @@ export function settleProviderTurn(
     throw new Error("Provider Turn settlement does not match the current AgentRun.");
   }
   const settledAt = orderedRunTimestamp(run, input.settledAt, "Provider Turn settledAt");
-  return validateProviderRuntimeBinding({
+  const settled = validateProviderRuntimeBinding({
     ...binding,
     run: {
       ...run,
@@ -376,6 +396,7 @@ export function settleProviderTurn(
         : { terminalReason: identity(input.reason, "Provider Turn terminal reason") })
     }
   });
+  return completeProviderRetry(settled, settled.run!);
 }
 
 /** Explicitly abandon an engineering input only after its execution resources
@@ -522,6 +543,18 @@ export function validateProviderRuntimeBinding(value: ProviderRuntimeBinding): P
   }
   if (!Object.hasOwn(value, "goal")) throw new Error("Provider Runtime Binding requires Goal state.");
   if (value.goal !== null) validateProviderGoal(value.goal);
+  if (value.retry !== undefined) validateProviderRetry(value.retry);
+  if (value.retryHistory !== undefined) {
+    if (!Array.isArray(value.retryHistory)) throw new Error("Provider retry audit must be an array.");
+    for (const retry of value.retryHistory) {
+      validateProviderRetry(retry);
+      if (retry.status === "waiting" || retry.status === "in-flight") throw new Error("Provider retry audit cannot schedule work.");
+    }
+  }
+  if (value.retryDisabled !== undefined && typeof value.retryDisabled !== "boolean") throw new Error("Provider retry switch must be boolean.");
+  if (value.run?.input !== undefined) validateProviderInput(value.run.input);
+  if (value.run?.failure !== undefined
+    && (!isStandardAgentError(value.run.failure.error) || !value.run.failure.ref)) throw new Error("Invalid Provider input failure.");
   return value;
 }
 

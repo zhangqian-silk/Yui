@@ -12,6 +12,30 @@ affected WorkItem, ReviewRound or Integration. Use `task next-action` and
 `execution audit` as decision support, not as an automatic plan.
 Active or quiet observations are not a Task-wide lock or proof of failure.
 
+### Bounded infrastructure retry
+
+The Controller, not the Agent, counts and schedules qualifying transient
+Provider retries: at most five automatic executions after the initial failure,
+within one ten-minute recovery window. Native acceptance, activity and partial
+output do not reset that count. Unknown delivery remains fenced for exact
+readback; it is never replayed.
+
+Inspect the current projection in Context, or use
+`task role session retry <task> <role> show`; Global Sessions use
+`session retry <role> show`. While `waiting` or `in-flight`, do not dispatch a
+duplicate. A readable failed Run remains immutable evidence while its recovery
+successor handles the same responsibility and frozen Review boundary.
+
+`cancel` withdraws pending automatic recovery; `disable` additionally disables
+future automatic chains on that Provider binding. Neither stops an admitted
+native Turn. `enable` permits future failures to qualify, without replaying
+old failures. These controls require the existing user/supervisor authority.
+
+`exhausted`, `cancelled` and `needs-attention` preserve the error, input and
+work. Read their exact reason, then choose an authorized next action. Unsupported
+Hosts/Adapters or unprovable Session/background state do not trigger automatic
+replacement, cleanup, model switching or a new grant.
+
 A failed AgentRun is immutable; retry creates a new attempt. Reuse a recoverable
 Session when useful and load the new attempt's current context, not an old
 Assignment from memory. A new Host process need not mean a new native Session.

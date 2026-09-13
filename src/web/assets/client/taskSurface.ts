@@ -383,7 +383,8 @@ export function renderTaskSurface(container, data, t, locale, actions) {
     const active = values("run").find((run) => run.roleName === role.name && run.status === "active");
     const incomplete = core.omitted.records > 0 || records("run").some((entry) => entry.omitted);
     roles.append(roleCard({
-      ...role, status: active || incomplete ? "unknown" : "idle",
+      ...role, providerRetry: entry.providerRetry,
+      status: entry.providerRetry?.status === "waiting" ? "waiting" : active || incomplete ? "unknown" : "idle",
       effectiveLaunch: active ? active.effective : null,
       launchDrift: active && active.effective.sourceDesiredRevision !== role.launchRevision
     }, task, t, locale, actions));

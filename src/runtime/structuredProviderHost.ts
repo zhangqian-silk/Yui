@@ -64,6 +64,9 @@ export type StructuredProviderTurnReceipt = Readonly<{
 export type StructuredProviderTurnInput = Readonly<{
   attemptId: string;
   boundedText: string;
+  /** Exact failed native Turn whose unfinished work this input continues. */
+  expectedFailedNativeTurnId?: string;
+  requireQuiescent?: boolean;
 }>;
 
 export type StructuredProviderTurnStarted = Readonly<{
@@ -704,7 +707,7 @@ class CodexStructuredProviderSession implements StructuredProviderSession {
             ? {}
             : {
                 error: recovered.error ?? "Provider Turn failed.",
-                rawError: serializeAgentErrorRaw(recovered)
+                ...(recovered.rawError === undefined ? {} : { rawError: recovered.rawError })
               })
         };
         session.#clientOwnedTurnId = undefined;
@@ -844,7 +847,11 @@ class CodexStructuredProviderSession implements StructuredProviderSession {
         conversationId: this.conversationId,
         attemptId: turn.attemptId,
         text: turn.boundedText,
-        expectedNoActiveTurn: true
+        expectedNoActiveTurn: true,
+        ...(turn.requireQuiescent ? { requireQuiescent: true } : {}),
+        ...(turn.expectedFailedNativeTurnId === undefined ? {} : {
+          expectedFailedNativeTurnId: turn.expectedFailedNativeTurnId
+        })
       });
       if (acceptance.status === "unknown") {
         throw new ProviderDeliveryUnknownError(acceptance.reason, turn.attemptId);

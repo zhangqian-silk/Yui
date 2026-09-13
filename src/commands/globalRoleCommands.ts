@@ -1,4 +1,6 @@
 import { roleNotFound, usageError } from "../errors/cliError.js";
+import { controlProviderRetry, providerRetryProjection, renderProviderRetry } from "../runtime/providerRetry.js";
+import { settleGlobalRetryInput } from "../message/globalProviderRetry.js";
 import {
   createRoleSessionSet,
   recordRoleAgentSession,
@@ -139,9 +141,9 @@ export function runGlobalRoleCommand(
   options: GlobalRoleCommandOptions = {}
 ): GlobalRoleCommandResult {
   const [command, ...rest] = args;
-  if (command === "message" || command === "interrupt") {
+  if (command === "message" || command === "interrupt" || command === "session" && rest[0] === "retry") {
     const env = options.env ?? process.env;
-    const target = command === "message" ? rest[1] : rest[0];
+    const target = command === "message" || command === "session" ? rest[1] : rest[0];
     if (env.YUI_SESSION_SCOPE !== undefined && env.YUI_SESSION_SCOPE !== "global"
       || env.YUI_SESSION_SCOPE === "global" && env.YUI_ROLE !== "operator"
         && env.YUI_ROLE !== target) {
@@ -255,6 +257,7 @@ function roleContext(
     pendingMessages: pendingQueue,
     messages: store.listGlobalRoleMessages(name),
     nativeTurn: sessions?.providerBinding?.run ?? null,
+    retry: providerRetryProjection(sessions?.providerBinding),
     interrupts: sessions?.interrupts ?? {},
     sessionManifestPath: environment.YUI_SESSION_MANIFEST,
     cliCommand: "yui"
@@ -555,6 +558,27 @@ function roleSession(
   options: GlobalRoleCommandOptions
 ): string {
   const [command, rawName, ...tail] = args;
+  if (command === "retry") {
+    const name = roleName(rawName);
+    const [action = "show", ...extra] = tail;
+    if (extra.length > 0 || !["show", "cancel", "disable", "enable"].includes(action)) {
+      throw usageError("Usage: yui session retry <role> [show|cancel|disable|enable]");
+    }
+    return store.transaction(tx => {
+      requireRole(name, tx);
+      const sessions = tx.getGlobalRoleSessionSet(name);
+      let binding = sessions?.providerBinding ?? null;
+      if (action !== "show") {
+        if (sessions === null || binding === null) throw usageError("No current Provider Session.");
+        binding = controlProviderRetry(binding, action as "cancel" | "disable" | "enable", Date.now());
+        tx.saveGlobalRoleSessionSet({ ...sessions, providerBinding: binding });
+        settleGlobalRetryInput(tx, name, binding, new Date());
+      }
+      return options.jsonOutput ? JSON.stringify({
+        roleName: name, retry: providerRetryProjection(binding), disabled: binding?.retryDisabled ?? false
+      }) + "\n" : renderProviderRetry(binding) + "\n";
+    });
+  }
   if (command !== "record" && command !== "replace") {
     throw usageError("Session usage: yui session record|replace <role> --native-id <id> [--reason <reason>].");
   }

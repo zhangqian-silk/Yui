@@ -7,6 +7,10 @@ import type {
 export function mapClaudeAgentError(
   input: AgentDriverErrorInput
 ): AgentErrorClassification {
+  return withTransientEvidence(mapClaudeDisplayError(input), input);
+}
+
+function mapClaudeDisplayError(input: AgentDriverErrorInput): AgentErrorClassification {
   const text = `${input.message}\n${input.raw}`;
   if (/^No conversation found with session ID: [A-Za-z0-9-]+\.?$/imu.test(input.message)) {
     return sessionUnavailable("provider.session-not-found");
@@ -33,6 +37,10 @@ export function mapClaudeAgentError(
 export function mapCodexAgentError(
   input: AgentDriverErrorInput
 ): AgentErrorClassification {
+  return withTransientEvidence(mapCodexDisplayError(input), input);
+}
+
+function mapCodexDisplayError(input: AgentDriverErrorInput): AgentErrorClassification {
   const text = `${input.message}\n${input.raw}`;
   if (/^server_error$/iu.test(input.message)) {
     return recoverable("availability", "provider.server-error");
@@ -227,4 +235,77 @@ function sessionUnavailable(code: string): AgentErrorClassification {
     code,
     sessionDisposition: "unrecoverable"
   });
+}
+
+/** Replay qualification is stricter than the readable, best-effort category.
+ * Never promote a number occurring in provider prose to submission safety. */
+function structuredTransientError(input: AgentDriverErrorInput): AgentErrorClassification | undefined {
+  if (/insufficient[_ -]quota|quota.{0,25}(exhaust|exceed)|billing[_ -]hard[_ -]limit|usageLimitExceeded|credits?.{0,20}(exhaust|insufficient)/iu.test(
+    `${input.message}\n${input.raw}`
+  )) return { category: "access", code: "provider.quota-exhausted", retryable: false };
+  const nodes: Record<string, unknown>[] = [];
+  const visit = (value: unknown, depth: number): void => {
+    if (depth > 8 || value === null || typeof value !== "object" || Array.isArray(value)) return;
+    const node = value as Record<string, unknown>;
+    nodes.push(node);
+    for (const key of ["cause", "error", "data", "codexErrorInfo", "responseTooManyFailedAttempts",
+      "httpConnectionFailed", "responseStreamConnectionFailed", "responseStreamDisconnected", "error_details"]) {
+      visit(node[key], depth + 1);
+    }
+  };
+  try { visit(JSON.parse(input.raw), 0); } catch { /* Display classification may still use prose. */ }
+  const codes = nodes.flatMap(n => [n.code, n.type, n.error, n.codexErrorInfo]).filter(v => typeof v === "string");
+  if (codes.some(c => ["authentication_error", "permission_error", "invalid_api_key", "invalid_model",
+    "model_not_found", "usage_limit_exceeded", "insufficient_quota"].includes(c))) {
+    return { category: "access", code: "provider.access-denied", retryable: false };
+  }
+  const statuses = nodes.flatMap(n => [n.httpStatusCode, n.statusCode, n.status]).filter(v => typeof v === "number");
+  if (statuses.some(s => s === 401 || s === 403 || s === 400 || s === 404)) {
+    return { category: "invalid-request", code: "provider.http-4xx", retryable: false };
+  }
+  const nativeCode = input.message.trim();
+  let result: AgentErrorClassification | undefined;
+  if (statuses.includes(429) || codes.includes("rate_limit_error") || nativeCode === "rate_limit_error") {
+    result = recoverable("rate-limit", "provider.rate-limit");
+  } else if (statuses.some(s => [500, 502, 503, 504].includes(s))
+    || codes.some(c => ["server_error", "overloaded_error"].includes(c))
+    || ["server_error", "overloaded_error"].includes(nativeCode)) {
+    result = recoverable("availability", "provider.server-error");
+  } else if (codes.some(c => ["ECONNRESET", "ECONNREFUSED", "EAI_AGAIN", "ETIMEDOUT", "EPIPE"].includes(c))) {
+    result = recoverable("transport", "transport.temporary-failure");
+  }
+  if (result === undefined) return undefined;
+  const waits: number[] = [];
+  for (const node of nodes) {
+    for (const value of [node.retry_after_ms, node.retryAfterMs]) {
+      if (typeof value === "number" && Number.isSafeInteger(value) && value >= 0) waits.push(value);
+    }
+    const headers = node.headers;
+    if (headers === null || typeof headers !== "object" || Array.isArray(headers)) continue;
+    const entries = Object.entries(headers);
+    const value = entries.find(([k]) => k.toLowerCase() === "retry-after")?.[1];
+    if (typeof value !== "string") continue;
+    if (/^\d+(?:\.\d+)?$/u.test(value.trim())) waits.push(Math.ceil(Number(value) * 1_000));
+    else {
+      const date = Date.parse(value);
+      if (Number.isFinite(date)) waits.push(Math.max(0, date - Date.now()));
+    }
+  }
+  const retryAfterMs = Math.max(...waits.filter(Number.isSafeInteger));
+  return { ...result, retryable: true,
+    ...(Number.isFinite(retryAfterMs) ? { retryAfterMs } : {}) };
+}
+
+/** Add positive evidence without renaming established diagnostics or letting
+ * a transient nested cause override a known fatal Session/request failure. */
+function withTransientEvidence(base: AgentErrorClassification, input: AgentDriverErrorInput): AgentErrorClassification {
+  const evidence = structuredTransientError(input);
+  if (evidence === undefined) return base;
+  const possiblyTransient = ["rate-limit", "availability", "transport", "unknown"].includes(base.category);
+  if (evidence.retryable === false) return possiblyTransient ? evidence : { ...base, retryable: false };
+  if (!possiblyTransient || base.sessionDisposition === "unrecoverable") return base;
+  return {
+    ...(base.category === "unknown" ? evidence : base), retryable: true,
+    ...(evidence.retryAfterMs === undefined ? {} : { retryAfterMs: evidence.retryAfterMs })
+  };
 }

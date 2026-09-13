@@ -4,6 +4,7 @@ import type { SchedulerReconcileSelection, SchedulerStorePort, TmuxDeliveryPort 
 import { isSchedulerTaskWorkspaceReady } from "./ports.js";
 import { taskOwnsManagedWorkspace } from "../task/task.js";
 import { hasImmediateWakeReason } from "./wakeReason.js";
+import { providerRetryPending } from "../runtime/providerRetry.js";
 
 export type LeaderWakeupProcessingResult = Readonly<{
   taskId: string;
@@ -45,6 +46,9 @@ export async function processLeaderWakeups(
     }
     const sessions = store.getTaskRoleSessionSet?.(task.id, role.name) ?? null;
     const provider = sessions?.providerBinding;
+    if (providerRetryPending(provider)) {
+      results.push({ ...base, status: "skipped", reason: "not-ready" }); continue;
+    }
     if (provider?.authority.owner === "human" || provider?.authority.owner === "unknown") {
       results.push({ ...base, status: "skipped", reason: "busy" }); continue;
     }
