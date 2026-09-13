@@ -1,4 +1,5 @@
 import type { TaskStore } from "../storage/taskStore.js";
+import { readTaskCatalog, type TaskCatalogOptions } from "../context/taskCatalog.js";
 import type { InputRequest } from "../input/inputRequest.js";
 import { type Task, type TaskStatus } from "../task/task.js";
 import type { WorkItem, WorkItemStatus } from "../workItem/workItem.js";
@@ -27,6 +28,10 @@ import {
   projectTaskRemoteDelivery,
   type TaskRemoteDelivery
 } from "../task/remoteDelivery.js";
+
+export function buildWebTaskCatalog(store: WebDashboardStore, options: TaskCatalogOptions) {
+  return store.transaction(reader => readTaskCatalog(reader, options));
+}
 
 export type WebDashboardStore = Pick<TaskStore,
   | "transaction"

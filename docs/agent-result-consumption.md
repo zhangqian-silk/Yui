@@ -2,6 +2,10 @@
 
 # Agent result consumption
 
+For candidate discovery before reading original results, use the
+[bounded Task catalog](task-discovery.md). A catalog summary never replaces a
+requirement or the original result.
+
 Every explicitly dispatched AgentRun produces one durable original result.
 Ordinary notification and native conversation do not implicitly create Runs.
 The next Agent in the ownership chain reads the exact result and decides what

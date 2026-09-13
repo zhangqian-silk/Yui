@@ -934,9 +934,13 @@ export function taskCard(task, hasAttention, state, t, locale, onSelect) {
   }
 
   // One signal only: an open input (needs the user) outranks a running count.
-  if (hasAttention) {
-    const badge = node("span", "task-signal is-input", String(task.openInputCount || 1));
+  if (hasAttention || (task.attention && task.attention.openInputs > 0)) {
+    const badge = node("span", "task-signal is-input", String(task.attention ? task.attention.openInputs : task.openInputCount || 1));
     badge.title = t("stats.inputs");
+    button.append(badge);
+  } else if (task.attention && task.attention.executionSignals > 0) {
+    const badge = node("span", "task-signal", String(task.attention.executionSignals));
+    badge.title = t("catalog.executionSignals");
     button.append(badge);
   } else if (task.workItems && task.workItems.running > 0) {
     const badge = node("span", "task-signal is-running", String(task.workItems.running));

@@ -140,10 +140,11 @@ export function parseTaskListOptions(args: readonly string[]): TaskListOptions {
 export function buildTaskOverview(
   store: TaskStore,
   options: TaskListOptions,
-  now = new Date()
+  now = new Date(),
+  taskId?: string
 ): TaskOverviewResult {
   const runtimeHealthPolicy = resolveRuntimeHealth(store.getConfig().runtimeHealth);
-  const tasks = store.listTasks()
+  const tasks = (taskId === undefined ? store.listTasks() : [store.getTask(taskId)].filter((task): task is Task => task !== null))
     .filter((task) => options.all || task.status !== "archived")
     .map((task) => buildTaskOverviewEntry(task, store, now, runtimeHealthPolicy));
   return { tasks };

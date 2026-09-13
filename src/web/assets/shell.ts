@@ -38,6 +38,12 @@ export const DASHBOARD_HTML = `<!doctype html>
       </label>
       <div id="status-filters" class="filters" role="group" aria-label="Filter by status" data-i18n-aria-label="filters.label"></div>
       <div id="task-list" class="task-list" aria-label="Tasks" data-i18n-aria-label="board.title" aria-live="polite"><div class="loading" data-i18n="loading.dashboard">Reading local state…</div></div>
+      <div id="catalog-controls" class="catalog-pager" aria-live="polite">
+        <button id="catalog-reset" type="button" data-i18n="catalog.first">First page</button>
+        <span id="catalog-count"></span>
+        <button id="catalog-next" type="button" data-i18n="catalog.next" disabled>Next page</button>
+        <button id="catalog-attention-reset" type="button" data-i18n="catalog.clearAttention" hidden>Clear attention filter</button>
+      </div>
       <div class="sidebar-foot">
         <div class="sidebar-controls">
           <label class="select-control">

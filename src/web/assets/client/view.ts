@@ -66,12 +66,17 @@ export function renderFilters(container, state, t, onFilter) {
     if (!btn) return;
     btn.classList.toggle("is-active", state.filter === status);
     const label = btn.querySelector(".filter-label");
-    if (label) label.textContent = status === "all" ? t("filter.unarchived") : translatedStatus(t, "status", status);
+    if (label) label.textContent = status === "all"
+      ? t(state.catalogAll ? "catalog.all" : "filter.unarchived") : translatedStatus(t, "status", status);
     const count = status === "all"
-      ? (counts.total === undefined ? undefined : counts.total - (counts.archived || 0))
+      ? (counts.total === undefined ? undefined : counts.total - (state.catalogAll ? 0 : counts.archived || 0))
       : counts[status];
     const badge = btn.querySelector(".filter-count");
     if (badge) {
+      if (status === "archived" && state.catalogScope && state.catalogScope.archived === "excluded") {
+        badge.hidden = true;
+        return;
+      }
       if (count !== undefined && count !== null) {
         badge.textContent = String(count);
         badge.hidden = false;
@@ -83,7 +88,7 @@ export function renderFilters(container, state, t, onFilter) {
 }
 
 function taskGroupOf(task, attentionIds) {
-  if (attentionIds.has(task.id)) return "attention";
+  if (attentionIds.has(task.id) || (task.attention && (task.attention.openInputs > 0 || task.attention.unknownOperations > 0))) return "attention";
   if (task.status === "active") return "active";
   if (task.status === "draft") return "draft";
   if (task.status === "cancelled") return "cancelled";
@@ -107,9 +112,9 @@ export function renderTasks(container, state, t, locale, onSelect) {
   const attentionIds = new Set((state.attention || []).map(function (item) { return item.taskId; }));
   const groups = { attention: [], active: [], draft: [], finished: [], cancelled: [], archived: [] };
   (state.tasks || []).forEach(function (task) {
-    if (state.filter === "all" && task.status === "archived") return;
+    if (state.filter === "all" && !state.catalogAll && task.status === "archived") return;
     if (state.filter !== "all" && task.status !== state.filter) return;
-    if (!taskMatchesQuery(task, query, locale)) return;
+    if (!state.catalogScope && !taskMatchesQuery(task, query, locale)) return;
     groups[taskGroupOf(task, attentionIds)].push(task);
   });
 
@@ -166,15 +171,33 @@ export function renderOverview(detail, state, t, locale, onSelect) {
   );
   wrap.append(rail);
 
+  if (state.catalogAttention) {
+    const catalog = node("section", "overview-block");
+    catalog.append(sectionHead(t("catalog.attention")));
+    catalog.append(node("p", "", t("catalog.signalsHelp")));
+    const groups = node("div", "overview-list");
+    Object.entries(state.catalogAttention).forEach(function (entry) {
+      const kind = entry[0], value = entry[1];
+      const button = node("button", "overview-row",
+        t("catalog." + kind) + " · " + value.count + " / " + value.taskCount + " " + t("catalog.tasks"));
+      button.type = "button";
+      button.dataset.catalogAttention = kind;
+      button.disabled = value.taskCount === 0;
+      groups.append(button);
+    });
+    catalog.append(groups);
+    wrap.append(catalog);
+  }
   const inbox = node("section", "overview-block");
   const inboxHead = sectionHead(t("overview.inbox"), {
-    count: (state.attention || []).length
+    count: counts ? counts.openInputs : (state.attention || []).length
   });
   inbox.append(inboxHead);
   const items = state.attention || [];
   if (!items.length) {
     const empty = node("div", "inbox-empty");
-    empty.append(node("span", "dot"), node("span", "", t("overview.inboxEmpty")));
+    empty.append(node("span", "dot"), node("span", "", counts && counts.openInputs > 0
+      ? t("catalog.inspectInputs") : t("overview.inboxEmpty")));
     inbox.append(empty);
   } else {
     const list = node("div", "inbox-list");
@@ -184,6 +207,7 @@ export function renderOverview(detail, state, t, locale, onSelect) {
     inbox.append(list);
   }
   wrap.append(inbox);
+  if (state.catalogScope) wrap.append(node("p", "", t("catalog.pageScope")));
 
   // Tasks whose Task-first projection says they need attention: blocked,
   // recovering, or in an attention state. This replaces the raw stalled-AgentRun
