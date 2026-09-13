@@ -3432,7 +3432,7 @@ function selectionCall(
     case "role.list": return store.listGlobalRoles();
     case "role.show": return store.getGlobalRole(String(params.name ?? ""));
     case "project.list": return callOptional(reader, "listProjects");
-    case "task.list": return callOptional(reader, "listTasks");
+    case "task.list": return store.listTaskChoices();
     case "task.integration.list": return store.listIntegrationAttempts(String(params.taskId ?? ""));
     case "task.change-set.list": return store.listChangeSets(String(params.taskId ?? ""));
     case "task.role.list": return callOptional(reader, "listRoles", [params.taskId]);

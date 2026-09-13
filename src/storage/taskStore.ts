@@ -289,6 +289,9 @@ export type TaskStore = {
   nextTaskId(): string;
   saveTask(task: Task): void;
   listTasks(): Task[];
+  /** Complete lightweight choice array for interactive selectors, not Context. */
+  listTaskChoices(): Pick<Task, "id" | "title" | "status">[];
+  queryTaskCatalog(query: import("./taskCatalog.js").TaskCatalogQuery): import("./taskCatalog.js").TaskCatalogFacts;
   /** Active Task ids only; production SQLite uses its bounded catalog index. */
   listActiveTaskIds(): string[];
   /**

@@ -38,6 +38,7 @@ import { existsSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { isDeepStrictEqual } from "node:util";
 import Database from "better-sqlite3";
+import { queryTaskCatalog, type TaskCatalogQuery } from "./taskCatalog.js";
 import { validatePluginValidation, type PluginValidation } from "../plugins/pluginPackage.js";
 import { validatePluginIntent, validatePluginIntentFailure, type PluginIntent, type PluginIntentFailure } from "../plugins/pluginIntent.js";
 import {
@@ -1205,6 +1206,17 @@ export class SqliteTaskStore implements TaskStore {
   listTasks(): Task[] {
     const tasks = this.#listPayload<Task>("task_records", "1=1", []);
     return this.#sortById(tasks, (task) => task.id);
+  }
+
+  queryTaskCatalog(query: TaskCatalogQuery) {
+    return queryTaskCatalog(this.#db, query);
+  }
+
+  listTaskChoices(): Pick<Task, "id" | "title" | "status">[] {
+    const rows = this.#db.prepare(`SELECT c.task_id AS id, c.status,
+      json_extract(r.payload, '$.title') AS title
+      FROM tasks_catalog c JOIN task_records r ON r.task_id = c.task_id`).all() as Pick<Task, "id" | "title" | "status">[];
+    return this.#sortById(rows, task => task.id);
   }
 
   getTask(id: string): Task | null {

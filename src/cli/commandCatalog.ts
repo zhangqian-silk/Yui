@@ -460,9 +460,9 @@ const taskChildren: readonly NodeInput[] = [
   },
   {
     name: "list",
-    summary: "List unarchived Task overviews.",
-    usage: "yui task list [--all] [--verbose]",
-    options: ["--all", "--verbose"]
+    summary: "List Task overviews or a bounded discovery catalog.",
+    usage: "yui task list [--all] [--verbose] | --view compact [--all] [--status <status>] [--project <id>] [--search <text>] [--attention <category>] [--limit <1..100>] [--cursor <cursor>]",
+    options: ["--all", "--verbose", "--view", "--status", "--project", "--search", "--attention", "--limit", "--cursor"]
   },
   { name: "show", summary: "Show a Task.", usage: "yui task show <id>" },
   {
