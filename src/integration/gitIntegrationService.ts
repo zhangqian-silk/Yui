@@ -171,7 +171,8 @@ export class GitIntegrationService {
 
   async integrate(
     taskId: string,
-    integrationId: string
+    integrationId: string,
+    signal?: AbortSignal
   ): Promise<IntegrationResult> {
     let initial = requireIntegration(this.store, taskId, integrationId);
     if (!["running", "conflicted", "blocked", "validating"].includes(initial.status)) {
@@ -182,7 +183,7 @@ export class GitIntegrationService {
     // CAS. A concurrent `project migrate` must not switch the catalog path or
     // remove the old checkout mid-Integration, so the per-Project maintenance
     // fence is held across every Git effect and released only on exit.
-    const release = acquireProjectMaintenanceLocks(this.home, [initial.projectId]);
+    const release = await acquireProjectMaintenanceLocks(this.home, [initial.projectId], { signal });
     try {
     // A concurrent abort may have settled the attempt while this caller was
     // acquiring the same Project fence. Never execute a pre-fence snapshot.
@@ -383,10 +384,11 @@ export class GitIntegrationService {
     taskId: string,
     integrationId: string,
     reason: string,
-    authorize: (store: TaskStore, taskId: string) => unknown
+    authorize: (store: TaskStore, taskId: string) => unknown,
+    signal?: AbortSignal
   ): Promise<IntegrationAttempt> {
     const initial = requireIntegration(this.store, taskId, integrationId);
-    const release = acquireProjectMaintenanceLocks(this.home, [initial.projectId]);
+    const release = await acquireProjectMaintenanceLocks(this.home, [initial.projectId], { signal });
     try {
       const attempt = requireIntegration(this.store, taskId, integrationId);
       authorize(this.store, taskId);
@@ -462,12 +464,29 @@ export class GitIntegrationService {
     } finally { release(); }
   }
 
-  async cleanup(integration: IntegrationAttempt): Promise<GitWorkspaceRemoval> {
+  async cleanup(
+    integration: IntegrationAttempt,
+    options: Readonly<{ signal?: AbortSignal; authorize?: () => unknown }> = {}
+  ): Promise<GitWorkspaceRemoval> {
     // The whole cleanup is one Git transaction against the Project's
     // repository, mirroring integrate(): a concurrent `project migrate` must
     // not switch the catalog path or remove the old checkout mid-cleanup.
-    const release = acquireProjectMaintenanceLocks(this.home, [integration.projectId]);
+    const release = await acquireProjectMaintenanceLocks(this.home, [integration.projectId], { signal: options.signal });
     try {
+      options.authorize?.();
+      const current = requireIntegration(this.store, integration.taskId, integration.id);
+      if (current.projectId !== integration.projectId
+        || !["committed", "superseded", "failed"].includes(current.status)) {
+        throw new Error("Integration changed before cleanup; read its current record.");
+      }
+      integration = current;
+      const activeJob = this.store.listDurableJobs(integration.taskId).find(job =>
+        job.owner.kind === "integration-attempt" && job.owner.integrationAttemptId === integration.id
+        && (job.status === "queued" || job.status === "running"
+          || (job.status === "unknown-needs-attention" && job.acknowledgedAt === undefined)));
+      if (activeJob !== undefined) {
+        throw new Error(`Integration ${integration.id} has an active DurableJob: ${activeJob.id}/${activeJob.status}.`);
+      }
       const task = this.store.getTask(integration.taskId);
       if (task === null || !task.projectBindings.some(
         ({ projectId }) => projectId === integration.projectId

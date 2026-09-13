@@ -1118,6 +1118,7 @@ export class FileTaskController {
   #operatorStartupRetryArmed = false;
   #lastOperatorSignalIdentity: string | undefined;
   #stopped = false;
+  readonly #workspaceWaitAbort = new AbortController();
   #lastRuntimeDrain: RuntimeEventDrainResult | undefined;
   #runtimeDrainPasses = 0;
   #runtimeListedEvents = 0;
@@ -1138,7 +1139,13 @@ export class FileTaskController {
     this.#now = options.now ?? (() => new Date());
     this.#startedAt = this.#now();
     this.#onError = options.onError ?? (() => {});
-    this.#workspacePreparer = options.workspacePreparer;
+    const workspacePreparer = options.workspacePreparer;
+    this.#workspacePreparer = workspacePreparer === undefined ? undefined : {
+      prepareTaskWorkspace: (taskId) =>
+        workspacePreparer.prepareTaskWorkspace(taskId, this.#workspaceWaitAbort.signal),
+      activateTaskWorkspace: (taskId, environment) =>
+        workspacePreparer.activateTaskWorkspace(taskId, environment, this.#workspaceWaitAbort.signal)
+    };
     this.#deliveryRetryMs = positiveInteger(
       options.deliveryRetryMs,
       DEFAULT_DELIVERY_RETRY_MS,
@@ -1308,6 +1315,7 @@ export class FileTaskController {
 
   stop(): void {
     this.#stopped = true;
+    this.#workspaceWaitAbort.abort(new Error("Controller stopped while waiting for Project maintenance."));
     this.#signalScheduler.stop();
     this.#operatorSignalScheduler.stop();
     if (this.#deadlineTimer !== undefined) {

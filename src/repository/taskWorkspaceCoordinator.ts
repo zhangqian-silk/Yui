@@ -128,8 +128,12 @@ export class TaskWorkspaceCoordinator {
         .map(({ projectId }) => projectId);
     const releaseMaintenance = projectIds.length === 0
       ? () => {}
-      : acquireProjectMaintenanceLocks(this.preparer.home, projectIds);
+      : await acquireProjectMaintenanceLocks(this.preparer.home, projectIds);
     try {
+      if (!isDeepStrictEqual(this.store.getWorkItem(taskId, workItemId), item)
+        || !isDeepStrictEqual(this.store.getWorkItemWorkspace(taskId, workItemId), workspace)) {
+        throw new Error(`Work item changed while waiting for cleanup: ${taskId}/${workItemId}.`);
+      }
       const state = await this.preparer.inspectWorkItemWorkspace(item.taskId, item.id);
       if (state === "dirty") return "dirty";
       this.#assertWorkItemRuntimeQuiescent(item);
@@ -140,7 +144,7 @@ export class TaskWorkspaceCoordinator {
         item.id
       );
       if (laneCleanup === "dirty") return "dirty";
-      return this.preparer.cleanupWorkItemWorkspace(item.taskId, item.id, disposition);
+      return await this.preparer.cleanupWorkItemWorkspace(item.taskId, item.id, disposition);
     } finally {
       releaseMaintenance();
     }
@@ -189,8 +193,12 @@ export class TaskWorkspaceCoordinator {
         .map(({ projectId }) => projectId);
     const releaseMaintenance = projectIds.length === 0
       ? () => {}
-      : acquireProjectMaintenanceLocks(this.preparer.home, projectIds);
+      : await acquireProjectMaintenanceLocks(this.preparer.home, projectIds);
     try {
+      if (!isDeepStrictEqual(this.store.getReviewRound(taskId, reviewRoundId), round)
+        || !isDeepStrictEqual(this.store.getReviewRoundWorkspace(taskId, reviewRoundId), workspace)) {
+        throw new Error(`ReviewRound changed while waiting for cleanup: ${taskId}/${reviewRoundId}.`);
+      }
       const state = await this.preparer.inspectReviewRoundWorkspace(taskId, reviewRoundId);
       if (state === "dirty") return "dirty";
       await this.#stopLiveRoles(taskId, this.#reviewRoundRoleNames(round));
@@ -199,7 +207,7 @@ export class TaskWorkspaceCoordinator {
         reviewRoundId
       );
       if (laneCleanup === "dirty") return "dirty";
-      return this.preparer.cleanupReviewRoundWorkspace(taskId, reviewRoundId);
+      return await this.preparer.cleanupReviewRoundWorkspace(taskId, reviewRoundId);
     } finally {
       releaseMaintenance();
     }
@@ -226,7 +234,14 @@ export class TaskWorkspaceCoordinator {
       for (const workspace of managedWorkspaces) {
         for (const entry of workspace.entries) projectIds.add(entry.projectId);
       }
-      releaseMaintenance = acquireProjectMaintenanceLocks(this.preparer.home, projectIds);
+      releaseMaintenance = await acquireProjectMaintenanceLocks(this.preparer.home, projectIds);
+      this.#assertTaskArchiveLifecycle(task);
+      const currentWorkspaces = [...this.store.listManagedWorkspaces(task.id)]
+        .sort((left, right) => managedWorkspaceKey(left.owner)
+          .localeCompare(managedWorkspaceKey(right.owner)));
+      if (!isDeepStrictEqual(currentWorkspaces, managedWorkspaces)) {
+        throw new Error(`Task workspaces changed while waiting for archive cleanup: ${taskId}.`);
+      }
       const laneWorkspaces = managedWorkspaces.filter(({ owner }) => owner.type === "execution-lane");
       const integrationWorkspaces = managedWorkspaces.filter(
         ({ owner }) => owner.type === "integration-attempt"
@@ -391,7 +406,7 @@ export class TaskWorkspaceCoordinator {
         );
       }
       this.#assertTaskArchiveLifecycle(task);
-      return this.preparer.cleanupTaskForArchive(taskId);
+      return await this.preparer.cleanupTaskForArchive(taskId);
     } catch (error) {
       const task = this.store.getTask(taskId);
       return {
@@ -488,7 +503,7 @@ export class TaskWorkspaceCoordinator {
           detail: "Remove only clean, exactly owned workspace resources.",
           paths: [workspace.root, ...workspace.entries.filter(e => e.access === "write").map(e => e.path)]
         }, async () => {
-          const release = acquireProjectMaintenanceLocks(this.preparer.home,
+          const release = await acquireProjectMaintenanceLocks(this.preparer.home,
             workspace.entries.map(e => e.projectId));
           try {
             if (!isDeepStrictEqual(this.store.getManagedWorkspace(workspace.owner), workspace)) {
@@ -501,16 +516,16 @@ export class TaskWorkspaceCoordinator {
                 if (item?.status === "accepted" && disposition === "integrated") {
                   await new WorkItemChangeSetManager(this.store).assertIntegrated(taskId, item.id);
                 }
-                return this.preparer.cleanupWorkItemWorkspace(taskId, owner.workItemId,
+                return await this.preparer.cleanupWorkItemWorkspace(taskId, owner.workItemId,
                   item?.status === "retired" ? "abandoned" : disposition);
               }
               case "review-round":
-                return this.preparer.cleanupReviewRoundWorkspace(taskId, owner.reviewRoundId);
+                return await this.preparer.cleanupReviewRoundWorkspace(taskId, owner.reviewRoundId);
               case "execution-lane":
-                return this.preparer.cleanupExecutionLaneWorkspace(taskId, owner.executionGroupId, owner.executionLaneId);
+                return await this.preparer.cleanupExecutionLaneWorkspace(taskId, owner.executionGroupId, owner.executionLaneId);
               case "integration-attempt":
                 if (await this.preparer.inspectIntegrationWorkspace(taskId, owner.integrationAttemptId) === "dirty") return "dirty";
-                return this.preparer.cleanupIntegrationWorkspace(taskId, owner.integrationAttemptId);
+                return await this.preparer.cleanupIntegrationWorkspace(taskId, owner.integrationAttemptId);
               case "task": {
                 const current = this.store.getTask(taskId)!;
                 const delivery = projectTaskRemoteDeliveryFromStore(this.store, current);

@@ -73,6 +73,12 @@ regressions, and fast regressions do not establish real-model behavior.
     pre-fix released Hosts can be hot-patched.
     Archive racing Host ingress retains the complete source envelope without
     reopening the Task or settling original uncertain input.
+18. Project maintenance waiters yield to the holder, use a shared 60-second
+    monotonic budget with independent 200–500ms jitter, and cancel on Controller
+    stop without losing activation intent. Disposable lock/SQLite/Git fixtures
+    cover exclusion, partial release and under-lock revalidation; injected time
+    checks the minute-long deadline without sleeping for a minute. Competing
+    activations each adopt their own workspace without replaying Git work.
 
 Keep the test phase seconds-scale; measure TypeScript build separately. Record
 incremental runtime when adding a critical regression. The seven recovery boundary

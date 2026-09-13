@@ -87,7 +87,12 @@ import {
   type GitWorkspaceState
 } from "./gitWorkspace.js";
 import type { Project } from "./project.js";
-import { acquireProjectMaintenanceLocks } from "./projectMaintenanceLock.js";
+import {
+  acquireProjectMaintenanceLocks,
+  ProjectMaintenanceLockedError,
+  ProjectMaintenanceLockCancelledError,
+  type ProjectMaintenanceLockOptions
+} from "./projectMaintenanceLock.js";
 import {
   generateTaskWorkspaceIdentity,
   taskWorkspaceRefSegment,
@@ -182,8 +187,8 @@ export class ReviewRoundWorkspaceEvidenceError extends Error {
 }
 
 export interface TaskWorkspacePreparer {
-  prepareTaskWorkspace(taskId: string): Promise<TaskWorkspacePreparation>;
-  activateTaskWorkspace(taskId: string, environment?: NodeJS.ProcessEnv): Promise<TaskWorkspaceActivation>;
+  prepareTaskWorkspace(taskId: string, signal?: AbortSignal): Promise<TaskWorkspacePreparation>;
+  activateTaskWorkspace(taskId: string, environment?: NodeJS.ProcessEnv, signal?: AbortSignal): Promise<TaskWorkspaceActivation>;
 }
 
 /**
@@ -196,7 +201,8 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
     readonly home: string,
     readonly store: TaskStore,
     readonly git: GitWorkspacePort = new NodeGitWorkspace(),
-    readonly now: () => Date = () => new Date()
+    readonly now: () => Date = () => new Date(),
+    readonly maintenanceLockOptions: ProjectMaintenanceLockOptions = {}
   ) {}
 
   #resourceRegistrarValue: ResourceRegistrar | undefined;
@@ -209,7 +215,7 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
     this.#resourceRegistrar().registerManagedWorkspace(workspace);
   }
 
-  async prepareTaskWorkspace(taskId: string): Promise<TaskWorkspacePreparation> {
+  async prepareTaskWorkspace(taskId: string, signal?: AbortSignal): Promise<TaskWorkspacePreparation> {
     // The per-Project maintenance fence makes prepare mutually exclusive with
     // Project maintenance and Task archive cleanup: a concurrent migration must not switch the
     // Project catalog to the Home-managed repo while prepare is creating
@@ -221,7 +227,7 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
     for (let attempt = 0; ; attempt += 1) {
       try {
         const task = requireTask(this.store, taskId);
-        const { release, current } = this.#acquireTaskProjectMaintenanceLocks(task);
+        const { release, current } = await this.#acquireTaskProjectMaintenanceLocks(task, signal);
         try {
           return await this.#prepareTaskWorkspaceLocked(current.id, false);
         } finally {
@@ -249,11 +255,18 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
    * later launch failure can never present itself as "activation never
    * happened".
    */
-  async activateTaskWorkspace(taskId: string, environment: NodeJS.ProcessEnv = {}): Promise<TaskWorkspaceActivation> {
+  async activateTaskWorkspace(
+    taskId: string,
+    environment: NodeJS.ProcessEnv = {},
+    signal?: AbortSignal
+  ): Promise<TaskWorkspaceActivation> {
     for (let attempt = 0; ; attempt += 1) {
       let attemptedRequest: TaskActivationRequest | undefined;
       try {
         const task = requireTask(this.store, taskId);
+        if (signal?.aborted) {
+          throw new ProjectMaintenanceLockCancelledError(task.projectBindings[0]?.projectId ?? task.id, signal.reason);
+        }
         const caller = taskLocalActor(this.store, environment, task.id);
         const actor = task.activationRequest?.operation.actorId === `task:${task.id}/role:leader`
           ? "leader" : caller;
@@ -285,11 +298,12 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
         const admission = admitStoredTaskActivation(this.store, task.id);
         if (admission.disposition === "ready") attemptedRequest = admission.request;
         validateDraftTaskForActivation(this.store, task);
-        const adopted = await this.#adoptActivationEnvironment(task);
-        return adopted.workspaceFree
-          ? this.#activateWorkspaceFreeTask(task.id, adopted, actor)
-          : await this.#prepareActivatedTaskWorkspace(task, adopted, actor);
+        return await this.#prepareActivatedTaskWorkspace(task, actor, environment, signal);
       } catch (error) {
+        // Waiting did not execute the workspace operation. Preserve the
+        // activation request instead of turning contention/stop into failure.
+        if (error instanceof ProjectMaintenanceLockedError
+          || error instanceof ProjectMaintenanceLockCancelledError) throw error;
         if (error instanceof StorageConflictError
           && attempt < TASK_WORKSPACE_PREPARE_MAX_CONFLICT_RETRIES) {
           continue;
@@ -309,12 +323,31 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
   /** Prepares the managed workspace of a Task being activated, under its fences. */
   async #prepareActivatedTaskWorkspace(
     task: Task,
-    environment: AdoptedActivationEnvironment,
-    actor: "user" | "operator" | "leader"
+    actor: "user" | "operator" | "leader",
+    callerEnvironment: NodeJS.ProcessEnv,
+    signal?: AbortSignal
   ): Promise<TaskWorkspaceActivation> {
-    const { release, current } = this.#acquireTaskProjectMaintenanceLocks(task);
+    const { release, current } = await this.#acquireTaskProjectMaintenanceLocks(task, signal);
     try {
-      return await this.#prepareTaskWorkspaceLocked(current.id, true, environment, actor);
+      taskLocalActor(this.store, callerEnvironment, current.id);
+      if (current.executionGate.state !== "enabled") {
+        throw new Error(`Task execution is not enabled: ${current.id}.`);
+      }
+      if (!isDeepStrictEqual(current.activationRequest, task.activationRequest)) {
+        throw new Error(`Task activation request changed while waiting for Project maintenance: ${task.id}.`);
+      }
+      const provider = this.store.getTaskRoleSessionSet(current.id, LEADER_ROLE)?.providerBinding;
+      if (provider?.run != null
+        && ["submitting", "accepted", "delivery-unknown"].includes(provider.run.status)) {
+        throw new Error("Planning native input is unsettled; preserve activation intent and retry after its exact terminal.");
+      }
+      validateDraftTaskForActivation(this.store, current);
+      // Acquire before resource adoption: a timed-out/cancelled waiter must
+      // not leave an adopted environment to be repeated on the next attempt.
+      const adopted = await this.#adoptActivationEnvironment(current);
+      return adopted.workspaceFree
+        ? this.#activateWorkspaceFreeTask(current.id, adopted, actor)
+        : await this.#prepareTaskWorkspaceLocked(current.id, true, adopted, actor);
     } finally {
       release();
     }
@@ -499,15 +532,22 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
    * caller re-reads the Task and re-acquires the correct fence set. The
    * caller owns `release` and MUST call it on every exit path.
    */
-  #acquireTaskProjectMaintenanceLocks(task: Task): Readonly<{
+  async #acquireTaskProjectMaintenanceLocks(task: Task, signal?: AbortSignal): Promise<Readonly<{
     release: () => void;
     current: Task;
-  }> {
+  }>> {
     const projectIds = task.projectBindings.map(({ projectId }) => projectId);
+    const waitSignal = signal ?? this.maintenanceLockOptions.signal;
     const release = projectIds.length === 0
       ? () => {}
-      : acquireProjectMaintenanceLocks(this.home, projectIds);
+      : await acquireProjectMaintenanceLocks(this.home, projectIds, {
+          ...this.maintenanceLockOptions,
+          signal: waitSignal
+        });
     try {
+      if (waitSignal?.aborted) {
+        throw new ProjectMaintenanceLockCancelledError(projectIds[0] ?? task.id, waitSignal.reason);
+      }
       const current = requireTask(this.store, task.id);
       const currentIds = current.projectBindings.map(({ projectId }) => projectId).sort();
       const lockedIds = [...projectIds].sort();
@@ -532,11 +572,11 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
    * catalog in that gap. The caller owns `release` and must call it on every
    * exit path.
    */
-  acquireTaskProjectMaintenanceLocks(taskId: string): Readonly<{
+  acquireTaskProjectMaintenanceLocks(taskId: string, signal?: AbortSignal): Promise<Readonly<{
     release: () => void;
     current: Task;
-  }> {
-    return this.#acquireTaskProjectMaintenanceLocks(requireTask(this.store, taskId));
+  }>> {
+    return this.#acquireTaskProjectMaintenanceLocks(requireTask(this.store, taskId), signal);
   }
 
   async #prepareTaskWorkspaceLocked(
@@ -547,6 +587,9 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
     actor: "user" | "operator" | "leader" = "user"
   ): Promise<TaskWorkspaceActivation> {
     const task = requireTask(this.store, taskId);
+    if (task.executionGate.state !== "enabled") {
+      throw new Error(`Task execution is not enabled: ${task.id}.`);
+    }
     if (activate && task.status !== "draft") {
       throw new Error(`Only a Draft Task can atomically adopt a workspace: ${task.id}/${task.status}.`);
     }
@@ -1191,15 +1234,17 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
     taskId: string,
     workItemId: string
   ): Promise<ManagedWorkspace> {
-    const item = requireWorkItem(this.store, taskId, workItemId);
+    let item = requireWorkItem(this.store, taskId, workItemId);
     const task = requireTask(this.store, item.taskId);
     assertWorkItemWorkspaceEligible(this.store, task, item);
     // Hold the per-Project maintenance fence across the ensure-main-prepared
     // and the WorkItem worktree creation, so concurrent Project maintenance
     // cannot switch the Project catalog between the two. The under-lock Task
     // snapshot drives every Project read and Git effect below.
-    const { release, current: lockedTask } = this.#acquireTaskProjectMaintenanceLocks(task);
+    const { release, current: lockedTask } = await this.#acquireTaskProjectMaintenanceLocks(task);
     try {
+      item = requireWorkItem(this.store, taskId, workItemId);
+      assertWorkItemWorkspaceEligible(this.store, lockedTask, item);
       const lockedProjectIds = lockedTask.projectBindings.map(({ projectId }) => projectId);
       await this.#prepareTaskWorkspaceWithRetries(lockedTask.id, lockedProjectIds);
       // prepareTaskWorkspace may have just minted and persisted the workspace
@@ -1411,9 +1456,12 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
     // already holds (one locked boundary across preparation and adoption);
     // otherwise the fence is acquired here.
     const { release, current: lockedTask } = heldFence === undefined
-      ? this.#acquireTaskProjectMaintenanceLocks(task)
+      ? await this.#acquireTaskProjectMaintenanceLocks(task)
       : { release: () => {}, current: heldFence.current };
     try {
+      if (lockedTask.status !== "active" || lockedTask.executionGate.state !== "enabled") {
+        throw new Error(`Task is not open for Execution Lane preparation: ${lockedTask.id}.`);
+      }
       const lineage = executionLaneLineage(this.store, lockedTask, executionGroupId, executionLaneId, hint);
       const item = lineage.purpose === "execution"
         ? this.store.getWorkItem(taskId, lineage.workItemId)
@@ -1750,8 +1798,11 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
     reviewRoundId: string
   ): Promise<ManagedWorkspace> {
     const taskSnapshot = requireTask(this.store, taskId);
-    const { release, current: task } = this.#acquireTaskProjectMaintenanceLocks(taskSnapshot);
+    const { release, current: task } = await this.#acquireTaskProjectMaintenanceLocks(taskSnapshot);
     try {
+    if (task.status !== "active" || task.executionGate.state !== "enabled") {
+      throw new Error(`Task is not open for ReviewRound preparation: ${task.id}.`);
+    }
     const taskSegment = this.#taskSegment(task);
     const round = this.store.getReviewRound(task.id, reviewRoundId);
     if (round === null) throw new Error(`ReviewRound not found: ${task.id}/${reviewRoundId}.`);

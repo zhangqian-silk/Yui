@@ -7,6 +7,8 @@ import {
   writeFileSync
 } from "node:fs";
 import { join } from "node:path";
+import { performance } from "node:perf_hooks";
+import { setTimeout as delay } from "node:timers/promises";
 
 /**
  * Per-Project maintenance fence.
@@ -20,26 +22,65 @@ import { join } from "node:path";
  * gone; the owner file records PID + process start time, so a recycled PID
  * can never pass for the original holder.
  *
- * Maintenance operations are long-lived, so a contended fence fails fast
- * with a retryable error instead of blocking the CLI for seconds.
+ * Contenders wait asynchronously within one monotonic budget. Only lock
+ * acquisition is retried; the caller's protected operation is never replayed.
  */
-const PROJECT_MAINTENANCE_LOCK_TIMEOUT_MS = 250;
-const PROJECT_MAINTENANCE_LOCK_RETRY_MS = 10;
+const PROJECT_MAINTENANCE_LOCK_TIMEOUT_MS = 60_000;
+const PROJECT_MAINTENANCE_LOCK_RETRY_MIN_MS = 200;
+const PROJECT_MAINTENANCE_LOCK_RETRY_MAX_MS = 500;
 /** A lock older than this with a dead owner is reclaimed. */
 const STALE_PROJECT_MAINTENANCE_LOCK_AGE_MS = 1_000;
 
 /**
- * Raised when a Project's maintenance fence is already held. The caller
- * made no changes and is safe to retry once the holder finishes.
+ * Raised when acquisition exhausted its budget. This acquisition has not
+ * started the protected operation; callers retain responsibility for any
+ * earlier effects and must not replay the whole operation implicitly.
  */
 export class ProjectMaintenanceLockedError extends Error {
   readonly projectId: string;
   readonly retryable = true;
-  constructor(projectId: string) {
-    super(`Project maintenance is already in progress for ${projectId}; retry once it finishes.`);
+  constructor(projectId: string, readonly timeoutMs = PROJECT_MAINTENANCE_LOCK_TIMEOUT_MS) {
+    super(`Timed out after ${timeoutMs}ms waiting for Project maintenance on ${projectId}; `
+      + "the lock was not acquired. Read current state before retrying.");
     this.name = "ProjectMaintenanceLockedError";
     this.projectId = projectId;
   }
+}
+
+export class ProjectMaintenanceLockCancelledError extends Error {
+  constructor(readonly projectId: string, cause: unknown) {
+    super(`Cancelled waiting for Project maintenance on ${projectId}; the lock was not acquired.`, { cause });
+    this.name = "ProjectMaintenanceLockCancelledError";
+  }
+}
+
+/** Timing seams keep deadline/jitter checks deterministic without minute-long tests. */
+export type ProjectMaintenanceLockOptions = Readonly<{
+  timeoutMs?: number;
+  signal?: AbortSignal;
+  now?: () => number;
+  random?: () => number;
+  wait?: (milliseconds: number, signal?: AbortSignal) => Promise<void>;
+}>;
+
+function acquisitionBudget(options: ProjectMaintenanceLockOptions) {
+  const timeoutMs = options.timeoutMs ?? PROJECT_MAINTENANCE_LOCK_TIMEOUT_MS;
+  if (!Number.isFinite(timeoutMs) || timeoutMs < 0) {
+    throw new RangeError("Project maintenance timeout must be a finite nonnegative number.");
+  }
+  const now = options.now ?? (() => performance.now());
+  return {
+    timeoutMs,
+    deadline: now() + timeoutMs,
+    now,
+    random: options.random ?? Math.random,
+    wait: options.wait ?? ((milliseconds: number, signal?: AbortSignal) => delay(milliseconds, undefined, { signal })),
+    signal: options.signal
+  };
+}
+
+function assertNotCancelled(projectId: string, signal: AbortSignal | undefined): void {
+  if (signal?.aborted) throw new ProjectMaintenanceLockCancelledError(projectId, signal.reason);
 }
 
 /** Directory of one Project's maintenance fence, below the Home's locks area. */
@@ -49,9 +90,8 @@ export function projectMaintenanceLockPath(home: string, projectId: string): str
 
 /**
  * Acquire one Project's maintenance fence. Returns the release function;
- * callers MUST release on every exit path (try/finally). A live holder
- * fails fast with {@link ProjectMaintenanceLockedError}; a stale (dead)
- * holder is reclaimed.
+ * callers MUST release on every exit path (try/finally). A live holder is
+ * never stolen, including at timeout; a stale (dead) holder is reclaimed.
  *
  * There is no in-process reentrancy: every acquisition contends, so two
  * independent operations in the same process are mutually exclusive just
@@ -59,11 +99,32 @@ export function projectMaintenanceLockPath(home: string, projectId: string): str
  * fence while its caller already holds it) goes through private
  * already-locked methods, never through a second acquisition.
  */
-export function acquireProjectMaintenanceLock(home: string, projectId: string): () => void {
+export function acquireProjectMaintenanceLock(
+  home: string,
+  projectId: string,
+  options: ProjectMaintenanceLockOptions = {}
+): Promise<() => void> {
+  return acquireWithBudget(home, projectId, acquisitionBudget(options));
+}
+
+async function acquireWithBudget(
+  home: string,
+  projectId: string,
+  budget: ReturnType<typeof acquisitionBudget>,
+  firstProject = true
+): Promise<() => void> {
   const lock = projectMaintenanceLockPath(home, projectId);
+  assertNotCancelled(projectId, budget.signal);
   mkdirSync(join(home, "locks", "projects"), { recursive: true, mode: 0o700 });
-  const deadline = Date.now() + PROJECT_MAINTENANCE_LOCK_TIMEOUT_MS;
+  let firstAttempt = firstProject;
   while (true) {
+    assertNotCancelled(projectId, budget.signal);
+    // Always try the first Project immediately, even for a zero-budget probe.
+    // Every retry and subsequent Project shares the original deadline.
+    if (!firstAttempt && budget.now() >= budget.deadline) {
+      throw new ProjectMaintenanceLockedError(projectId, budget.timeoutMs);
+    }
+    firstAttempt = false;
     try {
       mkdirSync(lock, { mode: 0o700 });
       const ownerIdentity = writeOwnerIdentity(lock);
@@ -78,9 +139,20 @@ export function acquireProjectMaintenanceLock(home: string, projectId: string): 
       };
     } catch (error) {
       if (!(error instanceof Error && "code" in error && error.code === "EEXIST")) throw error;
+      if (budget.now() >= budget.deadline) {
+        throw new ProjectMaintenanceLockedError(projectId, budget.timeoutMs);
+      }
       reclaimStaleProjectMaintenanceLock(lock);
-      if (Date.now() >= deadline) throw new ProjectMaintenanceLockedError(projectId);
-      Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, PROJECT_MAINTENANCE_LOCK_RETRY_MS);
+      const remaining = budget.deadline - budget.now();
+      if (remaining <= 0) throw new ProjectMaintenanceLockedError(projectId, budget.timeoutMs);
+      const jitter = PROJECT_MAINTENANCE_LOCK_RETRY_MIN_MS
+        + budget.random() * (PROJECT_MAINTENANCE_LOCK_RETRY_MAX_MS - PROJECT_MAINTENANCE_LOCK_RETRY_MIN_MS);
+      try {
+        await budget.wait(Math.min(jitter, remaining), budget.signal);
+      } catch (waitError) {
+        assertNotCancelled(projectId, budget.signal);
+        throw waitError;
+      }
     }
   }
 }
@@ -115,14 +187,16 @@ function releaseOwnedProjectMaintenanceLock(lock: string, ownerIdentity: string)
  * including ones this process already holds: callers that need nesting must
  * use an already-locked private path instead of acquiring twice.
  */
-export function acquireProjectMaintenanceLocks(
+export async function acquireProjectMaintenanceLocks(
   home: string,
-  projectIds: Iterable<string>
-): () => void {
+  projectIds: Iterable<string>,
+  options: ProjectMaintenanceLockOptions = {}
+): Promise<() => void> {
+  const budget = acquisitionBudget(options);
   const releases: Array<() => void> = [];
   try {
     for (const projectId of [...new Set(projectIds)].sort()) {
-      releases.push(acquireProjectMaintenanceLock(home, projectId));
+      releases.push(await acquireWithBudget(home, projectId, budget, releases.length === 0));
     }
   } catch (error) {
     for (const release of releases.reverse()) release();
