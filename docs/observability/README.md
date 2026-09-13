@@ -81,3 +81,65 @@ raw Provider history merely to explain a status.
 Start with exact read-only records. Process changes, cancellation, grant updates
 and resource cleanup require the relevant explicit action and scope. A generic
 diagnostic request does not authorize live-model, shared or production tests.
+
+## Task usage and time
+
+Task overview, Web Task/WorkItem cards and `execution audit` use the same pure
+projection of authorized Task events. Reading never samples a Provider or opens
+raw transcripts. There is no new metric store, migration, price table or budget
+policy. Existing history remains readable.
+
+Each metric has `value`, `status` (`known`, `partial`, `unknown`) and `reasons`.
+Unknown is `null`, not zero. A known zero requires actual numeric evidence.
+Partial is an observed subtotal, not a complete bill or guaranteed monotonic
+lower bound. Coverage names the observed Session identities, source/semantics
+and evidence cutoff; it is not a percentage of an unknowable Provider total.
+The declared basis is Task-fenced, observed sources only.
+JSON consumers read `cost.tokens.value` and `cost.toolCalls.value` with their
+status/reasons, replacing the numeric placeholders and observable flags.
+`elapsedSeconds` and `executionSeconds` replace the misleading Group-sum
+`wallClockSeconds`; this changes a read projection, not persistent storage.
+
+- Request usage reuses the Session reducer: stable request identity, latest
+  received revision, input plus output, no extra addition of cache/reasoning
+  subsets. Missing boundaries, mixed semantics and cumulative rollback are not
+  guessed. Remaining context is capacity, never consumption.
+- Replaced Sessions remain in the lifetime view. A nonzero first cumulative
+  snapshot is an excluded baseline: it may predate the Task. Later comparable
+  increments are partial; one nonzero snapshot alone yields unknown Task usage.
+  A zero baseline supports the subsequent counter. JSON also exposes raw
+  Session counters separately; they are not additional Task consumption.
+- Direct Leader chat can contribute without a Run or WorkItem. WorkItems
+  receive only request usage whose revisions share one exact, matching Run
+  binding. Cumulative counters are not apportioned. Raw whole-Session totals
+  are not exposed as WorkItem usage. Task totals need not equal WorkItem sums.
+- Child counters are excluded because the current contract cannot prove they
+  are additional to the parent. Child evidence marks coverage partial. Conflicting
+  Role ownership of one native counter is unknown, not two independent totals.
+- Tool counts deduplicate retained exact native Session/Turn/operation identities,
+  including failures. Operation history is compacted, so this is always partial
+  when evidence exists and unknown otherwise. Absence never proves zero tools.
+
+**Task elapsed** runs from Task creation (including planning and waiting) to its
+recorded completion, retirement or cancellation, or to the read time if active.
+An archived Task keeps its original endpoint; missing terminal evidence is
+unknown. Group count is irrelevant.
+
+**Observed native execution sum** merges overlapping complete Turn intervals
+within one native resource and adds independent parallel resources. Two
+independent ten-second intervals can total twenty seconds during ten seconds of
+elapsed time. It is not CPU/GPU time. Since Turn history is compacted, this is
+partial; missing start/end and live Turns are excluded, never extended indefinitely.
+Subsecond precision is retained. WorkItem cards do not substitute Group duration
+for either measure.
+
+The audit `usage` section is explicitly **Task lifetime** even when `--since` or
+`--until` filters other sections. It does not offer window consumption; filtering
+cumulative snapshots first would mislabel historical usage as window usage.
+Its existing AgentRun-duration section remains a separately labeled Run metric.
+
+Deterministic fixtures cover the shared reducer and CLI/Web/audit semantics.
+They do not establish live Provider completeness. Built-in normalization supports
+Codex cumulative and Claude request observations when supplied; this delivery
+does not collect real-model billing evidence or assert Provider behavior was
+live-tested.

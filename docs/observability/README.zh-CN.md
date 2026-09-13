@@ -69,3 +69,50 @@ Telemetry 和缓存是诊断材料，不是 Task 真相，也不是 transcript �
 
 从精确的只读记录开始。进程变更、取消、grant 更新和资源清理都需要相应的显式动作
 与范围。一个笼统的诊断请求不授权真实模型、共享或生产环境的测试。
+
+## Task 用量与耗时
+
+Task overview、Web Task/WorkItem 卡片和 `execution audit` 共用授权 Task
+事件的纯读投影。读取不采样 Provider、不打开原始 transcript；没有新增指标存储、
+迁移、价格表或预算策略，既有历史仍可读。
+
+每项指标带 `value`、`status`（`known`、`partial`、`unknown`）和 `reasons`。
+未知为 `null`，不是零；真实零必须有数值证据。部分值是已观测小计，不是完整账单，
+也不保证是单调增长的下界。覆盖说明包括已观测 Session 身份、来源/计数语义和
+证据截止点，不对不可知的 Provider 总量伪造覆盖百分比。口径是 Task 围栏内的
+已观测来源。
+JSON 使用方改读 `cost.tokens.value`、`cost.toolCalls.value` 及其状态/原因，
+不再读取数字占位和 observable 标志。`elapsedSeconds`、`executionSeconds`
+替代含义错误的 Group 求和 `wallClockSeconds`；这是读投影变更，不是持久存储变更。
+
+- 请求用量复用 Session reducer：按稳定请求身份取最后收到的修订，累加输入与
+  输出，缓存/推理子项不重复增加。缺失边界、混合语义、累计回退不猜测；剩余
+  上下文是容量，不是消费。
+- Session 替换不抹去历史。首次非零累计快照可能早于 Task，因此作为排除基线；
+  后续可比增量为部分值，仅一个非零快照时 Task 用量未知。零基线可支持后续
+  累计值。JSON 单独暴露原始 Session 计数，它不是额外的 Task 消费。
+- Leader 直聊不需要伪造 Run/WorkItem。WorkItem 仅接收各次修订均绑定同一
+  精确、匹配 Run 的请求用量；累计值不摊派，整个 Session 的原始计数不冒充
+  WorkItem 用量。Task 总量不必等于 WorkItem 小计之和。
+- 当前合同无法证明子执行计数在父统计之外，因此排除子计数并将覆盖标为部分。
+  多个 Role 对同一原生计数器的归属冲突为未知，不当成两份独立总量。
+- 工具次数按保留的精确原生 Session/Turn/operation 身份去重，失败调用也计一次。
+  工具历史已压缩，有证据时只能是部分次数；无证据为未知，不能推出零调用。
+
+**任务历时**从 Task 创建（含规划和等待）到记录的完成、退役或取消时间；
+活动 Task 截止本次读取时间。归档保留原终点，终态证据缺失则未知，与 Group
+数量无关。
+
+**已观测原生执行累计**合并同一原生资源上起止完整、彼此重叠的 Turn 区间，
+再相加独立并行资源。两个独立执行各十秒，可以在十秒自然时间内累计二十秒。
+它不是 CPU/GPU 时间。由于 Turn 历史已压缩，该指标为部分值；缺少起止证据和
+运行中的 Turn 不计入，不无限延长。保留不足一秒的精度，WorkItem 卡片不再用
+Group 时长替代上述含义。
+
+即使 `--since`、`--until` 过滤其他审计部分，`usage` 部分仍明确为 **Task 全生命周期**。
+首版不提供窗口消费，不能先过滤累计快照，再把历史消费称为窗口用量。
+既有 AgentRun 时长部分保留为单独标明的 Run 指标。
+
+确定性 fixture 验证共享 reducer 和 CLI/Web/audit 语义，不证明真实 Provider 的
+覆盖完整性。内置归一化支持来源所提供的 Codex 累计观察和 Claude 请求观察；
+本次交付不采集真实模型账单证据，也不声称已实测真实 Provider 行为。

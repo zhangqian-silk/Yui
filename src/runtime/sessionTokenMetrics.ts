@@ -80,12 +80,26 @@ export function projectSessionTokenMetrics(
   identity: SessionTokenIdentity | null
 ): SessionTokenMetrics {
   if (identity === null) return unobservedSessionTokenMetrics();
-  const observations = events
-    .map(runtimeObservationFromTaskEvent)
+  return projectSessionTokenObservations(events.flatMap((event) => {
+    const observation = runtimeObservationFromTaskEvent(event);
+    return observation === null ? [] : [observation];
+  }), identity);
+}
+
+/** Shared reducer for authorized, already decoded canonical observations. */
+export function projectSessionTokenObservations(
+  input: readonly RuntimeObservation[],
+  identity: SessionTokenIdentity
+): SessionTokenMetrics {
+  const observations = input
     .filter((observation): observation is RuntimeObservation => (
-      observation !== null
-      && isRuntimeTokenEvidence(observation)
+      isRuntimeTokenEvidence(observation)
       && matchesSessionIdentity(observation, identity)
+      && (observation.authority === "provider-structured" || observation.authority === "driver-inferred")
+      // Child counters have no declared inclusion relationship with the
+      // Session's parent counter. They must never be added as extra requests.
+      && observation.fence.continuationId === undefined
+      && observation.fence.parentContinuationId === undefined
     ))
     .sort(compareObservations);
   const incompleteBoundaries = observations.filter(({ payload }) => (

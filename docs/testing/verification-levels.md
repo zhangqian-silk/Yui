@@ -82,6 +82,10 @@ regressions, and fast regressions do not establish real-model behavior.
     cover exclusion, partial release and under-lock revalidation; injected time
     checks the minute-long deadline without sleeping for a minute. Competing
     activations each adopt their own workspace without replaying Git work.
+19. Task usage distinguishes zero, partial and unknown across exact requests,
+    cumulative baselines, Session replacement and native child overlap. A small
+    event fixture checks direct Leader/parallel time semantics and the shared
+    CLI/Web/audit lifetime projection without collecting Provider data.
 
 Keep the test phase seconds-scale; measure TypeScript build separately. Record
 incremental runtime when adding a critical regression. The seven recovery boundary

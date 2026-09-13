@@ -22,6 +22,7 @@ import { resolveRuntimeHealth } from "../config/yuiConfig.js";
 import { projectNextAction, type NextAction } from "../task/nextAction.js";
 import { projectTaskRemoteDeliveryFromStore } from "./taskRemoteDeliveryCommand.js";
 import type { TaskRemoteDelivery } from "../task/remoteDelivery.js";
+import { formatUsageMetric } from "../runtime/taskUsageMetrics.js";
 
 export type TaskListOptions = Readonly<{
   all: boolean;
@@ -538,7 +539,7 @@ function renderVerboseDetails(
       `  Remote delivery: ${deliveryCell(task.remoteDelivery)}; source=${task.remoteDelivery.source}${task.remoteDelivery.provisional ? " (provisional)" : ""}`,
       `  Monitoring: ${task.execution.monitoring}; attention: ${task.execution.attention.length}`,
       `  DAG: ${task.execution.observability.dag.nodes.length} nodes, ${task.execution.observability.dag.edges.length} edges; ready=${task.execution.observability.dag.readyIds.join(", ") || "none"}; blocked=${task.execution.observability.dag.blockedIds.join(", ") || "none"}`,
-      `  Cost: tokens=${task.execution.observability.cost.tokens}${task.execution.observability.cost.tokensObservable ? "" : " (partial)"}; tools=${task.execution.observability.cost.toolCalls}${task.execution.observability.cost.toolCallsObservable ? "" : " (partial)"}; wall=${task.execution.observability.cost.wallClockSeconds}s; retries=${task.execution.observability.cost.retryCount}`,
+      `  Observed usage (Task lifetime, observed sources only): tokens=${formatUsageMetric(task.execution.observability.cost.tokens)}; tools=${formatUsageMetric(task.execution.observability.cost.toolCalls)}; elapsed=${formatUsageMetric(task.execution.observability.cost.elapsedSeconds, "s")}; native execution sum=${formatUsageMetric(task.execution.observability.cost.executionSeconds, "s")}; retries=${task.execution.observability.cost.retryCount}`,
       `  Context: snapshots=${task.execution.observability.context.snapshotCount}; bytes=${task.execution.observability.context.totalBytes ?? "partial"}; compression=unavailable`,
       `  Session tokens: ${task.execution.observability.sessionTokens.length === 0
         ? "unobserved"
