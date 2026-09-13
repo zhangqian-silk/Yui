@@ -306,6 +306,7 @@ test("WorkItem no-op Integration records the decision and archive removes all co
   );
   const coordinator = new TaskWorkspaceCoordinator(store, preparer, {
     async stopTaskRoleSessions() {},
+    async releaseTaskTerminals() {},
     async assertTaskPhysicalResourcesReleased() {}
   });
   const cleaned = await coordinator.cleanupTaskForArchive(task.id, "integrated");

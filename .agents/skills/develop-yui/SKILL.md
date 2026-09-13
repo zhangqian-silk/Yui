@@ -71,6 +71,28 @@ Use isolated deterministic evidence otherwise. Remove temporary harnesses
 after preserving their reports; do not turn exploratory matrices into a second
 permanent suite.
 
+## Close the test resources you create
+
+For tests that start a Controller or Agent Host, own a fresh fixture Home and
+register teardown before the first CLI call (`setup` can start a Controller).
+Use `finally` or the test runner's teardown hook on both success and failure.
+Stop fixture work and its owned processes, stop its Controller, release only
+its tmux namespace, then remove its temporary directories. Controller restart
+replaces the Controller but intentionally keeps managed Sessions; it is not
+fixture teardown.
+
+Before handing off Yui development, the executing Agent checks that its test
+resources were released and cleans its own attributable leftovers without
+asking the user to do the mechanical work. A Leader checks the cleanup evidence
+for delegated tests as well. Preserve useful reports before removing scratch
+data; remove temporary release worktrees through Git only when clean.
+
+If cleanup fails or a resource's owner is unclear, retain its Home and report
+the exact paths/process identities for a separate Agent to inspect. Do not
+claim cleanup succeeded, delete the ownership evidence, sweep shared `/tmp`,
+or stop another Home. Hard-kill recovery and historical orphan cleanup are
+separate work, not a reason to add a background protocol to the normal path.
+
 ## Read specialized guidance when it applies
 
 - Before changing persistent schema/payloads or the updater, read

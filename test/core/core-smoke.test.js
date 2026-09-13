@@ -58,7 +58,7 @@ import {
   createRuntimeObservation,
   runtimeObservationTaskEventPayload
 } from "../../dist/runtime/runtimeObservation.js";
-import { createSessionOwnerIdentity } from "../../dist/runtime/sessionOwnerIdentity.js";
+import { createSessionOwnerIdentity, readLinuxProcessIdentity } from "../../dist/runtime/sessionOwnerIdentity.js";
 import {
   RuntimeLaunchError
 } from "../../dist/runtime/ports.js";
@@ -3402,15 +3402,12 @@ test("a packaged Controller restart inherits its direct parent's handover", (t) 
   const home = mkdtempSync(join(tmpdir(), "yui-controller-handover-smoke-"));
   const environment = { ...bareEnv, YUI_HOME: home };
   t.after(() => {
-    try {
-      execFileSync(
-        process.execPath,
-        [join(root, "dist", "cli.js"), "controller", "stop"],
-        { cwd: root, encoding: "utf8", env: environment }
-      );
-    } finally {
-      rmSync(home, { recursive: true, force: true });
-    }
+    execFileSync(
+      process.execPath,
+      [join(root, "dist", "cli.js"), "controller", "stop"],
+      { cwd: root, encoding: "utf8", env: environment }
+    );
+    rmSync(home, { recursive: true, force: true });
   });
   new SqliteTaskStore(home).close();
 
@@ -3428,6 +3425,17 @@ test("a packaged Controller restart inherits its direct parent's handover", (t) 
   assert.equal(restarted.ok, true);
   assert.equal(restarted.data.restarted, true);
   assert.ok(Number.isInteger(restarted.data.pid) && restarted.data.pid > 0);
+  const replacedPid = restarted.data.pid;
+  const replacement = JSON.parse(execFileSync(
+    process.execPath,
+    [join(root, "dist", "cli.js"), "--json", "controller", "restart"],
+    { cwd: root, encoding: "utf8", env: environment }
+  ));
+  assert.equal(replacement.data.previousPid, replacedPid);
+  assert.notEqual(replacement.data.pid, replacedPid);
+  const oldProcess = readLinuxProcessIdentity(replacedPid);
+  assert.ok(oldProcess === undefined || oldProcess.state === "Z",
+    "restart must wait for the old Controller process, including its Workers, to exit");
 });
 
 test("Controller begin-handover accepts a null fromReleaseId", async (t) => {

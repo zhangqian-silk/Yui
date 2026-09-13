@@ -190,6 +190,11 @@ export class SessionOwnerReconciliation {
     }
     const result = await terminateSessionOwners(owner, records, this.#terminationPorts(), options);
     if (result.outcome === "stop-confirmed") {
+      // A signalled Host exits into a retained tmux pane. Explicit release
+      // removes that window too, after physical exit proof, not on observation.
+      if (records.length > 0) {
+        this.#tmux?.killRole(owner.scope === "task" ? owner.taskId : "operator", owner.roleName);
+      }
       for (const record of result.confirmed) {
         this.#store.removeSessionOwner(sessionOwnerProcessKey(record));
       }

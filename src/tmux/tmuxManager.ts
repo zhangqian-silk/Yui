@@ -693,7 +693,9 @@ export class TmuxManager {
     let output: string;
     try {
       output = this.run([
-        "list-panes", "-s", "-t", this.sessionName(taskId), "-F",
+        // list-panes takes a pane target: the colon keeps this an exact
+        // session lookup instead of falling back to a similarly named one.
+        "list-panes", "-s", "-t", `=${this.sessionName(taskId)}:`, "-F",
         `#{window_name}${formatSeparator}#{pane_dead}${formatSeparator}#{pane_dead_status}${formatSeparator}#{pane_pid}${formatSeparator}#{pane_current_command}`
       ]);
     } catch (error) {
@@ -1116,7 +1118,7 @@ export class TmuxManager {
     this.recordTaskTargets(taskId);
     for (const session of [...sessions.filter((name) => name !== taskSession), taskSession]) {
       try {
-        this.run(["kill-session", "-t", session]);
+        this.run(["kill-session", "-t", `=${session}`]);
       } catch (error) {
         if (!isExplicitlyAbsentTmuxSession(error)) throw error;
       }
@@ -1131,7 +1133,7 @@ export class TmuxManager {
     await this.recordTaskTargetsAsync(taskId);
     for (const session of [...sessions.filter((name) => name !== taskSession), taskSession]) {
       try {
-        await this.runAsync(["kill-session", "-t", session]);
+        await this.runAsync(["kill-session", "-t", `=${session}`]);
       } catch (error) {
         if (!isExplicitlyAbsentTmuxSession(error)) throw error;
       }
@@ -1146,12 +1148,20 @@ export class TmuxManager {
 
   killRole(taskId: string, roleName: string): void {
     this.recordRoleTarget(taskId, roleName);
-    this.run(["kill-window", "-t", this.target(taskId, roleName)]);
+    try {
+      this.run(["kill-window", "-t", this.exactTarget(taskId, roleName)]);
+    } catch (error) {
+      if (!isExplicitlyAbsentTmuxSession(error)) throw error;
+    }
   }
 
   async killRoleAsync(taskId: string, roleName: string): Promise<void> {
     this.recordRoleTarget(taskId, roleName);
-    await this.runAsync(["kill-window", "-t", this.target(taskId, roleName)]);
+    try {
+      await this.runAsync(["kill-window", "-t", this.exactTarget(taskId, roleName)]);
+    } catch (error) {
+      if (!isExplicitlyAbsentTmuxSession(error)) throw error;
+    }
   }
 
   renameRole(taskId: string, oldRoleName: string, newRoleName: string): void {
@@ -1168,7 +1178,7 @@ export class TmuxManager {
 
   private hasSession(taskId: string): boolean {
     try {
-      this.run(["has-session", "-t", this.sessionName(taskId)]);
+      this.run(["has-session", "-t", `=${this.sessionName(taskId)}`]);
       return true;
     } catch (error) {
       if (isExplicitlyAbsentTmuxSession(error)) return false;
@@ -1178,7 +1188,7 @@ export class TmuxManager {
 
   private async hasSessionAsync(taskId: string): Promise<boolean> {
     try {
-      await this.runAsync(["has-session", "-t", this.sessionName(taskId)]);
+      await this.runAsync(["has-session", "-t", `=${this.sessionName(taskId)}`]);
       return true;
     } catch (error) {
       if (isExplicitlyAbsentTmuxSession(error)) return false;
@@ -1190,7 +1200,7 @@ export class TmuxManager {
     if (!this.hasSession(taskId)) return [];
     try {
       return this.run([
-        "list-windows", "-t", this.sessionName(taskId), "-F", "#{window_name}"
+        "list-windows", "-t", `=${this.sessionName(taskId)}`, "-F", "#{window_name}"
       ]).split("\n").map((name) => name.trim()).filter(Boolean);
     } catch (error) {
       if (isExplicitlyAbsentTmuxSession(error)) return [];
@@ -1203,7 +1213,7 @@ export class TmuxManager {
   ): Promise<Readonly<{ exists: boolean; names: string[] }>> {
     try {
       const names = (await this.runAsync([
-        "list-windows", "-t", this.sessionName(taskId), "-F", "#{window_name}"
+        "list-windows", "-t", `=${this.sessionName(taskId)}`, "-F", "#{window_name}"
       ])).split("\n").map((name) => name.trim()).filter(Boolean);
       return { exists: true, names };
     } catch (error) {

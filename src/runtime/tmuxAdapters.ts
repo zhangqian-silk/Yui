@@ -1000,7 +1000,6 @@ async function stopExactRole(
   hostId: string,
   roleName: string
 ): Promise<void> {
-  if (await probeRoleStatus(tmux, hostId, roleName) !== "running") return;
   try {
     await killRole(tmux, hostId, roleName);
   } catch (error) {

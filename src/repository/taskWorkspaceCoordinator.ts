@@ -33,6 +33,8 @@ export { WorkspaceCleanupBlockedError } from "./taskWorkspacePreparer.js";
 
 export type TaskRoleRuntimeStopper = Readonly<{
   stopTaskRoleSessions(taskId: string, roleNames: readonly string[]): Promise<void>;
+  /** Prove quiescence, then remove this Task's terminals, including exited panes. */
+  releaseTaskTerminals(taskId: string): Promise<void>;
   inspectTaskRolePanes?(taskId: string): readonly Readonly<{
     roleName: string;
     dead: boolean;
@@ -290,7 +292,7 @@ export class TaskWorkspaceCoordinator {
       if (checks.length > 0) throw new CleanupInspectionError(checks);
       const roleNames = this.store.listRoles(taskId).map(({ name }) => name);
       await this.#stopLiveRoles(taskId, roleNames);
-      await this.runtime.assertTaskPhysicalResourcesReleased?.(task.id);
+      await this.runtime.releaseTaskTerminals(task.id);
       this.#assertTaskArchiveSnapshot(snapshot);
       for (const workspace of laneWorkspaces) {
         this.#assertTaskArchiveLifecycle(task);
@@ -399,10 +401,7 @@ export class TaskWorkspaceCoordinator {
       const checks = archiveExecutionChecks(this.store, taskId);
       if (checks.length > 0) throw new CleanupInspectionError(checks);
       if (!runtimeReleased) throw new Error("One or more Role runtimes could not be safely released.");
-      if (this.runtime.assertTaskPhysicalResourcesReleased === undefined) {
-        throw new Error("Physical resource release inspection is unavailable; workspace references retained.");
-      }
-      await this.runtime.assertTaskPhysicalResourcesReleased(taskId);
+      await this.runtime.releaseTaskTerminals(taskId);
       return "released";
     });
     if (physicalReleased) {

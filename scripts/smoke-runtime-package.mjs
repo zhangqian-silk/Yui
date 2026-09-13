@@ -18,7 +18,6 @@ const yuiHome = join(isolatedHome, ".yui");
 const fakeBin = join(sandbox, "bin");
 let cli;
 let environment;
-let controllerStarted = false;
 const skills = [
   "yui-leader",
   "yui-worker",
@@ -136,7 +135,6 @@ try {
   }
 
   const created = runCli(cli, ["task", "create", "runtime smoke"], environment);
-  controllerStarted = true;
   const taskId = /Created Draft task (task-[A-Za-z0-9_-]+)/u.exec(created)?.[1];
   if (taskId === undefined) {
     throw new Error("Installed CLI did not create a Draft Task.");
@@ -163,19 +161,20 @@ try {
   if (!stopped.includes("Controller stopped.")) {
     throw new Error("Installed CLI controller did not stop cleanly.");
   }
-  controllerStarted = false;
-
-  process.stdout.write("Runtime package smoke passed.\n");
 } finally {
-  if (controllerStarted && cli !== undefined && environment !== undefined) {
+  // setup can start a Controller before any Task command succeeds. Inspect the
+  // fixture we own instead of setting a late "started" flag. Do not erase the
+  // Home when shutdown fails: another Agent needs its exact identity to clean it.
+  if (existsSync(join(yuiHome, "yui.db")) && cli !== undefined && environment !== undefined) {
     try {
       runCli(cli, ["controller", "stop"], environment);
-    } catch {
-      // Preserve the original smoke failure while making a best-effort cleanup.
+    } catch (error) {
+      throw new Error(`Runtime smoke cleanup failed; fixture retained at ${sandbox}.`, { cause: error });
     }
   }
   rmSync(sandbox, { recursive: true, force: true });
 }
+process.stdout.write("Runtime package smoke passed.\n");
 
 function runCli(cli, args, env, input) {
   return execFileSync(cli, args, { encoding: "utf8", env, input });

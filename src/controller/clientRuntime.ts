@@ -832,6 +832,21 @@ export class FileTaskWorkflowRuntime implements TaskWorkflowRuntimePort {
     );
   }
 
+  /** Archive cleanup is stronger than a read-only proof that no process is live. */
+  async releaseTaskTerminals(taskId: string): Promise<void> {
+    await this.assertTaskPhysicalResourcesReleased(taskId);
+    // A Home's server is shared with other Tasks and the Operator. Remove only
+    // this Task's session group; exited panes still own scrollback memory.
+    await this.tmux.stopTaskAsync(taskId);
+    const remaining = this.tmux.inspectTaskRolePanes(taskId);
+    if (remaining.length > 0) {
+      throw new WorkspaceCleanupBlockedError(
+        "physical-resource-live", `task:${taskId}`, true,
+        `Task terminals remain after cleanup: ${remaining.map(pane => pane.roleName).join(", ")}.`
+      );
+    }
+  }
+
   async stopGlobalRoleSession(roleName: string): Promise<void> {
     if (this.store.getGlobalRole(roleName) === null) {
       throw new Error(`Global Role not found: ${roleName}.`);

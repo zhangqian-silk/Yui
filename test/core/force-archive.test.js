@@ -149,6 +149,7 @@ test("force cleanup records independent failures and successes after archive wit
     }
   }, {
     async stopTaskRoleSessions() { assert.fail("no Role to stop"); },
+    async releaseTaskTerminals() {},
     async assertTaskPhysicalResourcesReleased() {}
   });
   await coordinator.cleanupArchivedTask(task.id, "integrated");
@@ -186,7 +187,7 @@ test("cleanup persistence failures propagate even when the next audit write coul
           { resource: "path:partial", detail: "One path removed" }, "removed", now);
         throw Object.assign(new Error("one-off durable cleanup write failure"), { code: "SQLITE_BUSY" });
       }
-    }, { async stopTaskRoleSessions() {}, async assertTaskPhysicalResourcesReleased() {} });
+    }, { async stopTaskRoleSessions() {}, async releaseTaskTerminals() {}, async assertTaskPhysicalResourcesReleased() {} });
     await assert.rejects(coordinator.cleanupArchivedTask(task.id, "integrated"), /write failure/);
     assert.equal(store.getTask(task.id).status, "archived");
     assert.equal(taskArchiveDiagnostics(store, store.getTask(task.id)).cleanupFinished, false);
@@ -286,6 +287,7 @@ test("force retains active Runs and queued Jobs, while plain settled archive sti
   command(["archive", task.id, "--integrated", "--force"]);
   await new TaskWorkspaceCoordinator(store, { home }, {
     async stopTaskRoleSessions() { assert.fail("An active Run must not be presumed stopped."); },
+    async releaseTaskTerminals() { assert.fail("Active execution must retain its terminals."); },
     async assertTaskPhysicalResourcesReleased() { assert.fail("Active execution must retain its resources."); }
   }).cleanupArchivedTask(task.id, "integrated");
   assert.deepEqual(store.getActiveRun(task.id, role.name), run);

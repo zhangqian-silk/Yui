@@ -114,6 +114,7 @@ test("archive preflight observes SQLite and Git without writes, and force still 
   const preparer = new FileTaskWorkspacePreparer(home, store);
   const coordinator = new TaskWorkspaceCoordinator(store, preparer, {
     async stopTaskRoleSessions() { assert.fail("inspection must not stop a runtime"); },
+    async releaseTaskTerminals() {},
     async assertTaskPhysicalResourcesReleased() {}
   });
   const before = { task: store.getTask(task.id), events: store.listEvents(task.id),
@@ -195,6 +196,7 @@ test("archive cleanup honors an explicitly adopted publication candidate but ret
   const preparer = new FileTaskWorkspacePreparer(home, store);
   const coordinator = new TaskWorkspaceCoordinator(store, preparer, {
     async stopTaskRoleSessions() { assert.fail("inspection must not stop runtime"); },
+    async releaseTaskTerminals() { assert.fail("inspection must not release terminals"); },
     async assertTaskPhysicalResourcesReleased() {}
   });
   const report = await inspectTaskArchive(coordinator, {
