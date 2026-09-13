@@ -19,6 +19,13 @@ body.terminal-active .app-shell{grid-template-columns:var(--sidebar-w) minmax(0,
 .task-group-head{display:flex;align-items:baseline;gap:8px;padding:3px 4px 2px}
 .sidebar-foot{flex:none;padding-top:10px;margin-top:8px;display:grid;gap:8px}
 .sidebar-controls{display:grid;grid-template-columns:1fr 1fr;gap:8px;align-items:center}
+.catalog-pager{display:grid;grid-template-columns:1fr 1fr;gap:6px;flex:none;padding-top:10px}
+.catalog-pager span{grid-column:1/-1;grid-row:1;text-align:center;font-size:11px;color:var(--muted)}
+.catalog-pager button{min-height:32px;min-width:0;border:1px solid var(--border);border-radius:6px;background:var(--bg);color:var(--text);font:inherit;font-size:11px;cursor:pointer}
+.catalog-pager button:hover:not(:disabled){border-color:var(--accent)}
+.catalog-pager button:focus-visible{outline:2px solid var(--accent);outline-offset:2px}
+.catalog-pager button:disabled{opacity:.45;cursor:default}
+#catalog-attention-reset{grid-column:1/-1}
 /* Main column = top bar + optional section nav + reading surface */
 .main-col{display:flex;flex-direction:column;min-width:0;min-height:0;height:100vh;overflow-y:auto;scrollbar-gutter:stable}
 .topbar{position:sticky;top:0;z-index:30;flex:none;display:flex;align-items:center;justify-content:space-between;gap:18px;padding:11px max(var(--page-space),calc((100% - 1100px) / 2));background:color-mix(in srgb,var(--bg) 92%,transparent);backdrop-filter:blur(10px);-webkit-backdrop-filter:blur(10px);border-bottom:1px solid var(--border)}

@@ -341,6 +341,7 @@ import {
   assertTaskInputControlAuthority
 } from "./taskActor.js";
 import { currentManagedRuntime, resolveManagedTaskReader } from "../runtime/managedCaller.js";
+import { parseTaskCatalogOptions, readTaskCatalog, renderTaskCatalog, taskCatalogScope } from "../context/taskCatalog.js";
 import { resolveMessageRecipient, messageContinuationBlocker } from "../message/messageContinuation.js";
 import { findTaskInterrupt, reserveTaskInterrupt, taskInterruptReceipt, taskInterruptWasRejected } from "../message/taskInterrupt.js";
 import { resolveTaskInputControl, type ResolvedInputTarget } from "../message/inputControlResolution.js";
@@ -820,7 +821,7 @@ export function runTaskCommand(
   switch (command) {
     case "create": return createTaskCommand(rest, store, options);
     case "update": return output(updateTaskCommand(rest, store, options));
-    case "list": return listTaskCommand(rest, store);
+    case "list": return listTaskCommand(rest, store, options.environment);
     case "show": return showTaskCommand(
       rest,
       store,
@@ -1614,10 +1615,15 @@ function createTaskAggregate(
   return { task, leader };
 }
 
-function listTaskCommand(args: string[], store: TaskWorkflowStore): TaskCommandExecution {
+function listTaskCommand(args: string[], store: TaskWorkflowStore, environment: NodeJS.ProcessEnv = {}): TaskCommandExecution {
+  if (args.includes("--view")) {
+    const result = readTaskCatalog(store, parseTaskCatalogOptions(args), environment);
+    return output(renderTaskCatalog(result), result);
+  }
+  const taskId = taskCatalogScope(store, environment);
   const options = parseTaskListOptions(args);
   const snapshot = store.transaction((reader) => ({
-    result: buildTaskOverview(reader, options),
+    result: buildTaskOverview(reader, options, new Date(), taskId),
     timeZone: reader.getConfig().timeZone
   }));
   const rendered = renderTaskOverview(

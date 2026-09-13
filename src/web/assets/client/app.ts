@@ -20,6 +20,10 @@ const elements = {
   search: document.querySelector("#search"),
   filters: document.querySelector("#status-filters"),
   tasks: document.querySelector("#task-list"),
+  catalogNext: document.querySelector("#catalog-next"),
+  catalogReset: document.querySelector("#catalog-reset"),
+  catalogCount: document.querySelector("#catalog-count"),
+  catalogAttentionReset: document.querySelector("#catalog-attention-reset"),
   detail: document.querySelector("#detail"),
   mainCol: document.querySelector(".main-col"),
   topbar: document.querySelector(".topbar"),
@@ -40,6 +44,13 @@ const state = {
   tasks: [],
   counts: null,
   attention: [],
+  catalogAttention: null,
+  catalogScope: null,
+  catalogAll: false,
+  catalogTotal: 0,
+  catalogCursor: null,
+  nextCursor: null,
+  attentionFilter: null,
   generatedAt: null,
   filter: "all",
   query: "",
@@ -48,6 +59,7 @@ const state = {
   detailKey: null
 };
 const VALID_FILTERS = ["all", "active", "draft", "completed", "cancelled", "archived"];
+const VALID_ATTENTION = ["openInputs", "pendingOperations", "unknownOperations", "executionSignals"];
 let terminalSession = null;
 let terminalStateKey = "terminal.closed";
 const submittedRequests = new Set();
@@ -120,6 +132,10 @@ function syncUrlFromState(options) {
   else params.delete("filter");
   if (state.query) params.set("q", state.query);
   else params.delete("q");
+  if (state.attentionFilter) params.set("attention", state.attentionFilter);
+  else params.delete("attention");
+  if (state.catalogAll) params.set("all", "true");
+  else params.delete("all");
   applyUrl(params, options);
 }
 
@@ -228,9 +244,16 @@ function renderCurrentDetail(force) {
 function renderDynamicContent() {
   renderFilters(elements.filters, state, i18n.t, function (filter) {
     state.filter = filter;
+    state.attentionFilter = null;
+    state.catalogAll = false;
     syncUrlFromState({ replace: false });
-    renderDynamicContent();
+    resetCatalog();
   });
+  elements.catalogNext.disabled = !state.nextCursor || refreshing;
+  elements.catalogCount.textContent = i18n.t("catalog.count")
+    .replace("{shown}", String(state.tasks.length)).replace("{total}", String(state.catalogTotal))
+    + (state.attentionFilter ? " · " + i18n.t("catalog." + state.attentionFilter) : "");
+  elements.catalogAttentionReset.hidden = !state.attentionFilter;
   const savedTaskScroll = elements.tasks.scrollTop;
   renderTasks(elements.tasks, state, i18n.t, i18n.getLocale(), selectTask);
   elements.tasks.scrollTop = savedTaskScroll;
@@ -463,9 +486,17 @@ async function answerInput(input, answer) {
 }
 
 let refreshing = false;
+let catalogRequest = 0;
+function resetCatalog() {
+  state.catalogCursor = null;
+  state.nextCursor = null;
+  refreshDashboard();
+}
 async function refreshDashboard(options) {
-  if (refreshing) return;
+  if (refreshing && options && options.quiet) return;
+  const request = ++catalogRequest;
   refreshing = true;
+  elements.catalogNext.disabled = true;
   const quiet = options && options.quiet;
   if (!quiet) {
     elements.refresh.disabled = true;
@@ -473,17 +504,29 @@ async function refreshDashboard(options) {
   }
   const previousInputs = state.counts ? state.counts.openInputs : null;
   try {
-    const dashboard = await requestJson("/api/dashboard");
+    const query = new URLSearchParams({ view: "compact" });
+    if (state.catalogAll) query.set("all", "true");
+    if (state.filter !== "all") query.set("status", state.filter);
+    if (state.query.trim()) query.set("search", state.query.trim());
+    if (state.attentionFilter) query.set("attention", state.attentionFilter);
+    if (state.catalogCursor) query.set("cursor", state.catalogCursor);
+    const dashboard = await requestJson("/api/dashboard?" + query.toString());
+    if (request !== catalogRequest) return;
     state.tasks = dashboard.tasks;
-    state.counts = dashboard.counts;
-    state.attention = dashboard.attention || [];
-    state.generatedAt = dashboard.generatedAt;
-    if (state.selected && !state.tasks.some(function (task) { return task.id === state.selected; })) {
-      clearSelection();
-    } else {
-      renderDynamicContent();
-    }
-    if (previousInputs !== null && dashboard.counts.openInputs > previousInputs) {
+    state.counts = { ...dashboard.counts, openInputs: dashboard.attention.openInputs.count };
+    state.catalogAttention = dashboard.attention;
+    state.catalogScope = dashboard.scope;
+    state.catalogTotal = dashboard.total;
+    state.nextCursor = dashboard.nextCursor;
+    state.attention = dashboard.attention.openInputs.refs.map(function (ref) {
+      const task = state.tasks.find(function (entry) { return entry.id === ref.taskId; });
+      return { taskId: ref.taskId, taskTitle: task ? task.title : ref.taskId };
+    });
+    state.generatedAt = new Date().toISOString();
+    // A selected Task may live on another page or outside current filters.
+    // Only its detail endpoint can establish that it no longer exists.
+    renderDynamicContent();
+    if (previousInputs !== null && state.counts.openInputs > previousInputs) {
       showToast(i18n.t("input.new"));
     }
     if (state.selected) {
@@ -492,13 +535,17 @@ async function refreshDashboard(options) {
       }
     }
   } catch {
+    if (request !== catalogRequest) return;
     if (!quiet) {
       renderError(elements.tasks, i18n.t("errors.dashboard"));
       showToast(i18n.t("errors.dashboard"));
     }
   } finally {
-    refreshing = false;
-    if (!quiet) elements.refresh.disabled = false;
+    if (request === catalogRequest) {
+      refreshing = false;
+      elements.refresh.disabled = false;
+      elements.catalogNext.disabled = !state.nextCursor;
+    }
   }
 }
 
@@ -650,12 +697,37 @@ if (elements.detailTabs) {
   });
 }
 
+let catalogSearchTimer = null;
 elements.search.addEventListener("input", function () {
   state.query = elements.search.value;
   syncUrlFromState({ replace: true });
-  const savedTaskScroll = elements.tasks.scrollTop;
-  renderTasks(elements.tasks, state, i18n.t, i18n.getLocale(), selectTask);
-  elements.tasks.scrollTop = savedTaskScroll;
+  window.clearTimeout(catalogSearchTimer);
+  catalogSearchTimer = window.setTimeout(resetCatalog, 200);
+});
+elements.catalogNext.addEventListener("click", function () {
+  if (!state.nextCursor) return;
+  state.catalogCursor = state.nextCursor;
+  refreshDashboard();
+});
+elements.catalogReset.addEventListener("click", function () {
+  resetCatalog();
+});
+elements.catalogAttentionReset.addEventListener("click", function () {
+  state.attentionFilter = null;
+  state.catalogAll = false;
+  syncUrlFromState({ replace: false });
+  resetCatalog();
+});
+elements.detail.addEventListener("click", function (event) {
+  const button = event.target.closest("[data-catalog-attention]");
+  if (!button) return;
+  state.attentionFilter = button.dataset.catalogAttention;
+  state.catalogAll = state.catalogScope && state.catalogScope.archived === "included";
+  state.filter = "all";
+  state.query = "";
+  elements.search.value = "";
+  syncUrlFromState({ replace: false });
+  resetCatalog();
 });
 elements.refresh.addEventListener("click", function () { refreshDashboard(); });
 elements.operatorTerminal.addEventListener("click", function () {
@@ -753,6 +825,8 @@ function applyStateFromUrl() {
   }
   const query = params.get("q");
   state.query = query || "";
+  state.attentionFilter = VALID_ATTENTION.includes(params.get("attention")) ? params.get("attention") : null;
+  state.catalogAll = params.get("all") === "true";
   if (elements.search) elements.search.value = state.query;
   const taskId = params.get("task");
   if (taskId) {
@@ -767,6 +841,7 @@ function applyStateFromUrl() {
 
 window.addEventListener("popstate", function () {
   applyStateFromUrl();
+  resetCatalog();
 });
 
 i18n.subscribe(function () {

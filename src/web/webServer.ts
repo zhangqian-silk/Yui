@@ -8,7 +8,8 @@ import {
 import type { Duplex } from "node:stream";
 import WebSocket, { WebSocketServer } from "ws";
 
-import { usageError } from "../errors/cliError.js";
+import { CliError, usageError } from "../errors/cliError.js";
+import { parseTaskCatalogOptions } from "../context/taskCatalog.js";
 import type { WebTaskSurface, WebControlInput } from "./webTaskSurface.js";
 import { WebRequestRejected } from "./webMutation.js";
 import { TASK_SUBMISSION_INTENTS, type TaskSubmissionIntent } from "../message/message.js";
@@ -17,6 +18,7 @@ import type { CapabilityResult } from "../kernel/capabilityRegistry.js";
 import { DASHBOARD_HTML, findWebAsset, type WebAsset } from "./assets/assetManifest.js";
 import {
   buildWebDashboardSnapshot,
+  buildWebTaskCatalog,
   buildWebTaskDetail,
   type WebDashboardStore
 } from "./webSnapshot.js";
@@ -311,7 +313,14 @@ async function handleHttpRequest(
       } else if (asset !== null) {
         sendAsset(response, asset, method === "HEAD");
       } else if (pathname === "/api/dashboard") {
-        sendJson(response, 200, buildWebDashboardSnapshot(store, now()), method === "HEAD");
+        const query = new URL(request.url!, "http://localhost").searchParams;
+        const snapshot = query.has("view")
+          ? buildWebTaskCatalog(store, parseTaskCatalogOptions(
+            [...query].flatMap(([key, value]) => key === "all"
+              ? (value === "true" ? ["--all"] : ["--invalid-all"])
+              : [`--${key}`, value])))
+          : buildWebDashboardSnapshot(store, now());
+        sendJson(response, 200, snapshot, method === "HEAD");
       } else if (pathname.startsWith("/api/tasks/")) {
         const taskId = decodeURIComponent(pathname.slice("/api/tasks/".length));
         const detail = taskId.length === 0 || taskId.includes("/")
@@ -327,6 +336,10 @@ async function handleHttpRequest(
         sendJson(response, 404, { error: "Not found." }, method === "HEAD");
       }
     } catch (error) {
+      if (error instanceof CliError) {
+        sendJson(response, 400, { error: error.message }, method === "HEAD");
+        return;
+      }
       if (error instanceof URIError) {
         sendJson(response, 400, { error: "Invalid URL encoding." }, method === "HEAD");
         return;

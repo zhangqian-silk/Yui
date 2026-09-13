@@ -237,9 +237,9 @@ export async function withContextObservations(
   return { ...core, observations };
 }
 
-function authorizeContext(store: TaskStore, taskId: string, environment: NodeJS.ProcessEnv) {
+/** Shared current/historical Session read identity; discovery may only narrow it. */
+export function resolveContextReader(store: TaskStore, environment: NodeJS.ProcessEnv) {
   const caller = resolveManagedTaskReader(store, environment);
-  if (caller !== undefined && caller.taskId !== taskId) throw usageError("Context is outside the caller's Task.");
   if (caller === undefined && environment.YUI_SESSION_SCOPE === "global" && environment.YUI_ROLE !== "operator") {
     throw usageError("Only Operator may read Task context from a global Session.");
   }
@@ -251,6 +251,12 @@ function authorizeContext(store: TaskStore, taskId: string, environment: NodeJS.
   if (environment.YUI_SESSION_SCOPE !== undefined && !["task", "global"].includes(environment.YUI_SESSION_SCOPE)) {
     throw usageError("Incomplete managed Context caller identity.");
   }
+  return caller;
+}
+
+function authorizeContext(store: TaskStore, taskId: string, environment: NodeJS.ProcessEnv) {
+  const caller = resolveContextReader(store, environment);
+  if (caller !== undefined && caller.taskId !== taskId) throw usageError("Context is outside the caller's Task.");
   const task = store.getTask(taskId);
   if (task === null) throw taskNotFound(taskId);
   let allow: Set<string> | undefined;
@@ -482,7 +488,7 @@ function authorizedEntries(store: TaskStore, taskId: string, environment: NodeJS
   return entries;
 }
 
-function materialize(store: string, refId: string, value: unknown): Entry {
+export function materialize(store: string, refId: string, value: unknown): Entry {
   const digest = contextContentDigest(value);
   const record = value as Record<string, unknown>;
   return { ref: { store, refId, revision: String(record.revision ?? record.updatedAt ?? record.createdAt ?? digest), digest }, value };
