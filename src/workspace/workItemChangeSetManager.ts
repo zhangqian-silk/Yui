@@ -1,5 +1,6 @@
 import { isDeepStrictEqual } from "node:util";
-import { lstat } from "node:fs/promises";
+import { lstat, realpath } from "node:fs/promises";
+import { join } from "node:path";
 
 import {
   createWorkItemChangeSet,
@@ -23,6 +24,7 @@ import type {
 } from "../worktree/managedWorkspace.js";
 import { managedWorkspaceKey } from "../worktree/managedWorkspace.js";
 import { captureManagedGitChanges } from "./gitChangeSetCapture.js";
+import { CleanupInspectionError, cleanupCheckFromError, workspacePathValue, type CleanupCheck } from "./cleanupInspection.js";
 
 const CAPTURABLE_WORK_ITEM_STATUSES = new Set([
   "open",
@@ -110,6 +112,16 @@ export class WorkItemChangeSetManager {
     workItemId: string,
     candidateId?: string
   ): Promise<WorkItemIntegrationProof | null> {
+    const inspection = await this.inspectIntegrated(taskId, workItemId, candidateId);
+    if (inspection.checks.length > 0) throw new CleanupInspectionError(inspection.checks);
+    return inspection.proof;
+  }
+
+  async inspectIntegrated(
+    taskId: string,
+    workItemId: string,
+    candidateId?: string
+  ): Promise<Readonly<{ proof: WorkItemIntegrationProof | null; checks: readonly CleanupCheck[] }>> {
     const item = this.store.getWorkItem(taskId, workItemId);
     if (item === null) throw new Error(`Work item not found: ${taskId}/${workItemId}.`);
     const candidate = candidateId === undefined ? governingWorkItemCandidate(item)
@@ -118,73 +130,123 @@ export class WorkItemChangeSetManager {
       throw new Error(`Candidate not found: ${taskId}/${workItemId}/${candidateId}.`);
     }
     const workspace = this.store.getWorkItemWorkspace(item.taskId, item.id);
-    if (
-      workspace === null
-      || workspace.owner.type !== "work-item"
-      || workspace.owner.workItemId !== item.id
-    ) return null;
+    if (workspace === null) return { proof: null, checks: [] };
     const git = new NodeGitWorkspace();
     const projects: ProjectIntegrationProof[] = [];
-    for (const entry of writableEntries(workspace)) {
-      const path = await lstat(entry.path).catch(error => {
-        if (error.code === "ENOENT") return null;
-        throw error;
-      });
-      if (path?.isSymbolicLink()) throw new Error(`WorkItem path is a symbolic link: ${entry.path}.`);
-      if (path !== null && !await git.isClean(entry.path)) {
-        throw new Error(
-          `WorkItem Project workspace is not clean: ${item.id}/${entry.projectId}.`
-        );
+    const checks: CleanupCheck[] = [];
+    const sources = [`work-item:${taskId}/${workItemId}`,
+      `candidate:${taskId}/${workItemId}/${candidate?.id ?? "missing"}`, managedWorkspaceKey(workspace.owner)];
+    const actions = [`yui task work show ${taskId}/${workItemId}`, `yui task integration list ${taskId}`];
+    const add = (resource: string, reason: string, detail: string, expected: unknown, observed: unknown) => {
+      checks.push({ resource, reason, detail, expected, observed, status: "blocked", sources, actions });
+    };
+    const resource = `work-item:${taskId}/${workItemId}`;
+    if (workspace.owner.type !== "work-item" || workspace.owner.taskId !== taskId || workspace.owner.workItemId !== item.id) {
+      add(resource, "workspace-identity-mismatch", "Managed workspace is not owned by this WorkItem.",
+        { type: "work-item", taskId, workItemId }, "different owner");
+      return { proof: null, checks };
+    }
+    if (candidate?.workspace === undefined) {
+      add(resource, "candidate-workspace-missing", "The governing Candidate has no frozen workspace.",
+        "frozen WorkItem workspace", null);
+    } else if (!isDeepStrictEqual(candidate.workspace, workspace)) {
+      const frozen = candidate.workspace;
+      if (!isDeepStrictEqual(frozen.owner, workspace.owner)) {
+        add(resource, "workspace-identity-mismatch", "Frozen and current workspace owners differ.",
+          frozen.owner, workspace.owner);
       }
+      // Paths remain frozen evidence. A path-shaped difference alone is NOT a
+      // receipt proving that migration moved this exact Candidate safely.
+      if (frozen.root !== workspace.root) {
+        add(resource, "workspace-path-mismatch", "Workspace roots differ; relocation is not proven.",
+          workspacePathValue(workspace, frozen.root), workspacePathValue(workspace, workspace.root));
+      }
+      if (!isDeepStrictEqual(frozen.entries.map(e => e.projectId), workspace.entries.map(e => e.projectId))) {
+        add(resource, "workspace-identity-mismatch", "Frozen and current Project scope/order differ.",
+          frozen.entries.map(e => e.projectId), workspace.entries.map(e => e.projectId));
+      }
+      for (const entry of workspace.entries) {
+        const previous = frozen.entries.find(e => e.projectId === entry.projectId);
+        if (previous === undefined) continue;
+        const entryResource = `${resource}/${entry.projectId}`;
+        if (previous.path !== entry.path) {
+          add(entryResource, "workspace-path-mismatch",
+            "Frozen and current Project paths differ; no relocation receipt is available. Historical evidence is unchanged.",
+            workspacePathValue(workspace, previous.path), workspacePathValue(workspace, entry.path));
+        }
+        for (const key of ["directory", "access", "branch", "baseRef", "baseCommit"] as const) {
+          if (previous[key] !== entry[key]) add(entryResource, "workspace-identity-mismatch",
+            `Frozen and current ${key} differ.`, { [key]: previous[key] }, { [key]: entry[key] });
+        }
+      }
+      for (const key of ["schemaVersion", "createdAt", "updatedAt"] as const) {
+        if (frozen[key] !== workspace[key]) add(resource, "workspace-metadata-mismatch",
+          `Frozen and current ${key} differ.`, { [key]: frozen[key] }, { [key]: workspace[key] });
+      }
+    }
+    for (const entry of writableEntries(workspace)) {
+      const projectResource = `${resource}/${entry.projectId}`;
       const resultCommit = candidate?.gitSnapshot?.projects.find(
         ({ projectId }) => projectId === entry.projectId
       )?.commit;
-      // Absence is a filesystem fact, not proof of integration or Git cleanup.
-      // Check any retained branch against the same frozen Candidate; the
-      // cleanup primitive separately removes its exact Git registration.
-      const repository = this.store.getTaskWorkspace(taskId)?.entries.find(e => e.projectId === entry.projectId);
-      const workspaceHeadCommit = path !== null ? (await git.inspect(entry.path, "HEAD")).baseCommit
-        : repository !== undefined && await git.refExists(repository.path, entry.branch)
-          ? (await git.inspect(repository.path, entry.branch)).baseCommit
-          : resultCommit;
-      if (candidate?.workspace === undefined
-        || !isDeepStrictEqual(candidate.workspace, workspace)
-        || resultCommit === undefined
-        || (candidateId === undefined && resultCommit !== workspaceHeadCommit)) {
-        throw new Error(
-          `WorkItem Project no longer matches its frozen result: ${item.id}/${entry.projectId}.`
-        );
-      }
-      // An explicit historical selection is proved against its immutable
-      // integrated commit, not mislabeled as the workspace's current HEAD.
-      const headCommit = resultCommit;
-      const integrated = this.store.listIntegrationAttempts(item.taskId).some(
-        (integration) => (
+      if (resultCommit === undefined) add(projectResource, "frozen-commit-missing",
+        "The governing Candidate has no frozen Project commit.", "frozen commit", null);
+      if (resultCommit !== undefined) {
+        // An explicit historical selection is proved against its immutable
+        // integrated commit, not mislabeled as the workspace's current HEAD.
+        const integrated = this.store.listIntegrationAttempts(item.taskId).some(integration =>
           integration.status === "committed"
           && integration.projectId === entry.projectId
           && integration.source.kind === "work-item"
           && integration.source.workItemId === item.id
           && integration.source.startCommit === entry.baseCommit
-          && integration.source.resultCommit === headCommit
-        )
-      );
-      if (!integrated) {
-        throw new Error(
-          `WorkItem result is not integrated: ${item.id}/${entry.projectId}.`
-        );
+          && integration.source.resultCommit === resultCommit);
+        if (!integrated) {
+          add(projectResource, "result-not-integrated", "WorkItem result is not integrated.",
+            { baseCommit: entry.baseCommit, resultCommit }, "no committed Integration with these exact commits");
+        }
+        projects.push({ projectId: entry.projectId, baseCommit: entry.baseCommit, headCommit: resultCommit });
       }
-      projects.push({
-        projectId: entry.projectId,
-        baseCommit: entry.baseCommit,
-        headCommit
-      });
+      if (entry.path !== join(workspace.root, entry.directory)) {
+        add(projectResource, "workspace-path-mismatch", "Current path differs from the exact owner-root/Project location.",
+          workspacePathValue(workspace, join(workspace.root, entry.directory)), workspacePathValue(workspace, entry.path));
+        continue;
+      }
+      try {
+        const path = await lstat(entry.path).catch(error => {
+          if (error.code === "ENOENT") return null;
+          throw error;
+        });
+        if (path !== null && (path.isSymbolicLink() || await realpath(entry.path) !== entry.path)) {
+          add(projectResource, "workspace-identity-mismatch", "WorkItem path resolves through a symbolic link.",
+            "real owned directory", "symbolic link");
+          continue;
+        }
+        // Absence is a filesystem fact, not proof of integration or Git cleanup.
+        // Check any retained branch against the same frozen Candidate; the
+        // cleanup primitive separately removes its exact Git registration.
+        const repository = this.store.getTaskWorkspace(taskId)?.entries.find(e => e.projectId === entry.projectId);
+        const workspaceHeadCommit = path !== null ? (await git.inspect(entry.path, "HEAD")).baseCommit
+          : repository !== undefined && await git.refExists(repository.path, entry.branch)
+            ? (await git.inspect(repository.path, entry.branch)).baseCommit
+            : resultCommit;
+        if (candidateId === undefined && resultCommit !== undefined && resultCommit !== workspaceHeadCommit) {
+          add(projectResource, "head-mismatch", "Current HEAD no longer matches the frozen result.",
+            resultCommit, workspaceHeadCommit ?? null);
+        }
+        if (path !== null && !await git.inspectClean(entry.path)) {
+          add(projectResource, "dirty-worktree", "WorkItem Project workspace is not clean.", "clean", "dirty");
+        }
+      } catch (error) {
+        checks.push(...cleanupCheckFromError(error, projectResource, sources, actions));
+      }
     }
-    return {
+    return { checks, proof: checks.length > 0 ? null : {
       workItemId: item.id,
       ...(item.assignee === undefined ? {} : { assignee: item.assignee }),
       workspace,
       projects
-    };
+    } };
   }
 
   /**

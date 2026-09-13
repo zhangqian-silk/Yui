@@ -2,7 +2,7 @@
  * Home and Role identity; writes still require current Session authority. */
 export function taskDiagnosticTarget(args: readonly string[]): string | undefined {
   if (args[0] !== "task") return undefined;
-  if (["show", "context", "next-action"].includes(args[1] ?? "")) {
+  if (["show", "context", "next-action", "archive-preflight"].includes(args[1] ?? "")) {
     return args[1] === "context" && ["inspect", "delta"].includes(args[2] ?? "")
       ? args[3] : args[2];
   }

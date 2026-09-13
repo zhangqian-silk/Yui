@@ -296,6 +296,10 @@ export const INTERACTION_POLICIES: readonly InteractionPolicy[] = Object.freeze(
     trailingOptions: { "--json": "flag" }
   },
   {
+    ...taskTarget("archive-preflight"),
+    trailingOptions: { "--integrated": "flag", "--abandon": "flag", "--force": "flag", "--json": "flag" }
+  },
+  {
     ...taskTarget("archive", 2, ["completed", "cancelled"]),
     trailingOptions: { "--integrated": "flag", "--abandon": "flag", "--force": "flag" },
     confirmation: { action: "Archive task", targetArgumentIndex: 2 }
