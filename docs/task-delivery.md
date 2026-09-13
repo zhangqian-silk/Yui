@@ -83,6 +83,43 @@ verified merge and exact Task-head coverage are separate facts. Task completion
 does not prove any of them. Remote delivery is read from exact publication/head
 evidence, not inferred from a title or branch name.
 
+Completion heads remain the immutable acceptance baseline. A later, authorized
+integration may produce a different publication candidate (including a rebase
+or merge before a remote squash). Neither ancestry nor a successful Integration
+proves that the accepted behavior survived, or accepts additional changes.
+
+For a completed, unarchived Task, record the exact candidate as the Publication's
+`localCommit`, then read `task publication diff <task>/<publication>`. This reads
+only Task-owned local Git objects and returns the original completion reference,
+both commit/tree endpoints, the full diff (including binary changes), and a
+digest binding those facts. Review removals, additions and conflict resolutions
+against the original requirements. If they preserve the accepted result and all
+relevant increments are accepted, use
+`task publication adopt <task>/<publication> --reviewed-diff <sha256> --acceptance <text>`.
+The acceptance must explain that judgment and its verification/review evidence;
+Core checks fixed identity and facts, not the meaning of the code. If an existing
+Task Integration produced that exact candidate, pass its local ID with
+`--integration <id>` to both commands to bind its committed evidence as well.
+This records one Task event, not a new delivery status, Candidate lifecycle,
+Git operation, or permission to change completed work.
+
+`task publication verify` remains the explicit, authorized provider read. It
+records the remote source head, PR/MR state and merge commit independently of
+Task acceptance. A mismatched head or non-merged state is saved as **reported**,
+superseding earlier verification; provider errors or mismatched external identity
+write nothing. A merged provider observation verifies only that Publication's
+exact local candidate. A squash merge needs no fabricated commit ancestry.
+Metadata/verification successors preserve adoption only through an uninterrupted
+same-candidate Publication lineage. Candidate or referenced Integration changes
+cannot silently reuse the decision.
+
+CLI, current Leader Context and Web derive coverage from these same facts, with
+no provider reads or evidence writes. They distinguish not delivered, merged
+but uncovered, covering merge not verified, partial delivery and verified merge.
+Each Project retains its own accepted head, selected candidate, adoption reference
+and reason. Unknown historical heads remain unknown; old exact-SHA evidence stays
+valid without inventing adoption, and archive never proves remote delivery.
+
 Cancelled intent does not prove the runtime stopped. User/Operator may reopen
 cancelled Tasks; Leader may reopen completed Tasks. Reopening requires fresh
 explicit input/work selection and never replays previous delivery requests.
@@ -91,9 +128,10 @@ explicit input/work selection and never replays previous delivery requests.
 
 Archive is a separate authorized action after active work is settled and
 resources are clean and removable. Choose integrated delivery or deliberate
-abandonment explicitly. Integrated archive requires exact merged heads and
-verified publication evidence. An explicitly authorized verification override
-cannot bypass missing or stale heads or an unmerged result.
+abandonment explicitly. Ordinary integrated archive requires every code Project
+to have a merged, verified Publication covering its accepted head, either exactly
+or through valid explicit adoption. Insufficient evidence blocks this path;
+force remains a separate explicit authorization and never proves coverage.
 
 Managed WorkItem resources must be integrated or deliberately abandoned before
 cleanup. Review, Lane and Integration resources must be settled. Dirty worktrees

@@ -34,6 +34,7 @@ const INHERITED_METADATA_FIELDS = [
   "targetBranch"
 ] as const satisfies readonly (keyof PublicationReferenceInput)[];
 const INHERITED_EVIDENCE_FIELDS = [
+  "headCommit",
   "remoteCommit",
   "evidence",
   "mergedAt"
@@ -61,7 +62,7 @@ function upsertPublication(
   store: TaskWorkflowStore,
   options: TaskCommandOptions
 ): TaskCommandExecution {
-  const usage = "Task publication upsert usage: yui task publication upsert <task> --project <project> --provider <github|gitlab> --repository <owner/name> --kind <pull-request|merge-request> --id <external-id> [--url <url>] [--title <text>] [--source-branch <branch>] [--target-branch <branch>] [--local-commit <sha>] [--remote-commit <sha>] [--state <open|merged|closed>] [--reported|--verified] [--evidence <text>] [--merged-at <iso-timestamp>].";
+  const usage = "Task publication upsert usage: yui task publication upsert <task> --project <project> --provider <github|gitlab> --repository <owner/name> --kind <pull-request|merge-request> --id <external-id> [--url <url>] [--title <text>] [--source-branch <branch>] [--target-branch <branch>] [--local-commit <sha>] [--head-commit <sha>] [--remote-commit <sha>] [--state <open|merged|closed>] [--reported|--verified] [--evidence <text>] [--merged-at <iso-timestamp>].";
   const parsed = parseUpsertArgs(args, usage);
   exactPositionals(parsed.positionals, 1, usage);
   const task = requireTask(store, parsed.positionals[0]);
@@ -101,6 +102,9 @@ function upsertPublication(
       : {}),
     ...(parsed.options.has("--remote-commit")
       ? { remoteCommit: requiredOption(parsed.options, "--remote-commit", usage) }
+      : {}),
+    ...(parsed.options.has("--head-commit")
+      ? { headCommit: requiredOption(parsed.options, "--head-commit", usage) }
       : {}),
     ...(state === undefined ? {} : { state }),
     ...(verification === undefined ? {} : { verification }),
@@ -268,6 +272,7 @@ function renderPublication(
       : [`Branches: ${reference.sourceBranch ?? "unknown"} -> ${reference.targetBranch ?? "unknown"}`]),
     `State: ${reference.state}`,
     `Verification: ${reference.verification}`,
+    ...(reference.headCommit === undefined ? [] : [`Remote head: ${reference.headCommit}`]),
     `Lineage: ${reference.localCommit ?? "unknown"} -> ${reference.externalId} -> ${reference.remoteCommit ?? "unknown"}`,
     ...(reference.mergedAt === undefined
       ? []
@@ -339,6 +344,10 @@ function inheritPublicationInput(
   const mergedAtChanged = input.mergedAt !== undefined
     && input.mergedAt !== existing.mergedAt;
   const evidenceContextChanged = localCommitChanged
+    || (input.headCommit !== undefined
+      && normalizeCommitForComparison(input.headCommit) !== existing.headCommit)
+    || input.projectId !== existing.projectId
+    || input.externalKind !== existing.externalKind
     || stateChanged
     || remoteCommitChanged
     || evidenceChanged
@@ -469,7 +478,7 @@ function parseUpsertArgs(args: string[], usage: string): ParsedUpsertTail {
   const valueOptions = new Set([
     "--project", "--provider", "--repository", "--kind", "--id", "--url",
     "--title", "--source-branch", "--target-branch", "--local-commit",
-    "--remote-commit", "--state", "--evidence", "--merged-at"
+    "--remote-commit", "--head-commit", "--state", "--evidence", "--merged-at"
   ]);
   const flags = new Set(["--reported", "--verified"]);
   const positionals: string[] = [];

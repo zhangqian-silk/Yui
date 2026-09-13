@@ -105,6 +105,7 @@ import {
 } from "./commands/taskRemoteDeliveryCommand.js";
 import { renderArchiveDiagnostics, taskArchiveDiagnostics } from "./task/archiveDiagnostics.js";
 import { runTaskPublicationVerifyCommand } from "./commands/taskPublicationVerifyCommand.js";
+import { runTaskPublicationAdoptCommand } from "./commands/taskPublicationAdoptCommand.js";
 import { createGitHubCliPublicationVerifier } from "./external/githubPublicationVerifier.js";
 import { createGitLabCliPublicationVerifier } from "./external/gitlabPublicationVerifier.js";
 import { taskLocalActor, assertTaskDeliveryAuthority } from "./commands/taskActor.js";
@@ -1325,6 +1326,13 @@ export async function main(): Promise<void> {
       emit(result.output, false, result.data);
       return;
     }
+    if (resolved[1] === "publication" && (resolved[2] === "diff" || resolved[2] === "adopt")) {
+      const result = await runTaskPublicationAdoptCommand(resolved.slice(2), store, {
+        environment: process.env
+      });
+      emit(result.output, false, result.data);
+      return;
+    }
     if (resolved[1] === "publication" && resolved[2] === "verify") {
       const result = await runTaskPublicationVerifyCommand(
         resolved.slice(3),
@@ -1337,12 +1345,6 @@ export async function main(): Promise<void> {
             gitlab: createGitLabCliPublicationVerifier({
               environmentPath: process.env.PATH
             })
-          },
-          candidateForTask: async (taskId) => {
-            const status = store.getTask(taskId)?.status;
-            return status === "active" || status === "cancelled"
-              ? snapshotActualTaskReviewCandidate(taskId, store, workspacePreparer)
-              : null;
           },
           environment: process.env
         }

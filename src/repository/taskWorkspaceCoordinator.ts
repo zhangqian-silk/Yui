@@ -518,7 +518,8 @@ export class TaskWorkspaceCoordinator {
                   throw new Error("Task main retained: local commits are not covered by verified remote delivery. Force does not discard them.");
                 }
                 for (const entry of workspace.entries.filter(e => e.access === "write")) {
-                  const expected = delivery.projects.find(p => p.projectId === entry.projectId)?.expectedLocalCommit;
+                  const covered = delivery.projects.find(p => p.projectId === entry.projectId);
+                  const expected = covered?.expectedLocalCommit;
                   const path = await lstat(entry.path).catch(error => {
                     if (error.code === "ENOENT") return null;
                     throw error;
@@ -526,7 +527,9 @@ export class TaskWorkspaceCoordinator {
                   if (expected !== null && expected !== undefined
                     && path !== null) {
                     const actual = await this.preparer.git.inspect(entry.path, "HEAD");
-                    if (actual.baseCommit !== expected) throw new Error(`Task main HEAD changed: ${entry.path}; retained.`);
+                    if (actual.baseCommit !== expected && actual.baseCommit !== covered?.deliveryLocalCommit) {
+                      throw new Error(`Task main HEAD changed: ${entry.path}; retained.`);
+                    }
                   }
                 }
                 const result = await this.preparer.cleanupTaskForArchive(taskId);

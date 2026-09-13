@@ -135,6 +135,8 @@ export interface GitWorkspacePort {
     repositoryPath: string;
     fromCommit: string;
     toCommit: string;
+    /** Fixed publication evidence, including binary bytes, without textconv. */
+    exact?: boolean;
   }>): Promise<string>;
   /** Issue 07: per-file added/deleted line totals between two commits. */
   diffNumstatBetween(input: Readonly<{
@@ -366,10 +368,12 @@ export class NodeGitWorkspace implements GitWorkspacePort {
     repositoryPath: string;
     fromCommit: string;
     toCommit: string;
+    exact?: boolean;
   }>): Promise<string> {
     return git([
       "-C", input.repositoryPath,
       "diff", "--no-color", "--no-ext-diff",
+      ...(input.exact ? ["--no-textconv", "--binary", "--full-index", "--no-renames"] : []),
       input.fromCommit, input.toCommit
     ]);
   }

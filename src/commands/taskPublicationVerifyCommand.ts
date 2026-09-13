@@ -2,7 +2,6 @@ import { isDeepStrictEqual } from "node:util";
 
 import { taskActor } from "./taskActor.js";
 import { upsertTaskPublication } from "./taskPublicationCommands.js";
-import { projectTaskRemoteDeliveryFromStore } from "./taskRemoteDeliveryCommand.js";
 import {
   dataError,
   runtimeError,
@@ -23,13 +22,9 @@ import type {
 } from "../task/publicationVerification.js";
 import type { Task } from "../task/task.js";
 import { resolveTaskRecordReference } from "../task/taskRecordReference.js";
-import type { TaskRemoteDeliveryCandidate } from "../task/remoteDelivery.js";
 
 export type TaskPublicationVerifyOptions = Readonly<{
   verifiers: Readonly<Partial<Record<PublicationProvider, PublicationVerifier>>>;
-  candidateForTask?: (
-    taskId: string
-  ) => Promise<TaskRemoteDeliveryCandidate | null>;
   environment?: NodeJS.ProcessEnv;
   now?: () => Date;
 }>;
@@ -70,12 +65,10 @@ export async function runTaskPublicationVerifyCommand(
     throw usageError(`Archived Task Publication cannot be verified: ${task.id}.`);
   }
   taskActor(options.environment, task.id);
-  const initialCandidate = await options.candidateForTask?.(reference.taskId) ?? null;
   const request = preparePublicationVerification(
     store,
     reference.taskId,
     reference.localId,
-    initialCandidate,
     options.environment
   );
   const verifier = options.verifiers[request.publication.provider];
@@ -106,17 +99,19 @@ export async function runTaskPublicationVerifyCommand(
     );
   }
   assertVerificationObservation(request, observation);
-  const finalCandidate = await options.candidateForTask?.(reference.taskId) ?? null;
   const result = commitPublicationVerification(
     store,
     request,
     observation,
-    finalCandidate,
     options.now?.() ?? new Date()
   );
   return {
     kind: "output",
-    output: result.idempotent
+    output: result.reference.verification !== "verified"
+      ? `Recorded Publication ${result.reference.id}: remote state=${observation.state}; `
+        + `head=${observation.headCommit}; local=${request.expectedLocalCommit}. `
+        + "Not verified; prior verification is no longer current.\n"
+      : result.idempotent
       ? `Publication ${result.reference.id} is already verified for `
         + `${result.reference.repository}#${result.reference.externalId}.\n`
       : `Verified publication ${result.reference.id} for `
@@ -129,7 +124,6 @@ function preparePublicationVerification(
   store: TaskStore,
   taskId: string,
   publicationId: string,
-  currentCandidate: TaskRemoteDeliveryCandidate | null,
   environment: NodeJS.ProcessEnv | undefined
 ): PublicationVerificationRequest {
   return store.transaction((reader) => {
@@ -152,12 +146,7 @@ function preparePublicationVerification(
         + `for ${publicationExternalKey(publication)}.`
       );
     }
-    const delivery = projectTaskRemoteDeliveryFromStore(
-      reader,
-      task,
-      currentCandidate
-    );
-    const project = delivery.projects.find(({ projectId }) => (
+    const project = task.projectBindings.find(({ projectId }) => (
       projectId === publication.projectId
     ));
     if (project === undefined) {
@@ -166,27 +155,16 @@ function preparePublicationVerification(
         + `${publication.projectId}.`
       );
     }
-    if (project.expectedLocalCommit === null) {
-      throw usageError(
-        `Task delivery head is unavailable for Publication ${publication.id}.`
-      );
-    }
     if (publication.localCommit === undefined) {
       throw usageError(
         `Publication ${publication.id} must record a local commit before verification.`
-      );
-    }
-    if (publication.localCommit !== project.expectedLocalCommit) {
-      throw usageError(
-        `Publication ${publication.id} local commit ${publication.localCommit} `
-        + `does not match Task delivery head ${project.expectedLocalCommit}.`
       );
     }
     return {
       task: taskVerificationInvariant(task),
       actor,
       publication,
-      expectedLocalCommit: project.expectedLocalCommit
+      expectedLocalCommit: publication.localCommit
     };
   });
 }
@@ -206,19 +184,10 @@ function assertVerificationObservation(
       `Provider returned mismatched Publication identity for ${publication.id}.`
     );
   }
-  if (observation.state !== "merged") {
-    throw usageError(
-      `Remote ${publication.externalKind} ${publication.repository}#`
-      + `${publication.externalId} is ${observation.state}, not merged.`
-    );
+  if (!/^[0-9a-f]{40}$/u.test(observation.headCommit)) {
+    throw usageError("Provider observation requires an exact remote head.");
   }
-  if (observation.headCommit !== request.expectedLocalCommit) {
-    throw usageError(
-      `Remote ${publication.externalKind} head ${observation.headCommit} `
-      + `does not match Task delivery head ${request.expectedLocalCommit}.`
-    );
-  }
-  if (observation.remoteCommit === undefined) {
+  if (observation.state === "merged" && observation.remoteCommit === undefined) {
     throw usageError(
       `Merged remote ${publication.externalKind} did not expose a remote commit.`
     );
@@ -232,7 +201,6 @@ function commitPublicationVerification(
   store: TaskStore,
   request: PublicationVerificationRequest,
   observation: PublicationVerificationObservation,
-  currentCandidate: TaskRemoteDeliveryCandidate | null,
   now: Date
 ): Readonly<{ reference: PublicationReference; idempotent: boolean }> {
   return store.transaction((tx) => {
@@ -257,20 +225,6 @@ function commitPublicationVerification(
         + `${task.id}/${request.publication.id}.`
       );
     }
-    const delivery = projectTaskRemoteDeliveryFromStore(
-      tx,
-      task,
-      currentCandidate
-    );
-    const expectedLocalCommit = delivery.projects.find(({ projectId }) => (
-      projectId === request.publication.projectId
-    ))?.expectedLocalCommit;
-    if (expectedLocalCommit !== request.expectedLocalCommit) {
-      throw usageError(
-        `Task delivery head changed during Publication verification: `
-        + `${request.publication.projectId}@${expectedLocalCommit ?? "unavailable"}.`
-      );
-    }
     return upsertTaskPublication(
       tx,
       task,
@@ -284,9 +238,11 @@ function commitPublicationVerification(
           ? {}
           : { externalUrl: observation.externalUrl }),
         localCommit: request.expectedLocalCommit,
-        remoteCommit: observation.remoteCommit!,
-        state: "merged",
-        verification: "verified",
+        headCommit: observation.headCommit,
+        ...(observation.remoteCommit === undefined ? {} : { remoteCommit: observation.remoteCommit }),
+        state: observation.state,
+        verification: observation.state === "merged"
+          && observation.headCommit === request.expectedLocalCommit ? "verified" : "reported",
         evidence: observation.evidence,
         ...(observation.mergedAt === undefined
           ? {}

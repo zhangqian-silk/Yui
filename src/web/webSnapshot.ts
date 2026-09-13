@@ -266,6 +266,7 @@ function webRemoteDelivery(
     publications: reader.listPublicationReferences(task.id),
     managedWorkspaces: reader.listManagedWorkspaces(task.id),
     runs: reader.listRuns(task.id),
+    integrations: reader.listIntegrationAttempts(task.id),
     currentCandidate: null
   });
 }

@@ -8,6 +8,7 @@ import { expandTaskMessageResult, type TaskMessage } from "../message/message.js
 import { managedWorkspaceKey } from "../worktree/managedWorkspace.js";
 import { runExecutionObservation, type AgentRun } from "../agentRun/agentRun.js";
 import { isGitArtifactRefString, parseGitArtifactRef } from "../artifacts/gitArtifactRef.js";
+import { projectTaskRemoteDeliveryFromStore } from "../commands/taskRemoteDeliveryCommand.js";
 
 const MAX_RECORDS = 256;
 const MAX_VALUE_BYTES = 4096;
@@ -337,6 +338,8 @@ function inspectValue(
   switch (family) {
     case "task": return refId === taskId ? task : null;
     case "task-brief": return refId === taskId ? store.getTaskBrief(taskId) : null;
+    case "remote-delivery": return refId === taskId && allow === undefined
+      ? projectTaskRemoteDeliveryFromStore(store, task) : null;
     case "role": return store.getRole(taskId, refId);
     case "role-profile": {
       const role = store.getRole(taskId, refId);
@@ -425,6 +428,7 @@ function authorizedEntries(store: TaskStore, taskId: string, environment: NodeJS
   };
   add("task", taskId, task);
   add("task-brief", taskId, store.getTaskBrief(taskId));
+  if (allow === undefined) add("remote-delivery", taskId, projectTaskRemoteDeliveryFromStore(store, task));
   for (const role of store.listRoles(taskId)) {
     add("role", role.name, role);
     add("role-profile", role.name, roleProfile(role));

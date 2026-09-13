@@ -65,14 +65,42 @@ Reviewer Run 持有报告；执行成功不等于语义通过。验收归 Leader
 覆盖是彼此独立的事实。Task 完成不证明其中任何一项。远程交付从确切的发布/head
 证据读取，而不从标题或分支名推断。
 
+完成 head 始终是不可变的验收基线。之后获授权的集成可能产生不同的发布候选
+（例如远端 squash 前的 rebase 或 merge）。祖先关系和 Integration 成功都不能
+证明验收行为未被撤销，也不验收额外增量。
+
+对于已完成但未归档的 Task，先把精确候选记为 Publication 的 `localCommit`，
+再读 `task publication diff <task>/<publication>`。此命令只读取 Task 自有的
+本地 Git 对象，返回原完成记录引用、两端 commit/tree、完整差异（含二进制变更），
+以及绑定这些事实的摘要。逐项核对删除、增加和冲突处理是否仍满足原需求；仅在原成果
+保留、相关增量也已验收时，执行
+`task publication adopt <task>/<publication> --reviewed-diff <sha256> --acceptance <text>`。
+验收依据应解释上述判断及其验证/审阅证据；Core 核验固定身份和事实，不裁定代码语义。
+如果已有本 Task 的 Integration 产出了该精确候选，在两个命令中都传入
+`--integration <id>`，一并绑定其已提交证据。这只新增一个 Task 事件，不新增交付
+状态表、Candidate 生命周期或 Git 操作，也不授权修改已完成成果。
+
+`task publication verify` 仍是显式且须获授权的 provider 读取。它独立于 Task
+验收，记录远端 source head、PR/MR 状态和 merge commit。head 不匹配或尚未合并时，
+保存为 **reported** 并取代旧验证；provider 错误或外部身份不匹配则不写任何证据。
+已合并的 provider 观察仅验证该 Publication 的精确本地候选；squash 不需要伪造
+提交祖先关系。元数据/验证更新只有沿连续同候选的 Publication 血缘才能继承采用；
+候选或所引用的 Integration 变化，不能悄悄复用旧决定。
+
+CLI、当前 Leader Context 和 Web 从同一组事实推导覆盖，不联网、不写证据。展示
+区分尚未交付、PR/MR 已合并但未覆盖、已覆盖合并但未验证、部分交付、已验证合并。
+每个 Project 保留自己的验收 head、候选、采用引用和原因。缺失的历史 head 仍然
+未知；旧精确 SHA 证据无需补造采用记录，归档也不能反推已交付。
+
 取消意图不证明运行时已停止。user/Operator 可以重开已取消的 Task；Leader 可以重开
 已完成的 Task。重开需要全新的显式输入/工作选择，绝不重放先前的交付请求。
 
 ## 归档
 
 归档是一次单独的授权动作，发生在活动工作已了结、资源干净可移除之后。显式选择
-集成交付或有意放弃。集成归档要求确切的已合并 head 和已验证的发布证据。一次显式
-授权的验证覆盖不能绕过缺失或陈旧的 head，也不能绕过一个未合并的结果。
+集成交付或有意放弃。普通 integrated 归档要求每个代码 Project 的已合并且已验证
+Publication 通过精确匹配或有效显式采用覆盖验收 head。证据不足时阻止此路径；
+force 仍需单独明确授权，绝不证明覆盖成立。
 
 受管的 WorkItem 资源必须在清理前被集成或有意放弃。Review、Lane 和 Integration
 资源必须已结算。脏 worktree 留给 Agent 解决；不发生隐式 reset 或强制删除。Task
