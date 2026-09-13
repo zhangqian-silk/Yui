@@ -94,6 +94,46 @@ yui task wake resolve <task> <wake> --reason <quiescence-evidence>
 resolve 在原生效果围栏清除后释放该认领。它既不重放通知，也不编造接受或完成。独立的
 Role 工作和合法的本地事实不是一把 Task 范围的恢复锁。
 
+## 输入时机：queue、steer 与 interrupt
+
+提交意图（`record / discuss / develop`）决定需求如何路由。输入时机决定一条已经
+获授权的输入何时到达 Role；它不激活 Task、不扩大 Assignment，也不提升 planning
+权限。[经认证的 Web 控制](architecture/capabilities-and-resources.zh-CN.md#cli-与-web)
+与 CLI 使用同样的三种操作。
+
+| 动作 | 效果 | 不证明什么 |
+| --- | --- | --- |
+| `queue` | 保存 Message，等待收件人的下一个合法机会，按 request ID 幂等 | 读取 Context 或接受投递不等于实施 |
+| `steer` | 保存 Message，并尝试原生 steer 精确的当前 Turn | 不受支持、目标陈旧或未确认的 steer 不等于排队延续 |
+| `interrupt` | 记录控制请求，请 Provider 取消精确的当前 Turn | 停止请求不等于终态，也不证明后台资源已停止 |
+
+选择实时目标前先检查 Session：
+
+```sh
+yui task role session inspect <task> <role>
+yui task message queue <task> "<continuation>" --request-id <id> --to leader
+yui task message steer <task> "<correction>" --request-id <id> --to leader --expected-target <turn>
+yui task role interrupt <task> <role> --expected-target <turn> --request-id <id> [--then-message <task/message>]
+```
+
+Worker/Reviewer 消息保留既有的 `--work-item` 或 `--review-round` 关联。同一个
+request ID 若换正文或目标会产生冲突。`steer` 与 `interrupt` 不会静默改目标、
+替换 Session、杀进程或回退到另一动作。没有活动受管 Turn 时返回 `NO_ACTIVE_TURN`；
+陈旧目标与不受支持的控制也保持为显式结果。
+
+裸 interrupt 不创建 Message。可选的 `--then-message` 引用一条已保存且符合交接条件
+的输入，只在精确终态之后、原 Session/writer 边界内保留下一次机会。它不是第四种动作，
+也不能用来重放已接受、待确认或未知的 steer。明确证明未投递时，若用户意图允许，
+可以显式选择新的控制；不确定性不允许重放。
+
+Global Role 使用同样的三种动作和自己的 owner、Session，不虚构 Task 或 Run。
+本地用户 Web Surface 通过共享 Global Role 处理器暴露这些动作。目前 CLI 存在可用性
+缺口：`src/cli.ts` 实现了 `yui role message queue|steer` 和 `yui role interrupt`，
+但 `src/cli/commandCatalog.ts` 没有注册顶层 `role`，因此公开 CLI 路由会拒绝这些路径，
+报告 unknown command。它们不是可用的 CLI 示例；应报告该缺口，不虚构 Task/Run 或
+借用浏览器用户权限。新的受控 Global Session 使用 Host console。活动的非受管 Session
+不会被静默采用，需要先执行显式的 Session 生命周期操作。
+
 ## 精确结果
 
 原生终态只结算相匹配的那次执行。已知的原生 Turn ID 必须匹配；串行流可以使用已证明的

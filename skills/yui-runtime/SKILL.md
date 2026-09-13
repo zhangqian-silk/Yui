@@ -92,8 +92,15 @@ the Operator has routed to its public/task-authorized context command; never
 invent a Task AgentRun identity for a GlobalRole.
 
 A GlobalRole's durable input uses the same three actions as a Task Role,
-addressed by the Role's own name instead of a Task: `yui role message
-queue|steer <global-role>` and `yui role interrupt <global-role>`. Queue and steer
+addressed by the Role's own name instead of a Task. The local-user Web surface
+exposes this contract. The current public CLI catalog does not register the
+top-level `role` path, even though its handlers implement `yui role message
+queue|steer` and `yui role interrupt`; CLI routing rejects these commands as
+unknown. Report this availability gap when it prevents authorized work. Do not
+invent another command, fabricate Task/Run ownership or borrow the browser's
+user authority to bypass a managed Session boundary.
+
+Queue and steer
 save an owned Message; bare interrupt records a control request, not a new
 Message. Each uses a stable request id and that Role's own Session; none fabricates a Task or
 runId to reuse Task-scoped delivery. `queue` delivers at the Role's next legal

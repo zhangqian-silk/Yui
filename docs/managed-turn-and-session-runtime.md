@@ -109,6 +109,53 @@ Resolve releases the claim after native-effect fences are clear. It neither
 replays the notification nor invents acceptance or completion. Independent
 Role work and legal local facts are not a Task-wide recovery lock.
 
+## Input timing: queue, steer and interrupt
+
+Submission intent (`record / discuss / develop`) decides how a requirement is
+routed. Input timing decides when an already-authorized input reaches a Role;
+it does not activate a Task, expand an Assignment or upgrade planning authority.
+The [authenticated Web controls](architecture/capabilities-and-resources.md#cli-and-web)
+use the same three operations as the CLI.
+
+| Action | Effect | What it does not prove |
+| --- | --- | --- |
+| `queue` | Saves a Message for the recipient's next legal opportunity, idempotently by request ID | Reading Context or accepting delivery is not implementation |
+| `steer` | Saves a Message and attempts native steering of the exact current Turn | Unsupported, stale or unconfirmed steering is not a queued continuation |
+| `interrupt` | Records a control request and asks the Provider to cancel the exact current Turn | A stop request is not a terminal or proof that background resources stopped |
+
+Inspect the Session before selecting a live target:
+
+```sh
+yui task role session inspect <task> <role>
+yui task message queue <task> "<continuation>" --request-id <id> --to leader
+yui task message steer <task> "<correction>" --request-id <id> --to leader --expected-target <turn>
+yui task role interrupt <task> <role> --expected-target <turn> --request-id <id> [--then-message <task/message>]
+```
+
+Worker/Reviewer messages retain their existing `--work-item` or `--review-round`
+association. Reusing a request ID with different content or a different target
+is a conflict. `steer` and `interrupt` never silently retarget, replace a Session,
+kill a process or fall back to another action. No live managed Turn yields
+`NO_ACTIVE_TURN`; stale targets and unsupported control remain explicit outcomes.
+
+Bare interrupt creates no Message. Optional `--then-message` names an already-saved,
+eligible input and reserves its next opportunity only after an exact terminal,
+within the original Session/writer boundary. It is not a fourth action or a way
+to replay accepted, pending or unknown steering. A conclusive non-delivery can
+permit an explicit new control choice when the user's intent authorizes it;
+uncertainty cannot.
+
+Global Roles use the same three actions with their own owner and Session,
+without inventing a Task or Run. The local-user Web surface exposes them through
+the shared Global Role handler. There is a current CLI availability gap:
+`src/cli.ts` implements `yui role message queue|steer` and `yui role interrupt`,
+but `src/cli/commandCatalog.ts` does not register the top-level `role` command,
+so public CLI routing rejects these paths as unknown. They are not usable CLI
+examples; report this gap rather than fabricating a Task/Run or borrowing the
+browser's user authority. New controlled Global Sessions use the Host console.
+A live unmanaged Session is not silently adopted; an explicit Session lifecycle
+action is needed first.
+
 ## Exact results
 
 The native terminal settles only the matching execution. Known native Turn IDs

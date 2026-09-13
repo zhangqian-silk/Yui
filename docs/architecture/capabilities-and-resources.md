@@ -111,8 +111,33 @@ capability's original name. A Web panel accepts only controlled text, an HTTP(S)
 link or a JSON query description — not author scripts or arbitrary HTML.
 
 The Web listener is started and stopped by the Controller and allows loopback
-only. A browser write goes through an existing domain transaction, and its error
-distinguishes a definite non-commit from a committed-but-unknown result. A query
-panel cannot use the browser's identity to run a mutation or manage plugins. A
-terminal connection only attaches a client; it does not take over durable
-ownership of the native conversation.
+only (`127.0.0.1`, `::1` or `localhost`; default port 4173). `yui web` opens this
+local surface, not a remote multi-user service or an OS sandbox.
+
+The page supplies a token that authenticates all HTTP API reads and writes via
+`x-yui-web-token`; the server also checks the loopback Host. These controls act
+as the trusted local user, not a Role selected by the request body. They support
+Task metadata edits, messages, InputRequest answers, and explicit
+`queue / steer / interrupt` for Task or Global Roles. Managed Agent capability
+RPC retains its own Session authentication and scope; a browser token is not
+a way for an Agent or plugin to bypass those boundaries.
+
+Read-only dashboard, Context and query-panel projections remain separate from
+these mutations. A query panel cannot borrow the browser's user authority to
+mutate state or manage plugins. Task controls share the public CLI's domain
+commands; Global Role controls share the Global handler but currently lack a
+registered top-level CLI path. Message submission intent
+(`record / discuss / develop`, default `discuss`) is
+separate from [input timing](../managed-turn-and-session-runtime.md#input-timing-queue-steer-and-interrupt).
+Transport acceptance does not establish implementation or Task acceptance.
+
+A browser write uses an existing domain transaction. Errors distinguish proven
+`not-submitted` from `unknown`, which can include an already-committed Message
+whose native delivery failed or is unconfirmed. Read the original Message,
+control receipt and current Session before choosing recovery; do not blindly
+resubmit under a new request ID or switch actions.
+
+A terminal WebSocket checks the token and same-origin handshake. It attaches a
+client without taking over durable conversation ownership, and respects the
+connection's `readOnly` flag. A terminal attachment is not a grant to control a
+different Session.

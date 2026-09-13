@@ -20,6 +20,7 @@ not a claim that every real Provider scenario has been validated.
 | Question | Current document |
 | --- | --- |
 | How do Session, AgentRun, messages and activation fit together? | [Session and AgentRun runtime](../managed-turn-and-session-runtime.md) |
+| What can Web control, and how do queue, steer and interrupt differ? | [Web permissions](capabilities-and-resources.md#cli-and-web) · [Input timing](../managed-turn-and-session-runtime.md#input-timing-queue-steer-and-interrupt) |
 | Who consumes results, synthesis and review? | [Result consumption](../agent-result-consumption.md) |
 | When is a WorkItem dependency satisfied? | [Task dependencies](../task-dag-semantics.md) |
 | How are records referenced inside a Task? | [Task-local identity](../task-local-identity.md) |

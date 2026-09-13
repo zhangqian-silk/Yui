@@ -78,6 +78,26 @@ Surface contribution 由 Registry 当前获授权目录派生，没有第二份�
 CLI contribution 使用能力原名称。Web panel 只接受受控 text、HTTP(S) link 或
 JSON query 描述，不接受作者脚本或任意 HTML。
 
-Web listener 由 Controller 启停，仅允许 loopback。浏览器写入通过现有领域
-事务，错误区分确定未提交与提交结果未知。查询面板不能借浏览器身份执行 mutation
-或插件管理。终端连接只 attach 客户端，不接管原生对话的持久所有权。
+Web listener 由 Controller 启停，仅允许 loopback（`127.0.0.1`、`::1` 或
+`localhost`；默认端口 4173）。`yui web` 打开的是本地 Surface，不是远程多用户
+服务或 OS 沙箱。
+
+页面提供 token，通过 `x-yui-web-token` 认证所有 HTTP API 读取与写入；服务端
+也检查 loopback Host。这些控制使用受信任本地用户身份，不由请求正文选择 Role。
+它们支持修改 Task 元数据、发送消息、回答 InputRequest，以及对 Task 或 Global
+Role 显式 `queue / steer / interrupt`。受管 Agent 的能力 RPC 仍使用自身 Session
+认证与范围；浏览器 token 不是 Agent 或插件绕过这些边界的途径。
+
+只读 dashboard、Context 和查询面板投影与这些修改分开。查询面板不能借浏览器的
+用户权限修改状态或管理插件。Task 控制复用公开 CLI 领域命令；Global Role 控制复用
+Global 处理器，但目前缺少已注册的顶层 CLI 路径。消息提交意图
+（`record / discuss / develop`，默认 `discuss`）与
+[输入时机](../managed-turn-and-session-runtime.zh-CN.md#输入时机queuesteer-与-interrupt)
+分开。传输接受不证明需求已实施或 Task 已验收。
+
+浏览器写入使用现有领域事务。错误区分已证明的 `not-submitted` 与 `unknown`；
+后者可能包含已经提交、但原生投递失败或未确认的 Message。选择恢复动作前先读
+原始 Message、控制回执和当前 Session，不盲目换 request ID 重发或切换动作。
+
+终端 WebSocket 校验 token 和同源握手。它只 attach 客户端，不接管对话的持久
+所有权，并遵守连接的 `readOnly` 标记。附着终端不授予控制其他 Session 的权限。

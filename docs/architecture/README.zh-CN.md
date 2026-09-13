@@ -8,7 +8,7 @@
 
 - [English README](../../README.md)：安装、配置和日常使用。
 - [中文 README](../../i18n/README.zh-CN.md)：同一产品入口的中文说明。
-- [总体架构](../../ARCHITECTURE.md)：职责、权威和端到端流程（英文）。
+- [总体架构](../../ARCHITECTURE.zh-CN.md)：职责、权威和端到端流程。
 - [能力、资源与 Surface](capabilities-and-resources.zh-CN.md)：扩展入口、实例所有权和资源效果。
 
 ## 领域合同
@@ -16,6 +16,7 @@
 | 问题 | 当前文档 |
 | --- | --- |
 | Session、AgentRun、消息和激活如何配合？ | [执行与会话](../managed-turn-and-session-runtime.zh-CN.md) |
+| Web 可以控制什么，queue、steer 和 interrupt 有何区别？ | [Web 权限](capabilities-and-resources.zh-CN.md#cli-与-web) · [输入时机](../managed-turn-and-session-runtime.zh-CN.md#输入时机queuesteer-与-interrupt) |
 | 谁消费结果、综合与审查？ | [结果消费](../agent-result-consumption.zh-CN.md) |
 | WorkItem 依赖何时满足？ | [Task 依赖](../task-dag-semantics.zh-CN.md) |
 | Task 内记录如何引用？ | [局部身份](../task-local-identity.zh-CN.md) |
