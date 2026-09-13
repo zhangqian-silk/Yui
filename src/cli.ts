@@ -96,7 +96,8 @@ import {
   preflightTaskCompletion,
   runTaskCommand,
   planReplicatedWorkItemLanes,
-  validateTaskArchiveRequest
+  validateTaskArchiveRequest,
+  parseTaskArchiveArguments
 } from "./commands/taskCommands.js";
 import {
   assertTaskRemoteDeliveryIntegrated,
@@ -104,6 +105,8 @@ import {
   type TaskRemoteDeliveryProof
 } from "./commands/taskRemoteDeliveryCommand.js";
 import { renderArchiveDiagnostics, taskArchiveDiagnostics } from "./task/archiveDiagnostics.js";
+import { inspectTaskArchive, renderTaskArchivePreflight } from "./task/archivePreflight.js";
+import { CleanupInspectionError } from "./workspace/cleanupInspection.js";
 import { runTaskPublicationVerifyCommand } from "./commands/taskPublicationVerifyCommand.js";
 import { runTaskPublicationAdoptCommand } from "./commands/taskPublicationAdoptCommand.js";
 import { createGitHubCliPublicationVerifier } from "./external/githubPublicationVerifier.js";
@@ -282,6 +285,9 @@ const args = normalizeAliases(
 );
 
 void main().catch((error: unknown) => {
+  if (error instanceof CleanupInspectionError) {
+    error = cleanupCliError(error, error.checks[0]?.resource ?? "workspace");
+  }
   if (error instanceof CliError) {
     const rendered = jsonOutput
       ? JSON.stringify({ ok: false, code: error.code, message: error.message, details: error.details })
@@ -1215,6 +1221,15 @@ export async function main(): Promise<void> {
     return;
   }
   if (resolved[0] === "task") {
+    if (resolved[1] === "archive-preflight") {
+      const request = parseTaskArchiveArguments(resolved.slice(2), "archive-preflight");
+      if (process.env.YUI_SESSION_SCOPE === "task" && process.env.YUI_TASK_ID !== request.taskId) {
+        throw usageError("Archive inspection must remain within this Session's Task.");
+      }
+      const data = await inspectTaskArchive(workspaceCoordinator, request);
+      emit(renderTaskArchivePreflight(data), false, data);
+      return;
+    }
     if (resolved[1] === "artifact") {
       // File/directory artifacts live in the Task's local Git repository, so
       // their save/read/list are asynchronous and handled here rather than in
@@ -1498,7 +1513,7 @@ export async function main(): Promise<void> {
             reference.localId
           );
         } catch (error) {
-          throw usageError(error instanceof Error ? error.message : String(error));
+          throw cleanupCliError(error, `work-item:${qualified}`);
         }
       }
       let removal;
@@ -1629,7 +1644,7 @@ export async function main(): Promise<void> {
           try {
             await new WorkItemChangeSetManager(store).assertIntegrated(task.id, item.id);
           } catch (error) {
-            throw usageError(error instanceof Error ? error.message : String(error));
+            throw cleanupCliError(error, `work-item:${task.id}/${item.id}`);
           }
         }
         const cleanup = await workspaceCoordinator.cleanupTaskForArchive(task.id, disposition);
@@ -1640,7 +1655,8 @@ export async function main(): Promise<void> {
             cleanupBlockedDetails(
               cleanup.reason ?? "dirty-worktree",
               cleanup.resource ?? `task:${task.id}`,
-              cleanup.retryable ?? true
+              cleanup.retryable ?? true,
+              cleanup.checks
             )
           );
         }
@@ -1651,7 +1667,8 @@ export async function main(): Promise<void> {
             cleanupBlockedDetails(
               cleanup.reason ?? "cleanup-failed",
               cleanup.resource ?? `task:${task.id}`,
-              cleanup.retryable ?? true
+              cleanup.retryable ?? true,
+              cleanup.checks
             )
           );
         }
@@ -2496,6 +2513,10 @@ function assertManagedSessionManifest(
 }
 
 function cleanupCliError(error: unknown, fallbackResource: string): CliError {
+  if (error instanceof CleanupInspectionError) {
+    return usageError(error.message, undefined,
+      cleanupBlockedDetails(error.checks[0]?.reason ?? "cleanup-failed", fallbackResource, true, error.checks));
+  }
   if (error instanceof WorkspaceCleanupBlockedError) {
     return usageError(
       error.message,
@@ -2514,13 +2535,15 @@ function cleanupCliError(error: unknown, fallbackResource: string): CliError {
 function cleanupBlockedDetails(
   reason: string,
   resource: string,
-  retryable: boolean
+  retryable: boolean,
+  checks?: readonly import("./workspace/cleanupInspection.js").CleanupCheck[]
 ): Readonly<Record<string, unknown>> {
   return {
     status: "blocked",
     blockedBy: [{ resource, reason, retryable }],
     remainingResources: [resource],
-    retryable
+    retryable,
+    ...(checks === undefined ? {} : { checks })
   };
 }
 

@@ -141,6 +141,7 @@ export function taskArchiveDiagnostics(store: TaskStore, task: Task) {
 export function renderArchiveDiagnostics(data: ReturnType<typeof taskArchiveDiagnostics>): string {
   return [
     `Archived: ${data.archived}; forced: ${data.forced}; cleanup finished: ${data.cleanupFinished}`,
+    `Retained references: ${data.retainedResources.length}; a finished cleanup attempt is not physical resource release evidence.`,
     ...data.warnings.map(w => `Warning [${w.resource}]: ${w.detail}`),
     ...data.retainedResources.map(r => `Retained [${r.resource}]: ${r.detail}${r.paths ? ` (${r.paths.join(", ")})` : ""}`)
   ].join("\n") + "\n";
