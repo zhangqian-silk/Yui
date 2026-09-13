@@ -58,8 +58,9 @@ Reviewer Run 持有报告；执行成功不等于语义通过。验收归 Leader
 干净且已提交的 Task-main 快照。当有一条新的 user/Operator 消息仍在等待 Leader
 投递时，它也会拒绝完成。当前原生轮次必须结束，待处理的通知才能到达；随后 Leader
 读取原始消息并重新评估完成。这派生自既有的 Message 和 mailbox 投递，而不是第二套
-确认或工作流状态。终态工作区清理在完成时可以只是建议，但在归档时不行。被选作
-结果的 Artifact 必须是固定的、存在的且 Task 局部的。
+确认或工作流状态。终态工作区清理在完成时可以只是建议。普通归档要求清理已结算；
+明确授权的 force 归档可以保留下文所述的未解决资源。被选作结果的 Artifact 必须是
+固定的、存在的且 Task 局部的。
 
 发布记录一个远程 PR/MR 引用。被报告的合并、独立验证的合并以及确切的 Task-head
 覆盖是彼此独立的事实。Task 完成不证明其中任何一项。远程交付从确切的发布/head
@@ -70,13 +71,50 @@ Reviewer Run 持有报告；执行成功不等于语义通过。验收归 Leader
 
 ## 归档
 
-归档是一次单独的授权动作，发生在活动工作已了结、资源干净可移除之后。显式选择
-集成交付或有意放弃。集成归档要求确切的已合并 head 和已验证的发布证据。一次显式
-授权的验证覆盖不能绕过缺失或陈旧的 head，也不能绕过一个未合并的结果。
+归档需要针对确切的 completed 或 cancelled（retired）Task 获得独立的 user/Operator
+授权。完成本身不授予归档权限，普通归档批准也不授权 force。显式选择一种处置：
 
-受管的 WorkItem 资源必须在清理前被集成或有意放弃。Review、Lane 和 Integration
-资源必须已结算。脏 worktree 留给 Agent 解决；不发生隐式 reset 或强制删除。Task
-main 分支和持久 Task 记录保留恢复信息。已归档的 Task 不能重开。
+```sh
+yui task archive <task> --integrated
+yui task archive <task> --abandon
+# 仅在明确授权 force 后使用，并保留所选处置：
+yui task archive <task> (--integrated|--abandon) --force
+```
+
+### 普通归档
+
+活动工作与输入必须已了结，受管资源干净且可安全移除。WorkItem 结果必须已集成或
+有意放弃；Review、Lane 和 Integration 资源必须已结算。使用 `--integrated` 时，
+每个需要代码交付的 Project 都要求确切的已合并 head 覆盖及已验证的 Publication
+证据。`--abandon` 记录有意不交付，而不是已验证合并。
+
+缺失或陈旧的覆盖、未解决的执行或脏 worktree 会阻止普通归档。先解决报告的事实，
+再显式重试；不会隐式 reset 或强制删除。
+
+### 明确授权的 force 归档
+
+`--force` 不只是覆盖合并验证要求。它先提交归档并停止新的 Task 调度，再尝试安全的
+前台清理。缺失或陈旧的交付证据、未合并结果、未解决的执行和清理失败会成为警告及
+保留资源引用，而不阻止这次归档提交。权限、合法生命周期、精确资源身份和强制审计
+持久化仍严格检查，失败时拒绝相应操作。
+
+Force 不验证合并、不验收工作、不证明物理静止、不丢弃脏数据，也不隐含 `--abandon`。
+它保留所选处置及原始 Publication/完成证据。未验证的本地提交和无法安全释放的资源
+仍有明确 owner 且可追溯。清理失败不回滚归档；迟到的运行时事件仍作为来源证据，
+不恢复 Task 或结算未知输入。
+
+### 清理前先读结果
+
+`yui task show <task> --json` 暴露 `data.archive.warnings`、
+`data.archive.retainedResources` 和 `data.archive.cleanupEvents`。
+`yui task context <task> --json` 保留原始记录与事件；
+`yui task remote-delivery <task> --json` 单独报告交付。警告包含历史清理尝试；
+保留引用描述当前所有权，不是第二套清理队列。
+
+归档结果中的 `archived=true` 证明已归档，不证明清理全部成功。即使 `cleanupFinished`
+也只代表前台清理已走完，不代表资源全部移除。重复归档只报告当前事实，不重放清理。
+检查后通过显式的精确 owner 资源操作进行安全清理；不隐含后台重试或更广泛的删除
+权限。两条归档路径都保留 Task 历史与恢复信息。已归档的 Task 不能重开。
 
 清理前用每个命令的 `--help` 查看它确切的权限和选项；阅读一份生命周期文档不授权
 一次外部写入。

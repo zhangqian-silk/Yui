@@ -27,7 +27,7 @@ Yui 是面向编程 Agent 的本地控制面。你只需用自然语言把目标
 - **自带 Agent** —— Codex CLI、Claude Code CLI 和 ACP 通过统一边界接入，
   可替换而不丢失 Task。
 - **本地优先、私有** —— 一切运行在你自己的机器上，面向单个受信任用户；
-  Web 视图仅本地回环、只读。
+  Web 仅本地回环，包含只读视图和经认证的用户控制。
 - **默认隔离** —— 仓库改动发生在受管 Git worktree 中，稳定 checkout 保持只读。
 
 > **状态：** 尚未发布 1.0（0.15.x）。CLI 与配置在版本之间仍可能变化；每次升级
@@ -122,7 +122,10 @@ Agent 可以重新读取任务上下文，继续兼容的 Session，或在必要
 进程失败不会抹掉任务，结果不确定的投递也不会被静默重复。
 
 想直观看进展，可以在另一个终端运行 `yui web`。本地 Web 展示同一份任务与
-待回答问题，不是另一套需要同步的任务系统。
+待回答问题，也允许发送消息、回答问题，以及显式 queue、steer 或 interrupt Task 输入。
+这些经认证的 Task 控制复用 CLI 的相同操作，不是另一套需要同步的任务系统。
+详见 [Web 权限](../docs/architecture/capabilities-and-resources.zh-CN.md#cli-与-web)
+和[输入时机](../docs/managed-turn-and-session-runtime.zh-CN.md#输入时机queuesteer-与-interrupt)。
 
 ## 架构
 
@@ -225,7 +228,7 @@ Yui 为你组织的东西 —— 是持久对象，而不是进程：
      它负责搬运工作、记录事实——但从不判断回答好坏
 
   Agent 在 Project 中工作：只读 checkout + 隔离 worktree。
-  Web 视图（yui web）：对存储的本地回环、只读投影。
+  Web（yui web）：本地回环视图 + 经认证的用户控制。
 ```
 
 ### 分层设计
@@ -234,7 +237,7 @@ Yui 为你组织的东西 —— 是持久对象，而不是进程：
 
 ```text
   体验层 Experience   —  你如何交互
-    CLI（Operator）· Web（本地回环、只读）· 原生 Agent 会话
+    CLI（Operator）· Web（本地回环、经认证）· 原生 Agent 会话
     采集输入 · 展示事实 · 确认操作 · 调用能力
         ▼
   决策层 Intelligence —  谁来决定
@@ -270,8 +273,11 @@ Yui 为你组织的东西 —— 是持久对象，而不是进程：
   WorkItem  open ─▶ accepted ─▶ retired
 
   Draft 只保存规划；激活后才采用交付工作区。
-  归档需要工作已了结、worktree 干净，且不可重新打开。
+  普通归档需要工作已了结、worktree 干净，且不可重新打开。
 ```
+
+明确授权的 force 归档可以保留未解决证据与不安全资源；它不证明交付，也不授权删除
+这些资源。详见[归档合同](../docs/task-delivery.zh-CN.md#归档)。
 
 ## 设计原则
 
@@ -321,8 +327,8 @@ Yui 面向一个受信任本地用户，不是 OS 沙箱，也不是远程多用
 
 ## 深入了解
 
-[总体架构](../ARCHITECTURE.md)介绍端到端设计，
-[文档导航](../docs/architecture/README.md)提供配置、执行、交付、存储和插件的
+[总体架构](../ARCHITECTURE.zh-CN.md)介绍端到端设计，
+[文档导航](../docs/architecture/README.zh-CN.md)提供配置、执行、交付、存储和插件的
 当前合同。想直接操作 CLI 时，使用 `yui --help` 查看命令。
 
 Yui 默认将控制面数据保存在 `~/.yui`，通过 `YUI_HOME` 选择另一个实例。

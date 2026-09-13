@@ -169,8 +169,9 @@ Leader management is limited to its Task; executable code still requires exact
 Operator-issued grants. Plugin validation is not a security certification.
 
 CLI contributions and controlled Web panels are projections of the Registry.
-Web is loopback-only and Controller-owned; browser credentials do not become
-Operator authority. See [Plugin SDK](docs/plugin-sdk.md) and
+Web is loopback-only and Controller-owned. Its authenticated local-user controls
+share CLI domain operations; query panels remain read-only and cannot borrow
+that user authority for mutations or plugin management. See [Plugin SDK](docs/plugin-sdk.md) and
 [capabilities and resources](docs/architecture/capabilities-and-resources.md).
 
 ## Persistence, completion and operation
@@ -181,8 +182,11 @@ Homes; malformed state is diagnosed, not automatically repaired.
 
 Completion freezes the delivery result and checks applicable acceptance,
 integration and review contracts. It is distinct from publication, verified
-remote merge, physical quiescence and archive. Archive requires settled work
-and clean removable managed resources, preserves Task history, and cannot reopen.
+remote merge, physical quiescence and archive. Ordinary archive requires settled
+work and clean removable managed resources. Explicitly authorized force archive
+can retain unresolved evidence and unsafe resources without claiming delivery or
+quiescence. Both preserve Task history and cannot reopen.
+See [Task delivery and archive](docs/task-delivery.md#archive).
 
 Runtime health and cost are observations, not semantic verdicts. The Agent reads
 exact faults and current intent to choose retry, repair or abandonment. Yui does

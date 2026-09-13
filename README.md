@@ -30,7 +30,7 @@ not from terminal windows you juggle or details you have to remember.
 - **Bring your own Agent** — Codex CLI, Claude Code CLI and ACP peers run behind
   one boundary and stay replaceable without losing the Task.
 - **Local-first and private** — everything runs on your machine for one trusted
-  user; the Web view is loopback and read-only.
+  user; Web is loopback-only, with read-only views and authenticated user controls.
 - **Isolated by default** — repository work happens in managed Git worktrees;
   the stable checkout stays read-only.
 
@@ -137,7 +137,11 @@ when necessary. A failed process does not erase the Task, and an uncertain
 submission is not silently repeated.
 
 For a visual overview, run `yui web` in another terminal. The local Web view
-shows the same tasks and pending questions; it is not a separate task system.
+shows the same tasks and pending questions and lets you send messages, answer
+questions and explicitly queue, steer or interrupt Task input. These authenticated
+Task controls use the same operations as the CLI; Web is not a separate task system.
+See [Web permissions](docs/architecture/capabilities-and-resources.md#cli-and-web)
+and [input timing](docs/managed-turn-and-session-runtime.md#input-timing-queue-steer-and-interrupt).
 
 ## Architecture
 
@@ -243,7 +247,7 @@ the Controller are what touch the store:
      it moves work and records facts — it never judges an answer
 
   Agents work in Projects: read-only checkout + isolated worktrees.
-  Web view (yui web): a loopback, read-only projection of the store.
+  Web (yui web): loopback views + authenticated user controls.
 ```
 
 ### Layered design
@@ -253,7 +257,7 @@ never a fixed workflow:
 
 ```text
   Experience   —  how you interact
-    CLI (Operator) · Web (loopback, read-only) · native Agent sessions
+    CLI (Operator) · Web (loopback, authenticated) · native Agent sessions
     collect input · show facts · confirm actions · invoke capabilities
         ▼
   Intelligence —  who decides
@@ -290,8 +294,12 @@ extra states:
   WorkItem  open ─▶ accepted ─▶ retired
 
   Draft holds planning only; activation adopts a delivery workspace.
-  Archive needs settled work and clean worktrees; it cannot reopen.
+  Ordinary archive needs settled work and clean worktrees; it cannot reopen.
 ```
+
+Explicitly authorized force archive can retain unresolved evidence and unsafe
+resources; it does not prove delivery or permission to delete them.
+See the [archive contract](docs/task-delivery.md#archive).
 
 ## Design principles
 

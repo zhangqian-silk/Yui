@@ -75,8 +75,10 @@ Leader delivery. The current native turn must end so the pending notification
 can arrive; the Leader then reads the original message and reassesses completion.
 This derives from existing Messages and mailbox delivery, not a second
 acknowledgement or workflow state.
-Terminal workspace cleanup can remain an advisory at completion, but not at
-archive. Artifacts selected as results must be fixed, present and Task-local.
+Terminal workspace cleanup can remain an advisory at completion. Ordinary
+archive requires it to be settled; explicitly authorized force archive may
+retain unresolved resources as described below. Artifacts selected as results
+must be fixed, present and Task-local.
 
 Publication records a remote PR/MR reference. Reported merge, independently
 verified merge and exact Task-head coverage are separate facts. Task completion
@@ -89,16 +91,61 @@ explicit input/work selection and never replays previous delivery requests.
 
 ## Archive
 
-Archive is a separate authorized action after active work is settled and
-resources are clean and removable. Choose integrated delivery or deliberate
-abandonment explicitly. Integrated archive requires exact merged heads and
-verified publication evidence. An explicitly authorized verification override
-cannot bypass missing or stale heads or an unmerged result.
+Archive requires independent user/Operator authorization for an exact completed
+or cancelled (retired) Task. Completion alone grants none, and ordinary archive
+approval does not authorize force. Select one disposition explicitly:
 
-Managed WorkItem resources must be integrated or deliberately abandoned before
-cleanup. Review, Lane and Integration resources must be settled. Dirty worktrees
-remain for the Agent to resolve; no implicit reset or force deletion occurs.
-Task main branches and durable Task records retain recovery information.
+```sh
+yui task archive <task> --integrated
+yui task archive <task> --abandon
+# Only with explicit force authorization, preserving the chosen disposition:
+yui task archive <task> (--integrated|--abandon) --force
+```
+
+### Ordinary archive
+
+Active work and inputs must be settled, and managed resources clean and safely
+removable. WorkItem results must be integrated or deliberately abandoned;
+Review, Lane and Integration resources must be settled. With `--integrated`,
+each Project requiring code delivery needs exact merged-head coverage and
+verified Publication evidence. `--abandon` records deliberate non-delivery,
+not verified merge.
+
+Missing/stale coverage, unresolved execution or dirty worktrees prevent ordinary
+archive. Resolve the reported facts before an explicit retry; no implicit reset
+or force deletion occurs.
+
+### Explicit force archive
+
+`--force` is not merely a merge-verification override. It commits the archive
+and stops new Task scheduling before attempting safe foreground cleanup.
+Missing or stale delivery evidence, an unmerged result, unresolved execution
+and cleanup failures become warnings with retained resource references, rather
+than blocking that archive commit. Authority, eligible lifecycle, exact resource
+identity and mandatory audit persistence still fail closed.
+
+Force neither verifies a merge nor accepts work, proves quiescence, discards
+dirty data or implies `--abandon`. It preserves the selected disposition and
+original Publication/completion evidence. Unverified local commits and resources
+that cannot safely be released stay owned and traceable. A cleanup failure does
+not roll back archive; late runtime events remain source evidence without
+resuming the Task or settling unknown input.
+
+### Read the result before cleanup
+
+`yui task show <task> --json` exposes `data.archive.warnings`,
+`data.archive.retainedResources` and `data.archive.cleanupEvents`.
+`yui task context <task> --json` retains the original records and events;
+`yui task remote-delivery <task> --json` reports delivery separately.
+Warnings include historical cleanup attempts; retained references describe
+current ownership, not a second cleanup queue.
+
+An archive result with `archived=true` proves archival, not that cleanup fully
+succeeded. Even `cleanupFinished` means the foreground pass finished, not that
+every resource was removed. Repeating archive reports current facts and does
+not replay cleanup. After inspection, use explicit exact-owner resource
+operations for safe cleanup; no background retry or broader deletion authority
+is implied. Both archive paths preserve Task history and recovery information.
 Archived Tasks cannot reopen.
 
 Use each command's `--help` to inspect its exact authority and options before
