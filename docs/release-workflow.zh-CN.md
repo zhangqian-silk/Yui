@@ -24,7 +24,7 @@ Agent 选择一个预先声明的计划，设施从持久状态驱动该计划�
 
 当前开发步骤先清退运行时兼容分支，尚未执行最终 1.0 基线切换，也不发布版本或重置
 存储编号。存储 `27→28` 只规范化可明确识别的单条 Role 调度去重键，旧迁移账本、
-Message、Task 结果和不确定外部效果保持不变。普通打开要求存储 28；已有 Home 只通过
+Message、Task 结果和不确定外部效果保持不变。普通打开要求存储 29；已有 Home 只通过
 显式升级入口前进，不增加运行时双读。
 
 这是一次 1.0 前的破坏性变更：
@@ -38,6 +38,16 @@ Message、Task 结果和不确定外部效果保持不变。普通打开要求�
 - 开发 link/unlink 要求当前登记文件，不搜索或接管旧 NVM 登记，不重建孤立链接。
 - GC 不再发现旧 deployment 布局或重建已删除 worktree；不受支持的 quarantine
   证据保留，不会被当成当前 move 回执清除。
+- `task activate` 只消费已有请求；没有请求就不采用资源。请求创建、延后准入和
+  原子工作区采用仍分开，并复用同一个现行执行边界。
+- 删除 `task integration queue` 及其状态机。Agent 选择每个 WorkItem 结果的顺序与
+  策略，逐项调用原子 Integration；保留精确检查、目标 CAS 和完成义务。
+
+存储 `28→29` 在删除活动队列表前，将每条旧 payload 原样保存在
+`integration.queue-retired` Task 事件中，并保留原队列 ID。事件编号越过已有计数器
+和历史最大 ID。此操作不验收交付、不生成 Integration、不重放工作；已有 Integration
+与 Job 保持不变。通过 `task event list <task>` 和引用的 WorkItem/Integration
+判断剩余工作；队列退役不代表未完成的 Integration 已结算。
 
 发布前应先收敛旧执行，对不受支持的锁、链接和隔离资源做显式清理。归属与处置尚未
 确定时保留原记录，运行时不替 Agent 选择恢复方案。

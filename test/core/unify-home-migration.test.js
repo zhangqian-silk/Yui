@@ -37,6 +37,7 @@ import { resolveEffectiveLaunch } from "../../dist/executor/effectiveLaunch.js";
 import { createRun, validateRun } from "../../dist/agentRun/agentRun.js";
 import { createRunInput } from "../../dist/context/runInputContract.js";
 import { sanitizedTestEnv } from "../helpers/sanitizedEnv.mjs";
+import { rebuildHistoricalFixture } from "../helpers/historicalHome.mjs";
 
 // This file exercises the 18->19 unify-home migration IN ISOLATION. Once storage
 // grew a 19->20 step (collapse-worktree-layout), "prior version" is no longer
@@ -61,9 +62,8 @@ function git(args, cwd) {
 }
 
 /**
- * A Home whose SQLite schema is bootstrapped to the current version, then its
- * migration ledger truncated back to the prior version so the real runner has
- * exactly the 18->19 step pending. Foreign keys are OFF on this raw connection
+ * A Home built from the real prior schema prefix with current singleton fixtures.
+ * The real runner has the 23->24 step pending. Foreign keys are OFF on this raw connection
  * (the store enables them per-connection), so old-layout rows can be seeded
  * without a full domain graph.
  */
@@ -72,14 +72,13 @@ function openPriorVersionHome(t, prefix) {
   t.after(() => rmSync(home, { recursive: true, force: true }));
   // Bootstrap the real schema + singleton rows, then close.
   new SqliteTaskStore(home).close();
+  rebuildHistoricalFixture(home, PRIOR_VERSION);
   const db = new Database(join(home, "yui.db"));
   t.after(() => db.close());
-  db.prepare("DELETE FROM schema_migrations WHERE version > ?").run(PRIOR_VERSION);
-  db.exec("DROP INDEX idx_task_provider_retry; DROP INDEX idx_global_provider_retry;");
   const head = db
     .prepare("SELECT MAX(version) AS version FROM schema_migrations")
     .get();
-  assert.equal(head.version, PRIOR_VERSION, "ledger truncated to the prior version");
+  assert.equal(head.version, PRIOR_VERSION, "real historical schema prefix");
   return { home, db };
 }
 
@@ -556,7 +555,7 @@ test("unify-home is a no-op on an already-unified Home and writes no manifest", 
 
 const RUN_CLOCK = new Date("2026-09-01T00:00:00.000Z");
 
-/** A bootstrapped Home left exactly at the prior version, opened as a live store. */
+/** Current APIs seed valid records before reconstructing the prior schema. */
 function openPriorVersionStore(t, prefix) {
   const home = mkdtempSync(join(tmpdir(), prefix));
   t.after(() => rmSync(home, { recursive: true, force: true }));
@@ -565,13 +564,11 @@ function openPriorVersionStore(t, prefix) {
   return { home, store };
 }
 
-/** Truncate the migration ledger back to the prior version on a live store. */
-function rewindLedgerToPriorVersion(store) {
-  const db = store.databaseHandle();
-  db.prepare("DELETE FROM schema_migrations WHERE version > ?").run(PRIOR_VERSION);
-  db.exec("DROP INDEX idx_task_provider_retry; DROP INDEX idx_global_provider_retry;");
-  const head = db.prepare("SELECT MAX(version) AS version FROM schema_migrations").get();
-  assert.equal(head.version, PRIOR_VERSION, "ledger rewound to the prior version");
+/** Close all writes, then build the prior physical schema around those facts. */
+function rebuildPriorVersionHome(store) {
+  const home = store.rootDirectory();
+  store.close();
+  rebuildHistoricalFixture(home, PRIOR_VERSION);
 }
 
 /**
@@ -641,8 +638,7 @@ test("real upgrade path: active run effective+workspace move together and pass t
   // Rewind so the real orchestrator sees the full pending chain (18->19->20),
   // then drive the ACTUAL upgrade (backup + migrate + gate). Close our handle
   // first so the orchestrator opens the database cleanly.
-  rewindLedgerToPriorVersion(store);
-  store.close();
+  rebuildPriorVersionHome(store);
 
   const result = await runStorageUpgrade({ home, mode: "execute", now: RUN_CLOCK });
   assert.equal(
@@ -863,8 +859,7 @@ test("P2: a clean migrating Home reports migration-ready with the unify step (up
 
   const taskId = "task-1";
   seedWorktrees(workspaceRoot, "app", "main-abcd", "linked-efgh");
-  rewindLedgerToPriorVersion(store);
-  store.close();
+  rebuildPriorVersionHome(store);
 
   const preflight = await runStorageUpgrade({ home, mode: "update-preflight", now: RUN_CLOCK });
   assert.equal(preflight.outcome, "update-preflight");
@@ -899,8 +894,7 @@ test("P2: dry-run and update-preflight surface the same blockers as execute {rea
   mkdirSync(newWorktreeRoot, { recursive: true });
   writeFileSync(join(newWorktreeRoot, "SOMEONE-ELSES-FILE.txt"), "not ours\n");
 
-  rewindLedgerToPriorVersion(store);
-  store.close();
+  rebuildPriorVersionHome(store);
 
   for (const mode of ["update-preflight", "dry-run"]) {
     const result = await runStorageUpgrade({ home, mode, now: RUN_CLOCK });

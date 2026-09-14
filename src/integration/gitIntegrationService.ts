@@ -831,7 +831,7 @@ export class GitIntegrationService {
         gate
       );
     }
-    // Jobless fallback (queue processing without a Controller): run the
+    // An explicit local caller without a Controller Job port runs the
     // plan gate in-process and record the artifact directly.
     const runtime = this.#runtimePreparation(attempt, managedWorkspace);
     this.runtimeIsolation.activate(runtime);

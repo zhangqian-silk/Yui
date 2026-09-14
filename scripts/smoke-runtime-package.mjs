@@ -142,6 +142,11 @@ try {
   assert.equal(json("doctor").storage.healthy, true);
   const { task } = json("task", "create", "runtime smoke");
   assert.equal(task.status, "draft");
+  assert.throws(() => runCli(cli, ["task", "activate", task.id], environment), error => {
+    assert.match(String(error.stderr), /activation request.*required/i);
+    return true;
+  }, "Activation must not invent request-free intent.");
+  assert.equal(json("task", "show", task.id).task.status, "draft");
   const original = "Keep the original requirement across restart.";
   json("task", "message", "send", task.id, original, "--intent", "record", "--request-id", "original");
   const beforeRestart = json("task", "message", "list", task.id);

@@ -17,7 +17,6 @@ import { assertTaskDeliveryAuthority as taskLocalActor } from "../task/taskAutho
 import { resolveTaskRecordReference } from "../task/taskRecordReference.js";
 import { governingWorkItemCandidate } from "../workItem/workItem.js";
 import { workspaceProjectEntry } from "../worktree/managedWorkspace.js";
-import { runTaskIntegrationQueueCommand } from "./taskIntegrationQueueCommands.js";
 
 export type TaskIntegrationCommandOptions = Readonly<{
   now?: () => Date;
@@ -49,9 +48,6 @@ export async function runTaskIntegrationCommand(
   }
   if (command === "list") return list(rest, store);
   if (command === "show") return show(rest, store, options.environment);
-  if (command === "queue") {
-    return runTaskIntegrationQueueCommand(rest, store, home, options);
-  }
   throw usageError(command === undefined
     ? "Task Integration command is required."
     : `Unknown command: task integration ${command}`);
@@ -349,19 +345,6 @@ function supersedeIntegrationCommand(
   // Superseding a committed Integration rewrites delivery-baseline evidence
   // and audit history, so it remains an explicit Task-control decision.
   taskLocalActor(store, environment, integration.taskId);
-  // A queue-backed committed Attempt cannot be superseded: the queue entry
-  // would remain in its current status while its Attempt becomes "superseded",
-  // leaving contradictory terminal records that never converge. This covers
-  // the crash window where the entry is still "running" or "conflicted" after
-  // the Attempt committed.
-  const queueBacked = store.listIntegrationQueueEntries(integration.taskId)
-    .some((entry) => entry.integrationAttemptId === integration.id);
-  if (queueBacked) {
-    throw usageError(
-      `Integration ${integration.id} is backed by a queue entry; `
-      + "reconcile the queue entry instead of superseding its Attempt."
-    );
-  }
   return store.transaction((tx) => {
     const current = tx.getIntegrationAttempt(integration.taskId, integration.id);
     if (current === null) {

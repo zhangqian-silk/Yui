@@ -180,6 +180,9 @@ Candidate 和 ReviewRound 保留来源；Core 不从散文中推导语义接受�
 获得受管 worktree。`scratch` 选择一个 Task 拥有的目录。`local` 需要一个已登记的 local
 Resource 及其 grant；Project ID 不是 local Resource ID。
 
+`task activate` 是对已有请求的前台采用，不是创建激活意图的另一条路径。
+没有请求的 Draft 会在资源准备前被拒绝；命令不代填环境计划或 request ID。
+
 资源准备先于对 Task 状态和工作区所有权的原子采用。一次失败的采用记录一个失败请求，
 并用持久事实通知 Leader；在失败未变时它不反复准备资源。Leader 选择显式重试或修正后的
 请求。成功激活同样为 Leader 留下一条交付通知。激活绝不把活动 Session 变更为交付权限。

@@ -44,7 +44,6 @@ import {
 import type { InputRequest } from "../input/inputRequest.js";
 import type { ChangeSet } from "../integration/changeSet.js";
 import type { IntegrationAttempt } from "../integration/integrationAttempt.js";
-import type { IntegrationQueueEntry } from "../integration/integrationQueueEntry.js";
 import type { DurableJob } from "../job/durableJob.js";
 import type { GlobalRoleMessage, TaskMessage } from "../message/message.js";
 import type { Milestone } from "../milestone/milestone.js";
@@ -325,7 +324,7 @@ export type TaskStore = {
   /**
    * Issue 06 (Task terminalization readiness): load the full record set the
    * completion readiness projection consumes, including managed workspaces,
-   * DurableJobs, integration queue entries, ReviewRounds, and the event
+   * DurableJobs, ReviewRounds, and the event
    * fold. Returns null when the Task does not exist.
    */
   readCompletionReadinessFacts(taskId: string): CompletionReadinessFacts | null;
@@ -341,10 +340,6 @@ export type TaskStore = {
   saveIntegrationAttempt(taskId: string, attempt: IntegrationAttempt): void;
   listIntegrationAttempts(taskId: string): IntegrationAttempt[];
   getIntegrationAttempt(taskId: string, integrationId: string): IntegrationAttempt | null;
-  nextIntegrationQueueEntryId(taskId: string): string;
-  saveIntegrationQueueEntry(taskId: string, entry: IntegrationQueueEntry): void;
-  listIntegrationQueueEntries(taskId: string): IntegrationQueueEntry[];
-  getIntegrationQueueEntry(taskId: string, entryId: string): IntegrationQueueEntry | null;
   nextDurableJobId(taskId: string): string;
   saveDurableJob(taskId: string, job: DurableJob): void;
   listDurableJobs(taskId: string): DurableJob[];

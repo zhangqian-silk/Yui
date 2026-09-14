@@ -45,9 +45,9 @@ InputRequest 表示待决问题；回答不自动接受 WorkItem 或改写依赖
 
 Direct 和 replicated 共享一个 Leader 接受边界。Replicated Producer 不形成
 Candidate；只有显式综合的 main Run 结果进入候选路径。Leader 直接管理的
-交付也必须满足适用的 Candidate、ChangeSet 和 Integration 边界。
+交付也必须满足适用的 Candidate 和 Integration 边界。
 
-隔离代码结果按 Project 捕获固定 ChangeSet，检查后 CAS 集成；未捕获、未集成
+隔离代码结果按 Project 冻结 Candidate 提交，检查后 CAS 集成；缺少快照、未集成
 或失效的最新结果不能满足交付。Review 依适用规则和 Task 合同检查。
 Leader 自己交付的 Task main 需要干净、已提交的精确快照。
 

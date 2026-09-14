@@ -19,7 +19,7 @@ test("direct ownership is actionable without dispatch and preserves managed assi
   const task = activateTask(createTask("task-1", "One coherent outcome", now), now);
   const item = createWorkItem("work-item-1", task.id, { title: "Independent acceptance" }, now);
   const facts = {
-    task, workItems: [item], changeSets: [], integrations: [], integrationQueueEntries: [],
+    task, workItems: [item], changeSets: [], integrations: [],
     reviewRounds: [], reviewConfig: null, openInputRequests: [], activeRuns: [], leaderRuns: []
   };
   assert.equal(projectWorkItemExecution(item, []).nextAction.kind, "execute-directly");

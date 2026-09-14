@@ -42,6 +42,7 @@ import { TmuxSessionHost } from "../../dist/runtime/tmuxAdapters.js";
 import { launchBrokerForHome } from "../../dist/runtime/launchBroker.js";
 import { randomBytes } from "node:crypto";
 import { createSessionOwnerIdentity, readLinuxProcessIdentity } from "../../dist/runtime/sessionOwnerIdentity.js";
+import { rebuildHistoricalFixture } from "../helpers/historicalHome.mjs";
 
 /** Independent minimum RPC-v4 Controller transport; intentionally no current
  * Controller/store parser on the Home-19 side. It authenticates the exact
@@ -536,17 +537,7 @@ test("frozen v1 Host process survives a Controller replacement and real Home 19â
   // Build the historical ledger using the released migration prefix, then
   // seed unchanged Task/Run records (the Host migration changes only ingress).
   // This is a disposable version fixture, never a downgrade of a real Home.
-  const seed = join(home, "seed-current.db");
-  renameSync(join(home, "yui.db"), seed);
-  const historical = new Database(join(home, "yui.db"));
-  migrateSqliteSchema(historical, { mode: "apply", throughVersion: 19 });
-  historical.pragma("foreign_keys = OFF");
-  historical.prepare("ATTACH DATABASE ? AS seed").run(seed);
-  for (const { name } of historical.prepare("SELECT name FROM sqlite_master WHERE type='table'").all()) {
-    if (name === "schema_migrations" || name.startsWith("sqlite_")) continue;
-    historical.exec(`INSERT OR REPLACE INTO "${name}" SELECT * FROM seed."${name}"`);
-  }
-  historical.close();
+  rebuildHistoricalFixture(home, 19);
   const socket = agentHostControlSocketPath({ home, scope: "task", taskId: "task-1", roleName: "worker" });
   const child = fork(fileURLToPath(new URL("../fixtures/agent-host-events-v1.mjs", import.meta.url)), [home, socket, home], {
     env: { PATH: process.env.PATH }, execArgv: [], stdio: ["ignore", "ignore", "pipe", "ipc"]

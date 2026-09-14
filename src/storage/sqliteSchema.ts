@@ -1364,6 +1364,49 @@ WHERE target_kind = 'role' AND role_name <> 'leader' AND pending IS NOT NULL
     WHERE json_extract(value, '$.type') = 'run'
       AND json_extract(value, '$.taskId') = mailboxes.task_id);
 `
+  },
+  {
+    version: 29,
+    name: "agent-ordered-atomic-integration",
+    introducedIn: "0.16.0",
+    // Retire the scheduler, not its user's intent. Freeze each complete queue
+    // payload in ordinary Task history before dropping the active table.
+    // Existing Integrations, Jobs and WorkItem delivery evidence remain exact;
+    // no entry is interpreted as committed or automatically replayed.
+    sql: `
+CREATE TEMP TABLE retired_integration_queue AS
+SELECT q.*,
+  strftime('%Y-%m-%dT%H:%M:%fZ', 'now') AS retired_at,
+  max(
+    coalesce((SELECT high_water FROM id_sequences
+              WHERE task_id = q.task_id AND kind = 'event'), 0),
+    coalesce((SELECT max(CAST(substr(event_id, 7) AS INTEGER)) FROM events
+              WHERE task_id = q.task_id), 0)
+  ) + row_number() OVER (
+    PARTITION BY q.task_id ORDER BY q.created_at,
+      CAST(substr(q.queue_id, length('integration-queue-') + 1) AS INTEGER)
+  ) AS event_sequence
+FROM integration_queue AS q;
+
+INSERT INTO events(task_id, event_id, type, occurred_at, payload)
+SELECT task_id, 'event-' || event_sequence, 'integration.queue-retired', retired_at,
+  json_object(
+    'schemaVersion', 2, 'id', 'event-' || event_sequence, 'taskId', task_id,
+    'type', 'integration.queue-retired', 'createdAt', retired_at,
+    'payload', json_object('queueId', queue_id, 'record', payload,
+      'disposition', 'retired-without-replay')
+  )
+FROM retired_integration_queue;
+
+INSERT INTO id_sequences(task_id, kind, high_water)
+SELECT task_id, 'event', max(event_sequence)
+FROM retired_integration_queue GROUP BY task_id
+ON CONFLICT(task_id, kind) DO UPDATE SET high_water = excluded.high_water;
+
+DROP TABLE retired_integration_queue;
+DROP TABLE integration_queue;
+DELETE FROM id_sequences WHERE kind = 'integrationQueue';
+`
   }
 ]);
 
@@ -1827,7 +1870,6 @@ export const SQLITE_SCHEMA_TABLES: readonly string[] = [
   "managed_workspaces",
   "id_sequences",
   "coordination_locks",
-  "integration_queue",
   "durable_jobs",
   "outbox",
   "mailboxes",

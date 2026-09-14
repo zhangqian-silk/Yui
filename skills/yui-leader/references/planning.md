@@ -51,9 +51,15 @@ and historical Runs/Sessions count even when no Session is currently busy.
 “Manual activation” means an explicit user action, not that the user must type
 CLI commands: an authorized Operator can perform the mechanical operation.
 
-With that authorization, use the formal supported activation operation
-(`task activate <task-id>`) within the caller's authority, or have the Operator
-perform it. Inspect the observable result. Preserve a busy or unknown
+With that authorization, inspect any existing activation request before creating
+one with `task activation request <task-id> --request-id <id> --environment <plan>`.
+Choose the plan from the authorized resources; retain the request id for retries.
+The Controller adopts an eligible request. `task activate <task-id>` is the
+foreground adoption operation for an existing request, not a request-free shortcut.
+A planning Session requests activation and finishes its turn; it must not
+synchronously wait for its own native turn to become quiescent.
+
+Inspect the observable result. Preserve a busy or unknown
 operation's exact request and follow
 [Runtime recovery](../../yui-runtime/references/recovery.md); do not
 self-dispatch, interrupt, kill or replace a Session to bypass the handoff.

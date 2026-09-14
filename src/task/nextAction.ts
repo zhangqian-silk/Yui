@@ -13,7 +13,6 @@ import {
   workItemDeliverySettled
 } from "../integration/deliveryObligation.js";
 import type { IntegrationAttempt } from "../integration/integrationAttempt.js";
-import type { IntegrationQueueEntry } from "../integration/integrationQueueEntry.js";
 import type { DurableJob } from "../job/durableJob.js";
 import { isCompletedTaskReviewEvidenceFromRuns } from "../review/reviewAcceptance.js";
 import type { ReviewConfig } from "../review/reviewConfig.js";
@@ -109,7 +108,6 @@ export type NextActionFacts = Readonly<{
   integrations: readonly IntegrationAttempt[];
   /** Current check-job state, not a second Integration lifecycle. */
   integrationJobs?: readonly Pick<DurableJob, "id" | "status">[];
-  integrationQueueEntries: readonly IntegrationQueueEntry[];
   reviewRounds: readonly ReviewRound[];
   reviewConfig: ReviewConfig | null;
   openInputRequests: readonly InputRequest[];
@@ -283,7 +281,7 @@ export function projectNextAction(facts: NextActionFacts): NextAction {
     }
     return buildAction(facts, {
       kind: "integrate-work-item",
-      reason: `Integration ${checkingIntegration.id} awaits check-result consumption (${job?.status ?? "read current Job"}); an empty integration queue does not finalize this direct attempt.`,
+      reason: `Integration ${checkingIntegration.id} awaits check-result consumption (${job?.status ?? "read current Job"}); its exact Job must be consumed to finalize the attempt.`,
       refs,
       preconditions: [{ fact: "The Integration retains its exact check Job", satisfied: true, ref: refs[0] }],
       recommendedCommand: `yui task integration continue ${task.id}/${checkingIntegration.id}`
@@ -865,8 +863,6 @@ export function durableStateFingerprint(facts: NextActionFacts): string {
       `change-set:${changeSet.id}:${changeSet.headCommit}`),
     ...facts.integrations.map((attempt) =>
       `integration:${attempt.id}:${attempt.status}:${attempt.updatedAt}`),
-    ...facts.integrationQueueEntries.map((entry) =>
-      `integration-queue:${entry.id}:${entry.status}:${entry.updatedAt}`),
     ...facts.reviewRounds.map((round) =>
       `review:${round.id}:${round.status}:${round.endedAt ?? ""}`)
   ];

@@ -380,7 +380,7 @@ const taskChildren: readonly NodeInput[] = [
       "--type": ["feature", "bugfix"]
     }
   },
-  { name: "activate", summary: "Activate a Draft Task.", usage: "yui task activate <id>" },
+  { name: "activate", summary: "Adopt an existing Activation request for a Draft Task.", usage: "yui task activate <id>" },
   {
     name: "activation",
     summary: "Request, cancel or inspect explicit Task Activation.",
@@ -1030,7 +1030,7 @@ const taskChildren: readonly NodeInput[] = [
   {
     name: "integration",
     summary: "Integrate WorkItem results and upstream commits with Leader-owned decisions.",
-    sections: [{ id: "manage", title: "Commands", entries: ["start", "continue", "resolve", "abort", "supersede", "list", "show", "cleanup", "queue"] }],
+    sections: [{ id: "manage", title: "Commands", entries: ["start", "continue", "resolve", "abort", "supersede", "list", "show", "cleanup"] }],
     children: [
       {
         name: "start",
@@ -1065,21 +1065,7 @@ const taskChildren: readonly NodeInput[] = [
       },
       { name: "list", summary: "List Integration Attempts.", usage: "yui task integration list <task>" },
       { name: "show", summary: "Show one Integration Attempt.", usage: "yui task integration show <task>/<integration>" },
-      { name: "cleanup", summary: "Remove a terminal Integration worktree and branch.", usage: "yui task integration cleanup <task>/<integration>" },
-      {
-        name: "queue",
-        summary: "Manage the serialized integration queue.",
-        sections: [{ id: "queue", title: "Commands", entries: ["enqueue", "list", "show", "process", "supersede", "requeue", "reconcile"] }],
-        children: [
-          { name: "enqueue", summary: "Enqueue a ChangeSet for serialized integration.", usage: "yui task integration queue enqueue <task> --project <project> --change-set <id> [--target <ref>] [--check <command> ...]", options: ["--project", "--change-set", "--target", "--check"] },
-          { name: "list", summary: "List integration queue entries.", usage: "yui task integration queue list <task> [--project <project>]", options: ["--project"] },
-          { name: "show", summary: "Show one integration queue entry.", usage: "yui task integration queue show <task>/<entry>" },
-          { name: "process", summary: "Process queued integration entries.", usage: "yui task integration queue process <task> [--project <project>] [--limit <n>]", options: ["--project", "--limit"] },
-          { name: "supersede", summary: "Supersede a queued entry.", usage: "yui task integration queue supersede <task>/<entry> --reason <text>", options: ["--reason"] },
-          { name: "requeue", summary: "Requeue a conflicted entry.", usage: "yui task integration queue requeue <task>/<entry>" },
-          { name: "reconcile", summary: "Reconcile a blocked entry.", usage: "yui task integration queue reconcile <task>/<entry>" }
-        ]
-      }
+      { name: "cleanup", summary: "Remove a terminal Integration worktree and branch.", usage: "yui task integration cleanup <task>/<integration>" }
     ]
   },
   {

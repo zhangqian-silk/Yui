@@ -62,6 +62,12 @@ function newStore(t, home) {
   return store;
 }
 
+function requestActivation(store, taskId) {
+  runTaskCommand(["activation", "request", taskId,
+    "--request-id", `start-${taskId}`, "--environment", "empty"],
+  store, { now: () => now, environment: userEnv });
+}
+
 /**
  * A bare remote plus a Home-managed clone that has diverged from it: one
  * local-only commit on the checkout and one remote-only commit on the seed.
@@ -115,6 +121,8 @@ test("competing Task activations each clone the remote exactly once into indepen
     projectBindings: task.projectBindings
   });
   store.saveTask(secondTask);
+  requestActivation(store, task.id);
+  requestActivation(store, secondTask.id);
   const workspaceGit = new NodeGitWorkspace();
   const clone = workspaceGit.clone.bind(workspaceGit);
   let notifyEntered;
@@ -199,6 +207,7 @@ test("Task activation rolls back every fresh clone when one remote cannot be clo
   });
   store.saveTask(task);
 
+  requestActivation(store, task.id);
   await assert.rejects(
     new FileTaskWorkspacePreparer(home, store).activateTaskWorkspace(task.id),
     /clone|repository|remote|missing/iu
@@ -227,6 +236,7 @@ test("WorkItem no-op Integration records the decision and archive removes all co
   });
   store.saveTask(task);
   const preparer = new FileTaskWorkspacePreparer(home, store);
+  requestActivation(store, task.id);
   await preparer.activateTaskWorkspace(task.id);
   const taskWorkspace = store.getTaskWorkspace(task.id);
   const taskEntry = taskWorkspace.entries[0];
@@ -337,6 +347,7 @@ test("upstream rebase uses the unified Integration lifecycle without ChangeSets"
   });
   store.saveTask(task);
   const preparer = new FileTaskWorkspacePreparer(home, store);
+  requestActivation(store, task.id);
   await preparer.activateTaskWorkspace(task.id);
   const taskEntry = store.getTaskWorkspace(task.id).entries[0];
   commitFile(taskEntry.path, "task.txt", "task\n", "task change");

@@ -17,6 +17,7 @@ import {
 } from "../../dist/storage/homeLayout.js";
 import { SqliteTaskStore } from "../../dist/storage/sqliteStore.js";
 import { createTask } from "../../dist/task/task.js";
+import { runTaskCommand } from "../../dist/commands/taskCommands.js";
 import {
   createCandidateGitSnapshot,
   createWorkItem,
@@ -145,6 +146,8 @@ test("new Task multi-project lifecycle lands every worktree at the single-layer 
   store.saveTask(task);
 
   const preparer = new FileTaskWorkspacePreparer(home, store);
+  runTaskCommand(["activation", "request", task.id, "--request-id", "start", "--environment", "empty"],
+    store, { now: () => now, environment: {} });
   await preparer.activateTaskWorkspace(task.id);
 
   // (1) Task main: one real worktree per Project at tasks/<taskId>/main/<dir>.

@@ -131,6 +131,10 @@ is required.
     links, unpinned release identities and unsupported quarantine receipts are
     refused without inventing acceptance or discarding evidence. Current link,
     configuration and quarantine operations remain usable.
+26. Activation refuses absent intent before resource adoption and still honors
+    planning deferral and cancellation. Retiring the integration queue preserves
+    exact records and active attempts in one rollback-safe migration, without
+    inventing delivery. Conflicted Integrations remain completion blockers.
 
 Keep the test phase seconds-scale; measure TypeScript build separately. Record
 incremental runtime when adding a critical regression. The seven recovery boundary

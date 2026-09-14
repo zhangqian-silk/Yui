@@ -527,11 +527,11 @@ function renderSubmissionFacets(container, submission, say) {
   const step = submission.nextStep;
   if (step) {
     const nextText = step.kind === "activate-manually"
-      ? say("Next: activate this Task explicitly (yui task activate " + step.taskId + ").",
-        "下一步：显式激活该 Task（yui task activate " + step.taskId + "）。")
+      ? say("Next: request activation with an explicit environment (yui task activation request " + step.taskId + " --request-id <id> --environment <plan>).",
+        "下一步：明确环境并请求激活（yui task activation request " + step.taskId + " --request-id <id> --environment <plan>）。")
       : step.kind === "start-execution"
-      ? say("Next: start execution first, then activate (" + step.taskId + ").",
-        "下一步：先启动执行，再激活（" + step.taskId + "）。")
+      ? say("Next: start execution first, then request activation (" + step.taskId + ").",
+        "下一步：先启动执行，再请求激活（" + step.taskId + "）。")
       : step.kind === "await-pending-activation"
       ? say("Next: waiting on the pending activation " + step.activationRef + ".",
         "下一步：等待待处理的激活 " + step.activationRef + "。")

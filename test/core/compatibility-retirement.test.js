@@ -19,6 +19,7 @@ import { SqliteResourceRegistry } from "../../dist/resources/sqliteResourceRegis
 import { createResourceRecord } from "../../dist/resources/resourceTypes.js";
 import { upsertResourceRecord } from "../../dist/resources/resourceRegistry.js";
 import { purgeResourceQuarantine, restoreAllResourceGc } from "../../dist/resources/resourceGc.js";
+import { rebuildHistoricalFixture } from "../helpers/historicalHome.mjs";
 
 test("only explicit migration normalizes an old dispatch without consuming its input or changing history", t => {
   const mailbox = enqueueSignal(createWorkMailbox({
@@ -39,9 +40,9 @@ test("only explicit migration normalizes an old dispatch without consuming its i
     assert.throws(() => runTaskCommand(["message", "send", "task-1", "old option", "--wake-policy", "none"],
       store, { environment: {} }), /option|usage/i);
   } finally { store.close(); }
+  rebuildHistoricalFixture(home, 27);
   const db = new Database(join(home, "yui.db"));
   try {
-    db.prepare("DELETE FROM schema_migrations WHERE version > 27").run();
     const oldLedger = db.prepare("SELECT * FROM schema_migrations ORDER BY version").all();
     const facts = db.prepare("SELECT payload FROM task_records").all();
     assert.throws(() => new SqliteTaskStore(home), /upgrade|version|contract/i);

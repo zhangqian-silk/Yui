@@ -7,6 +7,10 @@
 Task 生命周期是 `draft / active / completed / cancelled / archived`。Draft 保存
 意图、Project 绑定、规划讨论和可变需求。它在创建时不采用可写的交付工作区。
 
+激活要求先保存带明确环境计划的请求：
+`task activation request <task> --request-id <id> --environment <plan>`。
+Controller 采用符合条件的请求；`task activate <task>` 可以在前台消费已有请求，
+但不会隐式创建激活意图。
 激活会校验当前 Role、依赖、Project 范围和资源，准备物理工作区，并原子地采用
 状态/所有权。准备失败会让 Task 停在 Draft，附带一个失败请求和投递给 Leader 的
 诊断。延迟激活保留确切意图并等待原生静止，无论它是在规划 Run 中还是在后续讨论中
@@ -37,17 +41,19 @@ Task 仓库所有。对单个 Project，Agent 的正常 cwd 是其受管 Git 根
 
 ## Candidate、Review 与 Integration
 
-Provider 终态保存确切的原始 Run 结果。它不验收 WorkItem。Leader 评估结果，并为
-隔离代码捕获不可变的、按 Project 划分的 ChangeSet。治理 Candidate 为 Review 和
+Provider 终态保存确切的原始 Run 结果。它不验收 WorkItem。Leader 评估结果及其不可变的
+按 Project 划分的 Git 快照。ChangeSet 是可选的差异证据；治理 Candidate 为 Review 和
 Integration 提供来源；Producer 不独立进入这两条路径中的任何一条。
 
-Integration 在候选 worktree 中套用固定 ChangeSet，运行已配置的检查，然后只有在
+Agent 选择结果顺序与策略，再从精确 WorkItem Candidate 发起一次 Integration，
+不再维护单独的 ChangeSet 集成队列。
+Integration 在候选 worktree 中套用固定来源提交，运行已配置的检查，然后只有在
 目标 head 仍匹配时才推进目标。冲突、检查失败、目标移动或拒绝都保留证据，绝不推进
 目标。Agent 在保留的工作区内选择重试或手动解决。
 
 当检查是一个 DurableJob 时，Integration 在运行期间保留那个确切的 jobId。Job 结算
 后，`task integration continue <task>/<integration>` 消费其结果并执行带守卫的收尾。
-这个直接操作不依赖单独 integration 队列中的条目。
+未结算的 Integration（包括冲突）仍阻止完成，不依赖 Agent 采用了什么执行顺序。
 
 Review 遵循适用的 Candidate 规则或 Task-final 合同以及冻结的 head。确切的 main
 Reviewer Run 持有报告；执行成功不等于语义通过。验收归 Leader。即使默认审查策略

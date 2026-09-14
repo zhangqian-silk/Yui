@@ -29,6 +29,11 @@ test("a scratch Task preserves Operator intent through planning, activation and 
   const task = store.getTask("task-1");
   assert.equal(task.status, "draft");
   assert.equal(store.getTaskWorkspace(task.id), null);
+  const preparer = new FileTaskWorkspacePreparer(home, store, undefined, () => now);
+  await assert.rejects(preparer.activateTaskWorkspace(task.id), /activation request.*required/i);
+  assert.deepEqual(store.getTask(task.id), task, "Missing intent must fail before resource adoption.");
+  assert.deepEqual(store.listEnvironmentPreparations(task.id), []);
+  assert.equal(store.getTaskWorkspace(task.id), null);
   const scheduler = new FileSchedulerStoreAdapter(store);
   assert.equal(scheduler.prepareDraftPlanning(task.id, now), true);
   const run = store.getActiveRun(task.id, "leader");
@@ -44,7 +49,6 @@ test("a scratch Task preserves Operator intent through planning, activation and 
     taskId: task.id, roleName: "leader", agentId: "codex", runId: run.id,
     outcome: { status: "completed", output: "Planning captured; delivery requested." }
   }, now));
-  const preparer = new FileTaskWorkspacePreparer(home, store, undefined, () => now);
   await preparer.activateTaskWorkspace(task.id);
   assert.equal(store.getTask(task.id).status, "active");
   assert.equal(store.getTask(task.id).activationRequest.disposition, "adopted");

@@ -8,6 +8,10 @@ Task lifecycle is `draft / active / completed / cancelled / archived`. A Draft
 stores intent, Project bindings, planning discussion and mutable requirements.
 It does not adopt a writable delivery workspace at creation.
 
+Activation requires a durable request with an explicit environment plan:
+use `task activation request <task> --request-id <id> --environment <plan>`.
+The Controller adopts eligible requests; `task activate <task>` may consume an
+existing request in the foreground but never creates implicit activation intent.
 Activation validates current Roles, dependencies, Project scope and resources,
 prepares physical workspaces, and adopts status/ownership atomically. Failed
 preparation leaves the Task Draft with a failed request and a diagnosis delivered
@@ -47,11 +51,13 @@ managed workspace remains the Git/control ownership record.
 ## Candidate, Review and Integration
 
 Provider terminal saves the exact original Run result. It does not accept the
-WorkItem. The Leader evaluates the result and captures immutable per-Project
-ChangeSets for isolated code. The governing Candidate supplies provenance for
+WorkItem. The Leader evaluates the result and its immutable per-Project Git
+snapshot. Optional ChangeSets supply diff evidence. The governing Candidate supplies provenance for
 Review and Integration; Producers do not independently enter either path.
 
-Integration applies the fixed ChangeSet in a candidate worktree, runs configured
+The Agent chooses the order and strategy, then starts one Integration from an
+exact WorkItem Candidate. There is no separate ChangeSet integration queue.
+Integration applies the fixed source commits in a candidate worktree, runs configured
 checks, then advances the target only if its head still matches. Conflict,
 failed checks, target movement or rejection retain evidence and never advance
 the target. The Agent chooses retry or manual resolution within the retained
@@ -59,8 +65,9 @@ workspace.
 
 When checks are a DurableJob, the Integration retains that exact jobId while
 running. Once the Job settles, `task integration continue <task>/<integration>`
-consumes its result and performs the guarded finalization. The direct operation
-does not depend on entries in the separate integration queue.
+consumes its result and performs the guarded finalization. Existing unsettled
+Integrations, including conflicts, remain completion blockers independently of
+how the Agent ordered them.
 
 Review follows the applicable Candidate rule or Task-final contract and frozen
 heads. The exact main Reviewer Run holds the report; successful execution is

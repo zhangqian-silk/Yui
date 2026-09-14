@@ -301,12 +301,16 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
             changed: false
           };
         }
+        const admission = admitStoredTaskActivation(this.store, task.id);
+        if (admission.disposition === "absent") {
+          throw new Error(`Task activation request is required: ${task.id}. `
+            + `Use yui task activation request ${task.id} --request-id <id> --environment <plan> first.`);
+        }
         const provider = this.store.getTaskRoleSessionSet(task.id, LEADER_ROLE)?.providerBinding;
         if (provider?.run != null
           && ["submitting", "accepted", "delivery-unknown"].includes(provider.run.status)) {
           throw new Error("Planning native input is unsettled; preserve activation intent and retry after its exact terminal.");
         }
-        const admission = admitStoredTaskActivation(this.store, task.id);
         if (admission.disposition === "ready") attemptedRequest = admission.request;
         validateDraftTaskForActivation(this.store, task);
         return await this.#prepareActivatedTaskWorkspace(task, actor, environment, signal);
@@ -368,9 +372,8 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
    * Prepares and adopts the resource configuration an explicit activation
    * request named, before any status change.
    *
-   * A Task with no request keeps the historical behavior: its managed workspace
-   * is the whole environment. A request whose plan is empty and whose Task
-   * binds no Project owns nothing physical, and is reported as workspace-free
+   * A request whose plan is empty and whose Task binds no Project owns nothing
+   * physical, and is reported as workspace-free
    * so activation creates no directory at all.
    *
    * The exact request that was adopted travels with the result, so the later
@@ -381,7 +384,6 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
     task: Task
   ): Promise<AdoptedActivationEnvironment> {
     const admission = admitStoredTaskActivation(this.store, task.id);
-    if (admission.disposition === "absent") return { workspaceFree: false };
     if (admission.disposition !== "ready") {
       throw new Error(
         `Task activation is not adoptable: ${task.id}/${admission.disposition}`

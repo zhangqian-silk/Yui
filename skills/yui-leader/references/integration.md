@@ -5,11 +5,10 @@ notification. Inspect the original result, diff, checks and exact Candidate.
 If insufficient, return bounded feedback to the owning WorkItem/Role while
 its scope remains valid.
 
-For acceptable isolated Git changes, capture and integrate the latest Candidate
-before acceptance:
+For acceptable isolated Git changes, inspect the latest Candidate's committed
+Git snapshot and integrate it before acceptance:
 
 ```sh
-yui task work capture <work-id>
 yui task integration start <task> --project <project> \
   --work-item <work-id> --strategy <ff|cherry-pick|merge|manual> \
   --check "<Project Policy command>"
@@ -17,6 +16,11 @@ yui task work accept <work-id> --summary "<decision and evidence>"
 ```
 
 These are distinct decisions; confirm Integration succeeded before acceptance.
+ChangeSet capture is optional diff evidence, not a prerequisite for this operation.
+Choose the order and strategy for each result from current Task facts, then call
+one Integration at a time for the same target. There is no ChangeSet merge queue
+or queue processor. Core checks the exact source, checks and target update;
+the Agent owns sequencing and recovery decisions.
 Preserve each managed workspace's owner and the Task's recorded base. Do not
 silently advance that base because a remote branch moved.
 
@@ -45,8 +49,8 @@ the final target update. Read the terminal result, then use:
 yui task integration continue <task>/<integration>
 ```
 
-This also applies when no manual conflict resolution was needed. Do not start
-a duplicate Integration or wait for an empty queue to finalize it.
+This also applies when no manual conflict resolution was needed. Continue the
+same attempt; do not start a duplicate Integration to consume its Job result.
 
 Resume interrupted Git/Job work on this attempt when its source/candidate and
 Job identities can be proved. A clean HEAD, leftover REBASE_HEAD or successful

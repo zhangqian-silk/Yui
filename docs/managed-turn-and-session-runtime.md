@@ -217,6 +217,10 @@ the Projects still receive managed worktrees. `scratch` selects a Task-owned
 directory. `local` requires a registered local Resource and its grant; a Project
 ID is not a local Resource ID.
 
+`task activate` is foreground adoption of an existing request, not an alternative
+way to create activation intent. A request-free Draft is rejected before resource
+preparation; the command does not invent an environment plan or request ID.
+
 Resource preparation precedes the atomic adoption of Task status and workspace
 ownership. A failed adoption records a failed request and notifies the Leader
 with durable facts; it does not repeatedly prepare resources on unchanged

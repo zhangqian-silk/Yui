@@ -1260,7 +1260,7 @@ const SUBMISSION_ACTIVATION_LABEL: Record<SubmissionFeedback["activation"], stri
 function renderSubmissionNextStep(step: SubmissionNextStep): string {
   switch (step.kind) {
     case "activate-manually":
-      return `activate it explicitly with "yui task activate ${step.taskId}".`;
+      return `request activation with "yui task activation request ${step.taskId} --request-id <id> --environment <plan>".`;
     case "start-execution":
       return `start execution with "yui task execution start ${step.taskId}", then submit develop again.`;
     case "await-pending-activation":

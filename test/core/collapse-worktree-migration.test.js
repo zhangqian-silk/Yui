@@ -21,6 +21,7 @@ import { managedTaskRoot } from "../../dist/storage/homeLayout.js";
 import { SqliteTaskStore } from "../../dist/storage/sqliteStore.js";
 import { CURRENT_STORAGE_VERSION } from "../../dist/storage/storageVersions.js";
 import { sanitizedTestEnv } from "../helpers/sanitizedEnv.mjs";
+import { rebuildHistoricalFixture } from "../helpers/historicalHome.mjs";
 
 // The collapse-worktree-layout migration is version 20: it takes a v19 Home (real
 // worktrees under `<home>/workspaces/worktree/<projectName>/<taskKey>/<roleKey>`
@@ -44,8 +45,8 @@ function git(args, cwd) {
 }
 
 /**
- * A Home bootstrapped to head, then its migration ledger truncated back to v19 so
- * the real runner has exactly the 19->20 collapse step pending. Foreign keys are
+ * A Home built from the real storage-v24 prefix, with current singleton fixtures.
+ * The runner has the 24->25 collapse step pending. Foreign keys are
  * OFF on this raw connection (the store enables them per-connection), so
  * old-layout rows can be seeded without a full domain graph.
  */
@@ -53,14 +54,11 @@ function openV19Home(t, prefix) {
   const home = mkdtempSync(join(tmpdir(), prefix));
   t.after(() => rmSync(home, { recursive: true, force: true }));
   new SqliteTaskStore(home).close();
+  rebuildHistoricalFixture(home, V19);
   const db = new Database(join(home, "yui.db"));
   t.after(() => db.close());
-  db.prepare("DELETE FROM schema_migrations WHERE version > ?").run(V19);
-  // This fixture synthesizes an old Home from the current schema. Remove the
-  // later physical objects too; a deleted ledger alone is not a valid old Home.
-  db.exec("DROP INDEX idx_task_provider_retry; DROP INDEX idx_global_provider_retry;");
   const head = db.prepare("SELECT MAX(version) AS version FROM schema_migrations").get();
-  assert.equal(head.version, V19, "ledger truncated to v19");
+  assert.equal(head.version, V19, "real historical schema prefix");
   return { home, db };
 }
 

@@ -75,14 +75,18 @@ yui operator submit "<related request and delta>" --task <task-id> --intent disc
 yui task create "<independent outcome>" \
   --project <project> --base <project>=<ref>
 yui operator submit "<request and routing context>" --task <new-task-id> --intent develop
-yui task activate <new-task-id>
+yui task activation request <new-task-id> --request-id <id> --environment <plan>
 ```
+
+Inspect an existing request before creating another. `task activate <task-id>`
+can adopt an eligible request in the foreground; it never activates a Draft
+without a recorded request and environment plan.
 
 Choose the submission intent explicitly; it is never inferred from the message
 text. `discuss` (the default, and what an old client sends) routes the Draft to
 planning; `record` saves the message without waking the Leader; `develop` asks an
 unplanned Draft to activate now, and reports the exact next step when it cannot
-(already planned → activate manually; execution stopped → start it first). Pass
+(already planned → request activation explicitly; execution stopped → start it first). Pass
 `--request-id <key>` to make a submission idempotent: retrying the same key
 returns the original message and routing instead of creating a duplicate, and the
 same key with different text is refused as a conflict.

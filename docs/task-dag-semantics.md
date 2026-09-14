@@ -61,10 +61,10 @@ it does not accept a WorkItem or rewrite dependencies.
 Direct and replicated execution share one Leader acceptance boundary. A
 replicated Producer does not form a Candidate; only the explicitly synthesized
 main Run result enters the candidate path. Delivery the Leader manages directly
-must also satisfy the applicable Candidate, ChangeSet and Integration boundaries.
+must also satisfy the applicable Candidate and Integration boundaries.
 
-An isolated code result captures a fixed per-Project ChangeSet and integrates via
-compare-and-swap after its checks; an uncaptured, unintegrated or stale latest
+An isolated code result freezes per-Project Candidate commits and integrates via
+compare-and-swap after its checks; an unsnapshotted, unintegrated or stale latest
 result cannot satisfy delivery. Review is checked against the applicable rule and
 the Task contract. A Task main the Leader delivers itself needs a clean,
 committed, exact snapshot.

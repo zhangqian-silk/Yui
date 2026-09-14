@@ -33,7 +33,7 @@ The current development step retires runtime compatibility before the final
 1.0 baseline cutover. It does not publish a release or reset storage numbering.
 Storage 27→28 normalizes only provable singleton Role dispatch dedupe keys;
 the old migration ledger, Messages, Task results and unconfirmed effects remain
-unchanged. Ordinary opens require storage 28. Existing Homes advance only through
+unchanged. Ordinary opens require storage 29. Existing Homes advance only through
 the explicit upgrade boundary; no runtime dual-reader is added.
 
 This is a breaking pre-1.0 change:
@@ -50,6 +50,20 @@ This is a breaking pre-1.0 change:
 - GC no longer discovers retired deployment layouts or reconstructs removed
   worktrees. Unsupported quarantine evidence is retained, never purged as if
   it were a current move receipt.
+- `task activate` consumes an existing request; no request means no resource
+  adoption. Request creation, deferred admission and atomic workspace adoption
+  remain separate, using the same current boundary.
+- `task integration queue` and its state machine are removed. The Agent chooses
+  each WorkItem result's order and strategy and calls the atomic Integration
+  operations; exact checks, target CAS and completion obligations remain.
+
+Storage 28→29 preserves every former queue payload verbatim in a Task event
+`integration.queue-retired`, with its original queue ID, before dropping the
+active table. Event IDs advance past both the stored counter and existing
+history. This does not accept delivery, generate an Integration or replay work.
+Existing Integrations and Jobs stay intact. Inspect `task event list <task>`
+and the referenced WorkItem/Integration before deciding what remains to do;
+retiring the queue does not settle an unfinished Integration.
 
 Before rollout, settle old executions and use explicit cleanup for unsupported
 locks, links or quarantines. Preserve those records until their owner and
