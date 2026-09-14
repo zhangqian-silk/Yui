@@ -61,7 +61,9 @@ is required.
    delivery with its original intent and captured planning authority preserved;
    scratch workspace release does not require a fabricated Git identity.
 7. Session replacement preserves pending original Messages and independent work;
-   old Sessions keep scoped reads but cannot regain write authority;
+   cleanup blocks new notification claims, and successor acceptance cannot
+   settle an old wake or later queued input. Old Sessions keep scoped reads
+   but cannot regain write authority;
 8. InputRequests survive Session replacement without a synthetic AgentRun;
 9. late native terminals cannot settle successor input or invent acceptance;
 10. remote Operator startup carries its reserved workspace, Role instructions
@@ -177,3 +179,11 @@ different: paid APIs, shared Homes, production systems, real account quota, and
 other non-disposable external effects are never implied by a request to test or
 validate. They require an explicit user request for the exact resource and
 effect boundary.
+
+For authorized real-model probes, distinguish native acceptance, exact Turn
+completion and independently checked work (files, tests, commits and Task
+facts). A missing echo marker is not a functional failure. After Session
+replacement, verify the successor read the original input and correlate its
+own terminal; do not require every historical wake to receive that terminal.
+Check normal completion/archive before stopping execution, since stop/cancel
+cleanup is a different path. Preserve these evidence distinctions in the report.

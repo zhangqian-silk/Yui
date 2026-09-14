@@ -94,6 +94,14 @@ yui task wake resolve <task> <wake> --reason <quiescence-evidence>
 resolve 在原生效果围栏清除后释放该认领。它既不重放通知，也不编造接受或完成。独立的
 Role 工作和合法的本地事实不是一把 Task 范围的恢复锁。
 
+wake 状态记录通知投递，不记录 Message 的实施结果。普通 Leader 通知的 `consumed`
+表示原生接受；原生 Turn 完成与 Task 交付应分别依据运行证据和持久结果判断。
+被拒绝或释放的 wake 可以保留为 `dispatched`，但已不再占用 mailbox claim。Session 替换把待投递输入
+保留给新 wake 与当前 Context，不会追溯把旧 wake 标成已接受；旧回执也不能结算
+新批次。Session 清理期间，新输入保持排队。检查时应结合 wake、
+`notification.delivery` 事件、当前 mailbox 与 Session，不应要求每个历史 wake
+都对应一条最终回复。
+
 ## 输入时机：queue、steer 与 interrupt
 
 提交意图（`record / discuss / develop`）决定需求如何路由。输入时机决定一条已经
@@ -111,13 +119,15 @@ Role 工作和合法的本地事实不是一把 Task 范围的恢复锁。
 
 ```sh
 yui task role session inspect <task> <role>
-yui task message queue <task> "<continuation>" --request-id <id> --to leader
+yui task message queue <task> "<continuation>" --request-id <id>
 yui task message steer <task> "<correction>" --request-id <id> --to leader --expected-target <turn>
 yui task role interrupt <task> <role> --expected-target <turn> --request-id <id> [--then-message <task/message>]
 ```
 
-Worker/Reviewer 消息保留既有的 `--work-item` 或 `--review-round` 关联。同一个
-request ID 若换正文或目标会产生冲突。`steer` 与 `interrupt` 不会静默改目标、
+普通 Leader `queue` 输入省略 `--to`。显式 `--to <role>`（包括 `leader`）指向既有
+Assignment，必须带 `--work-item` 或 `--review-round`；Message 不能创建 Assignment。
+`steer` 仍需要显式 Role 与精确实时目标。同一个 request ID 若换正文或目标会产生冲突。
+`steer` 与 `interrupt` 不会静默改目标、
 替换 Session、杀进程或回退到另一动作。没有活动受管 Turn 时返回 `NO_ACTIVE_TURN`；
 陈旧目标与不受支持的控制也保持为显式结果。
 

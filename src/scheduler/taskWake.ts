@@ -20,8 +20,8 @@ export type TaskWakeStatus = "dispatched" | "consumed";
  * `toCursor` inclusive). The Agent reads the delta content on demand with
  * `yui task wake show`; the full projection stays in `yui task context`.
  *
- * The ledger is also the durable consumption cursor: the latest wake's
- * `toCursor` is the task's high-water mark. A task with no wake records falls
+ * The latest wake's `toCursor` bounds the next notification delta; it is not
+ * an implementation or completion receipt. A task with no wake records falls
  * back to its last Leader AgentRun creation time, preserving pre-ledger semantics.
  */
 export type TaskWake = Readonly<{
@@ -43,7 +43,8 @@ export type TaskWake = Readonly<{
   /** The Leader AgentRun this wake dispatched. */
   runId?: string;
   createdAt: string;
-  /** Set when the dispatched AgentRun reaches a terminal state. */
+  /** Set on native notification acceptance (or terminal settlement of a
+   * Run-backed wake). Never proves the Message requirements were implemented. */
   consumedAt?: string;
 }>;
 

@@ -554,8 +554,8 @@ const taskChildren: readonly NodeInput[] = [
       },
       {
         name: "queue",
-        summary: "Queue an input for delivery at the recipient's next legal opportunity (idempotent by request id).",
-        usage: "yui task message queue <id> (<body>|--body-file <path|->) --request-id <id> [--to <role> --work-item <id>|--review-round <id>]",
+        summary: "Queue ordinary Leader input without --to; an explicit Role requires an existing WorkItem/ReviewRound Assignment. Idempotent by request id.",
+        usage: "yui task message queue <id> (<body>|--body-file <path|->) --request-id <id> [--to <role> (--work-item <id>|--review-round <id>)]",
         options: ["--body-file", "--request-id", "--to", "--work-item", "--review-round"],
         fileOptions: ["--body-file"]
       },

@@ -157,6 +157,44 @@ test("Runless questions survive replacement and a successor can manage the origi
   assert.equal(store.getInputRequest("task-1", "input-1").requester.nativeSessionId, "leader-old");
 });
 
+test("Leader queue waits through Session cleanup and only its accepted wake consumes input", t => {
+  const { store, command, scheduler } = fixture(t);
+  const target = { kind: "role", taskId: "task-1", roleName: "leader" };
+  assert.throws(() => command(["message", "queue", "task-1", "Original input",
+    "--request-id", "original", "--to", "leader"]), /requires --work-item or --review-round/);
+  command(["message", "queue", "task-1", "Original input", "--request-id", "original"]);
+  const message = store.listMessages("task-1")[0];
+  command(["role", "session", "new", "task-1", "leader", "--reason", "Replace idle Session"]);
+  const pending = store.getWorkMailbox(target);
+  assert.equal(scheduler.claimLeaderNotification("task-1", later), null,
+    "Do not dispatch queued input to a Session whose cleanup is already requested.");
+  assert.deepEqual(store.getWorkMailbox(target), pending);
+  assert.equal(store.listTaskWakes("task-1").length, 0);
+
+  scheduler.completeRuntimeCleanup({ kind: "role-runtime", taskId: "task-1", roleName: "leader" }, later);
+  const first = scheduler.claimLeaderNotification("task-1", later);
+  assert.equal(first.disposition, "submit");
+  assert.ok(store.getTaskWake("task-1", first.wakeId).refs.some(ref => ref.id === message.id));
+  scheduler.settleLeaderNotification("task-1", first.attemptId, "unknown", later);
+  command(["role", "session", "new", "task-1", "leader", "--reason", "Discard unconfirmed attempt"]);
+  scheduler.completeRuntimeCleanup({ kind: "role-runtime", taskId: "task-1", roleName: "leader" }, later);
+  const successor = scheduler.claimLeaderNotification("task-1", later);
+  assert.notEqual(successor.wakeId, first.wakeId);
+  assert.ok(store.getTaskWake("task-1", successor.wakeId).refs.some(ref => ref.id === message.id));
+  assert.equal(pendingCompletionMessages(store, "task-1")[0].id, message.id);
+  scheduler.settleLeaderNotification("task-1", first.attemptId, "accepted", later);
+  assert.equal(store.getWorkMailbox(target).processing.batchId, successor.attemptId,
+    "A late receipt from the discarded attempt cannot settle its successor.");
+  assert.equal(store.getTaskWake("task-1", first.wakeId).status, "dispatched");
+  command(["message", "queue", "task-1", "Later input", "--request-id", "later"]);
+  scheduler.settleLeaderNotification("task-1", successor.attemptId, "accepted", later);
+  assert.equal(store.getTaskWake("task-1", successor.wakeId).status, "consumed");
+  assert.equal(store.getTaskWake("task-1", first.wakeId).status, "dispatched",
+    "Successor acceptance must not fabricate acceptance of the discarded wake.");
+  assert.deepEqual(pendingCompletionMessages(store, "task-1").map(m => m.body), ["Later input"]);
+  assert.equal(store.listRuns("task-1").length, 0, "Notification acceptance is not execution completion.");
+});
+
 test("late native terminals cannot settle successor input or fabricate acceptance", () => {
   let binding = createProviderRuntimeBinding({
     providerNamespace: "openai/codex", accountScope: "codex", conversationId: "thread",

@@ -109,6 +109,16 @@ Resolve releases the claim after native-effect fences are clear. It neither
 replays the notification nor invents acceptance or completion. Independent
 Role work and legal local facts are not a Task-wide recovery lock.
 
+Wake status records notification delivery, not Message implementation. For
+ordinary Leader notifications, `consumed` means native acceptance. Native Turn
+completion and Task delivery need their own runtime evidence and durable results.
+A rejected or released wake may remain `dispatched` without an active mailbox claim.
+Session replacement preserves queued input for a new wake and current Context;
+it does not retroactively mark an old wake accepted. Late receipts cannot settle
+the successor's batch. While Session cleanup is pending, new input remains queued.
+Inspect the wake, `notification.delivery` events, current mailbox and Session
+together; do not require one final response per historical wake.
+
 ## Input timing: queue, steer and interrupt
 
 Submission intent (`record / discuss / develop`) decides how a requirement is
@@ -127,13 +137,16 @@ Inspect the Session before selecting a live target:
 
 ```sh
 yui task role session inspect <task> <role>
-yui task message queue <task> "<continuation>" --request-id <id> --to leader
+yui task message queue <task> "<continuation>" --request-id <id>
 yui task message steer <task> "<correction>" --request-id <id> --to leader --expected-target <turn>
 yui task role interrupt <task> <role> --expected-target <turn> --request-id <id> [--then-message <task/message>]
 ```
 
-Worker/Reviewer messages retain their existing `--work-item` or `--review-round`
-association. Reusing a request ID with different content or a different target
+Ordinary Leader `queue` input omits `--to`. An explicit `--to <role>` (including
+`leader`) addresses an existing Assignment and requires `--work-item` or
+`--review-round`; a Message cannot establish that Assignment. `steer` still
+requires an explicit Role and exact live target.
+Reusing a request ID with different content or a different target
 is a conflict. `steer` and `interrupt` never silently retarget, replace a Session,
 kill a process or fall back to another action. No live managed Turn yields
 `NO_ACTIVE_TURN`; stale targets and unsupported control remain explicit outcomes.

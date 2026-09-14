@@ -2383,6 +2383,12 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
     return this.store.transaction((store) => {
       const task = store.getTask(taskId);
       if (task == null || !["active", "draft"].includes(task.status) || task.executionGate.state !== "enabled") return null;
+      // Admission refuses input while this Session is being cleaned up.
+      // Leave the original batch pending for its successor instead of
+      // claiming a notification that cannot legally reach the Provider.
+      if (hasRuntimeCleanupObligation(store.getWorkMailbox(runtimeLifecycleTarget({
+        scope: "task", taskId, roleName: "leader"
+      })))) return null;
       const target = { kind: "role", taskId, roleName: "leader" } as const;
       let mailbox = store.getWorkMailbox(target);
       if (mailbox === null) return null;
