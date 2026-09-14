@@ -158,7 +158,7 @@ test("dead exact owners are reclaimed, live holders and replacement locks are pr
   const home = newHome(t);
   const lock = projectMaintenanceLockPath(home, "project-1");
   mkdirSync(lock, { recursive: true });
-  writeFileSync(join(lock, "owner"), `${process.pid}:not-this-process-start\n`);
+  writeFileSync(join(lock, "owner"), `${process.pid}:0\n`);
   const old = new Date(Date.now() - 2_000);
   utimesSync(lock, old, old);
   assert.equal(isProjectMaintenanceFenced(home, "project-1"), false);

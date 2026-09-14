@@ -24,7 +24,7 @@ Agent 选择一个预先声明的计划，设施从持久状态驱动该计划�
 
 当前开发步骤先清退运行时兼容分支，尚未执行最终 1.0 基线切换，也不发布版本或重置
 存储编号。存储 `27→28` 只规范化可明确识别的单条 Role 调度去重键，旧迁移账本、
-Message、Task 结果和不确定外部效果保持不变。普通打开要求存储 29；已有 Home 只通过
+Message、Task 结果和不确定外部效果保持不变。普通打开要求存储 30；已有 Home 只通过
 显式升级入口前进，不增加运行时双读。
 
 这是一次 1.0 前的破坏性变更：
@@ -48,6 +48,22 @@ Message、Task 结果和不确定外部效果保持不变。普通打开要求�
 和历史最大 ID。此操作不验收交付、不生成 Integration、不重放工作；已有 Integration
 与 Job 保持不变。通过 `task event list <task>` 和引用的 WorkItem/Integration
 判断剩余工作；队列退役不代表未完成的 Integration 已结算。
+
+存储 `29→30` 将 Run-linked wake 的完整原文移入 `wake.run-link-retired` Task 事件。
+现有通知保留 ID、投递状态和引用，使用 wake schema 2；Run 终态不再消费通知。
+引用待退役 wake 的活动 Run、受管重试或未决 claim 会同时阻止预检和迁移；
+迁移不停止执行、不编造接受。Global Session 没有受控 binding 时统一显式保存
+`providerBinding: null`。
+
+现行边界进一步收敛：
+
+- Project／Artifact 文件锁及 handover lock 要求精确进程代际证据。owner 缺失、
+  格式不完整或 OS 身份不可读时保持围栏；仅凭年龄不能证明创建者退出，不再用
+  PID-only 存活判断代替身份确认。
+- PR head 查询只调用 `gh pr list --head ... --state open`。仅有效空数组证明不存在；
+  传输失败、身份格式错误和多个匹配都不允许继续创建。
+- 已有 Git 操作缺少原 Integration 进度回执时不再被接管。保留文件并明确诊断；
+  有精确回执的正常冲突／Job 续作仍受支持。
 
 发布前应先收敛旧执行，对不受支持的锁、链接和隔离资源做显式清理。归属与处置尚未
 确定时保留原记录，运行时不替 Agent 选择恢复方案。

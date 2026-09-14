@@ -135,6 +135,11 @@ is required.
     planning deferral and cancellation. Retiring the integration queue preserves
     exact records and active attempts in one rollback-safe migration, without
     inventing delivery. Conflicted Integrations remain completion blockers.
+27. Unknown lock ownership stays fenced, including unavailable OS evidence.
+    PR lookup distinguishes absence, malformed/ambiguous results and transport
+    failure through injected ports. Receipt-free Git operations remain unchanged,
+    while normal receipt-backed continuation still works. Notification-only
+    migration preserves current delivery and audit history and refuses live links.
 
 Keep the test phase seconds-scale; measure TypeScript build separately. Record
 incremental runtime when adding a critical regression. The seven recovery boundary

@@ -117,9 +117,8 @@ function resolveInputControl(
       detail: `Agent plan '${active.adapterId}' has no native interrupt; Yui will not `
         + "stop the owned process, kill, restart, or detach it." };
   }
-  // A Global Role now carries the same optional providerBinding as a Task Role;
-  // both read it the same way. Its absence is "no current Turn", never an error.
-  const binding = "providerBinding" in sessions ? sessions.providerBinding ?? null : null;
+  // Both scopes use the same explicit null for an uncontrolled Session.
+  const binding = sessions.providerBinding;
   const turn = binding?.run ?? null;
   if (binding === null || turn === null || !PRESENT_TURN_STATUSES.has(turn.status)) {
     return { outcome: "no-active-turn", code: "NO_ACTIVE_TURN",
@@ -159,7 +158,7 @@ function resolveInputControl(
     ...(turn.nativeTurnId === undefined ? {} : { nativeTurnId: turn.nativeTurnId }),
     attemptId: turn.attemptId,
     authority: { epoch: binding.authority.epoch, owner: "controller",
-      holderId: binding.authority.holderId ?? "controller" }
+      holderId: binding.authority.holderId! }
   } };
 }
 

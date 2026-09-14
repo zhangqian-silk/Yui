@@ -31,10 +31,6 @@ import {
 } from "../agentRun/agentRun.js";
 import { createRunInput } from "../context/runInputContract.js";
 import {
-  buildTaskWakeEnvelope,
-  type WakeEnvelope
-} from "../context/wakeNotification.js";
-import {
   bindExecution,
   claimPending,
   completeProcessing,
@@ -175,14 +171,13 @@ import {
   latestRunEventTime,
   latestStallEvidenceKey
 } from "../scheduler/roleRunStall.js";
-import { createTaskWake, fallbackWakeCursor, latestTaskWake, markTaskWakeConsumed } from "../scheduler/taskWake.js";
+import { createTaskWake, latestTaskWake, markTaskWakeConsumed } from "../scheduler/taskWake.js";
 import { wakeReason } from "../scheduler/wakeReason.js";
 import { queueLeaderWakeup } from "../scheduler/wakeupQueue.js";
 import { pendingWakeupProjection, type TaskStore } from "../storage/taskStore.js";
 import {
   formatRunReceiptId
 } from "../task/taskRecordReference.js";
-import { operationalTaskRecords } from "../task/taskRecordRetirement.js";
 import type { RuntimeLifecycleEvent, RuntimeRunTerminalOutcome } from "./runtimeEventInbox.js";
 import type {
   ProviderLifecycleObservation
@@ -1138,31 +1133,6 @@ export class FileSchedulerStoreAdapter implements SchedulerStorePort {
   getTaskBrief(taskId: string) { return this.store.getTaskBrief(taskId); }
   listDecisions(taskId: string) { return this.store.listDecisions(taskId); }
   listMilestones(taskId: string) { return this.store.listMilestones(taskId); }
-  getTaskWakeEnvelope(taskId: string): WakeEnvelope | null {
-    return this.store.transaction((reader) => {
-      const pending = reader.getPendingWakeup(taskId);
-      if (pending === null) return null;
-      const task = reader.getTask(taskId);
-      if (task === null) return null;
-      const latest = latestTaskWake(reader.listTaskWakes(taskId));
-      const fromCursor = latest?.toCursor ?? fallbackWakeCursor({
-        taskCreatedAt: task.createdAt,
-        leaderRunCreatedAt: operationalTaskRecords(
-          reader.listRuns(taskId),
-          reader.listEvents(taskId),
-          "run"
-        )
-          .filter((run) => run.roleName === "leader")
-          .at(-1)?.createdAt
-      });
-      return buildTaskWakeEnvelope(reader, {
-        taskId,
-        wakeId: reader.peekNextTaskWakeId(taskId),
-        reasons: pending.reasons,
-        fromCursor
-      });
-    });
-  }
   listRoles(taskId: string): SchedulerRole[] {
     return this.store.listRoles(taskId).map((role) => mapRole(this.store, role));
   }

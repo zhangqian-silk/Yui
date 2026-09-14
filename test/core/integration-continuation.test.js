@@ -151,6 +151,23 @@ test("ordinary conflict continues without resolve and consumes one exact check J
   assert.equal(f.starts(), 1);
 });
 
+test("an old Git conflict without its Integration receipt is diagnosed without adopting or replaying it", async t => {
+  const f = integrationFixture(t);
+  const conflict = await f.service().integrate("task-1", "integration-1");
+  assert.equal(conflict.status, "conflicted");
+  const { sourceProgress: _oldProgress, ...old } = conflict.attempt;
+  f.store.saveIntegrationAttempt("task-1", old);
+  const file = readFileSync(join(conflict.workspace.path, "file"), "utf8");
+  const operation = git(conflict.workspace.path, "rev-parse", "MERGE_HEAD");
+  const result = await f.service().integrate("task-1", old.id);
+  assert.equal(result.attempt.sourceProgress, undefined, "A matching MERGE_HEAD does not create an attempt-owned receipt.");
+  assert.match(result.attempt.summary, /receipt|progress/i);
+  assert.equal(readFileSync(join(conflict.workspace.path, "file"), "utf8"), file);
+  assert.equal(git(conflict.workspace.path, "rev-parse", "MERGE_HEAD"), operation);
+  assert.equal(f.git("rev-parse", "HEAD"), f.before);
+  assert.equal(f.starts(), 0);
+});
+
 test("interrupted rebase receipt and successful unbound Job resume without replay", async t => {
   const f = integrationFixture(t, "rebase");
   const conflict = await f.service().integrate("task-1", "integration-1");

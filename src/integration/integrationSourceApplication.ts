@@ -76,15 +76,11 @@ export async function applyIntegrationSource(input: Readonly<{
   const branch = workspace.branch.startsWith("refs/") ? workspace.branch : `refs/heads/${workspace.branch}`;
   const active = await activeGitOperation(path);
   if (current.sourceProgress === undefined) {
-    // Historical unfinished operations can be adopted only when Git still
-    // carries their exact source/target identity. Finished old operations
-    // without a receipt are deliberately not inferred from a clean tree.
+    // Only a pristine candidate can establish this attempt's first receipt.
+    // An unfinished operation without that receipt belongs to explicit recovery.
     const head = await line(path, "rev-parse", "HEAD");
     if (active !== undefined) {
-      if (kind === "cherry-pick") {
-        throw new Error("Historical cherry-pick has no durable completed-step cursor; preserve it and choose explicit recovery.");
-      }
-      await assertOperation(path, kind, commits[0]!, current.beforeCommit, branch, source);
+      throw new Error("Active Git operation has no attempt-owned progress receipt; preserve it and choose explicit recovery.");
     } else if (head !== current.beforeCommit || current.status === "conflicted") {
       throw new Error("Integration source completion is unproven: no attempt-owned Git receipt. Preserve the candidate; do not replay.");
     } else {
@@ -92,8 +88,7 @@ export async function applyIntegrationSource(input: Readonly<{
     }
     save({ sourceProgress: {
       workspace: resolve(path), branch, sourceDigest, completedSteps: 0,
-      head: current.beforeCommit,
-      ...(active === undefined ? {} : { activeAction: actionId() })
+      head: current.beforeCommit
     } });
   }
   let progress = current.sourceProgress!;

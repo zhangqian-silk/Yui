@@ -1,5 +1,6 @@
 import { mkdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { currentFileLockOwner, fileLockOwnerIsLive } from "../core/fileLockOwner.js";
 
 /**
  * Short per-Task commit fence for artifact repositories.
@@ -10,9 +11,9 @@ import { join } from "node:path";
  * into the wrong commit, or race the expected-HEAD check. This fence serializes
  * the commit critical section for one Task.
  *
- * Unlike the Project maintenance fence (which guards long operations and fails
- * fast so the CLI is not blocked), an artifact save is a short operation, so a
- * contended fence briefly RETRIES before giving up. It is otherwise the same
+ * The Project maintenance fence waits asynchronously for longer operations.
+ * An artifact save is short, so this synchronous critical section briefly
+ * retries a contended fence before giving up. It otherwise shares the same
  * crash-safe design: an exclusive directory under the Home's `locks/` area
  * (O_EXCL via mkdir), an owner file recording PID + process start time so a
  * recycled PID can never pass for the original holder, and reclaim of a stale
@@ -51,12 +52,13 @@ export function artifactCommitLockPath(home: string, taskId: string): string {
  */
 export function acquireArtifactCommitLock(home: string, taskId: string): () => void {
   const lock = artifactCommitLockPath(home, taskId);
+  const ownerIdentity = currentFileLockOwner();
   mkdirSync(join(home, "locks", "task-artifacts"), { recursive: true, mode: 0o700 });
   const deadline = Date.now() + ARTIFACT_COMMIT_LOCK_TIMEOUT_MS;
   while (true) {
     try {
       mkdirSync(lock, { mode: 0o700 });
-      const ownerIdentity = writeOwnerIdentity(lock);
+      writeOwnerIdentity(lock, ownerIdentity);
       let released = false;
       return () => {
         if (released) return;
@@ -73,8 +75,7 @@ export function acquireArtifactCommitLock(home: string, taskId: string): () => v
 }
 
 /** Write this process's owner identity and return the exact bytes recorded. */
-function writeOwnerIdentity(lock: string): string {
-  const identity = `${process.pid}:${processStartIdentity() ?? ""}`;
+function writeOwnerIdentity(lock: string, identity = currentFileLockOwner()): string {
   writeFileSync(join(lock, "owner"), `${identity}\n`, { mode: 0o600 });
   return identity;
 }
@@ -107,8 +108,8 @@ function reclaimStaleArtifactCommitLock(lock: string): void {
     expectedOwner = readFileSync(join(lock, "owner"), "utf8");
   } catch (error) {
     if (!isEnoent(error)) throw error;
-    // Ownerless lock: a crash between mkdir and owner publication. Reclaim only
-    // when old enough that the creator is not still initializing.
+    // Allow publication its initial grace period; an older missing owner is
+    // diagnosed as unverified below, never treated as a dead creator.
     try {
       if (Date.now() - statSync(lock).mtimeMs < STALE_ARTIFACT_COMMIT_LOCK_AGE_MS) return;
     } catch (statError) {
@@ -123,7 +124,7 @@ function reclaimStaleArtifactCommitLock(lock: string): void {
     if (isEnoent(error)) return;
     throw error;
   }
-  if (expectedOwner !== null && lockOwnerIsAlive(lock)) return;
+  if (fileLockOwnerIsLive(lock)) return;
 
   const reclaimLock = `${lock}.reclaim`;
   for (let attempt = 0; attempt < 2; attempt += 1) {
@@ -153,7 +154,7 @@ function reclaimStaleArtifactCommitLock(lock: string): void {
         currentOwner = null;
       }
       if (currentOwner !== expectedOwner) return;
-      if (currentOwner !== null && lockOwnerIsAlive(lock)) return;
+      if (fileLockOwnerIsLive(lock)) return;
       rmSync(lock, { recursive: true, force: true });
     } finally {
       rmSync(reclaimLock, { recursive: true, force: true });
@@ -163,58 +164,19 @@ function reclaimStaleArtifactCommitLock(lock: string): void {
 }
 
 /**
- * Reclaim a reclaim-lock directory only when provably orphaned: dead (or
- * unrecorded) owner AND older than the age bound. Returns true when it removed
+ * Reclaim a reclaim-lock directory only with a proven dead generation and
+ * after the age bound. Returns true when it removed
  * the lock (caller retries), false otherwise.
  */
 function reclaimOrphanedReclaimLock(reclaimLock: string): boolean {
   try {
     if (Date.now() - statSync(reclaimLock).mtimeMs < STALE_ARTIFACT_COMMIT_LOCK_AGE_MS) return false;
-    if (lockOwnerIsAlive(reclaimLock)) return false;
+    if (fileLockOwnerIsLive(reclaimLock)) return false;
     rmSync(reclaimLock, { recursive: true, force: true });
     return true;
   } catch (error) {
-    return isEnoent(error);
-  }
-}
-
-function lockOwnerIsAlive(lock: string): boolean {
-  let owner: string;
-  try {
-    owner = readFileSync(join(lock, "owner"), "utf8").trim();
-  } catch (error) {
-    if (isEnoent(error)) return false;
-    return true; // Unreadable owner fails closed: treat the fence as held.
-  }
-  const separator = owner.indexOf(":");
-  const pid = Number.parseInt(separator < 0 ? owner : owner.slice(0, separator), 10);
-  if (!Number.isInteger(pid) || pid <= 0) return false;
-  const recordedIdentity = separator < 0 ? "" : owner.slice(separator + 1);
-  const currentIdentity = processStartIdentity(pid);
-  if (currentIdentity !== undefined) {
-    return recordedIdentity !== "" && currentIdentity === recordedIdentity;
-  }
-  return processIsAlive(pid);
-}
-
-/** Linux process start time (clock ticks since boot) for a PID; undefined off /proc. */
-function processStartIdentity(pid: number = process.pid): string | undefined {
-  try {
-    const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
-    const close = stat.lastIndexOf(")");
-    const fields = stat.slice(close + 2).split(" ");
-    return fields[19] ?? "0"; // field 22: starttime
-  } catch {
-    return undefined;
-  }
-}
-
-function processIsAlive(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    return error instanceof Error && "code" in error && error.code === "EPERM";
+    if (isEnoent(error)) return true;
+    throw error;
   }
 }
 

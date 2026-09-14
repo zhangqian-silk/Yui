@@ -29,6 +29,7 @@ import {
 import { dirname, join, resolve } from "node:path";
 
 import { readLinuxProcessStartIdentity } from "../controller/domainIdentity.js";
+import { processGenerationIsLive } from "../core/fileLockOwner.js";
 import { writeTextFileAtomically } from "../storage/durableFile.js";
 
 export const RELEASES_DIRECTORY = "runtime/releases";
@@ -544,9 +545,7 @@ function isHandoverLockLive(existing: {
   ) {
     throw new Error("Unsupported handover lock identity; preserve the lock and inspect its owner before cleanup.");
   }
-  const currentIdentity = readLinuxProcessStartIdentity(existing.pid);
-  if (currentIdentity === undefined) return false;
-  return currentIdentity === existing.processStartIdentity;
+  return processGenerationIsLive(existing.pid, existing.processStartIdentity);
 }
 
 export function newHandoverId(): string {

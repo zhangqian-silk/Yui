@@ -26,8 +26,18 @@ export function rebuildHistoricalFixture(home, throughVersion) {
     for (const { name } of db.prepare("SELECT name FROM sqlite_master WHERE type='table'").all()) {
       if (name === "schema_migrations" || name.startsWith("sqlite_") || !sources.has(name)) continue;
       const table = quote(name);
-      assert.deepEqual(db.prepare(`PRAGMA main.table_info(${table})`).all().map(row => row.name),
-        db.prepare(`PRAGMA fixture_source.table_info(${table})`).all().map(row => row.name),
+      const columns = db.prepare(`PRAGMA main.table_info(${table})`).all().map(row => row.name);
+      const sourceColumns = db.prepare(`PRAGMA fixture_source.table_info(${table})`).all().map(row => row.name);
+      if (name === "task_wakes" && columns.includes("turn_id") && !sourceColumns.includes("turn_id")) {
+        // Current fixtures contain notification-only wakes. Their exact old
+        // column representation has a null execution link, never a guessed Run.
+        assert.deepEqual(columns.filter(column => column !== "turn_id"), sourceColumns);
+        db.exec(`INSERT OR REPLACE INTO main.${table} (${columns.map(quote).join(",")})
+          SELECT ${columns.map(column => column === "turn_id" ? "NULL" : quote(column)).join(",")}
+          FROM fixture_source.${table}`);
+        continue;
+      }
+      assert.deepEqual(columns, sourceColumns,
         `Historical fixture needs an explicit column transform: ${name}`);
       db.exec(`INSERT OR REPLACE INTO main.${table} SELECT * FROM fixture_source.${table}`);
     }

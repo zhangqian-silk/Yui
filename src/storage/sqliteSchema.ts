@@ -29,6 +29,7 @@ import {
 import { migrateAgentRunContract } from "./migrations/agentRunContract.js";
 import { migrateArtifactsToGit } from "./migrations/artifactsToGit.js";
 import { migrateIntegrationContinuation } from "./migrations/integrationContinuation.js";
+import { migrateNotificationOnlyWakes } from "./migrations/notificationOnlyWakes.js";
 import {
   UNIFY_HOME_LAYOUT_SQL,
   migrateUnifyHomeLayout
@@ -1407,6 +1408,13 @@ DROP TABLE retired_integration_queue;
 DROP TABLE integration_queue;
 DELETE FROM id_sequences WHERE kind = 'integrationQueue';
 `
+  },
+  {
+    version: 30,
+    name: "notification-only-wakes",
+    introducedIn: "0.16.0",
+    sql: "SELECT 1; -- Retire Run-linked wakes as audit events; notification schema 2; explicit Global providerBinding",
+    migrateData: migrateNotificationOnlyWakes
   }
 ]);
 

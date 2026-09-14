@@ -2884,11 +2884,10 @@ export class SqliteTaskStore implements TaskStore {
       const seq = this.#idSequence(wake.id, "taskWake");
       this.#db.prepare(
         `INSERT INTO task_wakes
-          (task_id, wake_id, seq, status, turn_id, from_cursor, to_cursor, reasons, payload, created_at, consumed_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
+          (task_id, wake_id, seq, status, from_cursor, to_cursor, reasons, payload, created_at, consumed_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`
        + ` ON CONFLICT(task_id, wake_id) DO UPDATE SET
            status = excluded.status,
-           turn_id = excluded.turn_id,
            reasons = excluded.reasons,
            payload = excluded.payload,
            consumed_at = excluded.consumed_at`
@@ -2897,7 +2896,6 @@ export class SqliteTaskStore implements TaskStore {
         wake.id,
         wake.seq,
         wake.status,
-        wake.runId ?? null,
         wake.fromCursor,
         wake.toCursor,
         this.#json([...wake.reasons]),

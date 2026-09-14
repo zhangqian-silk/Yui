@@ -151,8 +151,8 @@ export type ReleaseWorkflowAdapterDeps = Readonly<{
 }>;
 
 /**
- * The real adapter. It is NEVER exercised by the deterministic test suite
- * (fakes are); every branch dispatches to an existing atomic operation.
+ * The production adapter dispatches existing atomic operations. Deterministic
+ * tests inject command/idempotency ports and never contact release services.
  */
 export function createReleaseWorkflowPorts(
   deps: ReleaseWorkflowAdapterDeps
@@ -1193,13 +1193,6 @@ type PrLookupResult =
   | { readonly status: "failed"; readonly error: string };
 
 /**
- * Finds the open PR for a head ref. Prefers `gh pr view --head`; older gh
- * versions that lack the flag fall back to `gh pr list --head`. A non-zero
- * exit from both commands is a failed lookup (transport error), not an
- * authoritative "no PR found". Both paths request the head object id so the
- * caller can prove the PR names the frozen source commit before reuse.
- */
-/**
  * Resolves the SHA a remote head branch currently points at, or undefined
  * when the branch cannot be resolved or the answer is not a 40-hex commit.
  * Used to prove the proposed PR head is the exact frozen source commit
@@ -1229,38 +1222,28 @@ async function findHeadPullRequest(
   head: string,
   repo: string
 ): Promise<PrLookupResult> {
-  const viewed = await run("gh", [
-    "pr", "view", "--head", head,
-    "--repo", repo,
-    "--json", "number,headRefOid"
-  ]);
-  if (viewed.code === 0) {
-    const found = parsePrHeadEntry(viewed.stdout);
-    if (found !== undefined) {
-      return { status: "found", prNumber: found.prNumber, headSha: found.headSha };
-    }
-  }
-  // A non-zero exit from `gh pr view` may mean "no PR for head" (exit 1 with
-  // empty stdout) or a transport failure. The list fallback disambiguates.
+  // One documented query. Two matches are enough to prove ambiguity; never
+  // choose an arbitrary PR or mistake malformed output for authoritative absence.
   const listed = await run("gh", [
     "pr", "list", "--head", head,
     "--repo", repo,
     "--state", "open",
+    "--limit", "2",
     "--json", "number,headRefOid"
   ]);
-  if (listed.code === 0) {
-    const found = parsePrHeadList(listed.stdout);
-    if (found !== undefined) {
-      return { status: "found", prNumber: found.prNumber, headSha: found.headSha };
-    }
-    // Authoritative empty result: no open PR for this head.
-    return { status: "not-found" };
+  if (listed.code !== 0) {
+    return { status: "failed", error: listed.stderr.trim() || "gh PR lookup failed" };
   }
-  // Both commands failed: transport error, not "no PR found".
-  return {
-    status: "failed",
-    error: listed.stderr.trim() || viewed.stderr.trim() || "gh PR lookup failed"
-  };
+  let entries: unknown;
+  try { entries = JSON.parse(listed.stdout); }
+  catch { return { status: "failed", error: "gh PR list returned invalid JSON." }; }
+  if (!Array.isArray(entries)) return { status: "failed", error: "gh PR list did not return an array." };
+  if (entries.length === 0) return { status: "not-found" };
+  if (entries.length !== 1) return { status: "failed", error: "Multiple open PRs match this head; select the intended PR explicitly." };
+  const found = prHeadFromJson(entries[0]);
+  return found === undefined
+    ? { status: "failed", error: "gh PR list returned an invalid PR identity." }
+    : { status: "found", prNumber: found.prNumber, headSha: found.headSha };
 }
 
 /** Parses `gh pr view --json number,headRefOid` output. */
@@ -1272,22 +1255,11 @@ function parsePrHeadEntry(stdout: string): { prNumber: string; headSha: string }
   }
 }
 
-/** Parses the first entry of `gh pr list --json number,headRefOid` output. */
-function parsePrHeadList(stdout: string): { prNumber: string; headSha: string } | undefined {
-  try {
-    const parsed: unknown = JSON.parse(stdout.trim());
-    if (!Array.isArray(parsed) || parsed.length === 0) return undefined;
-    return prHeadFromJson(parsed[0]);
-  } catch {
-    return undefined;
-  }
-}
-
 function prHeadFromJson(value: unknown): { prNumber: string; headSha: string } | undefined {
   if (typeof value !== "object" || value === null) return undefined;
   const record = value as Record<string, unknown>;
-  if (typeof record.number !== "number" || !Number.isFinite(record.number)) return undefined;
-  if (typeof record.headRefOid !== "string" || record.headRefOid.length === 0) return undefined;
+  if (typeof record.number !== "number" || !Number.isSafeInteger(record.number) || record.number < 1) return undefined;
+  if (typeof record.headRefOid !== "string" || !/^[0-9a-f]{40}$/iu.test(record.headRefOid)) return undefined;
   return { prNumber: String(record.number), headSha: record.headRefOid };
 }
 

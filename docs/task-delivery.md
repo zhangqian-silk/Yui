@@ -63,6 +63,10 @@ failed checks, target movement or rejection retain evidence and never advance
 the target. The Agent chooses retry or manual resolution within the retained
 workspace.
 
+An existing merge/rebase/cherry-pick without the attempt's own progress receipt
+is not adopted from Git markers. Preserve the scene and choose explicit recovery;
+normal continuation uses the original receipt and never replays a completed step.
+
 When checks are a DurableJob, the Integration retains that exact jobId while
 running. Once the Job settles, `task integration continue <task>/<integration>`
 consumes its result and performs the guarded finalization. Existing unsettled

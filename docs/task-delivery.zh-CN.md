@@ -51,6 +51,9 @@ Integration 在候选 worktree 中套用固定来源提交，运行已配置的�
 目标 head 仍匹配时才推进目标。冲突、检查失败、目标移动或拒绝都保留证据，绝不推进
 目标。Agent 在保留的工作区内选择重试或手动解决。
 
+已有 merge/rebase/cherry-pick 若缺少原尝试的进度回执，不根据 Git 标记接管。
+保留现场并选择显式恢复；正常续作使用原回执，不重放已完成步骤。
+
 当检查是一个 DurableJob 时，Integration 在运行期间保留那个确切的 jobId。Job 结算
 后，`task integration continue <task>/<integration>` 消费其结果并执行带守卫的收尾。
 未结算的 Integration（包括冲突）仍阻止完成，不依赖 Agent 采用了什么执行顺序。

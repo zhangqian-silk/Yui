@@ -33,7 +33,7 @@ import {
   taskCatalogScope
 } from "../context/taskCatalog.js";
 import { listContextMessages } from "../context/taskContext.js";
-import { referencedWakeRunIds } from "../context/wakeNotification.js";
+import { referencedWakeRunIds } from "../context/wakeRunReferences.js";
 import {
   completeProcessing,
   type MailboxEntityRef
@@ -8853,14 +8853,12 @@ function taskWakeInspectionCommand(
         { header: "Wake", minWidth: 8, maxWidth: 18 },
         { header: "Status", minWidth: 8, maxWidth: 12 },
         { header: "Reasons", minWidth: 10, maxWidth: 40 },
-        { header: "AgentRun", minWidth: 10, maxWidth: 20 },
         { header: "Dispatched", minWidth: 10, maxWidth: 28 }
       ],
       wakes.map((wake) => [
         wake.id,
         wake.status,
         wake.reasons.map(renderWakeReason).join(", "),
-        wake.runId ?? "-",
         presentTime(wake.createdAt, timeZone)
       ]),
       defaultTableWidth()
@@ -8903,7 +8901,6 @@ function taskWakeInspectionCommand(
       `Notification: ${deliveryEvents.at(-1)?.payload.outcome ?? "unobserved"}`,
       `Reasons: ${wake.reasons.map(renderWakeReason).join(", ")}`,
       `Delta window: ${wake.fromCursor} → ${wake.toCursor}`,
-      ...(wake.runId === undefined ? [] : [`AgentRun: ${wake.runId}`]),
       `Dispatched: ${presentTime(wake.createdAt, timeZone)}`,
       ...(wake.consumedAt === undefined
         ? []

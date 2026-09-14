@@ -7,7 +7,7 @@ import {
 import { TASK_RECORD_ID_PREFIXES } from "../task/taskRecordReference.js";
 import { copyRef, type MailboxEntityRef } from "../coordination/workMailbox.js";
 
-export const CURRENT_TASK_WAKE_SCHEMA_VERSION = 1 as const;
+export const CURRENT_TASK_WAKE_SCHEMA_VERSION = 2 as const;
 
 export type TaskWakeStatus = "dispatched" | "consumed";
 
@@ -21,8 +21,8 @@ export type TaskWakeStatus = "dispatched" | "consumed";
  * `yui task wake show`; the full projection stays in `yui task context`.
  *
  * The latest wake's `toCursor` bounds the next notification delta; it is not
- * an implementation or completion receipt. A task with no wake records falls
- * back to its last Leader AgentRun creation time, preserving pre-ledger semantics.
+ * an implementation or completion receipt. A Task with no notifications starts
+ * its first window at Task creation, independently of AgentRun history.
  */
 export type TaskWake = Readonly<{
   schemaVersion: typeof CURRENT_TASK_WAKE_SCHEMA_VERSION;
@@ -40,11 +40,8 @@ export type TaskWake = Readonly<{
   /** ISO timestamp; the delta window's upper bound (dispatch time). */
   toCursor: string;
   status: TaskWakeStatus;
-  /** The Leader AgentRun this wake dispatched. */
-  runId?: string;
   createdAt: string;
-  /** Set on native notification acceptance (or terminal settlement of a
-   * Run-backed wake). Never proves the Message requirements were implemented. */
+  /** Set on native notification acceptance. Never proves implementation. */
   consumedAt?: string;
 }>;
 
@@ -55,9 +52,9 @@ export function createTaskWake(input: Readonly<{
   refs?: readonly MailboxEntityRef[];
   fromCursor: string;
   toCursor: string;
-  runId?: string;
   now: Date;
 }>): TaskWake {
+  if (Object.hasOwn(input, "runId")) throw new Error("A notification wake cannot dispatch an AgentRun.");
   const wake: TaskWake = {
     schemaVersion: CURRENT_TASK_WAKE_SCHEMA_VERSION,
     id: requireIdentity(input.id, "Task wake id"),
@@ -68,7 +65,6 @@ export function createTaskWake(input: Readonly<{
     fromCursor: requireTimestamp(input.fromCursor, "Wake fromCursor"),
     toCursor: requireTimestamp(input.toCursor, "Wake toCursor"),
     status: "dispatched",
-    ...(input.runId === undefined ? {} : { runId: requireIdentity(input.runId, "Wake AgentRun id") }),
     createdAt: input.now.toISOString()
   };
   validateTaskWake(wake);
@@ -76,6 +72,7 @@ export function createTaskWake(input: Readonly<{
 }
 
 export function validateTaskWake(wake: TaskWake): void {
+  if (Object.hasOwn(wake, "runId")) throw new Error("Run-backed wakes are not current notification records.");
   if (wake.refs !== undefined) {
     if (!Array.isArray(wake.refs)) throw new Error("Wake references must be an array.");
     wake.refs.forEach(copyRef);
@@ -117,18 +114,6 @@ export function latestTaskWake(wakes: readonly TaskWake[]): TaskWake | null {
     if (latest === null || wake.seq > latest.seq) latest = wake;
   }
   return latest;
-}
-
-/**
- * The delta lower bound for a Task's first wake: the last Leader AgentRun's
- * creation time, preserving the pre-ledger watermark semantics. When no
- * Leader AgentRun exists, the Task's own creation time bounds the window.
- */
-export function fallbackWakeCursor(input: Readonly<{
-  taskCreatedAt: string;
-  leaderRunCreatedAt?: string;
-}>): string {
-  return input.leaderRunCreatedAt ?? input.taskCreatedAt;
 }
 
 function wakeSequence(id: string): number {

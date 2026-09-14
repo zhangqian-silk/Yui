@@ -1,5 +1,4 @@
 import {
-  existsSync,
   mkdirSync,
   readFileSync,
   rmSync,
@@ -9,6 +8,7 @@ import {
 import { join } from "node:path";
 import { performance } from "node:perf_hooks";
 import { setTimeout as delay } from "node:timers/promises";
+import { currentFileLockOwner, fileLockOwnerIsLive } from "../core/fileLockOwner.js";
 
 /**
  * Per-Project maintenance fence.
@@ -115,6 +115,7 @@ async function acquireWithBudget(
 ): Promise<() => void> {
   const lock = projectMaintenanceLockPath(home, projectId);
   assertNotCancelled(projectId, budget.signal);
+  const ownerIdentity = currentFileLockOwner();
   mkdirSync(join(home, "locks", "projects"), { recursive: true, mode: 0o700 });
   let firstAttempt = firstProject;
   while (true) {
@@ -127,7 +128,7 @@ async function acquireWithBudget(
     firstAttempt = false;
     try {
       mkdirSync(lock, { mode: 0o700 });
-      const ownerIdentity = writeOwnerIdentity(lock);
+      writeOwnerIdentity(lock, ownerIdentity);
       let released = false;
       return () => {
         if (released) return;
@@ -158,8 +159,7 @@ async function acquireWithBudget(
 }
 
 /** Write this process's owner identity and return the exact bytes recorded. */
-function writeOwnerIdentity(lock: string): string {
-  const identity = `${process.pid}:${processStartIdentity() ?? ""}`;
+function writeOwnerIdentity(lock: string, identity = currentFileLockOwner()): string {
   writeFileSync(join(lock, "owner"), `${identity}\n`, { mode: 0o600 });
   return identity;
 }
@@ -212,13 +212,13 @@ export async function acquireProjectMaintenanceLocks(
 
 /**
  * Non-blocking fence check for the Controller: a Project is fenced only
- * while a live process holds its lock. A stale (dead-owner) lock reads as
- * unfenced, so a crashed maintenance process never wedges preparation.
+ * while a live or unverified process holds its lock. Only proven stale owners
+ * read as unfenced; incomplete evidence never authorizes preparation.
  */
 export function isProjectMaintenanceFenced(home: string, projectId: string): boolean {
   const lock = projectMaintenanceLockPath(home, projectId);
-  if (!existsSync(lock)) return false;
-  return lockOwnerIsAlive(lock);
+  try { return fileLockOwnerIsLive(lock); }
+  catch { return true; }
 }
 
 /**
@@ -235,9 +235,8 @@ function reclaimStaleProjectMaintenanceLock(lock: string): void {
     expectedOwner = readFileSync(join(lock, "owner"), "utf8");
   } catch (error) {
     if (!isEnoent(error)) throw error;
-    // Ownerless lock: a crash between mkdir and owner publication. Reclaim
-    // only when the directory is old enough that the creator is not still
-    // initializing; a fresh lock may have its owner file written imminently.
+    // Allow publication its initial grace period; an older missing owner is
+    // diagnosed as unverified below, never treated as a dead creator.
     try {
       if (Date.now() - statSync(lock).mtimeMs < STALE_PROJECT_MAINTENANCE_LOCK_AGE_MS) return;
     } catch (statError) {
@@ -252,7 +251,7 @@ function reclaimStaleProjectMaintenanceLock(lock: string): void {
     if (isEnoent(error)) return;
     throw error;
   }
-  if (expectedOwner !== null && lockOwnerIsAlive(lock)) return;
+  if (fileLockOwnerIsLive(lock)) return;
 
   const reclaimLock = `${lock}.reclaim`;
   for (let attempt = 0; attempt < 2; attempt += 1) {
@@ -291,7 +290,7 @@ function reclaimStaleProjectMaintenanceLock(lock: string): void {
         currentOwner = null;
       }
       if (currentOwner !== expectedOwner) return;
-      if (currentOwner !== null && lockOwnerIsAlive(lock)) return;
+      if (fileLockOwnerIsLive(lock)) return;
       rmSync(lock, { recursive: true, force: true });
     } finally {
       rmSync(reclaimLock, { recursive: true, force: true });
@@ -302,65 +301,22 @@ function reclaimStaleProjectMaintenanceLock(lock: string): void {
 
 /**
  * Reclaim a reclaim-lock directory only when it is provably orphaned: its
- * owner is dead (or unrecorded) AND it is older than the age bound, so a
+ * owner is provably dead AND it is older than the age bound, so a
  * lock whose owner just mkdir'ed but has not written its owner is not stolen.
  * Uses the same PID + start-time identity check as the main fence, so a
  * recycled PID with a different start identity does not keep an orphaned
- * reclaim lock alive. An ownerless (ENOENT owner) lock is still reclaimed;
- * an unreadable owner fails closed (treated as live).
+ * reclaim lock alive. An ownerless or unreadable lock remains unverified.
  * Returns true when it removed the lock (caller retries), false otherwise.
  */
 function reclaimOrphanedReclaimLock(reclaimLock: string): boolean {
   try {
     if (Date.now() - statSync(reclaimLock).mtimeMs < STALE_PROJECT_MAINTENANCE_LOCK_AGE_MS) return false;
-    if (lockOwnerIsAlive(reclaimLock)) return false;
+    if (fileLockOwnerIsLive(reclaimLock)) return false;
     rmSync(reclaimLock, { recursive: true, force: true });
     return true;
   } catch (error) {
-    return isEnoent(error);
-  }
-}
-
-function lockOwnerIsAlive(lock: string): boolean {
-  let owner: string;
-  try {
-    owner = readFileSync(join(lock, "owner"), "utf8").trim();
-  } catch (error) {
-    if (error instanceof Error && "code" in error && error.code === "ENOENT") return false;
-    // An unreadable owner file fails closed: treat the fence as held.
-    return true;
-  }
-  const separator = owner.indexOf(":");
-  const pid = Number.parseInt(separator < 0 ? owner : owner.slice(0, separator), 10);
-  if (!Number.isInteger(pid) || pid <= 0) return false;
-  const recordedIdentity = separator < 0 ? "" : owner.slice(separator + 1);
-  // PID + start-time identity: a recycled PID can never match the holder.
-  const currentIdentity = processStartIdentity(pid);
-  if (currentIdentity !== undefined) {
-    return recordedIdentity !== "" && currentIdentity === recordedIdentity;
-  }
-  // Off /proc (non-Linux): fall back to liveness.
-  return processIsAlive(pid);
-}
-
-/** Linux process start time (clock ticks since boot) for a PID; undefined off /proc. */
-function processStartIdentity(pid: number = process.pid): string | undefined {
-  try {
-    const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
-    const close = stat.lastIndexOf(")");
-    const fields = stat.slice(close + 2).split(" ");
-    return fields[19] ?? "0"; // field 22: starttime
-  } catch {
-    return undefined;
-  }
-}
-
-function processIsAlive(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (error) {
-    return error instanceof Error && "code" in error && error.code === "EPERM";
+    if (isEnoent(error)) return true;
+    throw error;
   }
 }
 

@@ -102,6 +102,9 @@ wake 状态记录通知投递，不记录 Message 的实施结果。普通 Leade
 `notification.delivery` 事件、当前 mailbox 与 Session，不应要求每个历史 wake
 都对应一条最终回复。
 
+现行 wake 只表示通知，Run 完成不能消费 wake；首次通知窗口从 Task 创建时间开始。
+退役的 Run-linked wake 通过 Task 事件保留原 ID 和完整原文，不作为第二种活动 wake 格式。
+
 ## 输入时机：queue、steer 与 interrupt
 
 提交意图（`record / discuss / develop`）决定需求如何路由。输入时机决定一条已经

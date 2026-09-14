@@ -33,7 +33,7 @@ The current development step retires runtime compatibility before the final
 1.0 baseline cutover. It does not publish a release or reset storage numbering.
 Storage 27→28 normalizes only provable singleton Role dispatch dedupe keys;
 the old migration ledger, Messages, Task results and unconfirmed effects remain
-unchanged. Ordinary opens require storage 29. Existing Homes advance only through
+unchanged. Ordinary opens require storage 30. Existing Homes advance only through
 the explicit upgrade boundary; no runtime dual-reader is added.
 
 This is a breaking pre-1.0 change:
@@ -64,6 +64,26 @@ history. This does not accept delivery, generate an Integration or replay work.
 Existing Integrations and Jobs stay intact. Inspect `task event list <task>`
 and the referenced WorkItem/Integration before deciding what remains to do;
 retiring the queue does not settle an unfinished Integration.
+
+Storage 29→30 retires Run-linked wakes into `wake.run-link-retired` Task events
+with the complete original payload. Current notification IDs, delivery status
+and references remain intact, using wake schema 2; Run termination no longer
+consumes notifications. Live Runs, owned retries and unresolved claims referring
+to a retiring wake block both preflight and migration. The migration does not
+stop execution or fabricate acceptance. Global Session sets use an explicit
+`providerBinding: null` when no controlled binding exists.
+
+Additional current boundaries:
+
+- Project/artifact file locks and handover locks require exact process-generation
+  evidence. Missing/invalid owners or unreadable OS identity remain fenced;
+  age alone never proves a creator exited. No PID-only positive fallback remains.
+- PR head lookup uses one `gh pr list --head ... --state open` query. Only an
+  empty, valid array proves absence. Transport errors, malformed identities and
+  multiple matches fail without attempting creation.
+- Existing Git operations cannot be adopted without the Integration's original
+  progress receipt. Preserve their files and diagnose explicitly; current
+  receipt-backed conflict/Job continuation remains supported.
 
 Before rollout, settle old executions and use explicit cleanup for unsupported
 locks, links or quarantines. Preserve those records until their owner and

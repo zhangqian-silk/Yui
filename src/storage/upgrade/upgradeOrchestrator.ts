@@ -39,6 +39,7 @@ import {
   preflightCollapseWorktreeLayout,
   type CollapseWorktreePreflightBlocker
 } from "../migrations/collapseWorktreeLayout.js";
+import { preflightNotificationOnlyWakes } from "../migrations/notificationOnlyWakes.js";
 import {
   migrateSqliteSchema,
   storageMigrationPlan,
@@ -534,16 +535,17 @@ function blocked(
 }
 
 /**
- * Run each path-relocating data migration's READ-ONLY preflight against the
+ * Run each data migration's registered READ-ONLY preflight against the
  * current (pre-upgrade) database and, when any finds a blocker, return a
  * `blocked` result the caller surfaces before touching the Controller or the
- * Home. Returns `null` when the plan carries no path-relocating data migration,
+ * Home. Returns `null` when the plan carries no registered readiness check,
  * or when every preflight is clear.
  *
- * Both the 18->19 unify and the 19->20 collapse migrations physically relocate
+ * Both the 23->24 unify and the 24->25 collapse migrations physically relocate
  * managed worktrees and share the same blocker shape (in-flight Job, conflicting
  * relocation target). When a Home is upgraded across both in one run, their
- * blockers are aggregated so the operator sees every readiness problem at once.
+ * blockers are aggregated so the operator sees their readiness problems together.
+ * Notification retirement separately rejects unsettled execution references.
  *
  * The database is opened read-only so the checks cannot mutate the authoritative
  * store, and the handle is always closed. An unexpected failure to evaluate a
@@ -557,8 +559,8 @@ function preflightMigrationBlockers(
 ): Extract<UpgradeResult, { outcome: "blocked" }> | null {
   const relocatesUnify = plan.some((step) => step.name === "unify-home-layout");
   const relocatesCollapse = plan.some((step) => step.name === "collapse-worktree-layout");
-  // Only meaningful when the plan actually includes a path-relocating migration.
-  if (!relocatesUnify && !relocatesCollapse) return null;
+  const retiresRunWakes = plan.some((step) => step.name === "notification-only-wakes");
+  if (!relocatesUnify && !relocatesCollapse && !retiresRunWakes) return null;
 
   type MigrationBlocker = UnifyHomePreflightBlocker | CollapseWorktreePreflightBlocker;
   let blockers: MigrationBlocker[];
@@ -571,6 +573,7 @@ function preflightMigrationBlockers(
       blockers = [];
       if (relocatesUnify) blockers.push(...preflightUnifyHomeLayout(database).blockers);
       if (relocatesCollapse) blockers.push(...preflightCollapseWorktreeLayout(database).blockers);
+      if (retiresRunWakes) preflightNotificationOnlyWakes(database);
     } finally {
       database.close();
     }
@@ -580,8 +583,8 @@ function preflightMigrationBlockers(
         classification,
         "in-flight",
         `The storage migration readiness check could not be completed: ${messageOf(error)}`,
-        "Resolve the reported problem, confirm no Job is queued or running against a managed "
-          + "workspace, then rerun the upgrade."
+        "Resolve the named execution or resource boundary, preserving original input and results. "
+          + "Confirm the relevant Runs and Jobs are settled, then rerun the upgrade."
       )
     };
   }

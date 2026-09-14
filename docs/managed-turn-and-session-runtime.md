@@ -119,6 +119,11 @@ the successor's batch. While Session cleanup is pending, new input remains queue
 Inspect the wake, `notification.delivery` events, current mailbox and Session
 together; do not require one final response per historical wake.
 
+Current wakes are notification-only. Run completion cannot consume a wake, and
+the first notification window starts at Task creation. Retired Run-linked wake
+records remain in Task events with their original ID and payload, not as a
+second active wake format.
+
 ## Input timing: queue, steer and interrupt
 
 Submission intent (`record / discuss / develop`) decides how a requirement is

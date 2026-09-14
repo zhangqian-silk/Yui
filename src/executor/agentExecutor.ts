@@ -73,12 +73,12 @@ export type GlobalRoleSessionSet = RoleSessionSetBase<GlobalRoleSessionOwner> & 
   history?: Record<string, RoleAgentSession>;
   /**
    * Provider-native conversation and Turn observations for a Global Role's own
-   * Session, matching the Task Role shape (decision-3 §6/§9). It is optional and
-   * absent on older Global sets, as declared by the centralized v19 migration.
+   * Session, matching the Task Role shape. Null means no controlled binding;
+   * current records do not use an absent field as a second representation.
    * A Global control reads this binding to target the exact
    * current native Turn; it never fabricates a Task Role binding to do so.
    */
-  providerBinding?: ProviderRuntimeBinding | null;
+  providerBinding: ProviderRuntimeBinding | null;
   /** Native control evidence, not input intent or an execution queue. */
   interrupts?: Record<string, {
     fingerprint: string; attemptId: string; nativeSessionId: string; receiptId: string;
@@ -156,7 +156,7 @@ export function createRoleSessionSet(
     updatedAt: now.toISOString()
   };
   return owner.scope === "global"
-    ? { ...base, schemaVersion: 5 } as GlobalRoleSessionSet
+    ? { ...base, schemaVersion: 5, providerBinding: null } as GlobalRoleSessionSet
     : {
         ...base,
         schemaVersion: 12,
@@ -715,13 +715,10 @@ export function validateRoleSessionSet<TSet extends RoleSessionSet>(set: TSet): 
         }
       }
     }
-    // A Global Role now carries the same optional Provider Runtime Binding shape
-    // as a Task Role (decision-3 §6/§9). It stays absent on every legacy set;
-    // when present, it is the exact native control evidence a Global steer or
-    // interrupt targets, validated identically to the Task branch. A fabricated
-    // Task binding is never accepted here, and its presence never upgrades the
-    // schemaVersion these raw-JSON sets are read at.
-    if (Object.hasOwn(globalSet, "providerBinding") && globalSet.providerBinding != null) {
+    if (!Object.hasOwn(globalSet, "providerBinding")) {
+      throw new Error("Global Role session set must contain its Provider Runtime Binding.");
+    }
+    if (globalSet.providerBinding !== null) {
       const providerBinding = validateProviderRuntimeBinding(globalSet.providerBinding);
       const conversationId = currentProviderConversation(providerBinding).conversationId;
       const session = [...Object.values(globalSet.sessions), ...Object.values(globalSet.history ?? {})]

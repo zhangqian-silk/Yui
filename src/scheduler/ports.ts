@@ -465,16 +465,6 @@ export interface SchedulerStorePort {
   getTaskBrief(taskId: string): TaskBrief | null;
   listDecisions(taskId: string): readonly Decision[];
   listMilestones(taskId: string): readonly Milestone[];
-  /**
-   * Issue 04 (long-term): the minimal wake envelope for a Leader wake —
-   * aggregated reason tags, the delta window, and read pointers. The Agent
-   * reads delta content on demand with `yui task wake show`. Returns null
-   * when no wake is pending. Optional so adapters without the feature keep
-   * the full-context prompt.
-   */
-  getTaskWakeEnvelope?(
-    taskId: string
-  ): import("../context/wakeNotification.js").WakeEnvelope | null;
   claimLeaderNotification(taskId: string, now: Date): LeaderNotification | null;
   prepareMessageContinuations?(taskId: string, now: Date): void;
   prepareDraftPlanning?(taskId: string, now: Date): boolean;
