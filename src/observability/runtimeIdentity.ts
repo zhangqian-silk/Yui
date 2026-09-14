@@ -29,24 +29,6 @@ export const UNSUPPORTED = "unsupported" as const;
 export type Unsupported = typeof UNSUPPORTED;
 export type OptionalFact = string | Unsupported;
 
-/**
- * Feature flag for the Issue 11 read-only status/audit presentation.
- *
- * Everything behind this flag is observe-only: identity fields, storage
- * evidence, and metrics snapshots. The flag defaults ON because the fields
- * change no behavior; set `YUI_STATUS_IDENTITY=0` (or `false`) to hide the new
- * sections and the fail-closed health exit. `execution audit` is an explicit
- * command and is not gated by this flag.
- */
-export function resolveStatusIdentityEnabled(
-  env: NodeJS.ProcessEnv = process.env
-): boolean {
-  const value = env.YUI_STATUS_IDENTITY;
-  if (value === undefined) return true;
-  const normalized = value.trim().toLowerCase();
-  return normalized !== "0" && normalized !== "false" && normalized !== "off";
-}
-
 export type RuntimeBuildIdentity = Readonly<{
   packageName: string;
   packageVersion: string;
@@ -359,7 +341,7 @@ export function collectStorageIdentity(
       code: "ignored-legacy-storage-manifest",
       severity: "warning",
       message: "schema.json is legacy metadata and is not a storage authority.",
-      remediation: "A successful storage upgrade removes it automatically."
+      remediation: "This file is not used. Preserve or archive it separately after inspecting its contents."
     });
   }
   if (dbPresent && dbHealth !== null && dbHealth !== "ok") {

@@ -179,8 +179,7 @@ import {
   collectStorageIdentity,
   countDroppedInboxEvents,
   createProductionRuntimeIdentityPorts,
-  evaluateStorageHealth,
-  resolveStatusIdentityEnabled
+  evaluateStorageHealth
 } from "./observability/runtimeIdentity.js";
 import {
   listOperatorSessions,
@@ -660,51 +659,41 @@ export async function main(): Promise<void> {
         scope: options.scope,
         environment: process.env
       });
-      if (resolveStatusIdentityEnabled(process.env)) {
-        // Issue 11 read-only identity/metrics section. Every fact is observed;
-        // missing producers render `unsupported` and storage contradictions
-        // fail closed with exit code 5.
-        const cliEntry = fileURLToPath(import.meta.url);
-        const packageRoot = resolve(cliEntry, "..", "..");
-        const build = collectRuntimeBuildIdentity(
-          createProductionRuntimeIdentityPorts(packageRoot, cliEntry, process.env)
-        );
-        const storage = collectStorageIdentity(home);
-        const droppedEvents = countDroppedInboxEvents(home);
-        let runtime: ControllerRuntimeSnapshot;
-        try {
-          const result = await callController(
-            home,
-            "controller.status",
-            {},
-            { timeoutMs: 2_000 }
-          );
-          runtime = parseControllerRuntimeSnapshot(result, droppedEvents);
-        } catch {
-          runtime = { source: "unsupported", droppedEvents };
-        }
-        const mismatch = summarizeDurablePhysicalMismatch(snapshot);
-        const identitySection = renderRuntimeIdentitySection({
-          build,
-          storage,
-          runtime,
-          mismatch,
-          inventoryRssBytes: snapshot.summary.rssBytes
-        });
-        emit(
-          `${renderControllerResourceStatus(snapshot, options.verbose)}\n\n${identitySection}`,
-          false,
-          { ...snapshot, identity: { build, storage, runtime, mismatch } }
-        );
-        // The exact current storage contract fails closed on contradictions.
-        if (evaluateStorageHealth(storage).status === "fail") process.exitCode = 5;
-        return;
-      }
-      emit(
-        renderControllerResourceStatus(snapshot, options.verbose),
-        false,
-        snapshot
+      // Status always includes identity/health. Missing producers stay
+      // `unsupported`; storage contradictions retain the nonzero health exit.
+      const cliEntry = fileURLToPath(import.meta.url);
+      const packageRoot = resolve(cliEntry, "..", "..");
+      const build = collectRuntimeBuildIdentity(
+        createProductionRuntimeIdentityPorts(packageRoot, cliEntry, process.env)
       );
+      const storage = collectStorageIdentity(home);
+      const droppedEvents = countDroppedInboxEvents(home);
+      let runtime: ControllerRuntimeSnapshot;
+      try {
+        const result = await callController(
+          home,
+          "controller.status",
+          {},
+          { timeoutMs: 2_000 }
+        );
+        runtime = parseControllerRuntimeSnapshot(result, droppedEvents);
+      } catch {
+        runtime = { source: "unsupported", droppedEvents };
+      }
+      const mismatch = summarizeDurablePhysicalMismatch(snapshot);
+      const identitySection = renderRuntimeIdentitySection({
+        build,
+        storage,
+        runtime,
+        mismatch,
+        inventoryRssBytes: snapshot.summary.rssBytes
+      });
+      emit(
+        `${renderControllerResourceStatus(snapshot, options.verbose)}\n\n${identitySection}`,
+        false,
+        { ...snapshot, identity: { build, storage, runtime, mismatch } }
+      );
+      if (evaluateStorageHealth(storage).status === "fail") process.exitCode = 5;
       return;
     }
     if (method === "cleanup") {
@@ -1982,7 +1971,7 @@ export async function main(): Promise<void> {
                 requestedRound.taskId,
                 requestedRound.id
               );
-              const freshTaskCandidate = (storedRound?.scope ?? "work-item") === "task"
+              const freshTaskCandidate = storedRound?.scope === "task"
                 ? await snapshotActualTaskReviewCandidate(
                   requestedRound.taskId,
                   store,
@@ -2786,7 +2775,7 @@ async function actualTaskReviewCandidateForTaskCommand(
     && args[3] !== undefined) {
     const reference = cliTaskRecordReference(args[3], "reviewRound", environment);
     const round = store.getReviewRound(reference.taskId, reference.localId);
-    if (round !== null && (round.scope ?? "work-item") === "task") {
+    if (round !== null && round.scope === "task") {
       taskId = reference.taskId;
     }
   } else if (args[1] === "work"
@@ -2795,7 +2784,7 @@ async function actualTaskReviewCandidateForTaskCommand(
     && args[4] !== undefined) {
     const reference = cliTaskRecordReference(args[4], "reviewRound", environment);
     const round = store.getReviewRound(reference.taskId, reference.localId);
-    if (round !== null && (round.scope ?? "work-item") === "task") {
+    if (round !== null && round.scope === "task") {
       taskId = reference.taskId;
     }
   } else if (args[1] === "run"
@@ -2808,7 +2797,7 @@ async function actualTaskReviewCandidateForTaskCommand(
       : store.getReviewRound(reference.taskId, run.reviewRoundId);
     if (run?.purpose === "review"
       && round !== null
-      && (round.scope ?? "work-item") === "task") {
+      && round.scope === "task") {
       taskId = reference.taskId;
     }
   } else if (args[1] === "archive"

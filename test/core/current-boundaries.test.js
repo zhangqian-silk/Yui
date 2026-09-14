@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import fs from "node:fs";
 import { syncBuiltinESMExports } from "node:module";
+import { createHash } from "node:crypto";
 import {
   acquireProjectMaintenanceLock, isProjectMaintenanceFenced, projectMaintenanceLockPath
 } from "../../dist/repository/projectMaintenanceLock.js";
@@ -12,6 +13,78 @@ import { acquireArtifactCommitLock, artifactCommitLockPath } from "../../dist/ar
 import { createReleaseWorkflowPorts } from "../../dist/release/releaseWorkflowPorts.js";
 import { currentFileLockOwner } from "../../dist/core/fileLockOwner.js";
 import { isForeignHandoverLockHeld } from "../../dist/release/runtimeRelease.js";
+import { SqliteTaskStore } from "../../dist/storage/sqliteStore.js";
+import { inspectStorageSchema } from "../../dist/storage/storageSchema.js";
+import { initializeCurrentTaskStore, openCurrentTaskStore } from "../../dist/storage/currentTaskStore.js";
+import { TmuxManager, yuiTmuxSessionName } from "../../dist/tmux/tmuxManager.js";
+import { resetDevHome } from "../../scripts/manage-dev-launcher.mjs";
+
+test("SQLite alone decides Home admission and reset; extra files never supply authority", async t => {
+  const home = mkdtempSync(join(tmpdir(), "yui-home-admission-"));
+  t.after(() => rmSync(home, { recursive: true, force: true }));
+  const store = new SqliteTaskStore(home);
+  const identity = store.getHomeIdentity();
+  store.close();
+  const before = readFileSync(join(home, "yui.db"));
+  for (const marker of ["schema.json", "state.json"]) {
+    writeFileSync(join(home, marker), "retained original evidence");
+    assert.equal(inspectStorageSchema(home).status, "current");
+    const reopened = openCurrentTaskStore(home);
+    try { assert.deepEqual(reopened.getHomeIdentity(), identity); }
+    finally { reopened.close(); }
+    assert.equal(readFileSync(join(home, marker), "utf8"), "retained original evidence");
+  }
+  assert.deepEqual(readFileSync(join(home, "yui.db")), before);
+  const incomplete = join(home, "incomplete");
+  mkdirSync(incomplete);
+  writeFileSync(join(incomplete, "state.json"), "unrecognized evidence");
+  assert.equal(inspectStorageSchema(incomplete).status, "invalid");
+  assert.throws(() => initializeCurrentTaskStore(incomplete), /supported storage contract/);
+  assert.equal(existsSync(join(incomplete, "yui.db")), false);
+  const resetRoot = join(home, "reset");
+  const resetHome = join(resetRoot, "home");
+  mkdirSync(resetHome, { recursive: true });
+  writeFileSync(join(resetHome, "state.json"), JSON.stringify({ homeIdentity: { homeId: identity.homeId } }));
+  await assert.rejects(resetDevHome({ outputDir: resetRoot }), /Cannot verify development Controller/);
+  assert.equal(existsSync(resetHome), true);
+  assert.equal(existsSync(join(resetHome, "yui.db")), false);
+  const knownResetRoot = join(home, "known-reset");
+  const knownResetHome = join(knownResetRoot, "home");
+  new SqliteTaskStore(knownResetHome).close();
+  writeFileSync(join(knownResetHome, "state.json"), "retained evidence");
+  const reset = await resetDevHome({ outputDir: knownResetRoot });
+  assert.equal(reset.moved, true);
+  assert.equal(existsSync(join(reset.backupPath, "yui.db")), true);
+  assert.equal(existsSync(join(reset.backupPath, "state.json")), true);
+});
+
+test("tmux writer scope uses current lease identities and diagnoses unknown owners without changing them", async () => {
+  const home = "/unused-in-memory-tmux-home";
+  const task = "task-1";
+  const session = yuiTmuxSessionName(home, task);
+  const role = createHash("sha256").update("leader").digest("hex").slice(0, 24);
+  let lease = `yui-writer-role-${role}-${"a".repeat(24)}`;
+  let clients = "";
+  const run = (_command, args) => {
+    if (args[2] === "list-sessions") return `${session}\x1f\n${lease}\x1f${session}\n`;
+    if (args[2] === "list-clients") return clients;
+    assert.fail(`Writer inspection must not mutate tmux: ${args.join(" ")}`);
+  };
+  const tmux = new TmuxManager("fixture-tmux", { run, runAsync: async (...args) => run(...args) }, { yuiHome: home });
+  assert.equal(tmux.hasWritableClient(task, "leader"), true);
+  assert.equal(await tmux.hasWritableClientAsync(task, "worker"), false);
+  lease = `yui-writer-host-${"b".repeat(24)}`;
+  assert.equal(tmux.hasWritableClient(task, "worker"), true);
+  lease = "yui-writer-unscoped";
+  assert.throws(() => tmux.hasWritableClient(task, "leader"), /Unverified.*writer/i);
+  await assert.rejects(tmux.hasWritableClientAsync(task), /Unverified.*writer/i);
+  assert.equal(lease, "yui-writer-unscoped");
+  lease = "ordinary-viewer";
+  clients = `${lease}\x1f${session}\x1f0\n`;
+  assert.equal(tmux.hasWritableClient(task, "worker"), true, "A direct writable client still fences every Role.");
+  clients = `${lease}\x1f${session}\x1f1\n`;
+  assert.equal(tmux.hasWritableClient(task, "worker"), false);
+});
 
 test("unverifiable lock owners never authorize reclaim or a protected operation", async t => {
   const home = mkdtempSync(join(tmpdir(), "yui-current-locks-"));

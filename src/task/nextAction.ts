@@ -526,7 +526,7 @@ export function projectNextAction(facts: NextActionFacts): NextAction {
   if (deliveryWorkItems.length === 0
     && !taskFinalReviewRequired(facts)
     && !facts.reviewRounds.some((round) => (
-      (round.scope ?? "work-item") === "task"
+      round.scope === "task"
       && (round.status === "pending" || round.status === "running")
     ))) {
     const reviewAlternative = facts.reviewConfig === null
@@ -1066,7 +1066,7 @@ function latestTaskFinalReview(
   return [...rounds]
     .reverse()
     .find((round) => (
-      (round.scope ?? "work-item") === "task"
+      round.scope === "task"
       && (contract === undefined || sameTaskFinalReviewContract(
         round.taskFinalReviewContract,
         contract
@@ -1079,7 +1079,7 @@ function hasValidFinalReview(facts: NextActionFacts): boolean {
   const final = [...facts.reviewRounds]
     .reverse()
     .find((round) => (
-      (round.scope ?? "work-item") === "task"
+      round.scope === "task"
       && (contract === undefined || sameTaskFinalReviewContract(
         round.taskFinalReviewContract,
         contract
@@ -1112,7 +1112,7 @@ function detectProtocolInconsistency(facts: NextActionFacts): Inconsistency | nu
     });
     const reviewRefs = facts.reviewRounds
       .filter((round) => (
-        (round.scope ?? "work-item") === "task"
+        round.scope === "task"
         && round.taskFinalReviewContract !== undefined
       ))
       .map((round) => ref("review-round", round.id));

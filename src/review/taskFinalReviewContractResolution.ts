@@ -32,7 +32,7 @@ export function resolveRecordedTaskFinalReviewContract(
           }]
     ))),
     ...reviewRounds.flatMap((round) => (
-      (round.scope ?? "work-item") !== "task"
+      round.scope !== "task"
       || round.taskFinalReviewContract === undefined
         ? []
         : [{

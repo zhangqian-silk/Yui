@@ -65,7 +65,7 @@ export function projectReviewDecision(input: Readonly<{
   currentCandidate: TaskReviewCandidate | null;
 }>): ReviewDecisionProjection {
   const { store, task, roles, runs, rounds, reviewConfig, currentCandidate } = input;
-  const taskRounds = rounds.filter((round) => (round.scope ?? "work-item") === "task");
+  const taskRounds = rounds.filter((round) => round.scope === "task");
   const accepted = [...taskRounds]
     .filter((round) => isCompletedTaskReviewEvidence(store, round))
     .sort(compareRoundIdentity)

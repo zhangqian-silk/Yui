@@ -38,12 +38,12 @@ Inspect current Projects, Tasks, and relevant Task context before routing:
 
 ```sh
 yui project list
-yui task list --view compact --json
+yui task list --json
 yui task context <candidate-task-id>
 ```
 
-Use the bounded catalog for discovery, not the detailed legacy list or an
-unconditional traversal of every page. Filter by Project/status/search when
+Task listing is a bounded catalog. Do not unconditionally traverse every page.
+Filter by Project/status/search when
 useful; follow `nextCursor` with the same filters only when more candidates
 are needed. Attention counts cover the authorized catalog before ordinary
 filters and pagination. Follow a category's `--attention` query to enumerate
@@ -52,7 +52,6 @@ its affected Tasks, clearing ordinary filters and retaining its `all` flag.
 candidates (including live Runs and open work), not a computed failure or
 execution status. Inspect the selected Task's Context and original Messages
 before routing or deciding; a summary/ref is not the requirement or report.
-The existing detailed list remains available to explicit legacy consumers.
 
 Route new input to an existing Task when it advances, corrects, narrows, or
 extends the same bounded outcome and shares final acceptance, delivery, or
@@ -83,7 +82,7 @@ can adopt an eligible request in the foreground; it never activates a Draft
 without a recorded request and environment plan.
 
 Choose the submission intent explicitly; it is never inferred from the message
-text. `discuss` (the default, and what an old client sends) routes the Draft to
+text. `discuss` (the default) routes the Draft to
 planning; `record` saves the message without waking the Leader; `develop` asks an
 unplanned Draft to activate now, and reports the exact next step when it cannot
 (already planned → request activation explicitly; execution stopped → start it first). Pass

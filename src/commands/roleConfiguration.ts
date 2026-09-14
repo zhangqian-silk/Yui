@@ -238,14 +238,8 @@ function permissionPatch(
   }
   const current = binding.config.permission;
   if (selected !== "configured" && !nativeOptions) {
-    // Nothing about permission was named, so the binding keeps what it already
-    // had. The fallback applies only to a binding that somehow carries no
-    // permission at all, and it must be the adapter's own default rather than a
-    // fixed `bypass`: ACP defaults to `default`, and defaulting it to bypass
-    // here would widen authority the user never granted.
-    return structuredClone(
-      current ?? defaultRoleAgentConfig(binding.adapterId).permission
-    ) as Record<string, unknown>;
+    // The validated binding always has its explicit permission strategy.
+    return structuredClone(current) as Record<string, unknown>;
   }
   const permission = current?.strategy === "configured"
     ? structuredClone(current) as unknown as Record<string, unknown>

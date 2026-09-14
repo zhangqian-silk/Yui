@@ -17,7 +17,6 @@ import type { SurfaceContributionRef, SurfacePanelContribution } from "../surfac
 import type { CapabilityResult } from "../kernel/capabilityRegistry.js";
 import { DASHBOARD_HTML, findWebAsset, type WebAsset } from "./assets/assetManifest.js";
 import {
-  buildWebDashboardSnapshot,
   buildWebTaskCatalog,
   buildWebTaskDetail,
   type WebDashboardStore
@@ -314,12 +313,10 @@ async function handleHttpRequest(
         sendAsset(response, asset, method === "HEAD");
       } else if (pathname === "/api/dashboard") {
         const query = new URL(request.url!, "http://localhost").searchParams;
-        const snapshot = query.has("view")
-          ? buildWebTaskCatalog(store, parseTaskCatalogOptions(
-            [...query].flatMap(([key, value]) => key === "all"
-              ? (value === "true" ? ["--all"] : ["--invalid-all"])
-              : [`--${key}`, value])))
-          : buildWebDashboardSnapshot(store, now());
+        const snapshot = buildWebTaskCatalog(store, parseTaskCatalogOptions(
+          [...query].flatMap(([key, value]) => key === "all"
+            ? (value === "true" ? ["--all"] : ["--invalid-all"])
+            : [`--${key}`, value])));
         sendJson(response, 200, snapshot, method === "HEAD");
       } else if (pathname.startsWith("/api/tasks/")) {
         const taskId = decodeURIComponent(pathname.slice("/api/tasks/".length));

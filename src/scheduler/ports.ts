@@ -258,19 +258,15 @@ export type AgentRunProgressFacts = Readonly<{
 export interface SchedulerStorePort {
   listTasks(): readonly SchedulerTask[];
   /**
-   * Indexed active-Task selection for full Controller reconciliation. Stores
-   * that do not expose the projection retain their existing selection path;
-   * production SQLite storage provides it directly from `tasks_catalog`.
+   * Indexed active-Task selection for full Controller reconciliation.
    */
-  listActiveTaskIds?(): readonly string[];
+  listActiveTaskIds(): readonly string[];
   /**
    * Draft Task ids that already carry an active planning Turn. Planning is the
    * one purpose admitted before activation, so the phases that keep an admitted
    * Turn converging can resolve those Drafts without scanning Task history.
-   * Optional: a store without the projection falls back to the full scan, which
-   * still consults the durable Turn before admitting anything.
    */
-  listPlanningDraftTaskIds?(): readonly string[];
+  listPlanningDraftTaskIds(): readonly string[];
   /**
    * Draft Task ids whose activation request is still pending. A deferral is
    * released by its planning Turn ending, which enqueues a mailbox signal — but
@@ -278,12 +274,9 @@ export interface SchedulerStorePort {
    * is acted on, has no dirty key to reconcile from. Full reconciliation reads
    * this projection instead, so a released request is recovered rather than
    * waiting for unrelated traffic on the Task.
-   *
-   * Optional: a store without the projection falls back to the full scan. The
-   * request itself is still re-read at the adoption boundary, so this only
-   * decides which Tasks are looked at, never whether one is adopted.
+   * The request is re-read at adoption; this index grants no authority.
    */
-  listPendingActivationRequestTaskIds?(): readonly string[];
+  listPendingActivationRequestTaskIds(): readonly string[];
   getTask(taskId: string): SchedulerTask | null;
   /** Durable Task-owned main workspace used to fence every active launch. */
   getTaskWorkspace(taskId: string): ManagedWorkspace | null;
@@ -368,7 +361,7 @@ export interface SchedulerStorePort {
    * ready-work projection. Production Controller full passes use this method
    * so empty historical mailboxes never enter reconciliation.
    */
-  listReadyWorkMailboxes?(): readonly WorkMailbox[];
+  listReadyWorkMailboxes(): readonly WorkMailbox[];
   claimWorkMailbox(input: SchedulerMailboxClaimInput): SchedulerMailboxClaimResult;
   /** Settles the exact ordinary Role dispatch after acceptance or terminalization. */
   settleRoleRunDispatch(input: Readonly<{
@@ -562,7 +555,7 @@ export function selectedSchedulerTasks(
 export function selectedActiveSchedulerTasks(
   store: Pick<
     SchedulerStorePort,
-    "listTasks" | "listActiveTaskIds" | "getTask" | "listPlanningDraftTaskIds"
+    "listActiveTaskIds" | "getTask" | "listPlanningDraftTaskIds" | "listRoles" | "getActiveRun"
   >,
   selection?: SchedulerReconcileSelection,
   options?: Readonly<{ includePlanningDrafts?: boolean }>
@@ -574,16 +567,11 @@ export function selectedActiveSchedulerTasks(
     return planningDrafts && hasActivePlanningRun(store, task);
   };
   if (selection === undefined || selection.full) {
-    const indexedTaskIds = store.listActiveTaskIds?.();
-    if (indexedTaskIds === undefined) {
-      return store.listTasks().filter((task) => (
-        admits(task) && !selection?.blockedTaskIds?.has(task.id)
-      ));
-    }
+    const indexedTaskIds = store.listActiveTaskIds();
     // The active index is bounded and authoritative for active Tasks; planning
     // Drafts come from their own bounded index rather than a full-history scan.
     const taskIds = planningDrafts
-      ? [...indexedTaskIds, ...(store.listPlanningDraftTaskIds?.() ?? [])]
+      ? [...indexedTaskIds, ...store.listPlanningDraftTaskIds()]
       : [...indexedTaskIds];
     const seen = new Set<string>();
     return taskIds.flatMap((taskId) => {
@@ -607,14 +595,13 @@ export function selectedActiveSchedulerTasks(
  * status alone.
  */
 function hasActivePlanningRun(
-  store: Pick<SchedulerStorePort, "getTask">
-    & Partial<Pick<SchedulerStorePort, "listRoles" | "getActiveRun">>,
+  store: Pick<SchedulerStorePort, "listRoles" | "getActiveRun">,
   task: SchedulerTask
 ): boolean {
   if (task.status !== "draft") return false;
-  const roles = store.listRoles?.(task.id) ?? [];
+  const roles = store.listRoles(task.id);
   return roles.some((role) => {
-    const run = store.getActiveRun?.(task.id, role.name) ?? null;
+    const run = store.getActiveRun(task.id, role.name);
     return run !== null
       && run.status === "active"
       && isSchedulerPlanningDraft(task, run.purpose);

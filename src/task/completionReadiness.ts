@@ -128,7 +128,7 @@ export function projectCompletionReadiness(
 
   // A pending/running Task-final Review must be resumed or blocked first.
   for (const round of facts.reviewRounds) {
-    if ((round.scope ?? "work-item") !== "task") continue;
+    if (round.scope !== "task") continue;
     if (round.status !== "pending" && round.status !== "running") continue;
     blockers.push({
       code: "active-task-review",

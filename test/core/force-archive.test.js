@@ -29,7 +29,7 @@ import { createRun } from "../../dist/agentRun/agentRun.js";
 import { createRunInput } from "../../dist/context/runInputContract.js";
 import { createDurableJob } from "../../dist/job/durableJob.js";
 import { createTaskRemoteDeliveryProof } from "../../dist/task/remoteDeliveryService.js";
-import { buildWebDashboardSnapshot } from "../../dist/web/webSnapshot.js";
+import { buildWebTaskCatalog, buildWebTaskDetail } from "../../dist/web/webSnapshot.js";
 
 const now = new Date("2026-09-12T00:00:00Z");
 const base = "a".repeat(40);
@@ -84,10 +84,11 @@ test("force archive commits despite stale delivery and retained resources, prese
   const input = { id: "input-1", taskId: task.id, status: "open" };
   const listInputs = store.listInputRequests;
   store.listInputRequests = () => [input];
-  const dashboard = buildWebDashboardSnapshot(store, now);
-  assert.equal(dashboard.counts.openInputs, 0);
-  assert.deepEqual(dashboard.attention, []);
-  assert.equal(dashboard.tasks[0].openInputCount, 1, "explicit archived detail retains unresolved facts");
+  const dashboard = buildWebTaskCatalog(store, { all: false, limit: 20 });
+  assert.equal(dashboard.attention.openInputs.count, 0);
+  assert.deepEqual(dashboard.tasks, []);
+  assert.equal(buildWebTaskDetail(store, task.id, now).openInputs.length, 1,
+    "explicit archived detail retains unresolved facts");
   store.listInputRequests = listInputs;
   const events = store.listEvents(task.id);
   command(["archive", task.id, "--integrated", "--force"]);

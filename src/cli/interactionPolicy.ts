@@ -289,7 +289,10 @@ export const INTERACTION_POLICIES: readonly InteractionPolicy[] = Object.freeze(
   {
     commandPath: ["task", "list"],
     selectors: [],
-    trailingOptions: { "--all": "flag", "--verbose": "flag" }
+    trailingOptions: {
+      "--all": "flag", "--status": "value", "--project": "value",
+      "--search": "value", "--attention": "value", "--limit": "value", "--cursor": "value"
+    }
   },
   {
     ...taskTarget("remote-delivery"),

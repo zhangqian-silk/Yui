@@ -66,8 +66,8 @@ export type ReviewRound = {
   reviewerRoleName: string;
   reviewerRunId?: string;
   reviewBaseCommit: string;
-  /** WorkItem review by default; `task` reviews the complete frozen Task. */
-  scope?: ReviewScope;
+  /** Exact review boundary; never inferred from a missing field. */
+  scope: ReviewScope;
   /** Present only when this round reviews the complete frozen Task. */
   taskCandidate?: TaskReviewCandidate;
   /** Exact Task/control capability that established this Task-final gate. */
@@ -105,6 +105,7 @@ export function createReviewRound(
     taskId: requireIdentity(taskId, "Task id"),
     workItemId: requireIdentity(workItemId, "Work Item id"),
     candidateId: requireIdentity(candidateId, "Candidate id"),
+    scope: "work-item",
     reviewerRoleName: requireIdentity(reviewerRoleName, "Reviewer Role"),
     reviewBaseCommit: requireCommit(reviewBaseCommit, "Review base commit"),
     requestedBy: validateReviewRequestSource(requestedBy),
@@ -270,12 +271,12 @@ export function retryReviewRound(
   if (round.status !== "failed") {
     throw new Error(`ReviewRound ${round.id} is not retryable from ${round.status}.`);
   }
-  const taskScope = (round.scope ?? "work-item") === "task";
+  const taskScope = round.scope === "task";
   return validateReviewRound({
     schemaVersion: round.schemaVersion,
     id: round.id,
     taskId: round.taskId,
-    ...(round.scope === undefined ? {} : { scope: round.scope }),
+    scope: round.scope,
     ...(taskScope
       ? {}
       : {
@@ -328,7 +329,7 @@ export function retryTaskReviewRound(
   requestedBy: TaskCompletedBy,
   now: Date
 ): ReviewRound {
-  if ((round.scope ?? "work-item") !== "task") {
+  if (round.scope !== "task") {
     throw new Error(`Only a Task-final ReviewRound can be retried in place: ${round.id}.`);
   }
   return retryReviewRound(round, requestedBy, now);
@@ -448,7 +449,7 @@ export function validateReviewRound(round: ReviewRound): ReviewRound {
   validateTaskRecordReference({ taskId: round.taskId, localId: round.id }, "reviewRound");
   requireIdentity(round.reviewerRoleName, "Reviewer Role");
   requireCommit(round.reviewBaseCommit, "Review base commit");
-  const scope = round.scope ?? "work-item";
+  const scope = round.scope;
   if (scope !== "work-item" && scope !== "task") {
     throw new Error(`ReviewRound scope is invalid: ${String(round.scope)}.`);
   }
@@ -604,10 +605,10 @@ function validateReviewExecutionGroup(
     || assignment.taskId !== round.taskId
     || assignment.reviewRoundId !== round.id
     || assignment.reviewBaseCommit !== round.reviewBaseCommit
-    || assignment.scope !== (round.scope ?? "work-item")) {
+    || assignment.scope !== round.scope) {
     throw new Error(`ReviewRound ExecutionGroup provenance is invalid: ${round.id}.`);
   }
-  if ((round.scope ?? "work-item") === "work-item"
+  if (round.scope === "work-item"
     && (assignment.workItemId !== round.workItemId
       || assignment.candidateId !== round.candidateId)) {
     throw new Error(`ReviewRound ExecutionGroup WorkItem target is invalid: ${round.id}.`);

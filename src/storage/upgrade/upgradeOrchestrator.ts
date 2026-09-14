@@ -322,7 +322,6 @@ export async function runStorageUpgrade(options: RunStorageUpgradeOptions): Prom
       database.close();
     }
     validateCurrentStore(options.home);
-    rmSync(join(options.home, "schema.json"), { force: true });
   } catch (error) {
     const restoration = migrationCommitted
       ? tryRestoreDatabaseBackup(options.home, backupPath)

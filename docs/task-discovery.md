@@ -2,25 +2,24 @@
 
 # Bounded Task discovery
 
-Agents discover candidates with `yui task list --view compact --json`, then
+Agents discover candidates with `yui task list --json`, then
 read the selected Task's Context and original Messages. The catalog is a
 current read, not a summary database, a Context snapshot, an acknowledgement,
 or an execution/acceptance decision.
 
-The explicit compact view keeps `task list --json` and `--verbose` detailed
-outputs unchanged for existing consumers. The built-in Operator uses compact;
-internal interactive selectors retain their complete `{id,title,status}` array
-and read only those columns. Web uses the same compact query at
-`GET /api/dashboard?view=compact`; its existing dashboard and Task detail
-endpoints retain execution, observability, usage and remote-delivery fields.
-No storage schema or migration changes are required.
+The catalog is the only list contract; there is no `--view` selector or
+`--verbose` full-history list. Internal interactive selectors retain their
+complete `{id,title,status}` array and read only those columns. Web uses the
+same query at `GET /api/dashboard`. The per-Task detail endpoint retains
+execution, observability, usage and remote-delivery fields. Discovery itself
+does not change persistent records.
 
 ## Query and page contract
 
 ```sh
-yui task list --view compact --project project-1 --status active --limit 20 --json
-yui task list --view compact --attention openInputs --json
-yui task list --view compact --search "candidate title" --json
+yui task list --project project-1 --status active --limit 20 --json
+yui task list --attention openInputs --json
+yui task list --search "candidate title" --json
 yui task context task-1 --json
 yui task context inspect task-1 --store task --ref task-1 --digest <digest> --json
 yui task message show task-1/message-1 --json

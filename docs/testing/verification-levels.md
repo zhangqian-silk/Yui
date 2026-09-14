@@ -140,6 +140,10 @@ is required.
     failure through injected ports. Receipt-free Git operations remain unchanged,
     while normal receipt-backed continuation still works. Notification-only
     migration preserves current delivery and audit history and refuses live links.
+28. SQLite admission ignores unrelated side files but refuses a non-empty Home
+    without its database. Default CLI/HTTP discovery stays bounded and retains
+    off-page Task detail; unknown writer leases diagnose without mutation.
+    Review migration preserves candidate evidence while making scope explicit.
 
 Keep the test phase seconds-scale; measure TypeScript build separately. Record
 incremental runtime when adding a critical regression. The seven recovery boundary
@@ -186,6 +190,9 @@ and never calls an installed model Agent.
 artifact and provenance boundaries. This validates runtime integration, not
 real-model behavior. Pure contract and safety tests remain in `test/core`;
 production wiring is exercised here rather than only through mocked ports.
+The package smoke also checks unconditional status identity and update-owned
+resource/identity capture through the assembled package, without an installation
+or publication effect.
 
 Configured Agents acting as developers or reviewers are ordinary execution
 resources. Using a live provider or model as the subject of validation is

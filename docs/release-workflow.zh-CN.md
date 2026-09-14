@@ -24,7 +24,7 @@ Agent 选择一个预先声明的计划，设施从持久状态驱动该计划�
 
 当前开发步骤先清退运行时兼容分支，尚未执行最终 1.0 基线切换，也不发布版本或重置
 存储编号。存储 `27→28` 只规范化可明确识别的单条 Role 调度去重键，旧迁移账本、
-Message、Task 结果和不确定外部效果保持不变。普通打开要求存储 30；已有 Home 只通过
+Message、Task 结果和不确定外部效果保持不变。普通打开要求存储 31；已有 Home 只通过
 显式升级入口前进，不增加运行时双读。
 
 这是一次 1.0 前的破坏性变更：
@@ -54,6 +54,19 @@ Message、Task 结果和不确定外部效果保持不变。普通打开要求�
 引用待退役 wake 的活动 Run、受管重试或未决 claim 会同时阻止预检和迁移；
 迁移不停止执行、不编造接受。Global Session 没有受控 binding 时统一显式保存
 `providerBinding: null`。
+
+存储 `30→31` 将 Review scope 统一为显式值：有效旧 WorkItem Review 的缺失／null
+scope 转为 `work-item`，Task-final 候选证据和原迁移账本不变。新建和重试均显式写入 scope。
+
+Task 列表及 `/api/dashboard` 只保留有界目录；调用方去掉 `--view compact`，
+详情使用单 Task 读取。Scheduler 目录索引是必需接口，不再兼容缺失时的全量扫描。
+额外 `schema.json`／`state.json` 不覆盖 SQLite 版本，也不用于开发 Home reset；
+升级保留无关文件。非空 Home 缺少数据库时仍拒绝初始化。
+不认识的 writer lease 明确诊断，不接管、不删除。
+
+`controller status` 固定输出身份信息，存储矛盾仍返回非零健康退出码；
+`YUI_STATUS_IDENTITY` 不再选择另一套契约。升级侧直接复用资源采集器读取生命周期，
+无需让旧 Home 先通过当前 schema 的健康校验。
 
 现行边界进一步收敛：
 

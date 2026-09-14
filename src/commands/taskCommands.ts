@@ -29,8 +29,7 @@ import { createRunInput } from "../context/runInputContract.js";
 import {
   parseTaskCatalogOptions,
   readTaskCatalog,
-  renderTaskCatalog,
-  taskCatalogScope
+  renderTaskCatalog
 } from "../context/taskCatalog.js";
 import { listContextMessages } from "../context/taskContext.js";
 import { referencedWakeRunIds } from "../context/wakeRunReferences.js";
@@ -359,11 +358,6 @@ import {
   runTaskInputCommand
 } from "./taskInputCommands.js";
 import { runTaskNextActionCommand } from "./taskNextActionCommand.js";
-import {
-  buildTaskOverview,
-  parseTaskListOptions,
-  renderTaskOverview
-} from "./taskOverviewCommand.js";
 import { runPublicationCommand } from "./taskPublicationCommands.js";
 import { renderTaskRemoteDelivery, runTaskRemoteDeliveryCommand } from "./taskRemoteDeliveryCommand.js";
 import {
@@ -639,7 +633,7 @@ export function preflightTaskCompletion(
     options
   );
   const activeTaskReview = store.listReviewRounds(task.id).some((round) => (
-    (round.scope ?? "work-item") === "task"
+    round.scope === "task"
     && (round.status === "pending" || round.status === "running")
   ));
   // Issue 06: one shared readiness projection enumerates every blocker.
@@ -1487,23 +1481,8 @@ function createTaskAggregate(
 }
 
 function listTaskCommand(args: string[], store: TaskWorkflowStore, environment: NodeJS.ProcessEnv = {}): TaskCommandExecution {
-  if (args.includes("--view")) {
-    const result = readTaskCatalog(store, parseTaskCatalogOptions(args), environment);
-    return output(renderTaskCatalog(result), result);
-  }
-  const taskId = taskCatalogScope(store, environment);
-  const options = parseTaskListOptions(args);
-  const snapshot = store.transaction((reader) => ({
-    result: buildTaskOverview(reader, options, new Date(), taskId),
-    timeZone: reader.getConfig().timeZone
-  }));
-  const rendered = renderTaskOverview(
-    snapshot.result,
-    options,
-    snapshot.timeZone,
-    defaultTableWidth()
-  );
-  return output(rendered, snapshot.result);
+  const result = readTaskCatalog(store, parseTaskCatalogOptions(args), environment);
+  return output(renderTaskCatalog(result), result);
 }
 
 function showTaskCommand(
@@ -5279,7 +5258,7 @@ function requestTaskReviewRound(
       throw usageError(producerCollision);
     }
     const taskRounds = reviewRoundsByIdentity(tx.listReviewRounds(task.id))
-      .filter((entry) => (entry.scope ?? "work-item") === "task");
+      .filter((entry) => entry.scope === "task");
     const exact = taskRounds.filter((entry) => (
       entry.reviewerRoleName === reviewerRoleName
       && (deltaRecheckRequested
@@ -5560,7 +5539,7 @@ function retryFailedTaskReviewRound(
     const task = requireTask(tx, reference.taskId);
     if (task.status !== "active") throw usageError(`Task is not active: ${task.id}.`);
     const requestedBy = taskActor(tx, options, task.id);
-    if ((round.scope ?? "work-item") !== "task") {
+    if (round.scope !== "task") {
       throw usageError(`ReviewRound ${round.id} is not a failed Task-final ReviewRound.`);
     }
     if (round.reviewerRunId !== undefined) {
@@ -6130,7 +6109,7 @@ function settleStaleFinalReviewRun(
     if (round === null) {
       throw dataError(`ReviewRound not found for AgentRun ${run.id}: ${run.reviewRoundId}.`);
     }
-    if ((round.scope ?? "work-item") !== "task") {
+    if (round.scope !== "task") {
       throw usageError(
         `Review AgentRun ${run.id} is not a Task-final review; request a new WorkItem review `
         + "for a new Candidate."
@@ -6157,7 +6136,7 @@ function settleStaleFinalReviewRun(
     }
 
     const taskRounds = reviewRoundsByIdentity(tx.listReviewRounds(task.id)
-      .filter((entry) => (entry.scope ?? "work-item") === "task"));
+      .filter((entry) => entry.scope === "task"));
     const roundIndex = taskRounds.findIndex(({ id }) => id === round.id);
     if (roundIndex < 0) {
       throw dataError(`Final ReviewRound is not in Task history: ${round.id}.`);
@@ -6775,7 +6754,7 @@ function assertNoConflictingTaskReviewRound(
   );
   const conflicting = rounds.find((entry) => (
     !reusable.has(entry.id)
-    && (entry.scope ?? "work-item") === "task"
+    && entry.scope === "task"
     && (entry.status === "pending" || entry.status === "running")
     && (reviewerRoleName === undefined || entry.reviewerRoleName === reviewerRoleName)
   ));
@@ -6860,7 +6839,7 @@ function prepareFinalTaskReview(
   if (taskFinalContract === undefined || task.projectBindings.length === 0) return null;
   const taskRounds = reviewRoundsByIdentity(store.listReviewRounds(task.id))
     .filter((round) => (
-      (round.scope ?? "work-item") === "task"
+      round.scope === "task"
       && sameTaskFinalReviewContract(
         round.taskFinalReviewContract,
         taskFinalContract
@@ -7017,7 +6996,7 @@ function retryFailedReviewRun(
     if (round === null) {
       throw dataError(`ReviewRound not found for run ${run.id}: ${run.reviewRoundId}.`);
     }
-    const taskScope = (round.scope ?? "work-item") === "task";
+    const taskScope = round.scope === "task";
     const retryLane = run.executionLaneId === undefined
       ? undefined
       : round.executionGroup?.lanes.find(({ id }) => id === run.executionLaneId);
@@ -7060,7 +7039,7 @@ function retryFailedReviewRun(
         );
       }
       const taskRounds = reviewRoundsByIdentity(allRounds
-        .filter((entry) => (entry.scope ?? "work-item") === "task"));
+        .filter((entry) => entry.scope === "task"));
       const roundIndex = taskRounds.findIndex(({ id }) => id === round.id);
       if (roundIndex < 0) {
         throw dataError(`Final ReviewRound is not in Task history: ${round.id}.`);
@@ -7609,14 +7588,14 @@ export function dispatchPreparedReviewRound(
       throw usageError(`ReviewRound is not dispatchable: ${round.id}/${round.status}.`);
     }
     if (round.workspace === undefined) {
-      if ((round.scope ?? "work-item") === "task") {
+      if (round.scope === "task") {
         throw new TaskFinalReviewDispatchDriftError(
           `ReviewRound workspace is not ready: ${round.id}.`
         );
       }
       throw usageError(`ReviewRound workspace is not ready: ${round.id}.`);
     }
-    const taskScope = (round.scope ?? "work-item") === "task";
+    const taskScope = round.scope === "task";
     let item: WorkItem | undefined;
     let candidate: WorkItemCandidate | undefined;
     if (taskScope) {
@@ -7651,7 +7630,7 @@ export function dispatchPreparedReviewRound(
     const task = requireTask(tx, taskId);
     if (task.status !== "active") throw usageError(`Task is not active: ${task.id}.`);
     assertTaskExecutionEnabled(task, "dispatching a Review");
-    if ((round.scope ?? "work-item") === "task") {
+    if (round.scope === "task") {
       let taskFinalContract: TaskFinalReviewContract | undefined;
       try {
         taskFinalContract = taskFinalReviewContractForMutation(tx, task.id, options);
@@ -7707,7 +7686,7 @@ export function dispatchPreparedReviewRound(
     }
     const reviewer = tx.getRole(taskId, round.reviewerRoleName);
     if (reviewer === null) {
-      if ((round.scope ?? "work-item") === "task") {
+      if (round.scope === "task") {
         throw new TaskFinalReviewDispatchDriftError(
           `Reviewer Role not found: ${taskId}/${round.reviewerRoleName}.`
         );
@@ -7720,7 +7699,7 @@ export function dispatchPreparedReviewRound(
       || storedWorkspace.owner.type !== "review-round"
       || storedWorkspace.owner.reviewRoundId !== round.id) {
       const message = `ReviewRound workspace ownership changed: ${round.id}.`;
-      if ((round.scope ?? "work-item") === "task") {
+      if (round.scope === "task") {
         throw new TaskFinalReviewDispatchDriftError(message);
       }
       throw usageError(message);
@@ -7734,7 +7713,7 @@ export function dispatchPreparedReviewRound(
       );
       const conflicting = tx.listReviewRounds(task.id).find((entry) => (
         entry.id !== round.id
-        && (entry.scope ?? "work-item") === "task"
+        && entry.scope === "task"
         && (entry.status === "pending" || entry.status === "running")
         && (requestedReviewers.has(entry.reviewerRoleName)
           || entry.executionGroup?.lanes.some(({ roleName }) => (

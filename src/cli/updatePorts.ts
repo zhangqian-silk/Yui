@@ -326,6 +326,7 @@ export function createUpdatePorts(
 
 const UPDATE_CLI_PATH = fileURLToPath(new URL("../cli.js", import.meta.url));
 const UPDATE_CLIENT_RUNTIME_PATH = fileURLToPath(new URL("../controller/clientRuntime.js", import.meta.url));
+const UPDATE_INVENTORY_PATH = fileURLToPath(new URL("../controller/resourceInventoryLinux.js", import.meta.url));
 const UPDATE_CONTROLLER_RECONCILIATION_PATH = fileURLToPath(
   new URL("../controller/updateReconciliation.js", import.meta.url)
 );
@@ -752,10 +753,33 @@ function runControllerCommand(
   method: "status" | "live-identity",
   cliBinary?: string
 ): Record<string, unknown> {
-  const command = cliBinary ?? process.execPath;
-  const args = cliBinary === undefined
+  let command = cliBinary ?? process.execPath;
+  let args = cliBinary === undefined
     ? [UPDATE_CLI_PATH, "--json", "controller", method]
     : ["--json", "controller", method];
+  if (method === "status") {
+    // Lifecycle capture consumes the resource collector, not public status's
+    // current-schema health verdict. This is the same schema-independent seam
+    // used for update-owned stop/reconciliation, with no environment bypass.
+    const inventoryModule = cliBinary === undefined
+      ? UPDATE_INVENTORY_PATH
+      : join(dirname(activatedControllerEntrypoint(cliBinary)), "resourceInventoryLinux.js");
+    const helper = [
+      "(async () => {",
+      "  const { pathToFileURL } = await import('node:url');",
+      "  const { scanControllerResourceInventory } = await import(pathToFileURL(process.argv[1]).href);",
+      "  const data = await scanControllerResourceInventory({",
+      "    currentHome: process.argv[2], scope: 'current', environment: process.env",
+      "  });",
+      "  process.stdout.write(JSON.stringify({ ok: true, data }));",
+      "})().catch(error => {",
+      "  process.stderr.write(JSON.stringify({ ok: false, code: error.code ?? 'RUNTIME_ERROR', message: error.message }));",
+      "  process.exitCode = 5;",
+      "});"
+    ].join(" ");
+    command = process.execPath;
+    args = ["-e", helper, inventoryModule, home];
+  }
   const result = spawn(
     command,
     args,
@@ -764,9 +788,6 @@ function runControllerCommand(
       env: {
         ...environment,
         YUI_HOME: home,
-        // Lifecycle capture needs the schema-independent resource inventory,
-        // not the optional current-schema identity health verdict.
-        YUI_STATUS_IDENTITY: "0",
         // This exact lifecycle child is part of the update process that owns
         // the handover lock. Managed Sessions never receive this bypass.
         YUI_UPDATE_HANDOVER_OWNER_PID: String(process.pid)

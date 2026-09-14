@@ -601,9 +601,9 @@ function selectedTaskIdsForBoundedPass(
 }
 
 function selectedReadyWorkMailboxes(
-  store: Pick<SchedulerStorePort, "listReadyWorkMailboxes" | "listWorkMailboxes">
+  store: Pick<SchedulerStorePort, "listReadyWorkMailboxes">
 ): readonly WorkMailbox[] {
-  return store.listReadyWorkMailboxes?.() ?? store.listWorkMailboxes();
+  return store.listReadyWorkMailboxes();
 }
 
 function selectedRuntimeLifecycleTargets(
@@ -857,12 +857,7 @@ async function adoptReleasedTaskActivations(
 ): Promise<void> {
   if (workspace === undefined) return;
   const candidates = selection.full
-    ? (store.listPendingActivationRequestTaskIds?.()
-      ?? store.listTasks().flatMap((task) => (
-        task.status === "draft" && task.activationRequest?.disposition === "pending"
-          ? [task.id]
-          : []
-      )))
+    ? store.listPendingActivationRequestTaskIds()
     : selection.taskIds;
   for (const taskId of candidates) {
     if (selection.blockedTaskIds?.has(taskId)) continue;

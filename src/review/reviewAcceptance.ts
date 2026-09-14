@@ -37,7 +37,7 @@ export function isCompletedTaskReviewEvidenceFromRuns(
   round: ReviewRound,
   runs: readonly AgentRun[]
 ): boolean {
-  if ((round.scope ?? "work-item") !== "task"
+  if (round.scope !== "task"
     || round.taskCandidate === undefined
     || round.taskCandidate.projects.length === 0) {
     return false;

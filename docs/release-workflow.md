@@ -33,7 +33,7 @@ The current development step retires runtime compatibility before the final
 1.0 baseline cutover. It does not publish a release or reset storage numbering.
 Storage 27→28 normalizes only provable singleton Role dispatch dedupe keys;
 the old migration ledger, Messages, Task results and unconfirmed effects remain
-unchanged. Ordinary opens require storage 30. Existing Homes advance only through
+unchanged. Ordinary opens require storage 31. Existing Homes advance only through
 the explicit upgrade boundary; no runtime dual-reader is added.
 
 This is a breaking pre-1.0 change:
@@ -72,6 +72,23 @@ consumes notifications. Live Runs, owned retries and unresolved claims referring
 to a retiring wake block both preflight and migration. The migration does not
 stop execution or fabricate acceptance. Global Session sets use an explicit
 `providerBinding: null` when no controlled binding exists.
+
+Storage 30→31 makes every Review's scope explicit. Missing/null scope in a valid
+older WorkItem Review becomes `work-item`; Task-final candidate evidence and
+the old ledger are unchanged. New and retried Reviews always write their scope.
+
+Task listing and `/api/dashboard` now expose only the bounded catalog; remove
+`--view compact` from callers and use per-Task reads for detail. Scheduler
+catalog projections are required internal ports, not optional full-scan adapters.
+Extra `schema.json`/`state.json` files cannot override SQLite's version or be
+used to reset a development Home; upgrades leave unrelated files untouched.
+A missing database in a non-empty Home remains a refusal to initialize.
+Unrecognized writer leases are diagnosed without adoption or deletion.
+
+`controller status` always reports identity and retains the nonzero health exit
+for contradictory storage. `YUI_STATUS_IDENTITY` no longer selects another
+contract. Update-owned lifecycle capture uses the same resource collector
+directly, without requiring the old Home to pass current-schema health.
 
 Additional current boundaries:
 

@@ -1,16 +1,11 @@
 import type { TaskStore } from "../storage/taskStore.js";
 import { providerRetryProjection } from "../runtime/providerRetry.js";
 import { readTaskCatalog, type TaskCatalogOptions } from "../context/taskCatalog.js";
-import type { InputRequest } from "../input/inputRequest.js";
-import { type Task, type TaskStatus } from "../task/task.js";
-import type { WorkItem, WorkItemStatus } from "../workItem/workItem.js";
+import type { Task } from "../task/task.js";
 import { isRoleRunStalled, latestRunDurableProgressAt } from "../scheduler/roleRunStall.js";
 import type { TaskEvent } from "../event/taskEvent.js";
 import { retiredTaskRecordIds } from "../task/taskRecordRetirement.js";
-import {
-  buildTaskExecutionProjection,
-  type TaskExecutionProjection
-} from "../scheduler/taskExecutionProjection.js";
+import { buildTaskExecutionProjection } from "../scheduler/taskExecutionProjection.js";
 import { projectWorkItemExecution } from "../execution/workItemExecutionProjection.js";
 import {
   classifyRuntimeHealth,
@@ -36,7 +31,6 @@ export function buildWebTaskCatalog(store: WebDashboardStore, options: TaskCatal
 
 export type WebDashboardStore = Pick<TaskStore,
   | "transaction"
-  | "listTasks"
   | "getTask"
   | "getTaskBrief"
   | "getRun"
@@ -65,89 +59,6 @@ export type WebDashboardStore = Pick<TaskStore,
 > & Readonly<{
   listEvents?: (taskId: string) => readonly TaskEvent[];
 }>;
-
-type WorkItemCounts = Readonly<Record<WorkItemStatus, number> & {
-  total: number;
-}>;
-
-type DashboardTask = Task & Readonly<{
-  workItems: WorkItemCounts;
-  roleCount: number;
-  openInputCount: number;
-  needsAttentionCount: number;
-  execution: TaskExecutionProjection | null;
-  /** Derived Task-first execution status, copied from the projection for the sidebar. */
-  executionStatus: TaskExecutionProjection["status"] | null;
-  projectNames?: readonly string[];
-}>;
-
-export type WebAttentionItem = Readonly<{
-  taskId: string;
-  taskTitle: string;
-  request: InputRequest;
-}>;
-
-export type WebDashboardSnapshot = Readonly<{
-  generatedAt: string;
-  counts: Readonly<Record<TaskStatus, number> & { total: number; openInputs: number }>;
-  attention: readonly WebAttentionItem[];
-  tasks: readonly DashboardTask[];
-}>;
-
-export function buildWebDashboardSnapshot(
-  store: WebDashboardStore,
-  now: Date = new Date()
-): WebDashboardSnapshot {
-  return store.transaction((reader) => {
-    const statusCounts: Record<TaskStatus, number> = {
-      draft: 0,
-      active: 0,
-      completed: 0,
-      cancelled: 0,
-      archived: 0
-    };
-    const projectNames = new Map(reader.listProjects().map((project) => [project.id, project.name]));
-    let openInputs = 0;
-    const attention: WebAttentionItem[] = [];
-    const tasks = reader.listTasks().map((task): DashboardTask => {
-      statusCounts[task.status] += 1;
-      const taskOpenInputs = reader.listInputRequests(task.id)
-        .filter((request) => request.status === "open").length;
-      if (task.status !== "archived") openInputs += taskOpenInputs;
-      const taskOpen = reader.listInputRequests(task.id)
-        .filter((request) => request.status === "open");
-      for (const request of task.status === "archived" ? [] : taskOpen) {
-        attention.push({ taskId: task.id, taskTitle: task.title, request });
-      }
-      const events = reader.listEvents?.(task.id) ?? [];
-      const needsAttentionCount = task.status === "archived" ? 0 : reader.listRuns(task.id)
-        .filter((run) => run.status === "active" && isRoleRunStalled(events, run.id))
-        .length;
-      const execution = buildTaskExecutionProjection(reader, task.id, task, now);
-      const names = task.projectBindings.flatMap(({ projectId }) => {
-        const name = projectNames.get(projectId);
-        return name === undefined ? [] : [name];
-      });
-      return {
-        ...task,
-        ...(names.length === 0 ? {} : { projectNames: names }),
-        workItems: countWorkItems(reader.listWorkItems(task.id)),
-        roleCount: reader.listRoles(task.id).length,
-        openInputCount: taskOpenInputs,
-        needsAttentionCount,
-        execution,
-        executionStatus: execution?.status ?? null
-      };
-    }).sort(compareDashboardTasks);
-
-    return {
-      generatedAt: now.toISOString(),
-      counts: { total: tasks.length, ...statusCounts, openInputs },
-      attention: attention.sort(compareAttention),
-      tasks
-    };
-  });
-}
 
 export function buildWebTaskDetail(
   store: WebDashboardStore,
@@ -396,36 +307,4 @@ function latestStallField(
       && event.payload.status !== "diagnostic-only")
     .sort((left, right) => Date.parse(right.createdAt) - Date.parse(left.createdAt))[0];
   return stalled?.payload[field];
-}
-
-function countWorkItems(items: readonly WorkItem[]): WorkItemCounts {
-  const counts: WorkItemCounts = {
-    total: items.length,
-    open: 0,
-    accepted: 0,
-    retired: 0
-  };
-  const mutable = counts as Record<keyof WorkItemCounts, number>;
-  for (const item of items) {
-    mutable[item.status] += 1;
-  }
-  return counts;
-}
-
-function compareDashboardTasks(left: DashboardTask, right: DashboardTask): number {
-  const statusOrder: Record<TaskStatus, number> = {
-    active: 0,
-    draft: 1,
-    completed: 2,
-    cancelled: 3,
-    archived: 4
-  };
-  return statusOrder[left.status] - statusOrder[right.status]
-    || Date.parse(right.updatedAt) - Date.parse(left.updatedAt)
-    || left.id.localeCompare(right.id);
-}
-
-function compareAttention(left: WebAttentionItem, right: WebAttentionItem): number {
-  return Date.parse(left.request.createdAt) - Date.parse(right.request.createdAt)
-    || left.request.id.localeCompare(right.request.id);
 }

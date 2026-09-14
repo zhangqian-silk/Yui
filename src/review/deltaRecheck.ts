@@ -67,7 +67,7 @@ export async function assessDeltaRecheck(input: Readonly<{
   const { repositoryPaths, previousRound, candidate, git } = input;
   if (previousRound.status !== "completed"
     || previousRound.reviewerRunId === undefined
-    || (previousRound.scope ?? "work-item") !== "task") {
+    || previousRound.scope !== "task") {
     return {
       kind: "ineligible",
       reason: "Delta recheck requires a semantic completed Task-final ReviewRound."

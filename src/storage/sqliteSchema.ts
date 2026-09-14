@@ -1415,6 +1415,17 @@ DELETE FROM id_sequences WHERE kind = 'integrationQueue';
     introducedIn: "0.16.0",
     sql: "SELECT 1; -- Retire Run-linked wakes as audit events; notification schema 2; explicit Global providerBinding",
     migrateData: migrateNotificationOnlyWakes
+  },
+  {
+    version: 31,
+    name: "explicit-review-scope",
+    introducedIn: "0.16.0",
+    sql: `
+UPDATE review_rounds
+SET payload = json_set(payload, '$.scope', 'work-item')
+WHERE json_type(payload, '$.scope') IS NULL
+   OR json_type(payload, '$.scope') = 'null';
+`
   }
 ]);
 

@@ -504,7 +504,7 @@ async function refreshDashboard(options) {
   }
   const previousInputs = state.counts ? state.counts.openInputs : null;
   try {
-    const query = new URLSearchParams({ view: "compact" });
+    const query = new URLSearchParams();
     if (state.catalogAll) query.set("all", "true");
     if (state.filter !== "all") query.set("status", state.filter);
     if (state.query.trim()) query.set("search", state.query.trim());

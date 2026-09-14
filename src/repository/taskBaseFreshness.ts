@@ -17,7 +17,7 @@ export type TaskBaseFreshnessStatus =
 export type TaskBaseFreshnessSource =
   | "local-tracking"
   | "remote-refresh"
-  | "compatibility-projection"
+  | "unknown"
   | "not-applicable";
 
 export type TaskBaseProvenanceSource =
@@ -198,7 +198,7 @@ export async function inspectTaskBaseFreshness(
       baseRef: binding.baseRef,
       baseCommit,
       status,
-      source: tracked?.source ?? (project.remoteUrl === undefined ? "not-applicable" : "compatibility-projection"),
+      source: tracked?.source ?? (project.remoteUrl === undefined ? "not-applicable" : "unknown"),
       workspacePath,
       workspaceClean,
       ...(physicalHead === undefined ? {} : { physicalHead }),

@@ -117,7 +117,7 @@ export function validateExactRunReviewRound(
     }
   }
   const task = store.getTask(run.taskId);
-  const taskScope = (round.scope ?? "work-item") === "task";
+  const taskScope = round.scope === "task";
   const item = taskScope || round.workItemId === undefined
     ? null
     : store.getWorkItem(run.taskId, round.workItemId);

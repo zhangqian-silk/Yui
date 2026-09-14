@@ -2,22 +2,21 @@
 
 # 有界任务发现
 
-Agent 使用 `yui task list --view compact --json` 发现候选任务，再读取目标
+Agent 使用 `yui task list --json` 发现候选任务，再读取目标
 Task Context 和原始 Message。目录是当前事实的只读视图，不是摘要数据库、
 Context 快照、消息确认、执行判断或验收结论。
 
-显式 compact 视图不改变既有 `task list --json`、`--verbose` 详细输出。
-内建 Operator 采用 compact；交互选择器保持完整的 `{id,title,status}` 数组，
-只读取这些窄字段。Web 通过 `GET /api/dashboard?view=compact` 使用同一查询；
-原 dashboard 和 Task 详情接口保留执行、观测、用量和远端交付字段。
-本功能不改变持久 schema，无需迁移。
+目录是唯一列表契约，不再提供 `--view` 选择或 `--verbose` 全历史列表。
+交互选择器保持完整的 `{id,title,status}` 数组，只读取这些窄字段。
+Web 通过 `GET /api/dashboard` 使用同一查询；单个 Task 的详情接口继续保留
+执行、观测、用量和远端交付字段。目录查询本身不改变持久记录。
 
 ## 查询和分页合同
 
 ```sh
-yui task list --view compact --project project-1 --status active --limit 20 --json
-yui task list --view compact --attention openInputs --json
-yui task list --view compact --search "候选标题" --json
+yui task list --project project-1 --status active --limit 20 --json
+yui task list --attention openInputs --json
+yui task list --search "候选标题" --json
 yui task context task-1 --json
 yui task context inspect task-1 --store task --ref task-1 --digest <digest> --json
 yui task message show task-1/message-1 --json

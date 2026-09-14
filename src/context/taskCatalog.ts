@@ -22,13 +22,12 @@ export function parseTaskCatalogOptions(args: readonly string[]): TaskCatalogOpt
   for (let i = 0; i < args.length; i++) {
     const key = args[i]!;
     if (key === "--all" && !all) { all = true; continue; }
-    if (!["--view", "--limit", "--cursor", "--status", "--project", "--search", "--attention"].includes(key)
+    if (!["--limit", "--cursor", "--status", "--project", "--search", "--attention"].includes(key)
       || values.has(key) || args[i + 1] === undefined || args[i + 1]!.startsWith("--")) {
-      throw usageError("Compact Task list expects --view compact [--all] [--status <status>] [--project <id>] [--search <text>] [--attention <category>] [--limit <1..100>] [--cursor <cursor>].");
+      throw usageError("Task list expects [--all] [--status <status>] [--project <id>] [--search <text>] [--attention <category>] [--limit <1..100>] [--cursor <cursor>].");
     }
     values.set(key, args[++i]!);
   }
-  if (values.get("--view") !== "compact") throw usageError("Task list view must be compact.");
   const status = values.get("--status");
   if (status !== undefined && !TASK_STATUSES.includes(status as typeof TASK_STATUSES[number])) {
     throw usageError("Unknown Task catalog status.");
@@ -106,11 +105,11 @@ export function readTaskCatalog(
         // sample size therefore must never be subtracted from one another.
         taskCount: source.taskCount,
         omittedTaskRefs: source.taskCount - selected.length,
-        query: { view: "compact", all: options.all, attention: kind }
+        query: { all: options.all, attention: kind }
       }];
     })) as Record<CatalogAttentionKind, {
       count: number; unit: string; refs: CatalogRef[]; taskCount: number; omittedTaskRefs: number;
-      query: { view: string; all: boolean; attention: CatalogAttentionKind };
+      query: { all: boolean; attention: CatalogAttentionKind };
     }>;
     const response = {
       view: "compact" as const,

@@ -186,7 +186,7 @@ function detectReviewDuplicates(
   const wanted = new Set(intent.taskCandidateCommits.map((commit) => commit.toLowerCase()));
   const duplicates: DeliveryDuplicate[] = [];
   for (const round of facts.reviewRounds) {
-    if ((round.scope ?? "work-item") !== "task") continue;
+    if (round.scope !== "task") continue;
     if (round.reviewerRoleName !== intent.reviewerRoleName) continue;
     const commits = new Set(
       (round.taskCandidate?.projects ?? []).map((project) => project.commit.toLowerCase())

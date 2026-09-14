@@ -2719,7 +2719,7 @@ test("direct and replicated Review keep Producer results non-authoritative", (t)
     environment: bareEnv
   });
   let round = store.listReviewRounds(task.id).at(-1);
-  assert.equal(round.scope ?? "work-item", "work-item");
+  assert.equal(round.scope, "work-item");
   assert.deepEqual(
     round.executionGroup.lanes.map(({ roleName }) => roleName),
     ["candidate-a", "candidate-b"]
@@ -3434,7 +3434,7 @@ test("Controller begin-handover accepts a null fromReleaseId", async (t) => {
 
 test("production storage exposes one current version and one migration floor", () => {
   assert.equal(MIN_SUPPORTED_STORAGE_VERSION, 1);
-  assert.equal(CURRENT_STORAGE_VERSION, 30);
+  assert.equal(CURRENT_STORAGE_VERSION, 31);
   for (const retiredExport of [
     "FileTaskStore",
     "STORAGE_STATE_FILE",
@@ -3729,7 +3729,7 @@ test("Task Role Profiles preserve runtime and portable behavior across add and u
   );
 });
 
-test("a pre-0.15.0 Home stays outside the migration floor and remains untouched", async (t) => {
+test("an unrecognized SQLite ledger is rejected without interpreting side files or changing the Home", async (t) => {
   const home = mkdtempSync(join(tmpdir(), "yui-pre-baseline-storage-smoke-"));
   t.after(() => rmSync(home, { recursive: true, force: true }));
   const databasePath = join(home, "yui.db");
@@ -3782,16 +3782,14 @@ test("a pre-0.15.0 Home stays outside the migration floor and remains untouched"
 
   const before = readFileSync(databasePath);
   const inspected = inspectStorageSchema(home);
-  assert.equal(inspected.status, "unsupported");
-  assert.equal(inspected.direction, "older");
-  assert.equal(inspected.currentVersion, 0);
+  assert.equal(inspected.status, "invalid");
+  assert.match(inspected.detail, /schema_migrations columns/);
   assert.equal(inspected.latestVersion, CURRENT_STORAGE_VERSION);
 
   const dryRun = await runStorageUpgrade({ home, mode: "dry-run" });
   assert.equal(dryRun.outcome, "blocked");
-  assert.equal(dryRun.stage, "unsupported");
+  assert.equal(dryRun.stage, "corruption");
   assert.equal(dryRun.sceneUnchanged, true);
-  assert.match(dryRun.action, /initialize a new Home/u);
   assert.deepEqual(readFileSync(databasePath), before);
   assert.equal(existsSync(manifestPath), true);
 });

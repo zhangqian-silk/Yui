@@ -1823,7 +1823,7 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
     if (round.status !== "pending") {
       throw new Error(`ReviewRound workspace can only prepare while pending: ${round.id}.`);
     }
-    const taskScope = (round.scope ?? "work-item") === "task";
+    const taskScope = round.scope === "task";
     const item = taskScope || round.workItemId === undefined
       ? undefined
       : requireWorkItem(this.store, task.id, round.workItemId);
@@ -2207,7 +2207,7 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
     const previous = this.store.listReviewRounds(task.id)
       .filter((candidate) => (
         candidate.id !== round.id
-        && (candidate.scope ?? "work-item") === "task"
+        && candidate.scope === "task"
         && candidate.reviewerRoleName === round.reviewerRoleName
         && (candidate.status === "completed" || candidate.status === "failed")
         && candidate.workspaceDisposition?.kind !== "removed"
@@ -2757,7 +2757,7 @@ export class FileTaskWorkspacePreparer implements TaskWorkspacePreparer {
   }
 
   #reviewWorktreeName(round: ReviewRound): string {
-    return (round.scope ?? "work-item") === "task"
+    return round.scope === "task"
       ? `reviewer-${round.reviewerRoleName}`
       : round.id;
   }

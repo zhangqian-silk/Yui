@@ -299,12 +299,13 @@ export async function resetDevHome(options = {}) {
       if (currentProcessStartIdentity === discovery.processStartIdentity) {
         throw cannotVerifyController(discoveryPath);
       }
-    } else {
-      // A Controller using the current protocol cannot exist without a
-      // durable Home identity. If identity is readable, retain the previous
-      // fail-closed orphan-socket check for its exact endpoint.
-      const homeId = await readHomeIdForReset(homePath).catch(() => null);
-      if (homeId !== null && pathExists(controllerSocketPath(homeId))) {
+    } else if (readdirSync(homePath).length > 0) {
+      // A non-empty Home needs a readable authoritative identity before its
+      // exact orphan endpoint can be ruled out. Unknown data is not an empty Home.
+      const homeId = await readHomeIdForReset(homePath).catch((error) => {
+        throw cannotVerifyController(discoveryPath, error);
+      });
+      if (pathExists(controllerSocketPath(homeId))) {
         throw cannotVerifyController(discoveryPath);
       }
     }
@@ -582,20 +583,15 @@ function readControllerDiscoveryForReset(homePath, homeId, discoveryPath) {
 async function readHomeIdForReset(homePath) {
   const databasePath = join(homePath, "yui.db");
   let homeId;
-  if (pathExists(databasePath)) {
-    const { default: Database } = await import("better-sqlite3");
-    const database = new Database(databasePath, { readonly: true, fileMustExist: true });
-    try {
-      const row = database.prepare(
-        "SELECT home_identity FROM home_meta WHERE id = 1"
-      ).get();
-      homeId = JSON.parse(row?.home_identity ?? "null")?.homeId;
-    } finally {
-      database.close();
-    }
-  } else {
-    homeId = JSON.parse(readFileSync(join(homePath, "state.json"), "utf8"))
-      ?.homeIdentity?.homeId;
+  const { default: Database } = await import("better-sqlite3");
+  const database = new Database(databasePath, { readonly: true, fileMustExist: true });
+  try {
+    const row = database.prepare(
+      "SELECT home_identity FROM home_meta WHERE id = 1"
+    ).get();
+    homeId = JSON.parse(row?.home_identity ?? "null")?.homeId;
+  } finally {
+    database.close();
   }
   if (typeof homeId !== "string" || !/^home-[a-f0-9]{16}$/u.test(homeId)) {
     throw new Error("Development Home identity is invalid.");

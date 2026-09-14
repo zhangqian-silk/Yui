@@ -425,7 +425,7 @@ function readLiveTaskState(store: TaskStore, taskId: string): AgentRunContextLiv
     }));
   const activeTaskReviews = store.listReviewRounds(taskId)
     .filter((round) => (
-      (round.scope ?? "work-item") === "task"
+      round.scope === "task"
       && (round.status === "pending" || round.status === "running")
     ))
     .map((round) => Object.freeze({

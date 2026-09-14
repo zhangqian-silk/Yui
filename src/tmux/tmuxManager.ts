@@ -1442,14 +1442,11 @@ function writableLeaseMatchesRole(
   roleName?: string
 ): boolean {
   if (!sessionName.startsWith(WRITABLE_CLIENT_SESSION_PREFIX)) return false;
-  if (roleName === undefined) return true;
-  if (sessionName.startsWith(HOST_WRITABLE_CLIENT_SESSION_PREFIX)) return true;
-  if (sessionName.startsWith(ROLE_WRITABLE_CLIENT_SESSION_PREFIX)) {
-    return sessionName.startsWith(writableClientSessionPrefix(roleName));
+  if (/^yui-writer-host-[a-f0-9]{24}$/u.test(sessionName)) return true;
+  if (/^yui-writer-role-[a-f0-9]{24}-[a-f0-9]{24}$/u.test(sessionName)) {
+    return roleName === undefined || sessionName.startsWith(writableClientSessionPrefix(roleName));
   }
-  // Conservative compatibility for writer leases created before Role-scoped
-  // lease names existed.
-  return true;
+  throw runtimeError(`Unverified tmux writer lease: ${sessionName}. Preserve it and inspect its owner before retrying.`);
 }
 
 function writableClientRowsContainMatch(
@@ -1479,9 +1476,8 @@ function writableClientRowsContainMatch(
     ) {
       return false;
     }
-    // Current Yui clients publish a lease before attach. A direct or legacy
-    // writable tmux client has no Role identity, so conservatively fence every
-    // Role in that host.
+    // A direct writable tmux client has no Role identity and fences the host.
+    // A Yui lease must instead prove its exact current scope.
     return !sessionName.startsWith(WRITABLE_CLIENT_SESSION_PREFIX)
       || writableLeaseMatchesRole(sessionName, roleName);
   });

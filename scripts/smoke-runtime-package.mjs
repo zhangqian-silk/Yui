@@ -14,6 +14,7 @@ import {
 import { delimiter, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { tmpdir } from "node:os";
 import { setTimeout as delay } from "node:timers/promises";
+import { pathToFileURL } from "node:url";
 
 const assembled = process.argv[2] === "--assembled";
 if (process.argv.length !== (assembled ? 4 : 2)) {
@@ -140,6 +141,15 @@ try {
   }
 
   assert.equal(json("doctor").storage.healthy, true);
+  const status = JSON.parse(runCli(cli, ["--json", "controller", "status"],
+    { ...environment, YUI_STATUS_IDENTITY: "0" })).data;
+  assert.ok(status.identity, "Status identity is unconditional, not a rollout flag.");
+  const { createUpdatePorts } = await import(pathToFileURL(join(root, "dist", "cli", "updatePorts.js")).href);
+  const lifecycle = createUpdatePorts(environment).controllerStatus(yuiHome);
+  const controller = status.resources.find(resource => resource.kind === "controller" && resource.state === "current");
+  assert.equal(lifecycle.running, true);
+  assert.equal(lifecycle.pid, controller.processes[0].pid);
+  assert.equal(lifecycle.identity.version, packageJson.version);
   const { task } = json("task", "create", "runtime smoke");
   assert.equal(task.status, "draft");
   assert.throws(() => runCli(cli, ["task", "activate", task.id], environment), error => {

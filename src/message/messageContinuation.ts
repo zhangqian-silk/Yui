@@ -77,7 +77,7 @@ export function messageContinuationBlocker(store: TaskStore, message: TaskMessag
   if (target.reviewRoundId !== undefined) {
     const round = store.getReviewRound(message.taskId, target.reviewRoundId);
     if (round === null) return "review-round-missing";
-    if ((round.scope ?? "work-item") === "task") {
+    if (round.scope === "task") {
       if (round.taskCandidate?.projects.some((project) =>
         task.projectBindings.find((binding) => binding.projectId === project.projectId)?.currentCommit !== project.commit)) {
         return "review-candidate-stale";

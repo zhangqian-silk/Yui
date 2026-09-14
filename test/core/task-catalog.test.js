@@ -26,7 +26,7 @@ test("compact discovery is bounded, paged before detail, and does not hide off-p
   const store = new SqliteTaskStore(home);
   t.after(() => store.close());
   const now = new Date("2026-09-13T00:00:00Z");
-  const emptyCatalog = runTaskCommand(["list", "--view", "compact"], store, { environment: {} }).data;
+  const emptyCatalog = runTaskCommand(["list"], store, { environment: {} }).data;
   assert.equal(emptyCatalog.total, 0);
   assert.equal(emptyCatalog.nextCursor, null);
   for (let i = 1; i <= 5; i++) {
@@ -44,7 +44,7 @@ test("compact discovery is bounded, paged before detail, and does not hide off-p
   for (const name of ["listTasks", "listRuns", "listEvents", "listWorkItems", "listContextSnapshots"]) {
     store[name] = () => assert.fail(`compact must not enumerate ${name}`);
   }
-  const read = (...args) => runTaskCommand(["list", "--view", "compact", ...args],
+  const read = (...args) => runTaskCommand(["list", ...args],
     store, { environment: {} }).data;
   const first = read("--limit", "2");
   assert.equal(first.total, 5);
@@ -67,6 +67,8 @@ test("compact discovery is bounded, paged before detail, and does not hide off-p
   assert.equal(read("--attention", "openInputs").tasks[0].id, "task-5");
   assert.throws(() => read("--search", "changed", "--cursor", first.nextCursor), /cursor/i);
   assert.throws(() => read("--limit", "0"), /limit/i);
+  assert.throws(() => read("--view", "compact"), /Task list/i);
+  assert.throws(() => read("--verbose"), /Task list/i);
   const ref = first.tasks[0].ref;
   store.listEvents = originalEvents;
   const detail = inspectTaskContext(store, ref.taskId, ref);
@@ -112,7 +114,7 @@ test("catalog scope, cursor and exact refs cannot widen a Session or Assignment"
   }
   const env = { YUI_SESSION_SCOPE: "task", YUI_TASK_ID: "task-1", YUI_ROLE: "leader",
     YUI_NATIVE_SESSION_ID: "leader", YUI_WORKSPACE: home };
-  const read = (environment, ...args) => runTaskCommand(["list", "--view", "compact", "--limit", "1", ...args],
+  const read = (environment, ...args) => runTaskCommand(["list", "--limit", "1", ...args],
     store, { environment }).data;
   const global = read({});
   const before = store.getStateRevision();
@@ -147,7 +149,7 @@ test("catalog byte budget includes escaped Unicode and continues; HTTP preserves
         currentFocus: "Verify", leaderSummary: '字😀"\\\n'.repeat(400), updatedBy: "leader" }, now));
     }
   });
-  const read = cursor => runTaskCommand(["list", "--view", "compact", "--limit", "100",
+  const read = cursor => runTaskCommand(["list", "--limit", "100",
     ...(cursor ? ["--cursor", cursor] : [])], store, { environment: {} }).data;
   let page = read();
   const ids = [];
@@ -182,20 +184,21 @@ test("catalog byte budget includes escaped Unicode and continues; HTTP preserves
   t.after(() => new Promise(resolve => server.close(resolve)));
   const base = `http://127.0.0.1:${server.address().port}`;
   const get = path => fetch(base + path, { headers: { "x-yui-web-token": "catalog-test" } });
-  const compact = await get("/api/dashboard?view=compact&limit=2");
+  const compact = await get("/api/dashboard?limit=2");
   assert.equal(compact.status, 200);
   const catalog = await compact.json();
   assert.equal(catalog.tasks.length, 2);
   assert.equal(catalog.tasks.some(task => task.id === "task-60"), false);
-  assert.equal((await get("/api/dashboard?view=compact&limit=0")).status, 400);
-  const legacy = runTaskCommand(["list"], store, { environment: {} }).data;
-  assert.ok(legacy.tasks[0].execution.observability);
-  assert.ok(legacy.tasks[0].remoteDelivery);
+  assert.equal((await get("/api/dashboard?limit=0")).status, 400);
+  assert.equal((await get("/api/dashboard?view=compact")).status, 400);
+  const defaultCatalog = await (await get("/api/dashboard")).json();
+  assert.ok(defaultCatalog.tasks.length <= 20);
+  assert.ok(defaultCatalog.nextCursor);
+  assert.equal(defaultCatalog.tasks[0].execution, undefined);
   const detail = await (await get("/api/tasks/task-60")).json();
   assert.ok(detail.execution.observability);
   assert.ok(detail.remoteDelivery);
   assert.equal(detail.execution.observability.cost.tokens.value, 30);
   assert.equal(detail.execution.observability.cost.sessions.length, 2);
-  assert.deepEqual(detail.execution.observability.cost.tokens,
-    legacy.tasks.find(task => task.id === "task-60").execution.observability.cost.tokens);
+  assert.equal(detail.task.id, "task-60");
 });

@@ -70,24 +70,11 @@ export class StorageSchemaError extends Error {
 /**
  * Inspect the one authoritative SQLite migration head without changing it.
  *
- * `schema.json` and `state.json` are recognized only to prevent setup from
- * overwriting an old Home whose SQLite authority is missing. They are not
- * version authorities for current Homes.
+ * Extra files never override the SQLite authority. A missing database in a
+ * non-empty Home is unverified, not permission to initialize over its evidence.
  */
 export function inspectStorageSchema(rootDir: string): StorageSchemaState {
   const databasePath = join(rootDir, CURRENT_DATABASE_FILENAME);
-  const hasPreBaselineEvidence =
-    existsSync(join(rootDir, "schema.json")) || existsSync(join(rootDir, "state.json"));
-  if (hasPreBaselineEvidence) {
-    return {
-      status: "unsupported",
-      direction: "older",
-      currentVersion: 0,
-      latestVersion: CURRENT_STORAGE_VERSION,
-      minimumSupportedVersion: MIN_SUPPORTED_STORAGE_VERSION,
-      databasePath
-    };
-  }
   if (!existsSync(databasePath)) {
     if (existsSync(rootDir)) {
       try {
