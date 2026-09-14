@@ -14,7 +14,6 @@ import {
 } from "../../dist/repository/taskWorkspacePreparer.js";
 import {
   managedTaskRoot,
-  managedWorktreeRoot
 } from "../../dist/storage/homeLayout.js";
 import { SqliteTaskStore } from "../../dist/storage/sqliteStore.js";
 import { createTask } from "../../dist/task/task.js";
@@ -108,7 +107,7 @@ function assertSingleLayerEntry(home, entry, ownerRoot, boundDirectory) {
   assert.equal(git(["-C", entry.path, "rev-parse", "--is-inside-work-tree"]), "true");
   // It is NOT under the legacy physical worktree root.
   assert.equal(
-    relative(managedWorktreeRoot(home), entry.path).startsWith(".."), true,
+    relative(join(home, "workspaces", "worktree"), entry.path).startsWith(".."), true,
     "worktree is not under the legacy worktree/ root"
   );
   // It IS under the managed tasks/ root.
@@ -254,7 +253,7 @@ test("new Task multi-project lifecycle lands every worktree at the single-layer 
 
   // Nothing at all was written under the legacy physical worktree root.
   assert.equal(
-    existsSync(managedWorktreeRoot(home)), false,
+    existsSync(join(home, "workspaces", "worktree")), false,
     "the collapsed layout never creates the legacy worktree/ root"
   );
 });

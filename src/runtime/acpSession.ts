@@ -13,7 +13,6 @@ import {
   acpPermissionSummary,
   acpPromptRequest,
   acpSetConfigOptionRequest,
-  acpSetModeRequest,
   acpStopReasonDetail,
   acpTerminalStatus,
   asObject,
@@ -157,20 +156,10 @@ export class AcpStructuredProviderSession implements StructuredProviderSession {
    * the complete list, so this is replaced wholesale and never merged.
    */
   #configOptions: readonly AcpConfigOption[] = [];
-  /** Legacy writes invalidate current evidence until the peer reports it again. */
-  readonly #unobservedConfigIds = new Set<string>();
-  /**
-   * True when this Agent described its options through the legacy `modes` field
-   * only. Mode changes then go to `session/set_mode`, because an Agent that
-   * never advertised config options must not receive
-   * `session/set_config_option`.
-   */
-  #legacyModes = false;
   /**
    * What Yui asked this Session for and what the Agent did with it, recorded so
    * a launch reports the configuration it actually runs under rather than the
-   * one it requested. Each entry carries how strongly it was confirmed, because
-   * a legacy mode-only peer cannot prove more than that it accepted the call.
+   * one it requested. Requested changes require a reported current value.
    */
   #appliedConfiguration: readonly AcpConfigurationOutcome[] = [];
 
@@ -427,7 +416,6 @@ export class AcpStructuredProviderSession implements StructuredProviderSession {
   #readConfiguration(result: object | null): void {
     const configuration = readAcpSessionConfiguration(result);
     this.#configOptions = configuration.options;
-    this.#legacyModes = configuration.legacyModes;
   }
 
   /**
@@ -486,35 +474,14 @@ export class AcpStructuredProviderSession implements StructuredProviderSession {
         continue;
       }
       const step = resolution.step;
-      if (this.#legacyModes) this.#unobservedConfigIds.add(step.configId);
-      // An Agent that only ever advertised legacy `modes` has no
-      // `session/set_config_option` handler, so mode changes must use the method
-      // it does implement. Sending the modern method to it would fail with
-      // method-not-found and read as the Agent refusing the value.
-      const result = this.#legacyModes
-        ? await this.#request("session/set_mode", acpSetModeRequest(this.#sessionId, step.value))
-        : await this.#request(
-            "session/set_config_option",
-            acpSetConfigOptionRequest(this.#sessionId, step.configId, step.value),
-            (response) => {
-              const options = readAcpConfigOptions(asObject(response)?.configOptions);
-              if (options !== undefined) this.#configOptions = options;
-            }
-          );
-      if (this.#legacyModes) {
-        // `session/set_mode` answers with no options, so the only fact available
-        // is that the Agent accepted the call. Yui's own view is left untouched:
-        // writing the requested value into the cached list would manufacture the
-        // very confirmation the protocol withheld, and the final verification
-        // would then read Yui's own assumption back as the Agent's report.
-        outcomes.push(Object.freeze({
-          field,
-          configId: step.configId,
-          value: step.value,
-          confirmation: "acknowledged" as const
-        }));
-        continue;
-      }
+      const result = await this.#request(
+        "session/set_config_option",
+        acpSetConfigOptionRequest(this.#sessionId, step.configId, step.value),
+        (response) => {
+          const options = readAcpConfigOptions(asObject(response)?.configOptions);
+          if (options !== undefined) this.#configOptions = options;
+        }
+      );
       // The answer is the whole option list, so it both confirms this step and
       // carries any change the Agent made alongside it.
       const options = readAcpConfigOptions(asObject(result)?.configOptions);
@@ -530,7 +497,7 @@ export class AcpStructuredProviderSession implements StructuredProviderSession {
     // Every call has landed, so this is the configuration the prompt would run
     // under. Re-checking all requested values here is what catches an axis that a
     // later call reset after its own step had already been confirmed.
-    const failures = verifyAcpConfiguration(desired, this.#configOptions, component, outcomes);
+    const failures = verifyAcpConfiguration(desired, this.#configOptions, component);
     if (failures.length > 0) {
       throw new Error(`ACP Session run configuration did not hold. ${failures.join(" ")}`);
     }
@@ -557,11 +524,6 @@ export class AcpStructuredProviderSession implements StructuredProviderSession {
    * rather than as the launch's confirmed one. Reading the private field on every
    * call rather than caching a projection is what makes that true: a snapshot
    * taken at launch would keep reporting a configuration this Session has left.
-   *
-   * A legacy mode-only peer has no reported value to pair with its
-   * `acknowledged` step, because Yui deliberately never wrote the requested value
-   * into its own view. That absence is stated as `unobserved` instead of being
-   * filled in from the request.
    */
   get runConfiguration(): AgentRunConfigurationObservation {
     if (this.#closed !== undefined) {
@@ -587,24 +549,8 @@ export class AcpStructuredProviderSession implements StructuredProviderSession {
     });
   }
 
-  /**
-   * What the Agent reports for one listed axis.
-   *
-   * Almost always an observation: the option list ACP sends is the Agent's own
-   * report. The exception is an axis Yui changed on a legacy peer, whose value
-   * here still dates from the setup reply because `session/set_mode` returned
-   * nothing to refresh it with. That entry is listed — the axis is real and its
-   * enumeration is accurate — but its value is stale by construction, so it is
-   * reported as unobserved rather than as the Agent's current answer.
-   */
+  /** The current complete option list is the Agent's own report. */
   #axisValue(option: AcpConfigOption): AgentRunConfigurationCurrentValue {
-    if (this.#unobservedConfigIds.has(option.id)) {
-      return Object.freeze({
-        status: "unobserved",
-        reason: "Yui set this axis with `session/set_mode`, which reports no "
-          + `configuration, so the Agent last reported \`${option.currentValue}\` before that call.`
-      });
-    }
     return Object.freeze({ status: "observed", value: option.currentValue });
   }
 
@@ -784,16 +730,6 @@ export class AcpStructuredProviderSession implements StructuredProviderSession {
     // already confirmed before any prompt was sent.
     if (update?.kind === "config-options") {
       this.#configOptions = update.options;
-      this.#unobservedConfigIds.clear();
-      return;
-    }
-    if (update?.kind === "mode") {
-      for (const option of this.#configOptions) {
-        if (option.category === "mode") this.#unobservedConfigIds.delete(option.id);
-      }
-      this.#configOptions = this.#configOptions.map((option) => option.category === "mode"
-        ? Object.freeze({ ...option, currentValue: update.modeId })
-        : option);
       return;
     }
     // Streamed content is Provider-visible progress, mirrored for the Turn

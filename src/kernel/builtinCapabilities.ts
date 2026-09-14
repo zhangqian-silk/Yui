@@ -49,7 +49,6 @@ const definitions: readonly Omit<CapabilityDescriptor, "contractVersion" | "prov
     effect: "local-mutation", requiredPermissions: ["task:read"], source: "sendTaskMessageCommand",
     inputSchema: object({ taskId: text, body: text,
       intent: { enum: ["record", "discuss", "develop"] },
-      wakePolicy: { enum: ["leader", "none"] },
       recipient: object({ roleName: text, workItemId: text, reviewRoundId: text }, ["roleName"])
     }, ["taskId", "body"]), outputSchema: recordOutput
   },
@@ -278,8 +277,7 @@ export function createBuiltinCapabilities(
         // gains develop from an intent argument; only a global Operator Session
         // (user-authority) may carry one. sendTaskMessageCommand enforces this,
         // so the capability just forwards the optional intent unchanged.
-        const result = sendTaskMessageCommand(store, taskId, params.body as string,
-          params.wakePolicy as "leader" | "none" | undefined, { environment: callerEnvironment(caller) },
+        const result = sendTaskMessageCommand(store, taskId, params.body as string, { environment: callerEnvironment(caller) },
           params.recipient as { roleName: string; workItemId?: string; reviewRoundId?: string } | undefined,
           params.intent as TaskSubmissionIntent | undefined);
         signal(taskId);
@@ -352,7 +350,7 @@ export function createBuiltinCapabilities(
           ...(patch.tags?.length === 0 ? { tags: null } : {})
         }, {
           environment: callerEnvironment(caller),
-          runtime: { notifyStateChanged: signal, reconcileTask: signal }
+          runtime: { notifyMailboxChanged: () => signal(taskId), reconcileTask: signal }
         });
       }
       if (name === "job.get") {

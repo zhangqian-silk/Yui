@@ -204,22 +204,12 @@ export function decideSubmissionRouting(
 /**
  * Normalize a possibly-absent submission intent to its effective value.
  *
- * An absent intent is `discuss` (task-32 §2.5: "默认/旧客户端都按 discuss"), so
- * every old client and every message saved before the field existed keeps its
- * historical Leader-waking behaviour. Body text is never inspected.
- *
- * A legacy `--wake-policy none` carried the "save only, do not wake" meaning that
- * `record` now names, so a caller that supplied only that older signal maps to
- * `record` rather than silently becoming a Leader-waking `discuss`. An explicit
- * intent always wins over the wake-policy shorthand.
+ * The current default is `discuss`. Body text is never inspected.
  */
 export function normalizeSubmissionIntent(
-  intent: TaskSubmissionIntent | undefined,
-  wakePolicy?: "leader" | "none"
+  intent: TaskSubmissionIntent | undefined
 ): TaskSubmissionIntent {
-  if (intent !== undefined) return intent;
-  if (wakePolicy === "none") return "record";
-  return "discuss";
+  return intent ?? "discuss";
 }
 
 /**

@@ -906,9 +906,9 @@ function taskProjectCommand(
     }
     return next;
   });
-  notifyMailbox(options.runtime, taskMailbox(updated.id), updated.id);
+  notifyMailbox(options.runtime, taskMailbox(updated.id));
   if (updated.status === "active") {
-    notifyMailbox(options.runtime, leaderMailbox(updated.id), updated.id);
+    notifyMailbox(options.runtime, leaderMailbox(updated.id));
   }
   return output(`Added Project to ${updated.id}\n`, { task: updated });
 }
@@ -968,7 +968,7 @@ function updateTaskCommand(
   return `Updated task ${result.id}\n`;
 }
 
-/** Shared domain transaction for structured capabilities and the legacy CLI.
+/** Shared domain transaction for structured capabilities and the CLI.
  * Parsing text flags must not become an alternate business write path. */
 export function updateTaskMetadataCommand(
   store: TaskWorkflowStore,
@@ -993,7 +993,7 @@ export function updateTaskMetadataCommand(
     enqueueWork(tx, taskMailbox(updated.id), "task-updated", now, [taskRef(updated.id)]);
     return updated;
   });
-  notifyMailbox(options.runtime, taskMailbox(result.id), result.id);
+  notifyMailbox(options.runtime, taskMailbox(result.id));
   return result;
 }
 
@@ -1332,8 +1332,7 @@ export function submitOperatorMessage(
   });
   notifyMailbox(
     options.runtime,
-    result.queuedForLeader ? leaderMailbox(result.task.id) : taskMailbox(result.task.id),
-    result.task.id
+    result.queuedForLeader ? leaderMailbox(result.task.id) : taskMailbox(result.task.id)
   );
   const header = result.created
     ? `Created Draft task ${result.task.id}: ${result.task.title}\n`
@@ -1385,7 +1384,7 @@ function createTaskCommand(
     projectBindings: parsed.projectBindings,
     ...(parsed.type === undefined ? {} : { type: parsed.type })
   }, now, parsed.defaultProjectIds));
-  notifyMailbox(options.runtime, taskMailbox(created.task.id), created.task.id);
+  notifyMailbox(options.runtime, taskMailbox(created.task.id));
   return output(
     `Created Draft task ${created.task.id}: ${created.task.title}\n`
       + `Assigned role: ${created.leader.name}\n`
@@ -1655,8 +1654,8 @@ function activateTaskCommand(
     );
   });
   if (result.changed) {
-    notifyMailbox(options.runtime, taskMailbox(result.task.id), result.task.id);
-    notifyMailbox(options.runtime, leaderMailbox(result.task.id), result.task.id);
+    notifyMailbox(options.runtime, taskMailbox(result.task.id));
+    notifyMailbox(options.runtime, leaderMailbox(result.task.id));
   }
   return result.changed
     ? `Activated task ${result.task.id}\n`
@@ -1807,7 +1806,7 @@ function completeTaskCommand(
     } as const;
   });
   if (result.changed) {
-    notifyMailbox(options.runtime, { kind: "operator" }, result.task.id);
+    notifyMailbox(options.runtime, { kind: "operator" });
   }
   if (result.finalReview !== undefined) {
     const status = result.finalReview.status === "pending"
@@ -1875,9 +1874,9 @@ function reopenTaskCommand(
     return { task: active, changed: true, wakeLeader: actor !== "leader" } as const;
   });
   if (result.changed) {
-    notifyMailbox(options.runtime, taskMailbox(result.task.id), result.task.id);
+    notifyMailbox(options.runtime, taskMailbox(result.task.id));
     if (result.wakeLeader) {
-      notifyMailbox(options.runtime, leaderMailbox(result.task.id), result.task.id);
+      notifyMailbox(options.runtime, leaderMailbox(result.task.id));
     }
   }
   return result.changed
@@ -1982,7 +1981,7 @@ function archiveTaskCommand(
     }, now);
     return { task: archived, changed: true } as const;
   });
-  if (result.changed && !request.force) options.runtime?.notifyStateChanged(result.task.id);
+  if (result.changed && !request.force) options.runtime?.notifyMailboxChanged({ kind: "task", taskId: result.task.id });
   const diagnostics = taskArchiveDiagnostics(store, result.task);
   return output((result.changed
     ? `Archived task ${result.task.id}\n`
@@ -2019,8 +2018,8 @@ function cancelTaskCommand(
     // AgentRuns, inputs, WorkItems and their results remain independently readable.
     return cancelled;
   });
-  options.runtime?.notifyStateChanged(result.id);
-  notifyMailbox(options.runtime, { kind: "operator" }, result.id);
+  options.runtime?.notifyMailboxChanged({ kind: "task", taskId: result.id });
+  notifyMailbox(options.runtime, { kind: "operator" });
   return output(`Cancelled task ${result.id}\n`, { task: result });
 }
 
@@ -2161,8 +2160,8 @@ function retireTaskCommand(
     return { task: retired, changed: true } as const;
   });
   if (result.changed) {
-    options.runtime?.notifyStateChanged(result.task.id);
-    notifyMailbox(options.runtime, { kind: "operator" }, result.task.id);
+    options.runtime?.notifyMailboxChanged({ kind: "task", taskId: result.task.id });
+    notifyMailbox(options.runtime, { kind: "operator" });
   }
   return output(
     result.changed
@@ -2313,7 +2312,7 @@ function taskMessageCommand(
       enqueueWork(tx, taskMailbox(ref.taskId), "message-continuation", now, [messageRef(ref.taskId, current.id)]);
       return updated;
     });
-    notifyMailbox(options.runtime, taskMailbox(ref.taskId), ref.taskId);
+    notifyMailbox(options.runtime, taskMailbox(ref.taskId));
     return output(`Handed off Message ${ref.localId} to ${message.recipient.roleName}.\n`, message);
   }
   if (command === "show") {
@@ -2332,10 +2331,10 @@ function taskMessageCommand(
     return { kind: "output", output: `${JSON.stringify(expanded, null, 2)}\n`, data: expanded };
   }
   if (command === "send") {
-    const usage = "Task message send usage: yui task message send <id> (<body>|--body-file <path|->) [--intent record|discuss|develop] [--request-id <key>] [--wake-policy leader|none] [--to <role> --work-item <id>|--review-round <id>].";
+    const usage = "Task message send usage: yui task message send <id> (<body>|--body-file <path|->) [--intent record|discuss|develop] [--request-id <key>] [--to <role> --work-item <id>|--review-round <id>].";
     const parsed = parseTail(
       rest,
-      new Set(["--body-file", "--intent", "--request-id", "--wake-policy", "--to", "--work-item", "--review-round"]),
+      new Set(["--body-file", "--intent", "--request-id", "--to", "--work-item", "--review-round"]),
       usage
     );
     if (parsed.positionals.length < 1 || parsed.positionals.length > 2) throw usageError(usage);
@@ -2345,15 +2344,6 @@ function taskMessageCommand(
       "--body",
       usage
     );
-    const wakePolicyRaw = parsed.options.get("--wake-policy");
-    let wakePolicy: "leader" | "none" | undefined;
-    if (wakePolicyRaw === undefined) {
-      wakePolicy = undefined;
-    } else if (wakePolicyRaw === "leader" || wakePolicyRaw === "none") {
-      wakePolicy = wakePolicyRaw;
-    } else {
-      throw usageError(`--wake-policy must be 'leader' or 'none': ${wakePolicyRaw}.`);
-    }
     const intent = parseSubmissionIntentOption(parsed.options.get("--intent"), usage);
     const submissionKey = parsed.options.get("--request-id");
     if (submissionKey !== undefined && submissionKey.trim().length === 0) {
@@ -2363,7 +2353,7 @@ function taskMessageCommand(
     const workItemId = parsed.options.get("--work-item");
     const reviewRoundId = parsed.options.get("--review-round");
     if (recipientRole === undefined && (workItemId !== undefined || reviewRoundId !== undefined)) throw usageError("--to is required for scoped Message delivery.");
-    const result = sendTaskMessageCommand(store, parsed.positionals[0], body, wakePolicy, options,
+    const result = sendTaskMessageCommand(store, parsed.positionals[0], body, options,
       recipientRole === undefined ? undefined : { roleName: recipientRole, workItemId, reviewRoundId },
       intent, submissionKey);
     // A user/operator submission returns the unified §2.5 feedback; render each
@@ -2485,7 +2475,7 @@ function queueTaskInput(
   if (recipientRole === undefined && (workItemId !== undefined || reviewRoundId !== undefined)) {
     throw usageError("--to is required for scoped Message delivery.");
   }
-  const result = sendTaskMessageCommand(store, taskId, body, undefined, options,
+  const result = sendTaskMessageCommand(store, taskId, body, options,
     recipientRole === undefined ? undefined : { roleName: recipientRole, workItemId, reviewRoundId },
     undefined, undefined, { action: "queue", requestId });
   const reason = result.message.continuation?.notDeliveredReason;
@@ -2549,9 +2539,9 @@ function steerTaskInput(
     throw usageError("Steering the Leader targets its current turn directly; it takes no --work-item/--review-round Assignment.");
   }
   const result = leaderTarget
-    ? sendTaskMessageCommand(store, taskId, body, "none", options,
+    ? sendTaskMessageCommand(store, taskId, body, options,
         undefined, undefined, undefined, { action: "steer", requestId, expectedTarget })
-    : sendTaskMessageCommand(store, taskId, body, undefined, options,
+    : sendTaskMessageCommand(store, taskId, body, options,
         { roleName: recipientRole, workItemId, reviewRoundId }, undefined, undefined,
         { action: "steer", requestId, expectedTarget });
   const roleName = result.message.recipient?.roleName ?? recipientRole;
@@ -2655,16 +2645,13 @@ function steerInputDelivery(taskId: string, messageId: string, roleName: string,
  */
 export function sendTaskMessageCommand(
   store: TaskWorkflowStore, taskId: string, body: string,
-  wakePolicy: "leader" | "none" | undefined, options: TaskCommandOptions = {},
+  options: TaskCommandOptions = {},
   recipient?: Readonly<{ roleName: string; workItemId?: string; reviewRoundId?: string }>,
   intent?: TaskSubmissionIntent,
   submissionKey?: string,
   inputControl?: Readonly<{ action: TaskMessageInputAction; requestId: string; expectedTarget?: string }>
 ) {
   if (!body.trim()) throw usageError("Message body is required.");
-  if (recipient !== undefined && wakePolicy !== undefined) {
-    throw usageError("--wake-policy applies only to unaddressed Leader Messages; an owner-directed Message uses its exact continuation boundary.");
-  }
   if (recipient !== undefined && intent !== undefined) {
     throw usageError("A submission intent applies only to unaddressed Leader Messages; an owner-directed Message uses its exact continuation boundary.");
   }
@@ -2724,7 +2711,7 @@ export function sendTaskMessageCommand(
     // owner-directed continuations keep their exact existing boundary and never
     // gain develop authority (task-32 §2.5).
     if (recipient === undefined && (actor === "user" || actor === "operator")) {
-      const effectiveIntent = normalizeSubmissionIntent(intent, wakePolicy);
+      const effectiveIntent = inputControl?.action === "steer" ? "record" : normalizeSubmissionIntent(intent);
       const routed = routeUserSubmission(tx, task, actor, body, effectiveIntent,
         now, submissionKey, { kind: "task", taskId: task.id }, inputControl);
       return {
@@ -2778,10 +2765,10 @@ export function sendTaskMessageCommand(
   });
   if (result.idempotentReplay) return result;
   if (recipient !== undefined) {
-    notifyMailbox(options.runtime, taskMailbox(result.task.id), result.task.id);
+    notifyMailbox(options.runtime, taskMailbox(result.task.id));
   } else if (result.actor !== "leader") {
     notifyMailbox(options.runtime, result.queuedForLeader
-      ? leaderMailbox(result.task.id) : taskMailbox(result.task.id), result.task.id);
+      ? leaderMailbox(result.task.id) : taskMailbox(result.task.id));
   }
   return result;
 }
@@ -2808,8 +2795,8 @@ function updateMessage(
   store: TaskWorkflowStore,
   options: TaskCommandOptions
 ): TaskCommandExecution {
-  const usage = "Task message update usage: yui task message update <task>/<message> (<body>|--body-file <path|->) [--wake-policy leader|none].";
-  const parsed = parseTail(args, new Set(["--body-file", "--wake-policy"]), usage);
+  const usage = "Task message update usage: yui task message update <task>/<message> (<body>|--body-file <path|->).";
+  const parsed = parseTail(args, new Set(["--body-file"]), usage);
   if (parsed.positionals.length < 1 || parsed.positionals.length > 2) throw usageError(usage);
   const body = readCommandText(
     parsed.positionals[1],
@@ -2817,14 +2804,6 @@ function updateMessage(
     "--body",
     usage
   );
-  const wakePolicyRaw = parsed.options.get("--wake-policy");
-  const wakePolicy = wakePolicyRaw === undefined
-    ? undefined
-    : wakePolicyRaw === "leader" || wakePolicyRaw === "none"
-      ? wakePolicyRaw
-      : (() => {
-          throw usageError(`--wake-policy must be 'leader' or 'none': ${wakePolicyRaw}.`);
-        })();
   const reference = taskRecordReference(
     parsed.positionals[0],
     "message",
@@ -2850,14 +2829,12 @@ function updateMessage(
       throw usageError(`Task Message is retired: ${task.id}/${message.id}.`);
     }
     const updated = updateDraftTaskMessage(message, {
-      body,
-      ...(wakePolicy === undefined ? {} : { wakePolicy })
+      body
     });
     tx.updateMessage(task.id, updated);
     recordTaskEvent(tx, task.id, "message.updated", {
       messageId: updated.id,
-      updatedBy: actor,
-      ...(wakePolicy === undefined ? {} : { wakePolicy })
+      updatedBy: actor
     }, now);
     const queuedForLeader = updated.wakePolicy !== "none";
     if (queuedForLeader) {
@@ -2867,7 +2844,7 @@ function updateMessage(
     return { task, message: updated, queuedForLeader };
   });
   notifyMailbox(options.runtime, result.queuedForLeader
-    ? leaderMailbox(result.task.id) : taskMailbox(result.task.id), result.task.id);
+    ? leaderMailbox(result.task.id) : taskMailbox(result.task.id));
   return output(`Updated Task Message ${result.task.id}/${result.message.id}\n`, {
     message: result.message
   });
@@ -2922,7 +2899,7 @@ function retireMessage(
     }, now));
     return { task, message, changed: true } as const;
   });
-  if (result.changed) options.runtime?.notifyStateChanged(result.task.id);
+  if (result.changed) options.runtime?.notifyMailboxChanged({ kind: "task", taskId: result.task.id });
   return `Retired Task Message ${result.task.id}/${result.message.id}\n`;
 }
 
@@ -2951,7 +2928,7 @@ function taskWakeForceCommand(
     queueLeaderWakeup(tx, task.id, wakeReasonTag, now);
     recordTaskEvent(tx, task.id, "task.wake-forced", { reason: wakeReasonTag }, now);
   });
-  notifyMailbox(options.runtime, leaderMailbox(task.id), task.id);
+  notifyMailbox(options.runtime, leaderMailbox(task.id));
   return `Woke ${task.id} (${wakeReasonTag})\n`;
 }
 
@@ -3327,7 +3304,7 @@ function taskRoleSessionCommand(
       enqueueWork(tx, target, RUNTIME_SESSION_REPLACE_REQUIRED_REASON, now, [{ type: "task", id: task.id }]);
       return { taskId: task.id, roleName: role.name, target, alreadyRequested: false };
     });
-    notifyMailbox(options.runtime, result.target, result.taskId);
+    notifyMailbox(options.runtime, result.target);
     return output(`Requested Session replacement for ${result.taskId}/${result.roleName}. `
       + "Yui will stop the old execution, retain its history and workspaces, and select a fresh Session. "
       + "If replacing your own Session, end this turn; the successor reads durable Task context.\n", result);
@@ -3453,7 +3430,7 @@ function addTaskRole(
     }, now);
     return { role: created, binding };
   });
-  notifyMailbox(options.runtime, taskMailbox(result.role.taskId), result.role.taskId);
+  notifyMailbox(options.runtime, taskMailbox(result.role.taskId));
   const profileId = parsed.one("--profile");
   const runtimeSource = profileId !== undefined
     ? `Agent Profile ${profileId}`
@@ -3629,7 +3606,7 @@ function updateTaskRole(
     });
     return next;
   });
-  notifyMailbox(options.runtime, taskMailbox(updated.taskId), updated.taskId);
+  notifyMailbox(options.runtime, taskMailbox(updated.taskId));
   const sessions = store.getTaskRoleSessionSet(updated.taskId, updated.name);
   return output(renderRoleDetails(`Updated Task Role: ${updated.name}`, updated, {
     kind: "task",
@@ -3678,7 +3655,7 @@ function removeTaskRole(
     enqueueWork(tx, taskMailbox(task.id), "role-removed", now, [taskRef(task.id)]);
     return role;
   });
-  notifyMailbox(options.runtime, taskMailbox(removed.taskId), removed.taskId);
+  notifyMailbox(options.runtime, taskMailbox(removed.taskId));
   return `Removed role ${removed.name} from ${removed.taskId}\n`;
 }
 
@@ -3744,7 +3721,7 @@ function bindTaskRole(
     }, now);
     return { role: switched.role, mode: switched.mode };
   });
-  notifyMailbox(options.runtime, taskMailbox(result.role.taskId), result.role.taskId);
+  notifyMailbox(options.runtime, taskMailbox(result.role.taskId));
   return `Bound ${result.role.taskId}/${result.role.name} to ${result.role.activeAgentId} (${result.mode})\n`;
 }
 
@@ -4044,7 +4021,7 @@ function editWork(
     }
     return { task, item: updated };
   });
-  options.runtime?.notifyStateChanged(result.task.id);
+  options.runtime?.notifyMailboxChanged({ kind: "task", taskId: result.task.id });
   return output(`Edited Work Item ${result.task.id}/${result.item.id}\n`, {
     workItem: result.item
   });
@@ -4113,7 +4090,7 @@ function createWork(
     enqueueWork(tx, taskMailbox(task.id), "work-created", now, [workItemRef(task.id, created.id)]);
     return { item: created, guard };
   });
-  notifyMailbox(options.runtime, taskMailbox(item.item.taskId), item.item.taskId);
+  notifyMailbox(options.runtime, taskMailbox(item.item.taskId));
   return output(
     withGuardWarnings(item.guard, `Created work item ${item.item.id} for ${item.item.taskId}\n`),
     { workItem: item.item }
@@ -4165,7 +4142,7 @@ function updateWorkScope(
     return { item: next, changed: true } as const;
   });
   if (updated.changed) {
-    notifyMailbox(options.runtime, taskMailbox(updated.item.taskId), updated.item.taskId);
+    notifyMailbox(options.runtime, taskMailbox(updated.item.taskId));
   }
   return `${updated.changed ? "Updated" : "Unchanged"} Work Item Project scope ${
     updated.item.id
@@ -4361,7 +4338,7 @@ function updateWork(
       reviewTrigger: candidatePolicy?.trigger ?? null
     };
   });
-  notifyMailbox(options.runtime, taskMailbox(result.item.taskId), result.item.taskId);
+  notifyMailbox(options.runtime, taskMailbox(result.item.taskId));
   if ((result.item.status === "open" && result.item.candidates.length > 0) && status === "completed") {
     const failure = result.reviewDispatch?.round.status === "failed"
       ? `Review could not start: ${
@@ -4660,7 +4637,7 @@ function dispatchWork(
     return { kind: "replicated" as const, runs };
   });
   for (const run of dispatch.runs) {
-    notifyMailbox(options.runtime, roleMailbox(run.taskId, run.roleName), run.taskId);
+    notifyMailbox(options.runtime, roleMailbox(run.taskId, run.roleName));
   }
   return dispatch.kind === "direct"
     ? `Direct WorkItem AgentRun queued as ${dispatch.runs[0]!.id}\n`
@@ -4959,7 +4936,7 @@ function retireWork(
     }
     return next;
   });
-  options.runtime?.notifyStateChanged(retired.taskId);
+  options.runtime?.notifyMailboxChanged({ kind: "task", taskId: retired.taskId });
   return output(`Retired Work Item ${retired.id}\n`, { workItem: retired });
 }
 
@@ -5236,7 +5213,7 @@ function synthesizeRuns(
     }, now);
     return created;
   });
-  notifyMailbox(options.runtime, roleMailbox(run.taskId, run.roleName), run.taskId);
+  notifyMailbox(options.runtime, roleMailbox(run.taskId, run.roleName));
   return output(`Dispatched synthesis AgentRun ${run.taskId}/${run.id}\n`, { run });
 }
 
@@ -5782,7 +5759,7 @@ function settleFailedReviewExecutionLaneRun(
     } as const;
   });
   for (const run of result.mainRuns) {
-    notifyMailbox(options.runtime, roleMailbox(run.taskId, run.roleName), run.taskId);
+    notifyMailbox(options.runtime, roleMailbox(run.taskId, run.roleName));
   }
   return output(
     result.changed
@@ -5865,7 +5842,7 @@ function settleFailedExecutionLaneRun(
     } as const;
   });
   for (const run of result.mainRuns) {
-    notifyMailbox(options.runtime, roleMailbox(run.taskId, run.roleName), run.taskId);
+    notifyMailbox(options.runtime, roleMailbox(run.taskId, run.roleName));
   }
   return output(
     result.changed
@@ -5979,7 +5956,7 @@ function retireRun(
     }, now));
     return { task, run: run, changed: true } as const;
   });
-  if (result.changed) options.runtime?.notifyStateChanged(result.task.id);
+  if (result.changed) options.runtime?.notifyMailboxChanged({ kind: "task", taskId: result.task.id });
   return output(`Retired AgentRun ${result.task.id}/${result.run.id}\n`, {
     run: result.run,
     retired: true
@@ -6581,8 +6558,7 @@ function retryRunOperation(
   });
   notifyMailbox(
     options.runtime,
-    roleMailbox(retried.run.taskId, retried.run.roleName),
-    retried.run.taskId
+    roleMailbox(retried.run.taskId, retried.run.roleName)
   );
   return output(
     `Retry queued as ${retried.run.id} for ${retried.run.taskId}/${retried.run.roleName}\n`
@@ -7313,7 +7289,7 @@ function retryFailedReviewRun(
     return { round: resetRound, previousRun: run, created: true };
   });
   if ("run" in result && result.run !== undefined) {
-    notifyMailbox(options.runtime, roleMailbox(result.run.taskId, result.run.roleName), result.run.taskId);
+    notifyMailbox(options.runtime, roleMailbox(result.run.taskId, result.run.roleName));
   }
   return output(
     result.created
@@ -8059,7 +8035,7 @@ export function dispatchPreparedReviewRound(
     return createdRuns;
   });
   for (const run of runs) {
-    notifyMailbox(options.runtime, roleMailbox(run.taskId, run.roleName), run.taskId);
+    notifyMailbox(options.runtime, roleMailbox(run.taskId, run.roleName));
   }
   return runs[0] ?? null;
 }
@@ -8096,7 +8072,7 @@ export function failPendingReviewRound(
     ]);
     return terminal;
   });
-  notifyMailbox(options.runtime, leaderMailbox(taskId), taskId);
+  notifyMailbox(options.runtime, leaderMailbox(taskId));
   return failed;
 }
 
@@ -8842,7 +8818,7 @@ function taskWakeDispatch(
       tx.saveWorkMailbox(completeProcessing(mailbox!, claim.batchId));
       return { taskId: task.id, wakeId: wake.id, outcome: "released-without-replay" };
     });
-    notifyMailbox(options.runtime, leaderMailbox(result.taskId), result.taskId);
+    notifyMailbox(options.runtime, leaderMailbox(result.taskId));
     return output(`Released ${result.wakeId} without replay; original acceptance remains unknown.\n`, result);
   }
   if (subcommand === "list" || subcommand === "show") {

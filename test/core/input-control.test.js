@@ -943,7 +943,7 @@ test("Leader then selects its own next notification ahead of ordinary queue", t 
   const { store, command } = fixture(t);
   withLeaderTurn(store, { attemptId: "a-1", nativeTurnId: "t-1" });
   const queued = command(["message", "queue", "task-1", "Ordinary later input", "--request-id", "q-later"]);
-  const saved = command(["message", "send", "task-1", "Chosen immediate successor", "--wake-policy", "none"]);
+  const saved = command(["message", "send", "task-1", "Chosen immediate successor", "--intent", "record"]);
   const result = command(["role", "interrupt", "task-1", "leader", "--expected-target", "t-1",
     "--then-message", `task-1/${saved.data.message.id}`, "--request-id", "i-next"]);
   assert.equal(result.kind, "input-interrupt");
@@ -971,7 +971,7 @@ test("a Leader-owned AgentRun can claim then without inventing a WorkItem Assign
   store.saveRun(run);
   store.saveActiveRun(run);
   withRunBoundTurn(store, "leader", { runId: run.id, attemptId: "a-leader", nativeTurnId: "t-leader" });
-  const saved = command(["message", "send", "task-1", "Continue after stopping", "--wake-policy", "none"]);
+  const saved = command(["message", "send", "task-1", "Continue after stopping", "--intent", "record"]);
   const control = command(["role", "interrupt", "task-1", "leader", "--expected-target", "t-leader",
     "--then-message", `task-1/${saved.data.message.id}`, "--request-id", "leader-with-run"]);
   assert.equal(control.kind, "input-interrupt");
@@ -983,7 +983,7 @@ test("a Leader-owned AgentRun can claim then without inventing a WorkItem Assign
 test("a replaced Leader never receives an old then, while new queue remains usable", t => {
   const { store, command } = fixture(t);
   withLeaderTurn(store, { attemptId: "a-1", nativeTurnId: "t-1" });
-  const saved = command(["message", "send", "task-1", "Old then", "--wake-policy", "none"]);
+  const saved = command(["message", "send", "task-1", "Old then", "--intent", "record"]);
   command(["role", "interrupt", "task-1", "leader", "--expected-target", "t-1",
     "--then-message", `task-1/${saved.data.message.id}`, "--request-id", "i-old"]);
   const original = store.getTaskRoleSessionSet("task-1", "leader");

@@ -504,7 +504,7 @@ function writeQuarantineReceipt(
   _home: string,
   record: ResourceRecord,
   now: Date,
-  method: "move" | "git-worktree-remove",
+  method: "move",
   receiptPath: string
 ): void {
   try {
@@ -531,8 +531,8 @@ function isGitWorktreePath(path: string): boolean {
 /**
  * Restore a quarantined resource to its original path. Move-based Git
  * quarantine is reversed with `git worktree move`, preserving the exact
- * checkout. Legacy remove-based receipts rebuild a detached worktree at the
- * recorded HEAD; a branch tip is never used as a substitute.
+ * checkout. A different recorded method remains audit evidence and requires
+ * separate recovery; it is never reinterpreted as a move or a fresh checkout.
  */
 function restoreQuarantinedRecord(
   record: ResourceRecord,
@@ -542,54 +542,34 @@ function restoreQuarantinedRecord(
   const quarantine = record.quarantine;
   if (quarantine === undefined) return record;
   try {
-    if (quarantine.method === "git-worktree-remove" && quarantine.gitRestore !== undefined) {
-      const git = quarantine.gitRestore;
-      if (existsSync(quarantine.originalPath)) {
-        return {
-          ...record,
-          disposition: "cleanup-failed",
-          blocker: `Restore failed: original path already exists: ${quarantine.originalPath}`,
-          updatedAt: now.toISOString()
-        };
-      }
-      mkdirSync(dirname(quarantine.originalPath), { recursive: true });
-      if (git.head !== undefined) {
-        execFileSync(
-          "git",
-          ["-C", git.repositoryPath, "worktree", "add", "--detach", "--", quarantine.originalPath, git.head]
-        );
-      } else {
-        throw new Error("no head recorded for Git worktree restore");
-      }
+    if (quarantine.method !== "move" || !["worktree", "runtime-artifact"].includes(record.kind)) {
+      throw new Error(`Unsupported quarantine provenance: ${record.kind}/${quarantine.method}; preserve its evidence for explicit recovery.`);
+    }
+    if (!existsSync(quarantine.path)) {
+      return {
+        ...record,
+        disposition: "cleanup-failed",
+        blocker: `Restore failed: quarantine path missing: ${quarantine.path}`,
+        updatedAt: now.toISOString()
+      };
+    }
+    if (existsSync(quarantine.originalPath)) {
+      return {
+        ...record,
+        disposition: "cleanup-failed",
+        blocker: `Restore failed: original path already exists: ${quarantine.originalPath}`,
+        updatedAt: now.toISOString()
+      };
+    }
+    mkdirSync(dirname(quarantine.originalPath), { recursive: true });
+    if (isGitWorktreePath(quarantine.path)) {
+      execFileSync(
+        "git",
+        ["-C", quarantine.path, "worktree", "move", "--", quarantine.path, quarantine.originalPath],
+        { timeout: 30_000 }
+      );
     } else {
-      // Move-based restore: rename the quarantine directory back.
-      if (!existsSync(quarantine.path)) {
-        return {
-          ...record,
-          disposition: "cleanup-failed",
-          blocker: `Restore failed: quarantine path missing: ${quarantine.path}`,
-          updatedAt: now.toISOString()
-        };
-      }
-      if (existsSync(quarantine.originalPath)) {
-        return {
-          ...record,
-          disposition: "cleanup-failed",
-          blocker: `Restore failed: original path already exists: ${quarantine.originalPath}`,
-          updatedAt: now.toISOString()
-        };
-      }
-      if (isGitWorktreePath(quarantine.path)) {
-        mkdirSync(dirname(quarantine.originalPath), { recursive: true });
-        execFileSync(
-          "git",
-          ["-C", quarantine.path, "worktree", "move", "--", quarantine.path, quarantine.originalPath],
-          { timeout: 30_000 }
-        );
-      } else {
-        mkdirSync(dirname(quarantine.originalPath), { recursive: true });
-        renameSync(quarantine.path, quarantine.originalPath);
-      }
+      renameSync(quarantine.path, quarantine.originalPath);
     }
   } catch (error) {
     return {
@@ -663,6 +643,14 @@ export async function purgeResourceQuarantine(
   for (const record of quarantined) {
     const quarantine = record.quarantine;
     if (quarantine === undefined) continue;
+    if (quarantine.method !== "move" || !["worktree", "runtime-artifact"].includes(record.kind)) {
+      const retained = { ...record, disposition: "cleanup-failed" as const,
+        blocker: `Unsupported quarantine provenance: ${record.kind}/${quarantine.method}; preserve its evidence for explicit recovery.`,
+        updatedAt: options.now.toISOString() };
+      state = upsertResourceRecord(state, retained);
+      failed.push(retained);
+      continue;
+    }
     const ageMs = options.now.getTime() - Date.parse(quarantine.movedAt);
     if (!Number.isFinite(ageMs) || ageMs < ttlMs) continue;
     // A live-reference source that cannot be trusted fails closed: keep the

@@ -113,9 +113,9 @@ export function taskBriefCommand(
       }
       return { task, brief };
     });
-    notifyMailbox(options.runtime, taskMailbox(result.task.id), result.task.id);
+    notifyMailbox(options.runtime, taskMailbox(result.task.id));
     if (result.task.status === "active") {
-      notifyMailbox(options.runtime, leaderMailbox(result.task.id), result.task.id);
+      notifyMailbox(options.runtime, leaderMailbox(result.task.id));
     }
     return output(`Updated brief for ${result.task.id}\n`, { taskId: result.task.id, brief: result.brief });
   }
@@ -155,8 +155,8 @@ export function taskDecisionCommand(
       }
       return { task, decision };
     });
-    notifyMailbox(options.runtime, taskMailbox(result.task.id), result.task.id);
-    if (result.task.status === "active") notifyMailbox(options.runtime, leaderMailbox(result.task.id), result.task.id);
+    notifyMailbox(options.runtime, taskMailbox(result.task.id));
+    if (result.task.status === "active") notifyMailbox(options.runtime, leaderMailbox(result.task.id));
     return output(`Recorded decision ${result.decision.id} for ${result.task.id}\n`);
   }
   if (command === "list") {
@@ -231,8 +231,8 @@ export function taskDecisionCommand(
       }
       return { task, decision };
     });
-    notifyMailbox(options.runtime, taskMailbox(result.task.id), result.task.id);
-    if (result.task.status === "active") notifyMailbox(options.runtime, leaderMailbox(result.task.id), result.task.id);
+    notifyMailbox(options.runtime, taskMailbox(result.task.id));
+    if (result.task.status === "active") notifyMailbox(options.runtime, leaderMailbox(result.task.id));
     return output(`Superseded decision ${result.decision.id} for ${result.task.id}\n`);
   }
   throw usageError(command === undefined
@@ -275,7 +275,7 @@ export function taskMilestoneCommand(
       enqueueWork(tx, taskMailbox(task.id), "milestone-added", now, [taskRef(task.id)]);
       return { task, milestone };
     });
-    notifyMailbox(options.runtime, taskMailbox(result.task.id), result.task.id);
+    notifyMailbox(options.runtime, taskMailbox(result.task.id));
     return output(`Added milestone ${result.milestone.id} for ${result.task.id}\n`);
   }
   if (command === "list") {

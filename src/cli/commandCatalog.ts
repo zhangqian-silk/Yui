@@ -544,11 +544,10 @@ const taskChildren: readonly NodeInput[] = [
       {
         name: "send",
         summary: "Send a Task message. An unaddressed user/operator message carries a submission intent (record|discuss|develop) and an optional idempotency key.",
-        usage: "yui task message send <id> (<body>|--body-file <path|->) [--intent record|discuss|develop] [--request-id <key>] [--wake-policy leader|none] [--to <role> --work-item <id>|--review-round <id>]",
-        options: ["--body-file", "--intent", "--request-id", "--wake-policy", "--to", "--work-item", "--review-round"],
+        usage: "yui task message send <id> (<body>|--body-file <path|->) [--intent record|discuss|develop] [--request-id <key>] [--to <role> --work-item <id>|--review-round <id>]",
+        options: ["--body-file", "--intent", "--request-id", "--to", "--work-item", "--review-round"],
         optionValues: {
-          "--intent": ["record", "discuss", "develop"],
-          "--wake-policy": ["leader", "none"]
+          "--intent": ["record", "discuss", "develop"]
         },
         fileOptions: ["--body-file"]
       },
@@ -579,12 +578,9 @@ const taskChildren: readonly NodeInput[] = [
       },
       {
         name: "update",
-        summary: "Replace the mutable body and wake policy of a Draft user/operator Message.",
-        usage: "yui task message update <task>/<message> (<body>|--body-file <path|->) [--wake-policy leader|none]",
-        options: ["--body-file", "--wake-policy"],
-        optionValues: {
-          "--wake-policy": ["leader", "none"]
-        },
+        summary: "Replace the body of a Draft user/operator Message without changing its submission intent.",
+        usage: "yui task message update <task>/<message> (<body>|--body-file <path|->)",
+        options: ["--body-file"],
         fileOptions: ["--body-file"]
       },
       {

@@ -103,19 +103,14 @@ export type AcpConfigurationRejection = Readonly<{
  * What became of one requested field, stated at the strength the protocol
  * actually supports.
  *
- * The three confirmations are not degrees of confidence in the same fact, they
- * are different facts. `observed` means the Agent's own complete option list
- * reports the value; `acknowledged` means the Agent accepted the call and the
- * method it implements returns nothing to check, which is all a legacy
- * `session/set_mode` peer can ever provide. Collapsing the second into the first
- * would report an unverified mode as a verified one, on the single axis where
- * that reads as granted authority.
+ * `already` reports the requested value before any write; `observed` confirms
+ * the requested change in the Agent's own complete option list.
  */
 export type AcpConfigurationOutcome = Readonly<{
   field: AcpConfigurationField;
   configId: string;
   value: string;
-  confirmation: "already" | "observed" | "acknowledged";
+  confirmation: "already" | "observed";
 }>;
 
 /** What one field resolves to against the option list the Agent reports now. */
@@ -323,21 +318,14 @@ function resolveRequest(
  *
  * Only stated values are checked. An unrequested axis has no expectation to
  * violate, and `default` permission means Yui asked for nothing.
- *
- * Legacy `session/set_mode` peers answer with no option list, so their mode
- * cannot be re-read; `acknowledged` outcomes carry that and are excluded here
- * rather than being verified against a value Yui wrote into its own cache.
  */
 export function verifyAcpConfiguration(
   desired: AcpDesiredSessionConfiguration,
   options: readonly AcpConfigOption[],
-  component: AgentExecutionComponentId,
-  outcomes: readonly AcpConfigurationOutcome[]
+  component: AgentExecutionComponentId
 ): readonly string[] {
   const failures: string[] = [];
   for (const field of ACP_CONFIGURATION_ORDER) {
-    const outcome = outcomes.find((candidate) => candidate.field === field);
-    if (outcome !== undefined && outcome.confirmation === "acknowledged") continue;
     const resolution = resolveAcpConfigurationField(field, desired, options, component);
     if (resolution.kind === "unrequested" || resolution.kind === "satisfied") continue;
     if (resolution.kind === "rejection") {

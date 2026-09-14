@@ -559,7 +559,6 @@ export async function startFileTaskControllerRuntime(
       environment: options.environment ?? process.env, onError: options.onError
     });
     const webSurface = createWebTaskSurface(store, { runtime: {
-      notifyStateChanged: (taskId) => runningRuntime?.signal(`task:${taskId}`),
       notifyMailboxChanged: (target) => {
         if (target.kind === "role") runningRuntime?.signal(`role:${target.taskId}/${target.roleName}`);
         else if (target.kind === "task") runningRuntime?.signal(`task:${target.taskId}`);

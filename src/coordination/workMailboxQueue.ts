@@ -36,14 +36,6 @@ export type RoleRunDispatchToken =
 
 export type RoleRunDispatchSettlement = "settled" | "absent" | "state-changed";
 
-const LEGACY_ROLE_RUN_DISPATCH_REASONS = new Set([
-  "turn-dispatched",
-  "turn-retried",
-  "review-requested",
-  "workitem-synthesis-ready",
-  "review-synthesis-ready"
-]);
-
 /** Atomically useful when called inside the caller's TaskStore transaction. */
 export function enqueueWork(
   store: WorkMailboxQueueStore,
@@ -137,29 +129,12 @@ export function captureRoleRunDispatch(
       };
     }
   }
-  // Valid earlier dispatches used sequence-generated dedupe keys and could
-  // include a companion WorkItem ref. Consume that complete legacy batch once
-  // the exact AgentRun reaches an accepted or terminal boundary.
-  if (pending.requestCount === 1
-    && pending.sources.length === 1
-    && pending.sources[0] === "yui"
-    && pending.reasons.some((reason) => LEGACY_ROLE_RUN_DISPATCH_REASONS.has(reason))
-    && pending.refs.some((ref) => (
-      mailboxEntityRefKey(ref) === mailboxEntityRefKey(exactRef)
-    ))) {
-    return {
-      kind: "pending",
-      fromSequence: pending.fromSequence,
-      toSequence: pending.toSequence
-    };
-  }
   return null;
 }
 
 /**
  * Settles one exact ordinary Role AgentRun dispatch. Provider acceptance is the
- * normal boundary; terminalization calls the same operation for conclusively
- * unaccepted and valid earlier dispatches.
+ * normal boundary; terminalization uses the same exact dispatch identity.
  */
 export function settleRoleRunDispatch(
   store: WorkMailboxQueueStore,

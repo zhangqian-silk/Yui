@@ -20,6 +20,33 @@ Agent 选择一个预先声明的计划，设施从持久状态驱动该计划�
 （`src/release/releaseWorkflowPorts.ts`）之后。可用临时 SQLite 和确定性的外部端口测试
 恢复逻辑，无需真实 GitHub、npm、git、Controller 或模型效果。
 
+## 1.0 前的契约清理
+
+当前开发步骤先清退运行时兼容分支，尚未执行最终 1.0 基线切换，也不发布版本或重置
+存储编号。存储 `27→28` 只规范化可明确识别的单条 Role 调度去重键，旧迁移账本、
+Message、Task 结果和不确定外部效果保持不变。普通打开要求存储 28；已有 Home 只通过
+显式升级入口前进，不增加运行时双读。
+
+这是一次 1.0 前的破坏性变更：
+
+- `message send` 统一使用 `--intent`；CLI 与 capability API 不再接受 `--wake-policy`
+  或 `wakePolicy` 参数，Draft 编辑保留原提交意图。
+- 内部命令集成实现 `notifyMailboxChanged`；Task-only 通知适配器及其调用已统一。
+- ACP peer 必须回报 `configOptions`，不再走 `modes`／`set_mode` 路径。
+- Release 恢复要求精确 Home 与安装 prefix。缺少固定目标的效果保持 unknown，
+  身份不完整的 handover lock 保持围栏。
+- 开发 link/unlink 要求当前登记文件，不搜索或接管旧 NVM 登记，不重建孤立链接。
+- GC 不再发现旧 deployment 布局或重建已删除 worktree；不受支持的 quarantine
+  证据保留，不会被当成当前 move 回执清除。
+
+发布前应先收敛旧执行，对不受支持的锁、链接和隔离资源做显式清理。归属与处置尚未
+确定时保留原记录，运行时不替 Agent 选择恢复方案。
+
+后续基线切换必须先验证到目标格式的桥接或导出，再用一个干净基线替换旧初始化和迁移链，
+之后才能删除基线之前的迁移及历史夹具。存储基线只重置一次，不在发布 `1.0.0` 时再次
+重置。未知版本拒绝、精确进程／Host 身份检查与持久审计证据仍应保留。版本 tag、真实
+Home 迁移和发布效果需要各自的发布授权。
+
 ## 授权模型
 
 每一次（再）提交一个步骤，都在外部调用**之前**通过 `checkGrant(grant, request, now)`

@@ -22,7 +22,6 @@ import { migrateSqliteSchema } from "../../dist/storage/sqliteSchema.js";
 import {
   managedRuntimeRoot,
   managedTaskRoot,
-  managedWorktreeRoot,
   storageBackupRoot
 } from "../../dist/storage/homeLayout.js";
 import { SqliteTaskStore } from "../../dist/storage/sqliteStore.js";
@@ -340,7 +339,7 @@ test("unify-home relocates managed trees into Home and rewrites live pointers", 
   // (1) The durable worktree tree is COPIED into Home; the original is PRESERVED
   // as the rollback anchor. The disposable runtime and the regenerable task views
   // are pointer-only — their trees are never physically moved by the migration.
-  const newWorktreeRoot = managedWorktreeRoot(home);
+  const newWorktreeRoot = join(home, "workspaces", "worktree");
   const newMain = join(newWorktreeRoot, "app", "main-abcd");
   const newLinked = join(newWorktreeRoot, "app", "work-item-1-efgh");
   assert.equal(existsSync(newMain), true, "main clone copied into Home");
@@ -506,7 +505,7 @@ test("unify-home refuses when a non-terminal durable Job is under a relocating r
 
   // Fail-closed: nothing moved, nothing rewritten, ledger unchanged.
   assert.equal(existsSync(join(workspace, "worktree")), true, "trees untouched on refusal");
-  assert.equal(existsSync(managedWorktreeRoot(home)), false, "no partial relocation");
+  assert.equal(existsSync(join(home, "workspaces", "worktree")), false, "no partial relocation");
   const row = db
     .prepare("SELECT path FROM managed_workspaces WHERE owner_kind = 'task'")
     .get();
@@ -695,7 +694,7 @@ test("real upgrade path: active run effective+workspace move together and pass t
 function worktreeRoots(workspace, home) {
   return {
     oldWorktreeRoot: join(workspace, "worktree"),
-    newWorktreeRoot: managedWorktreeRoot(home)
+    newWorktreeRoot: join(home, "workspaces", "worktree")
   };
 }
 
@@ -896,7 +895,7 @@ test("P2: dry-run and update-preflight surface the same blockers as execute {rea
 
   // Plant a FOREIGN directory at the relocation target (differs from the source):
   // a real target conflict the preflight must detect WITHOUT touching the store.
-  const newWorktreeRoot = managedWorktreeRoot(home);
+  const newWorktreeRoot = join(home, "workspaces", "worktree");
   mkdirSync(newWorktreeRoot, { recursive: true });
   writeFileSync(join(newWorktreeRoot, "SOMEONE-ELSES-FILE.txt"), "not ours\n");
 
@@ -1057,8 +1056,8 @@ test("P4: the preserved source keeps an independent, working Git after the migra
   assert.deepEqual(result.applied, [UNIFY_TARGET_VERSION]);
 
   // The NEW copy exists and is a valid, repaired worktree pair.
-  const newMain = join(managedWorktreeRoot(home), "app", "main-abcd");
-  const newLinked = join(managedWorktreeRoot(home), "app", "work-item-1-efgh");
+  const newMain = join(join(home, "workspaces", "worktree"), "app", "main-abcd");
+  const newLinked = join(join(home, "workspaces", "worktree"), "app", "work-item-1-efgh");
   assert.equal(existsSync(newMain), true, "main clone copied into Home");
   assert.equal(
     git(["-C", newLinked, "rev-parse", "--is-inside-work-tree"]),
@@ -1082,8 +1081,8 @@ test("P4: the preserved source keeps an independent, working Git after the migra
 
   // (2) The OLD tree is fully independent: hide the NEW copy entirely, then prove
   // the OLD worktrees still read HEAD, index, and status without it.
-  const hidden = `${managedWorktreeRoot(home)}.hidden`;
-  renameSync(managedWorktreeRoot(home), hidden);
+  const hidden = `${join(home, "workspaces", "worktree")}.hidden`;
+  renameSync(join(home, "workspaces", "worktree"), hidden);
   t.after(() => rmSync(hidden, { recursive: true, force: true }));
 
   assert.equal(

@@ -17,7 +17,7 @@ import test from "node:test";
 import Database from "better-sqlite3";
 
 import { migrateSqliteSchema, storageMigrationPlan } from "../../dist/storage/sqliteSchema.js";
-import { managedTaskRoot, managedWorktreeRoot } from "../../dist/storage/homeLayout.js";
+import { managedTaskRoot } from "../../dist/storage/homeLayout.js";
 import { SqliteTaskStore } from "../../dist/storage/sqliteStore.js";
 import { CURRENT_STORAGE_VERSION } from "../../dist/storage/storageVersions.js";
 import { sanitizedTestEnv } from "../helpers/sanitizedEnv.mjs";
@@ -66,7 +66,7 @@ function openV19Home(t, prefix) {
 
 /** The v19 physical worktree root: `<home>/workspaces/worktree`. */
 function worktreeRoot(home) {
-  return managedWorktreeRoot(home);
+  return join(home, "workspaces", "worktree");
 }
 
 /**

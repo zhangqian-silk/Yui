@@ -56,7 +56,7 @@ function provisionLeader(store, workspace) {
 }
 
 function submit(store, taskId, body, intent, key) {
-  return sendTaskMessageCommand(store, taskId, body, undefined,
+  return sendTaskMessageCommand(store, taskId, body,
     { environment: userEnv, now }, undefined, intent, key);
 }
 

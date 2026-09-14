@@ -249,7 +249,6 @@ export type TaskMessageContext = Readonly<{
 
 export type TaskMessageDraftUpdate = Readonly<{
   body: string;
-  wakePolicy?: "leader" | "none";
 }>;
 
 export function createTaskMessage(
@@ -422,10 +421,7 @@ export function updateDraftTaskMessage(
   }
   const updated: TaskMessage = {
     ...message,
-    body: requireBody(update.body),
-    ...(update.wakePolicy === undefined
-      ? {}
-      : { wakePolicy: update.wakePolicy })
+    body: requireBody(update.body)
   };
   validateTaskMessage(updated);
   return updated;

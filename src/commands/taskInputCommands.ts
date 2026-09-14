@@ -41,8 +41,7 @@ const LEADER_ROLE = "leader";
 
 type TaskInputCommandOptions = Readonly<{
   runtime?: {
-    notifyStateChanged(taskId: string): void;
-    notifyMailboxChanged?(target: MailboxTarget): void;
+    notifyMailboxChanged(target: MailboxTarget): void;
   };
   now?: () => Date;
   environment?: NodeJS.ProcessEnv;
@@ -154,7 +153,7 @@ function createRequest(
     }, now);
     return created;
   });
-  notifyMailbox(options, { kind: "operator" }, request.taskId);
+  notifyMailbox(options, { kind: "operator" });
   return output(`Created input request ${request.id} for ${request.taskId}\n`, { request });
 }
 
@@ -263,7 +262,7 @@ function answerRequest(
     );
     return answered;
   });
-  notifyMailbox(options, { kind: "role", taskId: request.taskId, roleName: LEADER_ROLE }, request.taskId);
+  notifyMailbox(options, { kind: "role", taskId: request.taskId, roleName: LEADER_ROLE });
   return output(`Answered input request ${request.id} for ${request.taskId}\n`, { request });
 }
 
@@ -302,7 +301,7 @@ function cancelRequest(
     );
     return cancelled;
   });
-  notifyMailbox(options, { kind: "role", taskId: request.taskId, roleName: LEADER_ROLE }, request.taskId);
+  notifyMailbox(options, { kind: "role", taskId: request.taskId, roleName: LEADER_ROLE });
   return output(`Cancelled input request ${request.id} for ${request.taskId}\n`, { request });
 }
 
@@ -665,12 +664,7 @@ function parseMultiValueTail(
 
 function notifyMailbox(
   options: TaskInputCommandOptions,
-  target: MailboxTarget,
-  compatibilityTaskId: string
+  target: MailboxTarget
 ): void {
-  if (options.runtime?.notifyMailboxChanged !== undefined) {
-    options.runtime.notifyMailboxChanged(target);
-  } else {
-    options.runtime?.notifyStateChanged(compatibilityTaskId);
-  }
+  options.runtime?.notifyMailboxChanged(target);
 }

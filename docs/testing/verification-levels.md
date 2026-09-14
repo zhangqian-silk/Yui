@@ -126,6 +126,11 @@ is required.
 24. Release resume re-queries uncertain effects, retains confirmed work and
     refuses exhausted grants, using disposable SQLite and fake external ports.
     These checks do not claim validation of real release services.
+25. The pre-1.0 contract cleanup normalizes old singleton dispatches only through
+    explicit storage migration. Unsupported CLI/ACP input, unregistered development
+    links, unpinned release identities and unsupported quarantine receipts are
+    refused without inventing acceptance or discarding evidence. Current link,
+    configuration and quarantine operations remain usable.
 
 Keep the test phase seconds-scale; measure TypeScript build separately. Record
 incremental runtime when adding a critical regression. The seven recovery boundary

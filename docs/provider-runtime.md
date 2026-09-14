@@ -91,7 +91,9 @@ The codec must not implement another Task/Run Store or invent native Turn IDs.
 Model, effort and permission requests are compiled against the peer's offered
 configuration axes and checked after application. Setters can change other axes;
 final observed values must still satisfy the requested launch before prompt.
-An acknowledgement without a reported value is weaker than an observed match.
+New and loaded Sessions must report `configOptions` (an empty array is valid).
+Configuration uses `session/set_config_option`; mode-only peers are unsupported.
+An acknowledgement without current reported values cannot satisfy a requested change.
 Unknown ACP products do not inherit a guessed bypass mode from another product.
 
 Yui distinguishes three configuration layers:

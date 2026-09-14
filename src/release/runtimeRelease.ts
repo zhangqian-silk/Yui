@@ -510,12 +510,7 @@ export function acquireHandoverLock(home: string): HandoverLock {
       if (isEnoent(error)) continue;
       throw error;
     }
-    if (
-      typeof existing.pid === "number"
-      && Number.isSafeInteger(existing.pid)
-      && existing.pid > 0
-      && isHandoverLockLive(existing)
-    ) {
+    if (isHandoverLockLive(existing)) {
       throw new Error(
         `Another Controller handover is already running (owner PID ${existing.pid}, `
           + `createdAt ${String(existing.createdAt)}): ${lockPath}`
@@ -533,8 +528,8 @@ export function acquireHandoverLock(home: string): HandoverLock {
  * A handover lock is live only when its owner process is still the same
  * generation that wrote it. A PID that exists but with a different start
  * identity was reused by an unrelated process, so the lock is stale.
- * Locks written before the start-identity field existed fall back to the
- * PID-exists check for backward compatibility.
+ * An incomplete identity is not proof of a stale owner. Diagnose it without
+ * removing the lock or authorizing an apparent parent by PID alone.
  */
 function isHandoverLockLive(existing: {
   pid?: unknown;
@@ -544,15 +539,14 @@ function isHandoverLockLive(existing: {
     typeof existing.pid !== "number"
     || !Number.isSafeInteger(existing.pid)
     || existing.pid <= 0
+    || typeof existing.processStartIdentity !== "string"
+    || !/^[0-9]{1,32}$/u.test(existing.processStartIdentity)
   ) {
-    return false;
+    throw new Error("Unsupported handover lock identity; preserve the lock and inspect its owner before cleanup.");
   }
   const currentIdentity = readLinuxProcessStartIdentity(existing.pid);
   if (currentIdentity === undefined) return false;
-  if (typeof existing.processStartIdentity === "string") {
-    return currentIdentity === existing.processStartIdentity;
-  }
-  return true;
+  return currentIdentity === existing.processStartIdentity;
 }
 
 export function newHandoverId(): string {

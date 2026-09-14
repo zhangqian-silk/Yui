@@ -1333,6 +1333,37 @@ CREATE INDEX idx_global_provider_retry ON global_role_session_sets(
   json_extract(payload, '$.providerBinding.retry.status')
 ) WHERE json_extract(payload, '$.providerBinding.retry.status') IN ('waiting', 'in-flight');
 `
+  },
+  {
+    version: 28,
+    name: "current-contract-only-dispatch",
+    introducedIn: "0.16.0",
+    // Freeze the one valid earlier singleton dispatch shape here, not in the
+    // normal runtime. Preserve the full input batch and sequence; only replace
+    // its transport dedupe identity. Merged/ambiguous batches, processing
+    // claims, original Messages, results and external-effect evidence remain
+    // untouched. This step does not accept, replay or complete any execution.
+    sql: `
+UPDATE mailboxes
+SET pending = json_set(pending,
+  '$.sources', json_array('turn-dispatch'),
+  '$.dedupeKeys', json_array('role-turn:' || task_id || ':' || role_name || ':' ||
+    (SELECT json_extract(value, '$.id') FROM json_each(mailboxes.pending, '$.refs')
+     WHERE json_extract(value, '$.type') = 'run'
+       AND json_extract(value, '$.taskId') = mailboxes.task_id)))
+WHERE target_kind = 'role' AND role_name <> 'leader' AND pending IS NOT NULL
+  AND json_extract(pending, '$.requestCount') = 1
+  AND json_array_length(pending, '$.sources') = 1
+  AND json_extract(pending, '$.sources[0]') = 'yui'
+  AND EXISTS (SELECT 1 FROM json_each(mailboxes.pending, '$.reasons')
+    WHERE value IN ('turn-dispatched', 'turn-retried', 'review-requested',
+                    'workitem-synthesis-ready', 'review-synthesis-ready'))
+  AND (SELECT count(*) FROM json_each(mailboxes.pending, '$.refs')
+       WHERE json_extract(value, '$.type') = 'run') = 1
+  AND EXISTS (SELECT 1 FROM json_each(mailboxes.pending, '$.refs')
+    WHERE json_extract(value, '$.type') = 'run'
+      AND json_extract(value, '$.taskId') = mailboxes.task_id);
+`
   }
 ]);
 

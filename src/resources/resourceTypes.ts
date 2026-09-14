@@ -67,9 +67,10 @@ export type ResourceQuarantineState = Readonly<{
   path: string;
   originalPath: string;
   movedAt: string;
-  /** How the resource was quarantined, so restore can reverse it. */
+  /** Recorded provenance. Only `move` is executable by current restore/purge;
+   * other receipts remain readable evidence for separate recovery. */
   method: "move" | "git-worktree-remove";
-  /** Git metadata needed to rebuild a linked worktree on restore. */
+  /** Preserved audit metadata, never an instruction to rebuild a checkout. */
   gitRestore?: Readonly<{
     repositoryPath: string;
     branch?: string;

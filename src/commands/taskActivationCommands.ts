@@ -94,7 +94,7 @@ function requestActivation(
         [{ type: "task", id: taskId }]
       );
     });
-    void options.runtime?.notifyMailboxChanged?.({ kind: "task", taskId });
+    void options.runtime?.notifyMailboxChanged({ kind: "task", taskId });
   }
   const request = result.request;
   const lines = [

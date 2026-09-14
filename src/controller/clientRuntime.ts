@@ -638,10 +638,6 @@ export class FileTaskWorkflowRuntime implements TaskWorkflowRuntimePort {
     readonly clientOptions: FileControllerClientOptions = {}
   ) {}
 
-  notifyStateChanged(taskId: string): void {
-    void this.notifyMailboxChanged({ kind: "task", taskId });
-  }
-
   notifyMailboxChanged(target: MailboxTarget): Promise<void> {
     const pending = callFileTaskController(
       this.home,

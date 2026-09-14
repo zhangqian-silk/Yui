@@ -73,8 +73,10 @@ ACP 协商初始化和 Session 能力，打开或加载一个确切的 Session�
 Task/Run Store，也不得编造原生 Turn ID。
 
 model、effort 和权限请求依据 peer 提供的配置轴编译，并在套用后检查。setter 可以
-改变其他轴；最终观察到的值在 prompt 之前仍必须满足请求的启动。一个没有回报值的
-确认弱于一次已观察的匹配。未知的 ACP 产品不从另一个产品继承猜测的旁路模式。
+改变其他轴；最终观察到的值在 prompt 之前仍必须满足请求的启动。
+新建和加载 Session 都必须回报 `configOptions`（可以为空数组），配置只使用
+`session/set_config_option`，不再支持 mode-only peer。仅确认调用、没有当前回报值
+不能证明请求的配置已生效。未知的 ACP 产品不从另一个产品继承猜测的旁路模式。
 
 Yui 区分三个配置层：
 

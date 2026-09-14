@@ -27,6 +27,42 @@ system sits behind `ReleaseWorkflowPorts`
 external ports exercise recovery without real GitHub, npm, git, Controller,
 or model effects.
 
+## Pre-1.0 contract cleanup
+
+The current development step retires runtime compatibility before the final
+1.0 baseline cutover. It does not publish a release or reset storage numbering.
+Storage 27→28 normalizes only provable singleton Role dispatch dedupe keys;
+the old migration ledger, Messages, Task results and unconfirmed effects remain
+unchanged. Ordinary opens require storage 28. Existing Homes advance only through
+the explicit upgrade boundary; no runtime dual-reader is added.
+
+This is a breaking pre-1.0 change:
+
+- `message send` uses `--intent`; `--wake-policy` is no longer accepted by the
+  CLI or capability API. Draft edits preserve intent.
+- Internal command integrations implement `notifyMailboxChanged`; the Task-only
+  notification adapter has been removed with its callers updated.
+- ACP peers must report `configOptions`; there is no `modes`/`set_mode` path.
+- Release recovery requires a pinned Home and installation prefix. Unpinned
+  identities remain unknown, and incomplete handover locks remain fenced.
+- Development link/unlink requires the current registry. It does not discover
+  or adopt older NVM registrations or reconstruct orphan links.
+- GC no longer discovers retired deployment layouts or reconstructs removed
+  worktrees. Unsupported quarantine evidence is retained, never purged as if
+  it were a current move receipt.
+
+Before rollout, settle old executions and use explicit cleanup for unsupported
+locks, links or quarantines. Preserve those records until their owner and
+disposition are established; the runtime does not choose recovery for them.
+
+The later baseline cutover must first establish a verified bridge/export to the
+chosen current format, then replace the old initialization/migration chain with
+one clean baseline. Only then remove pre-baseline migrations and their historical
+fixtures. Reset the storage baseline once; do not reset it again when tagging
+1.0.0. Keep unknown-version rejection, exact process/Host identity checks and
+durable audit evidence. Version tags and real migration/publication effects
+require their separate release authorization.
+
 ## Authorization model
 
 Every (re)submission of a step passes `checkGrant(grant, request, now)`

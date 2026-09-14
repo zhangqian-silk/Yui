@@ -342,7 +342,7 @@ export const INTERACTION_POLICIES: readonly InteractionPolicy[] = Object.freeze(
       provider: "messages",
       actionTarget: true
     }],
-    trailingOptions: { "--body-file": "value", "--wake-policy": "value" }
+    trailingOptions: { "--body-file": "value" }
   },
   {
     commandPath: ["task", "message", "retire"],

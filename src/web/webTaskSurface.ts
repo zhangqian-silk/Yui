@@ -82,10 +82,8 @@ export function createWebTaskSurface(
   // Notifications are after the outer transaction. Their failure must not be
   // reclassified as a rejection of a mutation that already committed.
   const notify = (taskId: string, leader = false) => {
-    if (options.runtime?.notifyMailboxChanged) {
-      void options.runtime.notifyMailboxChanged(leader
-        ? { kind: "role", taskId, roleName: "leader" } : { kind: "task", taskId });
-    } else options.runtime?.notifyStateChanged(taskId);
+    void options.runtime?.notifyMailboxChanged(leader
+      ? { kind: "role", taskId, roleName: "leader" } : { kind: "task", taskId });
   };
   return {
     globalState: (roleName: string) => {
@@ -109,7 +107,7 @@ export function createWebTaskSurface(
         env: {}, yuiHome: options.yuiHome
       }));
       if (result.kind === "output") {
-        if (input.action === "queue") void options.runtime?.notifyMailboxChanged?.({
+        if (input.action === "queue") void options.runtime?.notifyMailboxChanged({
           kind: "global-role-runtime", roleName
         });
         return { action: input.action, ...result.data };
@@ -156,7 +154,7 @@ export function createWebTaskSurface(
       // Preserve the submission's intent and frozen receipt separately from
       // queue/steer controls; an omitted intent still means discuss.
       const { message, task, queuedForLeader, feedback } = webLocalMutation(store, (tx) =>
-        sendTaskMessageCommand(tx, taskId, body, undefined, commandOptions, undefined, intent, requestId));
+        sendTaskMessageCommand(tx, taskId, body, commandOptions, undefined, intent, requestId));
       notify(taskId, queuedForLeader);
       return { record: message, revision: message.createdAt,
         disposition: queuedForLeader ? "queued" : "saved",

@@ -9,8 +9,7 @@ const WAKEUP_PREFIX = "leader-wakeup:";
 const RECOVERY_PREFIX = "leader-recovery:";
 
 export type JobCommandRuntimePort = Readonly<{
-  notifyStateChanged(taskId: string): void;
-  notifyMailboxChanged?(target: MailboxTarget): void;
+  notifyMailboxChanged(target: MailboxTarget): void;
 }>;
 
 export type JobCommandOptions = Readonly<{
@@ -132,7 +131,6 @@ function retryJob(
     );
   });
   const target: MailboxTarget = { kind: "role", taskId, roleName: "leader" };
-  if (runtime.notifyMailboxChanged !== undefined) runtime.notifyMailboxChanged(target);
-  else runtime.notifyStateChanged(taskId);
+  runtime.notifyMailboxChanged(target);
   return `Retry requested for ${id}\n`;
 }

@@ -252,12 +252,7 @@ export function taskRef(id: string): MailboxEntityRef {
 
 export function notifyMailbox(
   runtime: TaskWorkflowRuntimePort | undefined,
-  target: MailboxTarget,
-  compatibilityTaskId: string
+  target: MailboxTarget
 ): void {
-  if (runtime?.notifyMailboxChanged !== undefined) {
-    runtime.notifyMailboxChanged(target);
-  } else {
-    runtime?.notifyStateChanged(compatibilityTaskId);
-  }
+  void runtime?.notifyMailboxChanged(target);
 }

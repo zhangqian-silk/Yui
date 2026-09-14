@@ -113,8 +113,7 @@ export type TaskCommandExecution =
  * terminal bytes, or attaches a tmux client.
  */
 export type TaskWorkflowRuntimePort = Readonly<{
-  notifyStateChanged(taskId: string): void;
-  notifyMailboxChanged?(target: MailboxTarget): void | Promise<void>;
+  notifyMailboxChanged(target: MailboxTarget): void | Promise<void>;
   reconcileTask(taskId: string): void;
   inspectTaskRolePanes?(taskId: string): readonly TmuxRolePaneState[];
 }>;

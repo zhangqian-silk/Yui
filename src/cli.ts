@@ -1321,7 +1321,7 @@ export async function main(): Promise<void> {
           // Idempotent start is also a reliable kick: if an earlier caller
           // committed the gate but lost its Controller acknowledgement, retrying
           // start re-signals the same durable wake without creating another one.
-          await runtime.notifyMailboxChanged?.({ kind: "role", taskId, roleName: "leader" });
+          await runtime.notifyMailboxChanged({ kind: "role", taskId, roleName: "leader" });
           emit(result.output, false, result);
           return;
         }
@@ -3235,7 +3235,7 @@ async function preflightAgentConfigurationMutation(
   const mutation = profileAgentConfigurationMutation(commandArgs, store)
     ?? taskRoleAgentConfigurationMutation(commandArgs, store);
   if (mutation === undefined) {
-    await warmLegacyRoleConfigurationMutation(commandArgs, store, catalogs);
+    await warmConfigurationMutationCatalog(commandArgs, store, catalogs);
     return undefined;
   }
   const agent = store.getConfiguredAgent(mutation.agentId);
@@ -3286,7 +3286,7 @@ function taskRoleAgentConfigurationMutation(
     : undefined;
 }
 
-async function warmLegacyRoleConfigurationMutation(
+async function warmConfigurationMutationCatalog(
   commandArgs: readonly string[],
   store: TaskStore,
   catalogs: AgentConfigurationCatalogService

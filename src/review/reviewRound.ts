@@ -322,7 +322,7 @@ export function retryReviewRound(
   });
 }
 
-/** Task-final compatibility wrapper for callers that require that scope. */
+/** Scope guard for the Task-final retry operation. */
 export function retryTaskReviewRound(
   round: ReviewRound,
   requestedBy: TaskCompletedBy,

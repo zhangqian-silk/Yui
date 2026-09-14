@@ -56,7 +56,7 @@ function provisionLeader(store, workspace) {
 }
 
 function userSubmit(store, taskId, body, intent) {
-  return sendTaskMessageCommand(store, taskId, body, undefined,
+  return sendTaskMessageCommand(store, taskId, body,
     { environment: userEnv, now }, undefined, intent);
 }
 
@@ -265,7 +265,7 @@ test("a managed Task Session cannot carry a develop submission and persists noth
     YUI_TASK_ID: task.id,
     YUI_ROLE: "leader"
   });
-  assert.throws(() => sendTaskMessageCommand(store, task.id, "sneaky", undefined,
+  assert.throws(() => sendTaskMessageCommand(store, task.id, "sneaky",
     { environment: leaderEnv, now }, undefined, "develop"));
   assert.equal(store.getTask(task.id).activationRequest, undefined);
   assert.equal(store.listMessages(task.id).length, 0);

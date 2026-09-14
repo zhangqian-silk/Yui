@@ -61,12 +61,8 @@ export type AgentRunConfigurationAxis = Readonly<{
 /**
  * The Agent's current value for a requested axis, or why there is none to read.
  *
- * The second branch is not a failure. A legacy peer whose only method is
- * `session/set_mode` answers with nothing, so Yui deliberately never wrote the
- * requested value into its own view of the Session; there is genuinely no
- * reported value to show, and showing the pre-request one would read as the
- * Agent having refused the change. Saying `unobserved` keeps that distinct from
- * both agreement and drift.
+ * The second branch covers an axis the current peer no longer reports.
+ * Missing evidence is distinct from both agreement and drift.
  */
 export type AgentRunConfigurationCurrentValue =
   | Readonly<{ status: "observed"; value: string }>
@@ -78,10 +74,8 @@ export type AgentRunConfigurationCurrentValue =
  * `confirmation` is evidence about the moment the request was applied, stated at
  * the strength the protocol supported: `observed` means the Agent's own report
  * carried the value back, `already` means the Agent was holding it before Yui
- * asked, and `acknowledged` means the Agent accepted a call that returns nothing
- * to check. These are different facts rather than degrees of the same one, and
- * collapsing the last into the first would report an unverified permission mode
- * as a verified one.
+ * asked. `acknowledged` remains readable in stored diagnostic evidence but is
+ * not produced by current ACP configuration or accepted as its verification.
  *
  * `current` is a separate, later reading: what the Agent reports for that axis
  * now. Both are needed because an Agent may move an axis after confirming it —

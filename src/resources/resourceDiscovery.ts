@@ -2,7 +2,7 @@
  * Read-only resource discovery for Resource GC (Issue 10).
  *
  * Discovery enumerates the disk objects Yui created — managed Git worktrees,
- * legacy deployments, and runtime artifacts — and attributes each one to an
+ * and runtime artifacts — and attributes each one to an
  * owner. Only precisely attributable resources become cleanup candidates;
  * anything else is reported and retained.
  */
@@ -10,7 +10,6 @@
 import { execFile } from "node:child_process";
 import {
   existsSync,
-  lstatSync,
   readFileSync,
   readdirSync,
   statSync
@@ -175,42 +174,7 @@ export async function discoverResources(
     }
   }
 
-  // 2. Legacy deployments (historical runtime; no current-master creator).
-  for (const kind of ["deployment", "deployment-backup"] as const) {
-    const directory = kind === "deployment"
-      ? join(home, "runtime", "deployments")
-      : join(home, "runtime", "deploy-backups");
-    if (!existsSync(directory)) continue;
-    for (const entry of safeReaddir(directory)) {
-      const path = join(directory, entry.name);
-      if (isReleaseNamespacePath(home, path)) continue;
-      if (isResourceQuarantinePath(home, path)) continue;
-      const owner = attributeDeploymentOwner(home, entry.name, input.taskStatusById);
-      const isGit = existsSync(join(path, ".git"));
-      const cleanliness = isGit ? await gitWorktreeCleanliness(path) : "n/a";
-      const gitMetadata = isGit ? readDeploymentGitMetadata(path) : undefined;
-      const taskStatus = owner.taskId === undefined
-        ? undefined
-        : input.taskStatusById.get(owner.taskId);
-      discovered.push({
-        record: createResourceRecord({
-          kind: "deployment",
-          path: resolve(path),
-          owner,
-          ...(gitMetadata !== undefined ? { git: gitMetadata } : {}),
-          ...(sizeOf(path) === undefined ? {} : { sizeBytes: sizeOf(path) }),
-          cleanliness,
-          activeRefs: [],
-          disposition: "active"
-        }, input.now),
-        ownerTerminal: owner.taskId === undefined
-          ? false
-          : isTerminalTaskStatus(taskStatus as never)
-      });
-    }
-  }
-
-  // 3. Runtime artifacts.
+  // 2. Runtime artifacts created by the current runtime.
   discovered.push(...discoverRuntimeArtifacts(home, input));
 
   return discovered;
@@ -338,25 +302,11 @@ function attributeWorktreeOwner(
   return { home, projectId: project.id, basis: "unattributed" };
 }
 
-function attributeDeploymentOwner(
-  home: string,
-  name: string,
-  taskStatusById: ReadonlyMap<string, string>
-): ResourceOwner {
-  const taskId = extractTaskIdFromPath(name);
-  if (taskId !== undefined && taskStatusById.has(taskId)) {
-    return { home, taskId, basis: "naming-convention" };
-  }
-  return { home, basis: "unattributed" };
-}
-
 /** Extract a `task-N` id from a path or name segment. */
 export function extractTaskIdFromPath(value: string): string | undefined {
-  // Match both `task-N` (managed workspace convention) and `taskN` (legacy
-  // deployment naming such as `combined-task18-<sha>`).
-  const match = value.match(/(?:^|[/_-])(task-?\d+)(?:-[a-f0-9]{8})?(?:[/_$-]|$)/u);
+  const match = value.match(/(?:^|[/_-])(task-\d+)(?:-[a-f0-9]{8})?(?:[/_$-]|$)/u);
   if (match === null || match[1] === undefined) return undefined;
-  return match[1].includes("-") ? match[1] : `task-${match[1].slice(4)}`;
+  return match[1];
 }
 
 function projectRepositoryPath(home: string, project: Project): string | undefined {
@@ -365,60 +315,6 @@ function projectRepositoryPath(home: string, project: Project): string | undefin
     return existsSync(path) ? path : undefined;
   }
   return existsSync(project.path) ? project.path : undefined;
-}
-
-/**
- * Read Git metadata for a deployment that is a linked worktree. The .git
- * file points to the worktree's gitdir, which records the common dir and
- * the original branch/head needed for a controlled restore.
- */
-function readDeploymentGitMetadata(
-  path: string
-): { repositoryPath: string; commonDir?: string; branch?: string; head?: string } | undefined {
-  try {
-    const gitFile = join(path, ".git");
-    const gitStat = lstatSync(gitFile);
-    let gitDir: string;
-    if (gitStat.isFile()) {
-      const content = readFileSync(gitFile, "utf8").trim();
-      if (!content.startsWith("gitdir: ")) return { repositoryPath: path };
-      gitDir = content.slice("gitdir: ".length);
-    } else if (gitStat.isDirectory()) {
-      gitDir = gitFile;
-    } else {
-      return { repositoryPath: path };
-    }
-    const resolvedGitDir = resolve(gitDir);
-    const commonDirFile = join(resolvedGitDir, "commondir");
-    let commonDir: string | undefined;
-    if (existsSync(commonDirFile)) {
-      const raw = readFileSync(commonDirFile, "utf8").trim();
-      commonDir = resolve(resolvedGitDir, raw);
-    }
-    const headFile = join(resolvedGitDir, "HEAD");
-    let head: string | undefined;
-    let branch: string | undefined;
-    if (existsSync(headFile)) {
-      const headContent = readFileSync(headFile, "utf8").trim();
-      if (headContent.startsWith("ref: refs/heads/")) {
-        branch = headContent.slice("ref: ".length);
-        const refPath = join(commonDir ?? resolvedGitDir, headContent.slice("ref: ".length));
-        if (existsSync(refPath)) {
-          head = readFileSync(refPath, "utf8").trim();
-        }
-      } else if (/^[0-9a-f]{40}$/u.test(headContent)) {
-        head = headContent;
-      }
-    }
-    return {
-      repositoryPath: path,
-      ...(commonDir === undefined ? {} : { commonDir }),
-      ...(branch === undefined ? {} : { branch }),
-      ...(head === undefined ? {} : { head })
-    };
-  } catch {
-    return { repositoryPath: path };
-  }
 }
 
 function readTaskRuntimeMarker(

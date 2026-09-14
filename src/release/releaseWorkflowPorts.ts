@@ -1,6 +1,6 @@
 import { createHash, randomBytes } from "node:crypto";
 import { chmod, mkdir, mkdtemp, readFile, rename, rm, writeFile } from "node:fs/promises";
-import { dirname, join, resolve } from "node:path";
+import { dirname, isAbsolute, join, resolve } from "node:path";
 
 import { runUpdate, type StagedPackage, type UpdatePorts, type UpdateResult } from "../cli/updateOrchestrator.js";
 import { activatedControllerEntrypoint } from "../cli/updatePorts.js";
@@ -1148,33 +1148,11 @@ export function createReleaseWorkflowPorts(
           return { state: "unknown" };
         }
         case "controller-home": {
-          // P1-2 (rr22): the identity value is a JSON envelope
-          // {home, globalPrefix?} that pins the exact activation target;
-          // legacy identities are bare Home path strings and re-derive the
-          // prefix from the caller's environment.
-          let queriedHome = deps.home;
-          let pinnedPrefix: string | undefined;
+          // Recovery uses the exact persisted activation target, never the
+          // resume caller's current installation.
           const parsedIdentity = parseControllerHomeIdentity(externalIdentity.value);
-          if (parsedIdentity !== undefined) {
-            if (parsedIdentity.globalPrefix === undefined) return { state: "unknown" };
-            queriedHome = parsedIdentity.home;
-            pinnedPrefix = parsedIdentity.globalPrefix;
-          } else {
-            queriedHome = externalIdentity.value;
-          }
-          // P1-3 (rr20): Query the GLOBAL install target — the same binary
-          // `cli-update` activates via `npm install --global` — not the
-          // current checkout module. A checkout that happens to be the target
-          // version must not confirm a global install that is stale or never
-          // activated. A pinned prefix is used as-is; only legacy/unpinned
-          // identities re-derive via `npm prefix --global`, never PATH.
-          let globalPrefix = pinnedPrefix;
-          if (globalPrefix === undefined) {
-            const prefixResult = await run("npm", ["prefix", "--global"]);
-            if (prefixResult.code !== 0) return { state: "unknown" };
-            globalPrefix = prefixResult.stdout.trim();
-            if (globalPrefix.length === 0) return { state: "unknown" };
-          }
+          if (parsedIdentity === undefined) return { state: "unknown" };
+          const { home: queriedHome, globalPrefix } = parsedIdentity;
           const globalYui = join(globalPrefix, "bin", "yui");
           const homeEnv = { YUI_HOME: queriedHome };
           const checked = await run(process.execPath, [globalYui, "--json", "doctor"], undefined, homeEnv);
@@ -1561,11 +1539,10 @@ async function resolveGlobalPrefix(run: CommandRunner): Promise<string | undefin
 
 /**
  * The controller-home query identity for a cli-update effect. The value is a
- * JSON envelope carrying the Home and — when resolvable — the exact global
+ * JSON envelope carrying the Home and the exact global
  * prefix that was activated, so a resume query checks the same installation
  * instead of re-deriving the target from the caller's npm/PATH environment
- * (P1-2, rr22). Legacy identities are bare Home path strings; the query
- * accepts both shapes via {@link parseControllerHomeIdentity}.
+ * (P1-2, rr22). Without that evidence no identity is issued.
  */
 async function controllerHomeIdentity(
   run: CommandRunner,
@@ -1632,7 +1609,7 @@ async function readPersistedCliUpdateIdentity(
     return undefined;
   }
   const parsed = parseControllerHomeIdentity(raw);
-  if (parsed === undefined || parsed.globalPrefix === undefined) return undefined;
+  if (parsed === undefined) return undefined;
   return { kind: "controller-home", value: JSON.stringify(parsed) };
 }
 
@@ -1725,24 +1702,21 @@ async function readPersistedNpmPublishTarget(
 }
 
 /**
- * Parse a controller-home identity value. Accepts the JSON envelope
- * {home, globalPrefix?} written by {@link controllerHomeIdentity}; a legacy
- * bare Home path string (or any unparseable value) yields undefined so the
- * caller treats the raw value as the Home.
+ * Read the exact activation target. Missing or malformed identity remains
+ * unknown; no alternative installation can attest the original effect.
  */
 function parseControllerHomeIdentity(
   value: string
-): { home: string; globalPrefix?: string } | undefined {
+): { home: string; globalPrefix: string } | undefined {
   try {
     const parsed: unknown = JSON.parse(value);
-    if (!isRecord(parsed) || typeof parsed.home !== "string" || parsed.home.length === 0) {
+    if (!isRecord(parsed) || typeof parsed.home !== "string" || !isAbsolute(parsed.home)
+      || typeof parsed.globalPrefix !== "string" || !isAbsolute(parsed.globalPrefix)) {
       return undefined;
     }
     return {
       home: parsed.home,
-      ...(typeof parsed.globalPrefix === "string" && parsed.globalPrefix.length > 0
-        ? { globalPrefix: parsed.globalPrefix }
-        : {})
+      globalPrefix: parsed.globalPrefix
     };
   } catch {
     return undefined;

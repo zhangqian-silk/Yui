@@ -25,17 +25,6 @@ function route(overrides) {
 
 test("normalizeSubmissionIntent defaults an omitted intent to discuss", () => {
   assert.equal(normalizeSubmissionIntent(undefined), "discuss");
-  assert.equal(normalizeSubmissionIntent(undefined, "leader"), "discuss");
-});
-
-test("normalizeSubmissionIntent maps legacy --wake-policy none to record", () => {
-  assert.equal(normalizeSubmissionIntent(undefined, "none"), "record");
-});
-
-test("normalizeSubmissionIntent lets an explicit intent win over wake policy", () => {
-  assert.equal(normalizeSubmissionIntent("develop", "none"), "develop");
-  assert.equal(normalizeSubmissionIntent("record", "leader"), "record");
-  assert.equal(normalizeSubmissionIntent("discuss", "none"), "discuss");
 });
 
 // ---------------------------------------------------------------------------

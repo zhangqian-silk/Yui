@@ -9,7 +9,6 @@ import {
   readdirSync,
   readFileSync,
   readlinkSync,
-  realpathSync,
   renameSync,
   rmSync,
   statSync,
@@ -26,7 +25,6 @@ export const DEV_LAUNCHER_NAME = "yui";
 const managedMarker = "# yui-local-dev: managed";
 const globalBackupName = ".yui-link-original";
 const globalRecoveryName = ".yui-link-recovery.json";
-const legacyGlobalStateName = ".yui-link-state.json";
 const registrySchemaVersion = 3;
 const recoverySchemaVersion = 1;
 const controllerDiscoveryName = "controller.json";
@@ -71,7 +69,6 @@ export async function linkDevLauncher(options = {}) {
   const globalLauncherPath = join(globalBinDir, DEV_LAUNCHER_NAME);
   const backupPath = join(globalBinDir, globalBackupName);
   const statePath = resolveRegistryPath(options);
-  const legacyNvmDir = resolveLegacyNvmDir(options);
 
   mkdirSync(globalBinDir, { recursive: true });
   const releaseRegistryLock = acquireRegistryLock(statePath);
@@ -82,8 +79,7 @@ export async function linkDevLauncher(options = {}) {
       globalBinDir,
       globalLauncherPath,
       backupPath,
-      statePath,
-      legacyNvmDir
+      statePath
     });
   } finally {
     releaseRegistryLock();
@@ -96,17 +92,9 @@ function linkDevLauncherLocked({
   globalBinDir,
   globalLauncherPath,
   backupPath,
-  statePath,
-  legacyNvmDir
+  statePath
 }) {
-  const existingState = readGlobalState(statePath)
-    ?? adoptDiscoveredLegacyGlobalState(globalBinDir, statePath, legacyNvmDir)
-    ?? adoptDiscoveredManagedOrphanState(
-      globalBinDir,
-      statePath,
-      legacyNvmDir,
-      projectRoot
-    );
+  const existingState = readGlobalState(statePath);
   if (existingState !== null) {
     if (existingState.globalLauncherPath === globalLauncherPath) {
       ensureManagedGlobalLinkActive(existingState);
@@ -184,6 +172,7 @@ function linkDevLauncherLocked({
     }
   }
 
+  assertUnregisteredGlobalLinkAbsent(globalBinDir);
   if (pathExists(backupPath)) {
     throw new Error(`Refusing to overwrite an existing development backup: ${backupPath}`);
   }
@@ -249,25 +238,10 @@ export function unlinkDevLauncher(options = {}) {
 }
 
 function unlinkDevLauncherLocked({ options, projectRoot, statePath }) {
-  let state = readGlobalState(statePath);
-  let fallbackGlobalBinDir;
+  const state = readGlobalState(statePath);
   if (state === null) {
-    fallbackGlobalBinDir = resolve(options.globalBinDir ?? resolveNpmGlobalBinDir());
-    const legacyNvmDir = resolveLegacyNvmDir(options);
-    state = adoptDiscoveredLegacyGlobalState(
-      fallbackGlobalBinDir,
-      statePath,
-      legacyNvmDir
-    ) ?? adoptDiscoveredManagedOrphanState(
-      fallbackGlobalBinDir,
-      statePath,
-      legacyNvmDir,
-      projectRoot
-    );
-  }
-
-  if (state === null) {
-    const globalBinDir = fallbackGlobalBinDir;
+    const globalBinDir = resolve(options.globalBinDir ?? resolveNpmGlobalBinDir());
+    assertUnregisteredGlobalLinkAbsent(globalBinDir);
     const globalLauncherPath = join(globalBinDir, DEV_LAUNCHER_NAME);
     const backupPath = join(globalBinDir, globalBackupName);
     uninstallDevLauncher({ projectRoot, ...(options.outputDir === undefined ? {} : { outputDir: options.outputDir }) });
@@ -876,177 +850,6 @@ function removeManagedRecoveryState(state) {
   rmSync(recovery.recoveryPath);
 }
 
-function adoptLegacyGlobalState(globalBinDir, statePath) {
-  const legacyStatePath = join(globalBinDir, legacyGlobalStateName);
-  if (!pathExists(legacyStatePath)) return null;
-  let legacy;
-  try {
-    legacy = JSON.parse(readFileSync(legacyStatePath, "utf8"));
-  } catch {
-    throw new Error(`Invalid previous managed global yui state: ${legacyStatePath}`);
-  }
-  if (
-    typeof legacy !== "object" || legacy === null
-    || legacy.schemaVersion !== 2
-    || typeof legacy.activeProjectRoot !== "string"
-    || typeof legacy.localLauncherPath !== "string"
-    || typeof legacy.hadOriginal !== "boolean"
-    || !isAbsolute(legacy.activeProjectRoot)
-    || !isAbsolute(legacy.localLauncherPath)
-    || basename(legacy.localLauncherPath) !== DEV_LAUNCHER_NAME
-  ) {
-    throw new Error(`Invalid previous managed global yui state: ${legacyStatePath}`);
-  }
-
-  const globalLauncherPath = join(globalBinDir, DEV_LAUNCHER_NAME);
-  const backupPath = join(globalBinDir, globalBackupName);
-  if (!isSymlinkTo(globalLauncherPath, legacy.localLauncherPath)) {
-    throw new Error(`Previous managed global yui state is inconsistent: ${globalLauncherPath}`);
-  }
-  if (legacy.hadOriginal && !pathExists(backupPath)) {
-    throw new Error(`Cannot restore the original yui command; backup is missing: ${backupPath}`);
-  }
-  if (!legacy.hadOriginal && pathExists(backupPath)) {
-    throw new Error(`Previous managed global yui state has an unexpected backup: ${backupPath}`);
-  }
-
-  const state = {
-    schemaVersion: registrySchemaVersion,
-    activeProjectRoot: legacy.activeProjectRoot,
-    localLauncherPath: legacy.localLauncherPath,
-    globalLauncherPath,
-    backupPath,
-    hadOriginal: legacy.hadOriginal
-  };
-  writeGlobalState(statePath, state, true);
-  rmSync(legacyStatePath);
-  return state;
-}
-
-function adoptDiscoveredLegacyGlobalState(globalBinDir, statePath, nvmDir) {
-  const candidates = findLegacyGlobalStateBinDirs(globalBinDir, nvmDir);
-  if (candidates.length === 0) return null;
-  if (candidates.length > 1) {
-    const statePaths = candidates.map((candidate) => join(candidate, legacyGlobalStateName));
-    throw new Error(
-      "Multiple previous managed global yui states were found; refusing to choose or remove any of them:\n"
-        + statePaths.map((path) => `- ${path}`).join("\n")
-    );
-  }
-  return adoptLegacyGlobalState(candidates[0], statePath);
-}
-
-function adoptDiscoveredManagedOrphanState(
-  globalBinDir,
-  statePath,
-  nvmDir,
-  activeProjectRoot
-) {
-  const candidates = findManagedOrphanGlobalStates(globalBinDir, nvmDir);
-  if (candidates.length === 0) return null;
-  if (candidates.length > 1) {
-    throw new Error(
-      "Multiple managed global yui links were found without a registry; "
-        + "refusing to choose or remove any of them:\n"
-        + candidates.map(({ globalLauncherPath }) => `- ${globalLauncherPath}`).join("\n")
-    );
-  }
-  const candidate = candidates[0];
-  if (candidate.hadOriginal && !candidate.hasBackup) {
-    throw new Error(
-      `Cannot safely restore the original yui command because its backup is missing: `
-        + candidate.backupPath
-    );
-  }
-  if (!candidate.hadOriginal && candidate.hasBackup) {
-    throw new Error(
-      `Managed global yui recovery state has an unexpected backup: ${candidate.backupPath}`
-    );
-  }
-  if (candidate.hadOriginal && !isRestorableCommand(candidate.backupPath)) {
-    throw new Error(`Cannot safely restore an invalid yui backup: ${candidate.backupPath}`);
-  }
-  const state = {
-    schemaVersion: registrySchemaVersion,
-    activeProjectRoot: resolve(activeProjectRoot),
-    localLauncherPath: candidate.localLauncherPath,
-    globalLauncherPath: candidate.globalLauncherPath,
-    backupPath: candidate.backupPath,
-    hadOriginal: candidate.hadOriginal
-  };
-  writeGlobalState(statePath, state, true);
-  return state;
-}
-
-function findManagedOrphanGlobalStates(globalBinDir, nvmDir) {
-  return candidateGlobalBinDirs(globalBinDir, nvmDir)
-    .map((candidate) => inspectManagedGlobalLink(candidate))
-    .filter((candidate) => candidate !== null);
-}
-
-function inspectManagedGlobalLink(globalBinDir) {
-  const globalLauncherPath = join(globalBinDir, DEV_LAUNCHER_NAME);
-  const recovery = readManagedRecoveryState(globalBinDir);
-  if (recovery === null) return null;
-  if (!isSymlinkTo(globalLauncherPath, recovery.localLauncherPath)) {
-    throw new Error(
-      `Managed global yui recovery state is inconsistent: ${recovery.recoveryPath}`
-    );
-  }
-  const backupPath = join(globalBinDir, globalBackupName);
-  return {
-    localLauncherPath: recovery.localLauncherPath,
-    globalLauncherPath,
-    backupPath,
-    hadOriginal: recovery.hadOriginal,
-    hasBackup: pathExists(backupPath)
-  };
-}
-
-function findLegacyGlobalStateBinDirs(globalBinDir, nvmDir) {
-  return candidateGlobalBinDirs(globalBinDir, nvmDir)
-    .filter((candidate) => pathExists(join(candidate, legacyGlobalStateName)));
-}
-
-function candidateGlobalBinDirs(globalBinDir, nvmDir) {
-  const candidates = new Map();
-  const addCandidate = (candidate) => {
-    const resolvedCandidate = resolve(candidate);
-    let canonicalCandidate;
-    try {
-      canonicalCandidate = realpathSync(resolvedCandidate);
-    } catch (error) {
-      if (!(error instanceof Error && "code" in error && error.code === "ENOENT")) throw error;
-      canonicalCandidate = resolvedCandidate;
-    }
-    if (!candidates.has(canonicalCandidate)) {
-      candidates.set(canonicalCandidate, resolvedCandidate);
-    }
-  };
-  addCandidate(globalBinDir);
-  const nodeVersionsDirs = new Set();
-  const inferredNodeVersionsDir = inferNvmNodeVersionsDir(globalBinDir);
-  if (inferredNodeVersionsDir !== null) nodeVersionsDirs.add(inferredNodeVersionsDir);
-  if (nvmDir !== null) nodeVersionsDirs.add(join(nvmDir, "versions", "node"));
-  for (const nodeVersionsDir of nodeVersionsDirs) {
-    if (!pathExists(nodeVersionsDir)) continue;
-    for (const entry of readdirSync(nodeVersionsDir, { withFileTypes: true })) {
-      if (!entry.isDirectory()) continue;
-      addCandidate(join(nodeVersionsDir, entry.name, "bin"));
-    }
-  }
-  return [...candidates.values()].sort();
-}
-
-function inferNvmNodeVersionsDir(globalBinDir) {
-  const versionDir = dirname(resolve(globalBinDir));
-  const nodeVersionsDir = dirname(versionDir);
-  if (basename(nodeVersionsDir) !== "node" || basename(dirname(nodeVersionsDir)) !== "versions") {
-    return null;
-  }
-  return nodeVersionsDir;
-}
-
 function replaceActiveDevelopmentLink(globalLauncherPath, previousTarget, nextTarget) {
   rmSync(globalLauncherPath);
   try {
@@ -1219,15 +1022,16 @@ function resolveRegistryPath(options) {
   return join(stateRoot, "yui", "dev-launcher.json");
 }
 
-function resolveLegacyNvmDir(options) {
-  if (options.nvmDir !== undefined) return resolve(options.nvmDir);
-  // An explicit registry path is primarily a test/embedding seam. Avoid inspecting
-  // an unrelated real home unless its NVM root is explicitly supplied as well.
-  if (options.registryPath !== undefined) return null;
-  if (process.env.NVM_DIR !== undefined && process.env.NVM_DIR.length > 0) {
-    return resolve(process.env.NVM_DIR);
+/** Missing authority is not permission to reconstruct or replace a global link. */
+function assertUnregisteredGlobalLinkAbsent(globalBinDir) {
+  const launcher = join(globalBinDir, DEV_LAUNCHER_NAME);
+  const reserved = [globalBackupName, globalRecoveryName, ".yui-link-state.json"]
+    .find(name => pathExists(join(globalBinDir, name)));
+  const localTarget = managedDevelopmentLinkTarget(launcher);
+  if (reserved !== undefined || localTarget !== null) {
+    throw new Error(`Unregistered global yui link requires explicit inspection: ${launcher}. `
+      + "No registry was adopted and no original command was restored.");
   }
-  return join(homedir(), ".nvm");
 }
 
 async function assertCompatibleDevHome(homePath) {
@@ -1273,15 +1077,6 @@ function pathExists(path) {
   try {
     lstatSync(path);
     return true;
-  } catch (error) {
-    if (error instanceof Error && "code" in error && error.code === "ENOENT") return false;
-    throw error;
-  }
-}
-
-function isSymlinkTo(path, expectedTarget) {
-  try {
-    return lstatSync(path).isSymbolicLink() && resolve(dirname(path), readlinkSync(path)) === resolve(expectedTarget);
   } catch (error) {
     if (error instanceof Error && "code" in error && error.code === "ENOENT") return false;
     throw error;

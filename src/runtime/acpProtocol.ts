@@ -322,25 +322,9 @@ export function readAcpConfigOptions(value: unknown): readonly AcpConfigOption[]
   return Object.freeze(options);
 }
 
-/**
- * Read the session config options an Agent reports for a new or loaded Session.
- *
- * ACP is in transition here: `configOptions` supersedes the older `modes`
- * field, and Agents are asked to send both while both exist. Yui reads the
- * modern field when present and derives an equivalent `mode` option from
- * `modes` when it is not, so one code path configures either generation of
- * Agent. The derived option carries the same id ACP's own reference
- * implementation uses, and is marked so callers can send `session/set_mode`
- * instead of `session/set_config_option`.
- */
+/** Current ACP configuration contract for both new and loaded Sessions. */
 export type AcpSessionConfiguration = Readonly<{
   options: readonly AcpConfigOption[];
-  /**
-   * True when the options came from the legacy `modes` field, which is set with
-   * `session/set_mode`. Yui must not send `session/set_config_option` to an
-   * Agent that never advertised config options.
-   */
-  legacyModes: boolean;
 }>;
 
 /** The config option id ACP uses for a session's permission mode. */
@@ -348,50 +332,11 @@ export const ACP_MODE_CONFIG_ID = "mode";
 
 export function readAcpSessionConfiguration(value: unknown): AcpSessionConfiguration {
   const result = asObject(value);
-  const modern = readAcpConfigOptions(result?.configOptions);
-  if (modern !== undefined) {
-    return Object.freeze({ options: modern, legacyModes: false });
+  const options = readAcpConfigOptions(result?.configOptions);
+  if (options === undefined) {
+    throw new Error("ACP Session must report configOptions; mode-only peers are unsupported.");
   }
-  const legacy = readAcpSessionModes(result?.modes);
-  return Object.freeze({
-    options: legacy === undefined ? Object.freeze([]) : Object.freeze([legacy]),
-    legacyModes: legacy !== undefined
-  });
-}
-
-/**
- * Convert the legacy `modes` field into the one config option it describes.
- *
- * The shape is fixed by ACP: `currentModeId` plus `availableModes`. Presenting
- * it as a config option keeps mode selection in one vocabulary without
- * pretending the Agent supports the newer method.
- */
-function readAcpSessionModes(value: unknown): AcpConfigOption | undefined {
-  const modes = asObject(value);
-  const currentValue = modes === null ? undefined : optionalText(modes.currentModeId);
-  if (modes === null || currentValue === undefined) return undefined;
-  const values: AcpConfigOptionValue[] = [];
-  if (Array.isArray(modes.availableModes)) {
-    for (const entry of modes.availableModes) {
-      const mode = asObject(entry);
-      const id = mode === null ? undefined : optionalText(mode.id);
-      if (mode === null || id === undefined) continue;
-      values.push(Object.freeze({
-        value: id,
-        name: optionalText(mode.name) ?? id,
-        ...(optionalText(mode.description) === undefined
-          ? {}
-          : { description: optionalText(mode.description)! })
-      }));
-    }
-  }
-  return Object.freeze({
-    id: ACP_MODE_CONFIG_ID,
-    name: "Mode",
-    category: "mode",
-    currentValue,
-    options: Object.freeze(values)
-  });
+  return Object.freeze({ options });
 }
 
 export function acpSetConfigOptionRequest(
@@ -400,10 +345,6 @@ export function acpSetConfigOptionRequest(
   value: string
 ): AcpJsonValue {
   return { sessionId, configId, value };
-}
-
-export function acpSetModeRequest(sessionId: string, modeId: string): AcpJsonValue {
-  return { sessionId, modeId };
 }
 
 export function acpCancelNotification(sessionId: string): AcpJsonValue {
@@ -477,8 +418,6 @@ export type AcpSessionUpdate =
    * than merging into it.
    */
   | Readonly<{ kind: "config-options"; options: readonly AcpConfigOption[] }>
-  /** The Agent changed the session mode through the legacy `modes` field. */
-  | Readonly<{ kind: "mode"; modeId: string }>
   | Readonly<{ kind: "other"; sessionUpdate: string }>;
 
 /** Decode a `session/update` notification payload for the given session. */
@@ -528,10 +467,6 @@ export function readAcpSessionUpdate(
       return options === undefined
         ? undefined
         : Object.freeze({ kind: "config-options", options });
-    }
-    case "current_mode_update": {
-      const modeId = optionalText(update.currentModeId);
-      return modeId === undefined ? undefined : Object.freeze({ kind: "mode", modeId });
     }
     case "usage_update":
       return Object.freeze({
