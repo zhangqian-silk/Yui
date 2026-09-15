@@ -734,7 +734,9 @@ export async function main(): Promise<void> {
           + "cleanup [--all] | stop | restart."
       );
     }
-    validateCurrentTaskStore(home);
+    // Stopping an exactly identified Controller is a recovery operation:
+    // malformed domain records must not prevent quiescing its process.
+    if (method === "restart") validateCurrentTaskStore(home);
     const controllerMethod: "stop" | "restart" = method;
     const updateHandoverOwner = process.env.YUI_UPDATE_HANDOVER_OWNER_PID;
     // A pre-fix updater cannot pass the owner environment variable to the
@@ -1759,7 +1761,8 @@ export async function main(): Promise<void> {
       }
       if (resolved[1] === "upstream") {
         const result = await runTaskUpstreamCommand(resolved.slice(2), store, home, {
-          environment: process.env
+          environment: process.env,
+          jobPort: createControllerIntegrationJobPort(home, { environment: process.env })
         });
         emit(result.output, false, result.data);
         return;

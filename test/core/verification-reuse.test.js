@@ -1,12 +1,12 @@
 import assert from "node:assert/strict";
 import test from "node:test";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { SqliteTaskStore } from "../../dist/storage/sqliteStore.js";
 import { addProjectKnowledge, createProject } from "../../dist/repository/project.js";
-import { normalizeVerificationPlan } from "../../dist/verification/verificationPlan.js";
-import { resolveVerificationGate, runL1Gate, beginGateVerification, lookupReusableGateArtifact,
+import { normalizeVerificationPlan, planL2JobSteps } from "../../dist/verification/verificationPlan.js";
+import { resolveVerificationGate, runGateStepsInProcess, beginGateVerification, lookupReusableGateArtifact,
   recordGateArtifactFromStepOutcomes, checkResultsFromGateArtifact } from "../../dist/verification/verificationGateService.js";
 import { findL2ArtifactForCommit, touchGateArtifact } from "../../dist/verification/gateArtifactStore.js";
 import { recordGateArtifactReuse } from "../../dist/verification/gateArtifact.js";
@@ -21,51 +21,33 @@ function fixture(t) {
   const workspace = join(root, "workspace");
   mkdirSync(workspace);
   const at = new Date("2026-09-15T00:00:00Z");
-  const script = `const fs = require("fs"); const p = ${JSON.stringify(join(root, "count"))};
-    fs.writeFileSync(p, String((fs.existsSync(p) ? Number(fs.readFileSync(p)) : 0) + 1));
-    console.log("actual-check"); process.exit(process.env.CHECK_FAIL === "1" ? 1 : 0);`;
+  const script = 'console.log("actual-check");';
   const check = { name: "check", argv: [process.execPath, "-e", script] };
   const raw = { schemaVersion: 1, kind: "verification-plan", id: "checks", version: "1",
-    bootstrap: [], l1: { categories: [
-      { id: "code", paths: ["file"], checks: [check] },
-      { id: "other", paths: ["other"], checks: [{ ...check, name: "other-check" }] }
-    ] },
+    bootstrap: [], l1: { categories: [] },
     l2: { steps: [check] } };
   const project = addProjectKnowledge(createProject("project-1", "Fixture", workspace,
     { stable: "main", development: "main" }, at), "knowledge-1", "Checks", JSON.stringify(raw), at);
   store.saveProject(project);
   const gate = resolveVerificationGate(project);
-  return { root, store, workspace, at, gate, raw, count: () => Number(readFileSync(join(root, "count"), "utf8")) };
+  return { root, store, workspace, at, gate, raw };
 }
 
-test("explicit rerun reports its failure and invalidates old success; ordinary repetition reuses exact evidence", async t => {
+test("incomplete proof, stale reuse and missing logs cannot resurrect a successful artifact", async t => {
   const f = fixture(t);
-  const input = { store: f.store, projectId: "project-1", gate: f.gate, commit: "a".repeat(40),
-    changedPaths: ["file"], workspace: f.workspace, environment: { PATH: process.env.PATH },
-    logsDirectory: join(f.root, "logs"), now: f.at };
-  assert.equal((await runL1Gate(input)).artifact.outcome, "succeeded");
-  assert.equal(f.count(), 1);
-  const failed = await runL1Gate({ ...input, rerun: true,
-    environment: { ...input.environment, CHECK_FAIL: "1" }, now: new Date(f.at.getTime() + 1000) });
-  assert.equal(failed.reused, false);
-  assert.equal(failed.artifact.outcome, "failed", "This execution must never borrow the old green result.");
-  assert.ok(failed.checks.some(check => check.outcome === "failed"));
-  const identity = { projectId: failed.artifact.projectId, level: failed.artifact.level, commit: failed.artifact.commit,
-    planDigest: failed.artifact.planDigest, toolchainDigest: failed.artifact.toolchainDigest };
-  assert.equal(await lookupReusableGateArtifact(f.store, identity), null);
-  assert.equal(f.store.getGateArtifact("project-1", failed.artifact.key).outcome, "failed");
-  assert.equal((await runL1Gate({ ...input, now: new Date(f.at.getTime() + 2000) })).reused, false);
-  const reused = await runL1Gate({ ...input, now: new Date(f.at.getTime() + 3000) });
-  assert.equal(reused.reused, true);
-  assert.equal(f.count(), 3);
-  assert.equal(Object.hasOwn(reused.artifact, "potentialReuseCount"), false);
-  const other = await runL1Gate({ ...input, changedPaths: ["other"], now: new Date(f.at.getTime() + 4000) });
-  assert.equal(other.reused, false, "Different selected checks cannot reuse one another's L1 evidence.");
-  assert.equal(f.count(), 4);
-  beginGateVerification(f.store, identity, f.gate.plan, new Date(f.at.getTime() + 5000));
+  const identity = { projectId: "project-1", level: "L2", commit: "a".repeat(40),
+    planDigest: f.gate.planDigest, toolchainDigest: f.gate.toolchainDigest,
+    boundary: { targetRef: "main", baseHead: "b".repeat(40) } };
+  const outcomes = await runGateStepsInProcess(f.workspace, planL2JobSteps(f.gate.plan, f.workspace),
+    { PATH: process.env.PATH }, join(f.root, "logs"), identity.commit);
+  const artifact = await recordGateArtifactFromStepOutcomes(f.store, identity, f.gate.plan, outcomes, true, f.at);
+  assert.equal((await lookupReusableGateArtifact(f.store, identity)).key, artifact.key);
+  const reused = recordGateArtifactReuse(artifact, new Date(f.at.getTime() + 1000));
+  touchGateArtifact(f.store, reused);
+  beginGateVerification(f.store, identity, f.gate.plan, new Date(f.at.getTime() + 2000));
   assert.equal(await lookupReusableGateArtifact(f.store, identity), null, "A fresh execution first withdraws old success.");
   assert.throws(() => touchGateArtifact(f.store,
-    recordGateArtifactReuse(reused.artifact, new Date(f.at.getTime() + 5500))), /changed/);
+    recordGateArtifactReuse(reused, new Date(f.at.getTime() + 3000))), /changed/);
   assert.equal(await lookupReusableGateArtifact(f.store, identity), null, "A stale reuse cannot resurrect old success.");
   await assert.rejects(recordGateArtifactFromStepOutcomes(f.store, identity, f.gate.plan, [{
     name: "check", command: "fixture", exitCode: 0, signal: null, timedOut: false, durationMs: 1,
@@ -79,24 +61,23 @@ test("explicit rerun reports its failure and invalidates old success; ordinary r
 
 test("release lookup cannot skip a newer failed proof or conceal an incomplete overall outcome", async t => {
   const f = fixture(t);
-  const input = { store: f.store, projectId: "project-1", gate: f.gate, commit: "a".repeat(40),
-    changedPaths: ["file"], workspace: f.workspace, environment: { PATH: process.env.PATH },
-    logsDirectory: join(f.root, "logs"), now: f.at };
-  const first = await runL1Gate(input);
-  const sourceLogPath = join(input.logsDirectory, first.artifact.steps[0].logPath);
-  const query = { projectId: "project-1", commit: input.commit,
+  const commit = "a".repeat(40);
+  const outcomes = await runGateStepsInProcess(f.workspace, planL2JobSteps(f.gate.plan, f.workspace),
+    { PATH: process.env.PATH }, join(f.root, "logs"), commit);
+  const sourceLogPath = outcomes[0].sourceLogPath;
+  const query = { projectId: "project-1", commit,
     planDigest: f.gate.planDigest, toolchainDigest: f.gate.toolchainDigest, targetRef: "main" };
   const { targetRef: _target, ...identity } = query;
   const outcome = { name: "gate-1", command: "fixture", exitCode: 0, signal: null,
     timedOut: false, durationMs: 1, sourceLogPath, logName: "gate-1.log" };
-  await recordGateArtifactFromStepOutcomes(f.store, { ...identity, level: "L2",
+  const first = await recordGateArtifactFromStepOutcomes(f.store, { ...identity, level: "L2",
     boundary: { targetRef: "main", baseHead: "b".repeat(40) } }, f.gate.plan, [outcome], true, f.at);
   assert.ok(await findL2ArtifactForCommit(f.store, query));
   const failed = await recordGateArtifactFromStepOutcomes(f.store, { ...identity, level: "L2",
     boundary: { targetRef: "main", baseHead: "c".repeat(40) } }, f.gate.plan,
     [{ ...outcome, exitCode: 1 }], false, new Date(f.at.getTime() + 1000));
   assert.equal(await findL2ArtifactForCommit(f.store, query), null);
-  assert.ok(checkResultsFromGateArtifact({ ...first.artifact, status: "incomplete", outcome: "unknown" })
+  assert.ok(checkResultsFromGateArtifact({ ...first, status: "incomplete", outcome: "unknown" })
     .some(check => check.outcome === "failed"));
   assert.equal(failed.outcome, "failed");
 });

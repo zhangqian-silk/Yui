@@ -82,8 +82,9 @@ how the Agent ordered them.
 
 A configured VerificationPlan reuses only complete, successful, log-verified
 evidence for the exact Project, commit, plan, toolchain and target/base boundary.
-L1 also binds the selected checks, so a different path category cannot borrow
-another category's result. A plan with no reusable evidence executes normally.
+A plan with no reusable evidence executes normally. The unused L1 execution and
+path-selector helpers have been removed; stored L1 plan data and historical
+artifacts remain readable, not an automatic execution path.
 Plans require `schemaVersion: 1`; there is no `record/reuse/enforce` mode.
 
 Request fresh checks when creating an operation:
@@ -103,11 +104,25 @@ they run after its checks; they are neither ignored nor rejected by text matchin
 Unstructured checks do not search historical Jobs for a substitute result.
 
 Fresh execution withdraws the old success before starting. Failure is recorded
-as failure; interruption or missing logs leave no reusable success. A stale
+as failure; interruption, missing logs or a mutated candidate leave no reusable
+success. Both Job and local execution verify the exact clean candidate before
+publishing successful proof. The v4 execution digest excludes older proof without
+deleting its history. A stale
 cache consumer cannot restore an older result. Release lookup considers the
 newest recorded matching proof rather than searching past a failure for an
 older green result. The cache represents current reusable evidence, not Task
 execution history; original Job and Integration records remain separate.
+
+The public upstream CLI uses the same Controller Job port as other Integration
+commands. `--latest` may return independent pending Jobs for several Projects;
+continue each returned Integration ID rather than issuing another upstream
+request to poll it.
+
+Job admission, management and pre-spawn checks bind a non-Leader to its current
+Assignment, exact WorkItem workspace and writable Project scope. The existing
+Job owner contract does not represent Review/replica workspaces, so those
+requests fail explicitly rather than falling back to Task main. Leader/Operator
+supervision and settlement of already-running Jobs remain separate.
 
 The identity covers declared inputs, not every external service or untracked
 environment condition. Use explicit reruns for changing external inputs,

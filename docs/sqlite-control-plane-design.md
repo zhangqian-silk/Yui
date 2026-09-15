@@ -34,6 +34,12 @@ model. A newer, below-minimum, incomplete, or malformed Home fails closed.
 There is no runtime normalization, repair worker, file-Store fallback, dual
 read/write path, or second migration authority.
 
+Typed domain payloads use one current validator registry on writes, ordinary
+reads, bounded Context pages and full-Home diagnostics. Direct and worker-backed
+Stores do not have different validation strength. Invalid records are rejected
+without advancing the revision; an invalid stored record remains available for
+explicit diagnosis, never normalized into a valid-looking replacement.
+
 ## Write and concurrency contract
 
 - Each mutation is one SQLite transaction.

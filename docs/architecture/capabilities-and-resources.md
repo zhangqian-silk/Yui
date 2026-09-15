@@ -125,8 +125,8 @@ a way for an Agent or plugin to bypass those boundaries.
 Read-only dashboard, Context and query-panel projections remain separate from
 these mutations. A query panel cannot borrow the browser's user authority to
 mutate state or manage plugins. Task controls share the public CLI's domain
-commands; Global Role controls share the Global handler but currently lack a
-registered top-level CLI path. Message submission intent
+commands; Global Role controls share the Global handler with
+`yui role message queue/steer` and `yui role interrupt`. Message submission intent
 (`record / discuss / develop`, default `discuss`) is
 separate from [input timing](../managed-turn-and-session-runtime.md#input-timing-queue-steer-and-interrupt).
 Transport acceptance does not establish implementation or Task acceptance.

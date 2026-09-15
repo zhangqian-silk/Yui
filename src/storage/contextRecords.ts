@@ -1,4 +1,6 @@
 import type Database from "better-sqlite3";
+import { validateStoredRecord } from "./recordValidation.js";
+import { validateWorkItemCandidate, type WorkItemCandidate } from "../workItem/workItem.js";
 
 /** Read-only projections of existing tables, not a new Context index or Store. */
 const FAMILIES = {
@@ -119,5 +121,10 @@ export function queryContextRecords(
   const rows = db.prepare(`SELECT ${id} AS id, ${payload} AS payload
     FROM ${from} WHERE ${condition} ORDER BY ${order} LIMIT @limit OFFSET @offset`
   ).all({ ...params, limit: query.limit, offset: query.offset ?? 0 }) as { id: string; payload: string }[];
-  return { count, records: rows.map(row => ({ id: row.id, value: JSON.parse(row.payload) })) };
+  return { count, records: rows.map(row => {
+    const value: unknown = JSON.parse(row.payload);
+    if (candidate) validateWorkItemCandidate(value as WorkItemCandidate);
+    else validateStoredRecord(table, value);
+    return { id: row.id, value };
+  }) };
 }

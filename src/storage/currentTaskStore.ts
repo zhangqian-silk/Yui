@@ -55,7 +55,7 @@ export function readCurrentHomeIdentity(home: string): HomeIdentity {
 export function validateCurrentTaskStore(home: string): void {
   const store = openCurrentTaskStore(home);
   try {
-    store.getConfig();
+    store.validateCurrentRecords();
   } finally {
     store.close();
   }

@@ -1,5 +1,6 @@
 import { validateTaskRecordReference } from "../task/taskRecordReference.js";
 import type { TaskCompletedBy } from "../task/task.js";
+import { requireTimestamp } from "../domain/validation.js";
 
 export type Milestone = {
   schemaVersion: 2;
@@ -10,6 +11,16 @@ export type Milestone = {
   createdBy: TaskCompletedBy;
   createdAt: string;
 };
+
+export function validateMilestone(milestone: Milestone): Milestone {
+  if (milestone.schemaVersion !== 2) throw new Error("Milestone must use schemaVersion 2.");
+  validateTaskRecordReference({ taskId: milestone.taskId, localId: milestone.id }, "milestone");
+  requireText(milestone.title, "Milestone title");
+  requireText(milestone.summary, "Milestone summary");
+  requireTaskControlActor(milestone.createdBy);
+  requireTimestamp(milestone.createdAt, "Milestone createdAt");
+  return milestone;
+}
 
 export function createMilestone(
   id: string,

@@ -259,7 +259,7 @@ export function verificationPlanDigest(plan: VerificationPlan): string {
   const canonical = canonicalJson({
     // Old artifacts may have skipped shell commands or run in the wrong cwd.
     // Keep that history, but never reuse it as proof under corrected semantics.
-    executionContract: "workspace-argv-or-shell/v3",
+    executionContract: "workspace-argv-or-shell/clean-candidate/v4",
     id: plan.id,
     version: plan.version,
     toolchain: plan.toolchain,
@@ -297,29 +297,6 @@ export function toolchainDigest(plan: VerificationPlan, toolchain: ResolvedToolc
   return createHash("sha256").update(canonical).digest("hex");
 }
 
-/**
- * Select the L1 checks for a change: every category whose path prefixes match
- * a changed path. A category with no path prefixes matches nothing (it must
- * be selected explicitly by the caller).
- */
-export function selectL1Checks(
-  plan: VerificationPlan,
-  changedPaths: readonly string[]
-): readonly VerificationStep[] {
-  const selected = new Map<string, VerificationStep>();
-  for (const category of plan.l1.categories) {
-    if (category.paths.length === 0) continue;
-    const matches = changedPaths.some((path) =>
-      category.paths.some((prefix) => path === prefix || path.startsWith(`${prefix}/`))
-    );
-    if (!matches) continue;
-    for (const check of category.checks) {
-      if (!selected.has(check.name)) selected.set(check.name, check);
-    }
-  }
-  return Object.freeze([...selected.values()]);
-}
-
 /** Bootstrap steps as DurableJob steps, named `bootstrap-N`. */
 export function planBootstrapJobSteps(plan: VerificationPlan, workspace: string): readonly DurableJobStep[] {
   return plan.bootstrap.map((step, index) => toDurableJobStep(step, `bootstrap-${index + 1}`, workspace));
@@ -328,11 +305,6 @@ export function planBootstrapJobSteps(plan: VerificationPlan, workspace: string)
 /** L2 gate steps as DurableJob steps, named `gate-N`. */
 export function planL2JobSteps(plan: VerificationPlan, workspace: string): readonly DurableJobStep[] {
   return plan.l2.steps.map((step, index) => toDurableJobStep(step, `gate-${index + 1}`, workspace));
-}
-
-/** L1 steps as DurableJob steps, named `l1-N`. */
-export function planL1JobSteps(steps: readonly VerificationStep[], workspace: string): readonly DurableJobStep[] {
-  return steps.map((step, index) => toDurableJobStep(step, `l1-${index + 1}`, workspace));
 }
 
 function toDurableJobStep(step: VerificationStep, name: string, workspace: string): DurableJobStep {

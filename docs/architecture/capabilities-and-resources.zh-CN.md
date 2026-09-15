@@ -90,7 +90,7 @@ Role 显式 `queue / steer / interrupt`。受管 Agent 的能力 RPC 仍使用�
 
 只读 dashboard、Context 和查询面板投影与这些修改分开。查询面板不能借浏览器的
 用户权限修改状态或管理插件。Task 控制复用公开 CLI 领域命令；Global Role 控制复用
-Global 处理器，但目前缺少已注册的顶层 CLI 路径。消息提交意图
+Global 处理器，与 `yui role message queue/steer` 和 `yui role interrupt` 共用入口。消息提交意图
 （`record / discuss / develop`，默认 `discuss`）与
 [输入时机](../managed-turn-and-session-runtime.zh-CN.md#输入时机queuesteer-与-interrupt)
 分开。传输接受不证明需求已实施或 Task 已验收。

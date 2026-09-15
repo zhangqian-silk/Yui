@@ -1,6 +1,7 @@
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync } from "node:fs";
+import { createHash } from "node:crypto";
+import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, rmSync, rmdirSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import test from "node:test";
@@ -21,6 +22,10 @@ import { createDurableJobControl } from "../../dist/controller/jobControl.js";
 import { createRole, createRoleAgentBinding } from "../../dist/role/role.js";
 import { createRoleSessionSet, recordRoleAgentSession } from "../../dist/executor/agentExecutor.js";
 import { resolveEffectiveLaunch } from "../../dist/executor/effectiveLaunch.js";
+import { runTaskUpstreamCommand } from "../../dist/commands/taskUpstreamCommands.js";
+import { FileTaskWorkspacePreparer } from "../../dist/repository/taskWorkspacePreparer.js";
+import { integrationTmuxSocketRoot } from "../../dist/storage/homeLayout.js";
+import { completeGateArtifact } from "../../dist/verification/gateArtifact.js";
 
 const now = new Date("2026-09-12T00:00:00Z");
 const git = (path, ...args) => execFileSync("git", ["-C", path, ...args], {
@@ -135,14 +140,17 @@ export function integrationFixture(t, strategy = "merge") {
   t.after(() => {
     // Fake Jobs never launch processes. Remove only each fixture's exact
     // marked runtime, including checks intentionally left unfinished.
-    const isolation = service().runtimeIsolation;
-    for (const attempt of store.listIntegrationAttempts(task.id)) {
-      const workspace = store.getIntegrationWorkspace(task.id, attempt.id);
-      if (workspace !== null) isolation.cleanup(isolation.preflight({
-        workspace, allowExactActive: true
-      }), "completion");
-    }
-    store.close();
+    try {
+      const isolation = service().runtimeIsolation;
+      for (const attempt of store.listIntegrationAttempts(task.id)) {
+        const workspace = store.getIntegrationWorkspace(task.id, attempt.id);
+        if (workspace !== null) isolation.cleanup(isolation.preflight({
+          workspace, allowExactActive: true
+        }), "completion");
+      }
+    } finally { store.close(); }
+    try { rmdirSync(integrationTmuxSocketRoot(home)); }
+    catch (error) { if (error.code !== "ENOENT") throw error; }
     rmSync(root, { recursive: true, force: true });
   });
   return {
@@ -167,6 +175,77 @@ export function integrationFixture(t, strategy = "merge") {
     }
   };
 }
+
+test("a check that mutates its candidate cannot publish reusable successful evidence", async t => {
+  const f = integrationFixture(t, "ff");
+  git(f.repo, "checkout", "-b", "clean-candidate");
+  git(f.repo, "commit", "--allow-empty", "-m", "candidate");
+  const candidate = git(f.repo, "rev-parse", "HEAD");
+  git(f.repo, "checkout", "main");
+  const plan = { schemaVersion: 1, kind: "verification-plan", id: "checks", version: "1",
+    bootstrap: [], l1: { categories: [] }, l2: { steps: [{
+      name: "mutating-check", argv: [process.execPath, "-e", "require('fs').writeFileSync('file','mutated\\n')"]
+    }] } };
+  const project = addProjectKnowledge(f.store.getProject("project-1"), "knowledge-1", "Checks", JSON.stringify(plan), now);
+  f.store.saveProject(project);
+  const seed = { ...f.store.getIntegrationAttempt("task-1", "integration-1"), checkCommands: [],
+    source: { kind: "work-item", workItemId: "work-item-1", startCommit: f.before, resultCommit: candidate, strategy: "ff" } };
+  f.store.saveIntegrationAttempt("task-1", seed);
+  const service = new GitIntegrationService(f.home, f.store, undefined, () => now, { PATH: process.env.PATH });
+  const first = await service.integrate("task-1", seed.id);
+  assert.equal(first.status, "blocked");
+  const gate = resolveVerificationGate(project);
+  const artifacts = () => f.store.findL2GateArtifactsForCommit({
+    projectId: project.id, commit: candidate, planDigest: gate.planDigest,
+    toolchainDigest: gate.toolchainDigest, targetRef: "main"
+  });
+  assert.ok(artifacts().every(artifact => artifact.outcome !== "succeeded"),
+    "The candidate integrity check must precede reusable success publication.");
+  await service.abort("task-1", seed.id, "Abandon mutated checks", () => {});
+  f.store.saveIntegrationAttempt("task-1", { ...seed, id: "integration-2" });
+  const second = await service.integrate("task-1", "integration-2");
+  assert.equal(second.status, "blocked", "A fresh attempt must run the check, not reuse the rejected candidate's green.");
+  assert.equal(git(f.repo, "rev-parse", "HEAD"), f.before);
+  assert.ok(artifacts().every(artifact => artifact.outcome !== "succeeded"));
+
+  // A continuation with admission persisted but no Job binding must withdraw
+  // any prior success before the (idempotent) Job start, too.
+  writeFileSync(join(second.workspace.path, "file"), "target\n");
+  const log = Buffer.from("an earlier complete check");
+  f.store.saveGateArtifact(completeGateArtifact(artifacts()[0], [{
+    name: "gate-1", command: "earlier check", outcome: "passed", exitCode: 0,
+    signal: null, timedOut: false, durationMs: 1, logPath: "earlier.log",
+    logDigest: createHash("sha256").update(log).digest("hex"), logBytes: log.length
+  }], "succeeded", now), new Map([["gate-1", log]]));
+  let started = false;
+  const resumed = await new GitIntegrationService(f.home, f.store, undefined, () => now,
+    { PATH: process.env.PATH }, undefined, {
+      ...f.jobs,
+      async startCheckJob(input) {
+        assert.ok(artifacts().every(artifact => artifact.status === "incomplete"));
+        started = true;
+        return f.jobs.startCheckJob(input);
+      }
+    }).integrate("task-1", "integration-2");
+  assert.equal(resumed.status, "checks-running");
+  assert.equal(started, true);
+});
+
+test("upstream uses its supplied Job port and returns exact continuation references", async t => {
+  const f = integrationFixture(t, "rebase");
+  // Workspace adoption has independent lifecycle coverage. This fixture already
+  // provides its exact managed Git records; exercise the upstream command/Job
+  // composition without changing that separately tested layout.
+  t.mock.method(FileTaskWorkspacePreparer.prototype, "prepareTaskWorkspace", async () => {});
+  const result = await runTaskUpstreamCommand(["integrate", "task-1", "--latest", "--check", "true"],
+    f.store, f.home, { now: () => now, environment: { PATH: process.env.PATH }, jobPort: f.jobs });
+  assert.equal(result.data.integrations.length, 1);
+  const integration = result.data.integrations[0];
+  assert.equal(integration.status, "checks-running");
+  assert.equal(f.starts(), 1);
+  assert.ok(result.output.includes(`Job ${integration.job.id}`));
+  assert.ok(result.output.includes(`yui task integration continue task-1/${integration.attempt.id}`));
+});
 
 test("Integration reuses exact checks, reruns explicitly, and cannot bypass equivalent unfinished verification", async t => {
   const f = integrationFixture(t);

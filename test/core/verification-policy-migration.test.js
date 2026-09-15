@@ -24,6 +24,7 @@ test("policy cutover normalizes only active configuration and refuses to relabel
     bootstrap: [], l1: { categories: [] }, l2: { steps: [{ name: "check", argv: ["true"] }] } };
   // Independent persisted v2 encoding, not derived from the current contract.
   const oldPlanDigest = "6a91e32a43e087cba908a4c0de0c71b72dc179c1f9245e746f9a280667cb7f84";
+  const oldV3Digest = "192269a7f4012881bf8b69adffe75fb0ac0e5c1678812e32fd7016b44f12ef91";
   const store = new SqliteTaskStore(home);
   let project = addProjectKnowledge(createProject("project-1", "Fixture", join(home, "repo"),
     { stable: "main", development: "main" }, at), "knowledge-1", "Checks", JSON.stringify(plan), at);
@@ -44,11 +45,17 @@ test("policy cutover normalizes only active configuration and refuses to relabel
     timedOut: false, durationMs: 1, logPath: "check.log",
     logDigest: createHash("sha256").update(log).digest("hex"), logBytes: log.length
   }], "succeeded", at);
+  const oldV3Artifact = completeGateArtifact(createGateArtifact({
+    projectId: project.id, level: "L2", commit: artifact.commit, planDigest: oldV3Digest,
+    toolchainDigest: artifact.toolchainDigest, boundary: artifact.boundary
+  }, { planId: plan.id, planVersion: plan.version, generator: "yui" }, at),
+  artifact.steps, "succeeded", at);
   try {
     store.saveProject(project);
     store.saveTask(activateTask(createTask("task-1", "Keep admitted checks", at), at));
     store.saveIntegrationAttempt("task-1", attempt);
     store.saveGateArtifact(artifact, new Map([["check", log]]));
+    store.saveGateArtifact(oldV3Artifact, new Map([["check", log]]));
   } finally { store.close(); }
   rebuildHistoricalFixture(home, 32);
   const { schemaVersion: _version, ...unversioned } = plan;
@@ -90,6 +97,7 @@ test("policy cutover normalizes only active configuration and refuses to relabel
     assert.deepEqual(normalized.l2, plan.l2);
     assert.match(verificationPlanDigest(normalized), /^[a-f0-9]{64}$/);
     assert.notEqual(verificationPlanDigest(normalized), oldPlanDigest);
+    assert.notEqual(verificationPlanDigest(normalized), oldV3Digest, "Pre-clean-candidate proof must not become reusable again.");
     assert.equal(current.findGateArtifactByIdentity({
       projectId: project.id, level: artifact.level, commit: artifact.commit,
       planDigest: verificationPlanDigest(normalized), toolchainDigest: artifact.toolchainDigest,
@@ -97,6 +105,7 @@ test("policy cutover normalizes only active configuration and refuses to relabel
     }), null, "Old successful evidence must not re-enter the current reuse contract.");
     assert.deepEqual(current.getIntegrationAttempt("task-1", attempt.id), { ...terminal, rerunChecks: false });
     assert.deepEqual(current.getGateArtifact(project.id, artifact.key), artifact);
+    assert.deepEqual(current.getGateArtifact(project.id, oldV3Artifact.key), oldV3Artifact);
     assert.deepEqual(current.getGateArtifactLogs(artifact.key).get("check"), log);
     assert.throws(() => current.saveIntegrationAttempt("task-1", { ...terminal, rerunChecks: true }), /immutable/);
     assert.throws(() => current.saveConfig({ ...current.getConfig(), leaderNextActionMode: "display" }), /unknown|unexpected/i);

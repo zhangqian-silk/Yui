@@ -18,6 +18,8 @@ import {
 } from "../controller/jobControl.js";
 import type { JsonValue } from "../core/protocol.js";
 import { inspectJobOperation } from "../job/jobOperation.js";
+import { assertJobAssignmentScope } from "../job/jobAssignmentScope.js";
+import type { DurableJob } from "../job/durableJob.js";
 import type { TaskSubmissionIntent } from "../message/message.js";
 import { createPluginService } from "../plugins/pluginService.js";
 import { createProjectResources, type EnvironmentPlan } from "../resources/projectResourceService.js";
@@ -388,6 +390,10 @@ export function createBuiltinCapabilities(
         const sessions = store.getTaskRoleSessionSet(task.id, caller.role!);
         if (sessions?.sessions[sessions.activeAgentId]?.effective.executionAuthority !== "delivery") {
           throw new Error("Planning Sessions cannot start delivery Jobs.");
+        }
+        if (descriptor?.name === "job.start" && input !== undefined) {
+          assertJobAssignmentScope(store,
+            input as Pick<DurableJob, "taskId" | "owner" | "projectId" | "workspace">, caller);
         }
       }
       if (permission === "task:read" || permission === "job:start") continue;

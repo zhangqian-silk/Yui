@@ -4,27 +4,6 @@ import type { TaskStore } from "../storage/taskStore.js";
 import type { WorkItem } from "../workItem/workItem.js";
 import type { Task } from "./task.js";
 
-/**
- * Runtime Task-event types that are emitted with a Role but no Turn in their
- * payload. Each one is still only exempted when its `roleName` resolves to the
- * Leader — the `runtime.` prefix is never exempted, and a type absent from this
- * set keeps disqualifying the Draft.
- *
- * Turn lifecycle events are deliberately not listed: they use one generic type
- * per transition and name the Turn in their payload, so the guard resolves that
- * Turn's own purpose instead of trusting the type. Listing invented
- * `turn.planning-*` types would have exempted nothing while silently
- * disqualifying every Draft that ever held a planning conversation.
- */
-export const PLANNING_ROLE_EVENT_TYPES: ReadonlySet<string> = new Set([
-  "runtime.session-stop-requested",
-  "runtime.session-termination",
-  // Written by the liveness/host-exit paths, which admit a Draft planning Turn.
-  // Its payload carries the Role and embeds the Turn only inside the serialized
-  // observation, so it is resolved as Role-scoped rather than by that blob.
-  "runtime.process-exit-observed"
-]);
-
 type DraftPlanFacts = Readonly<{
   task: Task;
   workItems: readonly WorkItem[];

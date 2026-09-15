@@ -561,7 +561,6 @@ export class TaskWorkspaceCoordinator {
   #reviewRoundRoleNames(round: ReviewRound): readonly string[] {
     return [
       round.reviewerRoleName,
-      ...(round.executionGroup?.lanes.map(({ roleName }) => roleName) ?? []),
       ...(round.executionGroup?.lanes.map(({ roleName }) => roleName) ?? [])
     ];
   }

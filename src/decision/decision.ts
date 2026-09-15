@@ -1,4 +1,5 @@
 import { validateTaskRecordReference } from "../task/taskRecordReference.js";
+import { requireTimestamp } from "../domain/validation.js";
 
 export type DecisionStatus = "active" | "superseded";
 
@@ -14,6 +15,21 @@ export type Decision = {
   createdAt: string;
   updatedAt: string;
 };
+
+export function validateDecision(decision: Decision): Decision {
+  if (decision.schemaVersion !== 1) throw new Error("Decision must use schemaVersion 1.");
+  validateTaskRecordReference({ taskId: decision.taskId, localId: decision.id }, "decision");
+  requireText(decision.title, "Decision title");
+  requireText(decision.rationale, "Decision rationale");
+  requireTimestamp(decision.createdAt, "Decision createdAt");
+  requireTimestamp(decision.updatedAt, "Decision updatedAt");
+  if (decision.status !== "active" && decision.status !== "superseded") throw new Error("Decision status is invalid.");
+  if (decision.status === "superseded") {
+    requireText(decision.supersededReason!, "Decision supersede reason");
+    requireTimestamp(decision.supersededAt!, "Decision supersededAt");
+  }
+  return decision;
+}
 
 export function createDecision(
   id: string,

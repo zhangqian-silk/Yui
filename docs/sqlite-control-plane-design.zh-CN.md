@@ -28,6 +28,11 @@ Yui 只有一个权威产品 Store：WAL 模式下的 `YUI_HOME/yui.db`。`schem
 不完整的或损坏的 Home 一律 fail closed。不存在运行时归一化、修复 worker、
 文件 Store 回退、双读写路径或第二套迁移权威。
 
+类型化领域记录在写入、普通读取、有界 Context 分页和全 Home 检查时，共用一份
+现行校验注册表。直接 Store 与 worker-backed Store 不存在不同强度的校验。
+无效写入不会推进 revision；已存在的无效记录只会报错并保留供明确诊断，
+不会被自动规范化成看似有效的替代记录。
+
 ## 写入与并发合同
 
 - 每次修改是一个 SQLite 事务。

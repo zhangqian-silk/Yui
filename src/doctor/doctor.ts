@@ -500,8 +500,10 @@ function inspectState(
   if (!existsSync(databasePath)) {
     return blockedStorage("invalid", "Current storage is incomplete: yui.db is missing.");
   }
+  let ownedStore: ReturnType<typeof openCurrentTaskStore> | undefined;
   try {
-    const store = openCurrentTaskStore(home);
+    const store = ownedStore = openCurrentTaskStore(home);
+    store.validateCurrentRecords();
     const config = store.getConfig();
     const agents = store.listConfiguredAgents();
     const tasks = store.listTasks();
@@ -536,6 +538,8 @@ function inspectState(
     };
   } catch (error) {
     return blockedStorage("invalid", errorMessage(error));
+  } finally {
+    ownedStore?.close();
   }
 }
 
@@ -1044,8 +1048,9 @@ function errorMessage(error: unknown): string {
  * the Home store cannot be opened (the doctor must still run on broken Homes).
  */
 function readDurableConfigSafely(home: string): { tmuxBin: string; gitBin: string } {
+  let ownedStore: ReturnType<typeof openCurrentTaskStore> | undefined;
   try {
-    const store = openCurrentTaskStore(home);
+    const store = ownedStore = openCurrentTaskStore(home);
     const config = store.getConfig();
     return {
       tmuxBin: resolveTmuxBin(config.tmuxBin),
@@ -1053,5 +1058,7 @@ function readDurableConfigSafely(home: string): { tmuxBin: string; gitBin: strin
     };
   } catch {
     return { tmuxBin: "tmux", gitBin: "git" };
+  } finally {
+    ownedStore?.close();
   }
 }

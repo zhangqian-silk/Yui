@@ -1,5 +1,4 @@
 import { execFile, spawn } from "node:child_process";
-import { createHash } from "node:crypto";
 import {
   lstat,
   mkdir,
@@ -34,7 +33,7 @@ import {
   type TaskRuntimeIsolationPort,
   type TaskRuntimeIsolationPreparation
 } from "../runtime/taskRuntimeIsolation.js";
-import { managedIntegrationRuntimeRoot } from "../storage/homeLayout.js";
+import { integrationTmuxSocketRoot, managedIntegrationRuntimeRoot } from "../storage/homeLayout.js";
 import type { TaskStore } from "../storage/taskStore.js";
 import { advanceTaskProjectCommit } from "../task/task.js";
 import { yuiTmuxServerName } from "../tmux/tmuxManager.js";
@@ -587,6 +586,14 @@ export class GitIntegrationService {
       })
     }, this.now());
     this.store.saveIntegrationAttempt(attempt.taskId, persisted);
+    if (gate !== undefined) {
+      // Resumption can enter here after persisting admission but before the
+      // original call withdrew old proof or recorded its Job id.
+      beginGateVerification(this.store, gateIdentityForCandidate({
+        projectId: attempt.projectId, gate, level: "L2", commit: head,
+        targetRef: attempt.targetRef, baseHead: attempt.beforeCommit
+      }), gate.plan, this.now());
+    }
     // All domain admission and durable candidate identity precede Job effects.
     this.runtimeIsolation.activate(runtime);
     await prepareIntegrationRuntimeHome(runtime, this.home);
@@ -660,14 +667,14 @@ export class GitIntegrationService {
         baseHead: attempt.beforeCommit
       });
       try {
-        const artifact = await recordGateArtifactFromJob(
+        const artifact = await this.#publishGateEvidence(workspace, job.head, () => recordGateArtifactFromJob(
           this.store,
           this.home,
           identity,
           gate.plan,
           job,
           this.now()
-        );
+        ));
         if (checks.every((check) => check.outcome !== "failed")) {
           checks.push(...checkResultsFromGateArtifact(artifact));
         }
@@ -783,7 +790,6 @@ export class GitIntegrationService {
         );
       }
     }
-    beginGateVerification(this.store, identity, gate.plan, this.now());
     if (this.jobPort !== undefined) {
       return this.#startCheckJob(
         attempt,
@@ -794,6 +800,7 @@ export class GitIntegrationService {
         gate
       );
     }
+    beginGateVerification(this.store, identity, gate.plan, this.now());
     // An explicit local caller without a Controller Job port runs the
     // plan gate in-process and record the artifact directly.
     const runtime = this.#runtimePreparation(attempt, managedWorkspace);
@@ -813,14 +820,14 @@ export class GitIntegrationService {
         && outcomes.every((outcome) =>
           outcome.exitCode === 0 && outcome.signal === null && !outcome.timedOut
         );
-      const artifact = await recordGateArtifactFromStepOutcomes(
+      const artifact = await this.#publishGateEvidence(workspace, candidateCommit, () => recordGateArtifactFromStepOutcomes(
         this.store,
         identity,
         gate.plan,
         outcomes,
         succeeded,
         this.now()
-      );
+      ));
       const checks = checkResultsFromGateArtifact(artifact);
       cleanupReason = succeeded ? "completion" : "failure";
       if (!succeeded) {
@@ -842,6 +849,18 @@ export class GitIntegrationService {
     } finally {
       this.runtimeIsolation.cleanup(runtime, cleanupReason);
     }
+  }
+
+  /** Both executors publish proof only for the exact clean candidate they
+   * checked. A later delivery/CAS failure is separate from this evidence, but
+   * a mutated candidate must never enter the reusable-success cache. */
+  async #publishGateEvidence<T>(
+    workspace: IntegrationWorkspace,
+    candidateCommit: string,
+    publish: () => Promise<T>
+  ): Promise<T> {
+    await assertIntegrationCandidate(workspace.path, candidateCommit, workspace.branch);
+    return publish();
   }
 
   async #finalizeGateSuccess(
@@ -1339,19 +1358,6 @@ function defaultIntegrationRuntimeIsolation(
       globalInstallPaths: [process.execPath]
     }
   });
-}
-
-/**
- * Short `/tmp` directory that holds ONLY the integration check's tmux socket
- * endpoint. tmux uses a `sockaddr_un` path whose length budget cannot absorb a
- * deep Home path, so this single IPC endpoint is the one approved exception to
- * the unified-Home contract. All other integration runtime state (data, cache,
- * ordinary temp) lives in the Home partition from `managedIntegrationRuntimeRoot`.
- */
-function integrationTmuxSocketRoot(home: string): string {
-  const uid = typeof process.getuid === "function" ? process.getuid() : 0;
-  const homeDigest = createHash("sha256").update(resolve(home)).digest("hex").slice(0, 16);
-  return join("/tmp", `yi-${uid.toString(36)}-${homeDigest}`);
 }
 
 /**

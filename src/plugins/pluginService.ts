@@ -337,10 +337,17 @@ export function createPluginService(store: TaskStore, host: InstanceHost, regist
           // recorded on the plugin's own failure channel — not a Task product
           // artifact (product artifacts are files in the Task's Git repository).
           try {
-            store.recordPluginIntentFailure(taskId, retired.ref.id, intent.revision, {
-              message: `Plugin instance cleanup failed for ${retired.ref.id}/${retired.ref.generation}: `
-                + (error instanceof Error ? error.message : String(error)),
-              occurredAt: new Date().toISOString()
+            store.transaction(tx => {
+              const current = tx.getPluginIntent(taskId, pkg.manifest.id);
+              if (current === null) return;
+              // A draining generation can fail after another replacement.
+              // Attach this diagnostic to the current selection, without
+              // changing it or treating its activation as a failure.
+              tx.recordPluginIntentFailure(taskId, pkg.manifest.id, current.revision, {
+                message: `Plugin instance cleanup failed for ${retired.ref.id}/${retired.ref.generation}: `
+                  + (error instanceof Error ? error.message : String(error)),
+                occurredAt: new Date().toISOString()
+              });
             });
           } catch { /* best-effort telemetry; never mask the successful activation */ }
         });

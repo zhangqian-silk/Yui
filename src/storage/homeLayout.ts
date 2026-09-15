@@ -1,4 +1,5 @@
 import { isAbsolute, join, relative, resolve } from "node:path";
+import { createHash } from "node:crypto";
 
 /**
  * The single authority for every Yui self-managed path derived from a Home.
@@ -72,6 +73,14 @@ export function managedRuntimeRoot(home: string): string {
  */
 export function managedIntegrationRuntimeRoot(home: string): string {
   return join(homeRoot(home), "runtime", "integration-runtimes");
+}
+
+/** The shared Home-scoped short IPC directory; ordinary integration data stays
+ * inside Home. A fixture that owns the whole Home may remove this when empty. */
+export function integrationTmuxSocketRoot(home: string): string {
+  const uid = typeof process.getuid === "function" ? process.getuid() : 0;
+  const homeDigest = createHash("sha256").update(homeRoot(home)).digest("hex").slice(0, 16);
+  return join("/tmp", `yi-${uid.toString(36)}-${homeDigest}`);
 }
 
 /**

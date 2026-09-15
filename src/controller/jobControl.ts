@@ -30,6 +30,7 @@ import { redactLaunchText } from "../runtime/launchDiagnostics.js";
 import { requireManagedTaskCaller } from "../runtime/managedCaller.js";
 import type { TaskStore } from "../storage/taskStore.js";
 import type { ManagedWorkspace } from "../worktree/managedWorkspace.js";
+import { assertJobAssignmentScope, JobAssignmentScopeError } from "../job/jobAssignmentScope.js";
 
 /**
  * rr8: The caller identity a `job.start`/`job.cancel` request is bound to.
@@ -104,6 +105,7 @@ export function createDurableJobControl(store: TaskStore): DurableJobControlPort
       // startJob with the same key create a duplicate job.
       return store.transaction((tx) => {
         const context = authority.authenticate(Object.freeze({ ...params.caller }), params.taskId);
+        requireJobAssignment(tx, params, params.caller);
         assertNonSecretJobInput(params);
         const baseKey = durableJobIdempotencyKey({
           owner: params.owner,
@@ -181,6 +183,7 @@ export function createDurableJobControl(store: TaskStore): DurableJobControlPort
         // rr8: Bind the cancel request to the caller's managed identity. The
         // same rules as job.start apply, checked against the job's owner.
         assertCallerAuthorized(tx, caller, taskId);
+        requireJobAssignment(tx, current, caller);
         const next = requestDurableJobCancel(current, now);
         if (next !== current) tx.saveDurableJob(taskId, next);
         return next;
@@ -191,6 +194,7 @@ export function createDurableJobControl(store: TaskStore): DurableJobControlPort
         const current = tx.getDurableJob(taskId, jobId);
         if (current === null) return null;
         assertCallerAuthorized(tx, caller, taskId);
+        requireJobAssignment(tx, current, caller);
         const next = acknowledgeUnknownDurableJob(current, now);
         if (next !== current) tx.saveDurableJob(taskId, next);
         return next;
@@ -223,7 +227,20 @@ export function authorizeJobStart(store: TaskStore, job: DurableJob): void {
   if (jobAuthorityBinding(store, scope, role, job.taskId) !== job.operation.authorityRef) {
     throw jobDomainError("Job caller binding was revoked; no execution was started.");
   }
+  requireJobAssignment(store, job, { scope, role });
   validateJobTarget(store, job);
+}
+
+function requireJobAssignment(
+  store: TaskStore,
+  target: Pick<DurableJob, "taskId" | "owner" | "projectId" | "workspace">,
+  caller: Pick<DurableJobCaller, "scope" | "role">
+): void {
+  try { assertJobAssignmentScope(store, target, caller); }
+  catch (error) {
+    if (error instanceof JobAssignmentScopeError) throw jobControlError("UNAUTHORIZED", error.message);
+    throw error;
+  }
 }
 
 function jobAuthorityBinding(store: TaskStore, scope: string, roleName: string, taskId: string): string {
@@ -440,8 +457,8 @@ function validateJobTarget(store: TaskStore, params: Omit<DurableJobStartParams,
  * - `task` + mismatched taskId: rejected.
  * - A non-Leader Task caller requires its current active Assignment.
  * - A Leader Task caller requires its current, unrevoked native Session.
- * - `task`: authority inside the matching Task after current Session and
- *   native Session verification; Role does not narrow it.
+ * - Non-Leader Task callers additionally pass the shared exact Assignment
+ *   check for every Job operation and before a queued Job starts.
  */
 /**
  * Verify the caller's current native Session and Task scope. This local Home

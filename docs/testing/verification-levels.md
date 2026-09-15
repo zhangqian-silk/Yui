@@ -150,7 +150,7 @@ is required.
     and refuses unknown old shapes without advancing the migration ledger.
 30. WorkItem overlap is a read-only advisory; exact permission/dependency guards
     remain. Real local verification proves default reuse, explicit rerun failure,
-    selected-check isolation, incomplete evidence and stale-consumer rejection.
+    incomplete evidence and stale-consumer rejection through the current proof path.
     An Integration rerun cannot bypass an equivalent unfinished gate. Policy
     migration preserves historical execution and blocks an admitted old gate.
 31. Message edits preserve submission intent and immutable request identity;
@@ -162,6 +162,13 @@ is required.
     The actual Controller continues admitted requests but not cancellations.
     Required Store reads fail before config mutation or full-scan fallback.
     Explicit Job requests replay one operation and reject changed or missing keys.
+32. Worker Job admission/management and the pre-spawn gate reject a different
+    owner/workspace; legitimate Worker and Leader Jobs remain usable. Candidate
+    mutation blocks publication of reusable success, including after explicit
+    abort/retry. Upstream wiring returns its admitted Job and continuation IDs.
+    Plugin replacement retains delayed old-generation cleanup errors without
+    undoing a newer selection. A shared validator rejects bad record writes,
+    ordinary/Context reads and full-Home health checks without repairing data.
 
 Keep the test phase seconds-scale; measure TypeScript build separately. Record
 incremental runtime when adding a critical regression. The seven recovery boundary

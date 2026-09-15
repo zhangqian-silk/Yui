@@ -374,8 +374,10 @@ Publication rechecks the complete contribution, dependencies and permissions
 again. A failure does not change the existing directory; a competing
 activate/disable makes a late candidate refuse to publish. After a successful
 publication, the old generation only serves existing references and is disposed
-once drained; a cleanup failure keeps a diagnostic Artifact and neither rolls
-back the new Provider nor pretends the current instance is still unpublished.
+once drained. A cleanup failure is retained on that plugin's diagnostic channel
+with the old generation identity, even if another replacement has already
+published. It is not a Task Artifact, does not roll back the new Provider, and
+does not pretend the current instance is still unpublished.
 
 ## Storage and other ingress
 

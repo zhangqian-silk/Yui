@@ -13,7 +13,6 @@ import {
   gateArtifactRef,
   isReusableGateArtifact,
   parseGateArtifactRef,
-  recordGateArtifactReuse,
   verifyGateArtifactLogs,
   type GateArtifact,
   type GateArtifactIdentity,
@@ -25,14 +24,11 @@ import {
   importGateArtifactSteps,
   loadGateArtifact,
   saveGateArtifact,
-  touchGateArtifact,
   type GateArtifactStepInput
 } from "./gateArtifactStore.js";
 import {
-  planL1JobSteps,
   resolveProjectVerificationPlan,
   resolveToolchain,
-  selectL1Checks,
   toolchainDigest,
   verificationPlanDigest,
   type ResolvedToolchain,
@@ -471,70 +467,6 @@ export async function verifyGateArtifactForReview(
     };
   }
   return { ok: true, artifact };
-}
-
-/**
- * Run an L1 gate for a change: select the affected categories' checks, run
- * them in-process, and record the L1 artifact. Exact evidence is reused unless
- * this invocation explicitly requests a rerun.
- */
-export async function runL1Gate(input: Readonly<{
-  store: GateArtifactStorePort;
-  projectId: string;
-  gate: ResolvedVerificationGate;
-  commit: string;
-  changedPaths: readonly string[];
-  workspace: string;
-  environment: Readonly<Record<string, string>>;
-  logsDirectory: string;
-  now: Date;
-  rerun?: boolean;
-}>): Promise<{ artifact: GateArtifact; reused: boolean; checks: CheckResult[] }> {
-  if (input.rerun !== undefined && typeof input.rerun !== "boolean") {
-    throw new Error("Verification rerun must be a boolean.");
-  }
-  const selected = selectL1Checks(input.gate.plan, input.changedPaths);
-  const identity = { ...gateIdentityForCandidate({
-    projectId: input.projectId,
-    gate: input.gate,
-    level: "L1",
-    commit: input.commit
-  }), planDigest: createHash("sha256").update(JSON.stringify([input.gate.planDigest, selected])).digest("hex") };
-  if (!input.rerun) {
-    const existing = await lookupReusableGateArtifact(input.store, identity);
-    if (existing !== null) {
-      const reused = recordGateArtifactReuse(existing, input.now);
-      touchGateArtifact(input.store, reused);
-      return {
-        artifact: reused,
-        reused: true,
-        checks: checkResultsFromGateArtifact(reused, true)
-      };
-    }
-  }
-  beginGateVerification(input.store, identity, input.gate.plan, input.now);
-  const outcomes = await runGateStepsInProcess(
-    input.workspace,
-    planL1JobSteps(selected, input.workspace),
-    input.environment,
-    input.logsDirectory,
-    input.commit
-  );
-  const succeeded = outcomes.length > 0
-    && outcomes.every((outcome) => outcome.exitCode === 0 && outcome.signal === null && !outcome.timedOut);
-  const artifact = await recordGateArtifactFromStepOutcomes(
-    input.store,
-    identity,
-    input.gate.plan,
-    outcomes,
-    succeeded,
-    input.now
-  );
-  return {
-    artifact,
-    reused: false,
-    checks: checkResultsFromGateArtifact(artifact, false)
-  };
 }
 
 /** Stable digest of a log file, for ad-hoc evidence binding. */

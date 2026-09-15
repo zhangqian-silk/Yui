@@ -23,12 +23,6 @@ import {
   validateRuntimeProcessExitObservation,
   type RuntimeProcessExitObservation
 } from "../../runtime/processExitObservation.js";
-import { validateAgentProfile } from "../../profile/agentProfile.js";
-import { validateRoleSessionSet } from "../../executor/agentExecutor.js";
-import { validateReviewRound } from "../../review/reviewRound.js";
-import { validateRun } from "../../agentRun/agentRun.js";
-import { validateDurableJob } from "../../job/durableJob.js";
-import { validateWorkItem } from "../../workItem/workItem.js";
 import { SqliteTaskStore } from "../sqliteStore.js";
 import { storageBackupRoot } from "../homeLayout.js";
 import {
@@ -377,24 +371,8 @@ export async function runStorageUpgrade(options: RunStorageUpgradeOptions): Prom
 function validateCurrentStore(home: string): void {
   const store = new SqliteTaskStore(home);
   try {
-    store.getConfig();
-    for (const profile of store.listAgentProfiles()) validateAgentProfile(profile);
-    for (const sessions of store.listGlobalRoleSessionSets()) {
-      validateRoleSessionSet(sessions);
-    }
-    for (const owner of store.listSessionOwners()) {
-      if (owner.schemaVersion !== 2 || Object.hasOwn(owner, "launchId")) {
-        throw new Error("Session owner runtime identity is invalid.");
-      }
-    }
+    store.validateCurrentRecords();
     for (const taskId of store.listTasks().map(({ id }) => id)) {
-      for (const job of store.listDurableJobs(taskId)) validateDurableJob(job);
-      for (const item of store.listWorkItems(taskId)) validateWorkItem(item);
-      for (const round of store.listReviewRounds(taskId)) validateReviewRound(round);
-      for (const run of store.listRuns(taskId)) validateRun(run);
-      for (const sessions of store.listRoleSessionSets(taskId)) {
-        validateRoleSessionSet(sessions);
-      }
       for (const event of store.listEvents(taskId)) {
         if (event.type === RUNTIME_OBSERVATION_TASK_EVENT) {
           createRuntimeObservation(

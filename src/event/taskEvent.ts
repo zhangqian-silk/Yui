@@ -1,4 +1,5 @@
 import { validateTaskRecordReference } from "../task/taskRecordReference.js";
+import { requireTimestamp } from "../domain/validation.js";
 
 export type TaskEventPayload = Record<string, string>;
 
@@ -26,7 +27,18 @@ export function createTaskEvent(
     payload: normalizePayload(payload),
     createdAt: now.toISOString()
   };
+  return validateTaskEvent(event);
+}
+
+export function validateTaskEvent(event: TaskEvent): TaskEvent {
+  if (event.schemaVersion !== 2) throw new Error("Task Event must use schemaVersion 2.");
   validateTaskRecordReference({ taskId: event.taskId, localId: event.id }, "event");
+  requireText(event.type, "Task event type");
+  if (event.payload === null || typeof event.payload !== "object" || Array.isArray(event.payload)) {
+    throw new Error("Task event payload must be an object.");
+  }
+  normalizePayload(event.payload);
+  requireTimestamp(event.createdAt, "Task event createdAt");
   return event;
 }
 

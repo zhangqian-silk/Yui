@@ -93,10 +93,22 @@ upgrade backup. This is an approved behavior change, not an assertion that
 
 Admitted `running`/`validating` plan gates block preflight and migration; settle
 them with the old release first. No in-flight Job is relabelled under the new
-proof contract. The v3 verification-plan digest excludes old cache entries from
+proof contract. That cutover's v3 verification-plan digest excluded older cache entries from
 automatic reuse without rewriting historical Job/Integration results or deleting
 their logs. Historical plan interpretation is frozen inside the migration
 directory so earlier migrations keep their original semantics.
+
+The current clean-candidate proof uses a v4 execution digest. Both local and
+Job-backed verification check candidate cleanliness, branch and exact HEAD
+before publishing reusable success; pre-v4 cache entries cannot silently pass
+this boundary. Existing records/logs remain readable and admitted Jobs are not
+relabeled under a new digest. Settle old attempts with their matching contract,
+or explicitly abandon them before starting another operation.
+
+The unused L1 runner/path selector is removed, with current cache regressions
+covering the shared proof primitives and actual Integration path instead.
+Persisted plan metadata and historical L1 artifacts are retained; this does not
+reset the Home version or remove the supported migration chain.
 
 Storage 33→34 removes Message `wakePolicy` and activation `origin` from current
 records, preserving their original representations in audit Events. Historical
