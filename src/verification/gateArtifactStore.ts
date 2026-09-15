@@ -61,7 +61,9 @@ export function findGateArtifact(
  * commit, plan digest, toolchain digest, and target ref.  Unlike
  * {@link findGateArtifact} the base head is not part of the match: a release
  * consumes the gate that proved the exact frozen tree, regardless of which
- * base it integrated onto.  Logs are verified before returning.
+ * base it integrated onto. The newest recorded matching result governs:
+ * failure/incompleteness/corruption must not fall through to an older success.
+ * Logs are verified before returning.
  */
 export async function findL2ArtifactForCommit(
   store: GateArtifactStorePort,
@@ -73,14 +75,18 @@ export async function findL2ArtifactForCommit(
     targetRef: string;
   }>
 ): Promise<GateArtifact | null> {
-  const artifacts = store.findL2GateArtifactsForCommit(query);
-  for (const artifact of artifacts) {
-    if (!isReusableGateArtifact(artifact)) continue;
+  const recordedAt = (artifact: GateArtifact) => Date.parse(artifact.completedAt ?? artifact.createdAt);
+  const artifacts = [...store.findL2GateArtifactsForCommit(query)]
+    .sort((left, right) => recordedAt(right) - recordedAt(left));
+  const latest = artifacts[0];
+  if (latest === undefined) return null;
+  for (const artifact of artifacts.filter(value => recordedAt(value) === recordedAt(latest))) {
+    if (!isReusableGateArtifact(artifact)) return null;
     const logs = store.getGateArtifactLogs(artifact.key);
     const verification = verifyGateArtifactLogs(artifact, logs);
-    if (verification.ok) return artifact;
+    if (!verification.ok) return null;
   }
-  return null;
+  return latest;
 }
 
 /**

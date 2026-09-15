@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import type { DurableJobStep } from "../../job/durableJob.js";
-import type { VerificationPlan, VerificationStep } from "../../verification/verificationPlan.js";
+import type { HistoricalVerificationPlan as VerificationPlan, HistoricalVerificationStep as VerificationStep } from "./verificationPlanV1.js";
 
 /** Frozen pre-fix encoding used only to recognize valid historical Jobs.
  * Never use corrected execution semantics to reinterpret a released migration,

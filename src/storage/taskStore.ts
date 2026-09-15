@@ -16,8 +16,6 @@ import {
   resolveAgentLaunchInactivityTimeoutSeconds,
   resolveControllerTaskConcurrency,
   resolveDeliveryTimeoutSeconds,
-  resolveLeaderNextActionMode,
-  resolveLeaderSemanticBudgetRuns,
   resolveResourcesGcAutoQuarantine,
   resolveResourcesGcMode,
   resolveResourcesQuarantineTtlHours,
@@ -145,16 +143,10 @@ export type YuiConfig = Readonly<{
    */
   resourcesGcAutoQuarantine?: boolean;
   review?: ReviewConfig;
-  /**
-   * Issue 07 (Leader convergence) feature mode. An omitted value resolves to
-   * `display` within the current config contract.
-   */
-  leaderNextActionMode?: "display" | "warn" | "enforce";
   runtimeHealth?: import("../config/yuiConfig.js").RuntimeHealthConfig;
   controllerTaskConcurrency?: number;
   agentLaunchInactivityTimeoutSeconds?: number;
   deliveryTimeoutSeconds?: number;
-  leaderSemanticBudgetRuns?: number;
   resourcesQuarantineTtlHours?: number;
   /**
    * Path to the tmux binary. Defaults to `tmux` on PATH.
@@ -572,12 +564,10 @@ export function validateYuiConfig(config: YuiConfig): void {
       "resourcesGcMode",
       "resourcesGcAutoQuarantine",
       "review",
-      "leaderNextActionMode",
       "runtimeHealth",
       "controllerTaskConcurrency",
       "agentLaunchInactivityTimeoutSeconds",
       "deliveryTimeoutSeconds",
-      "leaderSemanticBudgetRuns",
       "resourcesQuarantineTtlHours",
       "tmuxBin",
       "tmuxHistoryLimit",
@@ -602,7 +592,6 @@ export function validateYuiConfig(config: YuiConfig): void {
     reconciliationIntervalMilliseconds(config.reconciliationIntervalSeconds);
     resolveTimeZone(config.timeZone);
     if (config.review !== undefined) validateReviewConfig(config.review);
-    resolveLeaderNextActionMode(config.leaderNextActionMode);
     resolveResourcesGcMode(config.resourcesGcMode);
     resolveResourcesGcAutoQuarantine(config.resourcesGcAutoQuarantine);
     resolveResourcesQuarantineTtlHours(config.resourcesQuarantineTtlHours);
@@ -610,7 +599,6 @@ export function validateYuiConfig(config: YuiConfig): void {
     resolveControllerTaskConcurrency(config.controllerTaskConcurrency);
     resolveAgentLaunchInactivityTimeoutSeconds(config.agentLaunchInactivityTimeoutSeconds);
     resolveDeliveryTimeoutSeconds(config.deliveryTimeoutSeconds);
-    resolveLeaderSemanticBudgetRuns(config.leaderSemanticBudgetRuns);
     resolveTmuxBin(config.tmuxBin);
     resolveTmuxHistoryLimit(config.tmuxHistoryLimit);
     resolveTelemetryEnabled(config.telemetryEnabled);

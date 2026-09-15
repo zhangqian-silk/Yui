@@ -33,7 +33,7 @@ The current development step retires runtime compatibility before the final
 1.0 baseline cutover. It does not publish a release or reset storage numbering.
 Storage 27→28 normalizes only provable singleton Role dispatch dedupe keys;
 the old migration ledger, Messages, Task results and unconfirmed effects remain
-unchanged. Ordinary opens require storage 32. Existing Homes advance only through
+unchanged. Ordinary opens require storage 33. Existing Homes advance only through
 the explicit upgrade boundary; no runtime dual-reader is added.
 
 This is a breaking pre-1.0 change:
@@ -82,6 +82,21 @@ Before removal, the entire original payload is preserved verbatim in a
 `work-item.execution-state-retired` Task event. Current status, scope, Candidates
 and execution groups are unchanged; no Run or acceptance is created. Unrecognized
 historical shapes fail without changing the record or advancing the ledger.
+
+Storage 32→33 retires the Leader rollout/budget settings and VerificationPlan
+rollout modes. Active plan bodies gain an explicit schema version; their checks
+remain unchanged, while retired Knowledge bodies are preserved. Integration
+records gain explicit `rerunChecks: false`, and shadow reuse counters are removed
+from cached artifacts. Original settings remain recoverable from the explicit
+upgrade backup. This is an approved behavior change, not an assertion that
+`record`, `reuse` and `enforce` meant the same thing.
+
+Admitted `running`/`validating` plan gates block preflight and migration; settle
+them with the old release first. No in-flight Job is relabelled under the new
+proof contract. The v3 verification-plan digest excludes old cache entries from
+automatic reuse without rewriting historical Job/Integration results or deleting
+their logs. Historical plan interpretation is frozen inside the migration
+directory so earlier migrations keep their original semantics.
 
 Core Scheduler readers and persistence operations are required ports. A missing
 Session/event reader cannot be interpreted as empty evidence or skipped error

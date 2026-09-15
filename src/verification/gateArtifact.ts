@@ -11,10 +11,11 @@ import {
 /**
  * Issue 08: the reusable exact-SHA gate evidence record.
  *
- * A GateArtifact binds one gate run to its full identity tuple: Project,
+ * A GateArtifact is the latest cached proof for its full identity tuple: Project,
  * candidate commit, VerificationPlan digest, toolchain digest, and (for L2)
- * the source/base/target boundary. The same tuple reuses the same successful
- * artifact; any tuple change invalidates it. Artifacts are stored in the
+ * the source/base/target boundary. Fresh execution withdraws the previous
+ * success; a failed or incomplete latest result is not reusable. Job and
+ * Integration records own execution history. Artifacts are stored in the
  * SQLite `gate_artifacts` / `gate_artifact_logs` tables, backend-neutral
  * through the GateArtifactStorePort.
  */
@@ -75,8 +76,6 @@ export type GateArtifact = Readonly<{
   generator: string;
   status: GateArtifactStatus;
   outcome: GateArtifactOutcome;
-  /** Shadow metric: how often a record-mode run saw a reusable artifact. */
-  potentialReuseCount: number;
   /** How often this artifact was actually reused. */
   reuseCount: number;
   createdAt: string;
@@ -125,7 +124,6 @@ export function createGateArtifact(
     generator: requireText(metadata.generator, "GateArtifact generator"),
     status: "incomplete",
     outcome: "unknown",
-    potentialReuseCount: 0,
     reuseCount: 0,
     createdAt: timestamp,
     lastUsedAt: timestamp
@@ -154,20 +152,7 @@ export function completeGateArtifact(
   });
 }
 
-/** Record a shadow potential-reuse observation (record mode). */
-export function recordGateArtifactPotentialReuse(
-  artifact: GateArtifact,
-  now: Date
-): GateArtifact {
-  validateGateArtifact(artifact);
-  return validateGateArtifact({
-    ...artifact,
-    potentialReuseCount: artifact.potentialReuseCount + 1,
-    lastUsedAt: now.toISOString()
-  });
-}
-
-/** Record an actual reuse (reuse/enforce mode). */
+/** Record an actual reuse of complete successful evidence. */
 export function recordGateArtifactReuse(
   artifact: GateArtifact,
   now: Date
@@ -247,7 +232,7 @@ export function validateGateArtifact(artifact: GateArtifact): GateArtifact {
       throw new Error(`GateArtifact step ${step.name} logBytes is invalid.`);
     }
   }
-  requirePositiveInteger(artifact.potentialReuseCount + 1, "GateArtifact potentialReuseCount");
+  if (Object.hasOwn(artifact, "potentialReuseCount")) throw new Error("GateArtifact contains retired shadow metrics.");
   requirePositiveInteger(artifact.reuseCount + 1, "GateArtifact reuseCount");
   requireTimestamp(artifact.createdAt, "GateArtifact createdAt");
   requireTimestamp(artifact.lastUsedAt, "GateArtifact lastUsedAt");
@@ -293,7 +278,9 @@ export function verifyGateArtifactLogs(
 }
 
 export function isReusableGateArtifact(artifact: GateArtifact): boolean {
-  return artifact.status === "complete" && artifact.outcome === "succeeded";
+  return artifact.status === "complete" && artifact.outcome === "succeeded"
+    && artifact.steps.length > 0 && artifact.steps.every(step =>
+      step.outcome === "passed" && step.exitCode === 0 && step.signal === null && !step.timedOut);
 }
 
 function requireCommit(value: string, label: string): string {

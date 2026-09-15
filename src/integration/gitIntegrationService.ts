@@ -1,6 +1,5 @@
 import { execFile, spawn } from "node:child_process";
 import { createHash } from "node:crypto";
-import { existsSync } from "node:fs";
 import {
   lstat,
   mkdir,
@@ -40,12 +39,11 @@ import type { TaskStore } from "../storage/taskStore.js";
 import { advanceTaskProjectCommit } from "../task/task.js";
 import { yuiTmuxServerName } from "../tmux/tmuxManager.js";
 import {
-  recordGateArtifactPotentialReuse,
   recordGateArtifactReuse
 } from "../verification/gateArtifact.js";
 import { touchGateArtifact } from "../verification/gateArtifactStore.js";
 import {
-  assertNoAdHocFullSuiteChecks,
+  beginGateVerification,
   checkResultsFromGateArtifact,
   checkResultsFromGateJob,
   gateIdentityForCandidate,
@@ -71,16 +69,14 @@ import {
   type IntegrationAttempt
 } from "./integrationAttempt.js";
 import {
-  findReusableIntegrationCheckEvidence,
-  INTEGRATION_RUNTIME_RELEASE_ENV
-} from "./integrationCheckEvidenceReuse.js";
-import {
   applyIntegrationSource,
   assertIntegrationCandidate,
   assertRecordedSourceCandidate
 } from "./integrationSourceApplication.js";
 
 const executeFile = promisify(execFile);
+/** Preserve the exact execution-environment fence in durable Job input digests. */
+const INTEGRATION_RUNTIME_RELEASE_ENV = "YUI_INTEGRATION_RUNTIME_RELEASE_ID";
 
 const INTEGRATION_OPERATIONAL_ENVIRONMENT_NAMES = [
   "PATH",
@@ -573,36 +569,8 @@ export class GitIntegrationService {
     }
     await assertIntegrationCandidate(path, attempt.candidateCommit, workspace.branch);
     await assertTargetReadyForChecks(repositoryPath, attempt.targetRef, attempt.beforeCommit);
-    const { runtime, head, steps, environment, inputDigest, releaseId } =
+    const { runtime, head, steps, environment, inputDigest } =
       await this.#checkSpecification(attempt, managedWorkspace, gate);
-    const ownedJobs = this.store.listDurableJobs(attempt.taskId).filter(job =>
-      job.owner.kind === "integration-attempt" && job.owner.integrationAttemptId === attempt.id);
-    if (gate === undefined && releaseId !== null && attempt.checkInputDigest === undefined
-      && ownedJobs.length === 0 && attempt.jobId === undefined) {
-      const reusable = findReusableIntegrationCheckEvidence({
-        taskId: attempt.taskId,
-        projectId: attempt.projectId,
-        currentAttemptId: attempt.id,
-        candidateCommit: head,
-        checkCommands: attempt.checkCommands,
-        runtimeReleaseId: releaseId,
-        attempts: this.store.listIntegrationAttempts(attempt.taskId),
-        jobs: this.store.listDurableJobs(attempt.taskId),
-        logExists: (homeRelativePath) => existsSync(join(this.home, homeRelativePath)),
-        logPathFor: (job, relativeLogPath) => (
-          join(job.artifactsLocator, "logs", relativeLogPath)
-        )
-      });
-      if (reusable !== null) {
-        return this.#finalizeGateSuccess(
-          updateIntegrationAttempt(attempt, { checkInputDigest: inputDigest }, this.now()),
-          workspace,
-          repositoryPath,
-          head,
-          [...reusable.checks]
-        );
-      }
-    }
     if (attempt.checkInputDigest !== undefined && attempt.checkInputDigest !== inputDigest) {
       throw new Error("Integration check conditions changed since admission; inspect the original Job, then abort or start a new attempt.");
     }
@@ -756,11 +724,10 @@ export class GitIntegrationService {
   /**
    * Issue 08: the VerificationPlan gate for a configured Project.
    *
-   * Enforce mode rejects ad-hoc full-suite checks before the gate. Reuse mode
-   * returns an existing successful artifact for the same identity tuple
+   * Returns an existing successful artifact for the same identity tuple
    * (project + exact commit + plan digest + toolchain digest + target
-   * boundary); record mode always runs and only counts shadow potential
-   * reuses. The gate itself runs as bootstrap + L2 DurableJob steps (or
+   * boundary), unless this attempt explicitly requests fresh checks.
+   * The gate itself runs as bootstrap + L2 DurableJob steps (or
    * in-process when no Controller job port is available) and records a
    * self-contained GateArtifact. The final CAS in
    * {@link #finalizeGateSuccess} still fences a target that moves during the
@@ -775,23 +742,24 @@ export class GitIntegrationService {
     gate: ResolvedVerificationGate
   ): Promise<IntegrationResult> {
     const spec = await this.#checkSpecification(attempt, managedWorkspace, gate);
+    const unsettled = this.store.listIntegrationAttempts(attempt.taskId).find(other => {
+      if (other.id === attempt.id || other.projectId !== attempt.projectId
+        || other.targetRef !== attempt.targetRef || other.beforeCommit !== attempt.beforeCommit
+        || other.candidateCommit !== attempt.candidateCommit
+        || other.gatePlanDigest !== gate.planDigest || other.gateToolchainDigest !== gate.toolchainDigest) return false;
+      if (other.status === "running" || other.status === "validating") return true;
+      const job = other.jobId === undefined ? null : this.store.getDurableJob(other.taskId, other.jobId);
+      return job !== null && (job.status === "queued" || job.status === "running"
+        || (job.status === "unknown-needs-attention" && job.acknowledgedAt === undefined));
+    });
+    if (unsettled !== undefined) {
+      throw new Error(`Exact verification is unsettled in ${unsettled.taskId}/${unsettled.id}; continue or settle its original Job before requesting another check.`);
+    }
     attempt = updateIntegrationAttempt(attempt, {
       checkInputDigest: spec.inputDigest,
       gatePlanDigest: gate.planDigest, gateToolchainDigest: gate.toolchainDigest
     }, this.now());
     this.store.saveIntegrationAttempt(attempt.taskId, attempt);
-    if (gate.mode === "enforce") {
-      try {
-        assertNoAdHocFullSuiteChecks(gate.plan, attempt.checkCommands);
-      } catch (error) {
-        return this.#fail(
-          attempt,
-          error instanceof Error ? error : new Error(String(error)),
-          "verification-plan",
-          workspace
-        );
-      }
-    }
     const candidateCommit = await gitLine(["-C", path, "rev-parse", "HEAD^{commit}"]);
     const identity = gateIdentityForCandidate({
       projectId: attempt.projectId,
@@ -801,7 +769,7 @@ export class GitIntegrationService {
       targetRef: attempt.targetRef,
       baseHead: attempt.beforeCommit
     });
-    if (gate.mode !== "record") {
+    if (!attempt.rerunChecks && attempt.checkCommands.length === 0) {
       const existing = await lookupReusableGateArtifact(this.store, identity);
       if (existing !== null) {
         touchGateArtifact(this.store, recordGateArtifactReuse(existing, this.now()));
@@ -814,13 +782,8 @@ export class GitIntegrationService {
           checks
         );
       }
-    } else {
-      // Record mode: observe the potential reuse without skipping the gate.
-      const existing = await lookupReusableGateArtifact(this.store, identity);
-      if (existing !== null) {
-        touchGateArtifact(this.store, recordGateArtifactPotentialReuse(existing, this.now()));
-      }
     }
+    beginGateVerification(this.store, identity, gate.plan, this.now());
     if (this.jobPort !== undefined) {
       return this.#startCheckJob(
         attempt,
@@ -838,10 +801,7 @@ export class GitIntegrationService {
     let cleanupReason: "completion" | "failure" = "failure";
     try {
       await prepareIntegrationRuntimeHome(runtime, this.home);
-      const steps = [
-        ...planBootstrapJobSteps(gate.plan, path),
-        ...planL2JobSteps(gate.plan, path)
-      ];
+      const steps = spec.steps;
       const outcomes = await runGateStepsInProcess(
         path,
         steps,
@@ -929,12 +889,12 @@ export class GitIntegrationService {
     const runtime = this.#runtimePreparation(attempt, managedWorkspace);
     const head = attempt.candidateCommit;
     if (head === undefined) throw new Error("Integration check specification requires a candidate.");
-    const steps: DurableJobStep[] = gate === undefined
-      ? attempt.checkCommands.map((command, index) => ({
-          name: `check-${index + 1}`, command, timeoutMs: 30 * 60_000
-        }))
+    const explicitChecks = attempt.checkCommands.map((command, index) => ({
+      name: `check-${index + 1}`, command, timeoutMs: 30 * 60_000
+    }));
+    const steps: DurableJobStep[] = gate === undefined ? explicitChecks
       : [...planBootstrapJobSteps(gate.plan, managedWorkspace.root),
-          ...planL2JobSteps(gate.plan, managedWorkspace.root)]
+          ...planL2JobSteps(gate.plan, managedWorkspace.root), ...explicitChecks]
         .map(step => ({ ...step, timeoutMs: 30 * 60_000 }));
     const releaseId = integrationRuntimeReleaseIdentity(this.home);
     const environment = Object.freeze({
@@ -946,7 +906,7 @@ export class GitIntegrationService {
       projectId: attempt.projectId, head, workspace: managedWorkspace.root,
       env: environment, steps
     });
-    return { runtime, head, steps, environment, inputDigest, releaseId };
+    return { runtime, head, steps, environment, inputDigest };
   }
 
   async #recoverValidating(

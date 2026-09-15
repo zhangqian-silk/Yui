@@ -31,7 +31,7 @@ test("structured verification survives RPC and both executors preserve cwd, argv
   const workspace = join(root, "workspace");
   mkdirSync(join(workspace, "nested"), { recursive: true });
   const plan = normalizeVerificationPlan({
-    kind: "verification-plan", id: "normal-checks", version: "1",
+    schemaVersion: 1, kind: "verification-plan", id: "normal-checks", version: "1",
     bootstrap: [], l1: { categories: [] },
     l2: { steps: [
       { name: "argv-env-cwd", cwd: "nested", env: { CHECK_VALUE: "literal" },

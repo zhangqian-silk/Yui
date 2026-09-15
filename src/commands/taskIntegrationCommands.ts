@@ -117,12 +117,13 @@ async function start(
   now: () => Date,
   options: TaskIntegrationCommandOptions
 ): Promise<Readonly<{ output: string; data: unknown }>> {
-  const usage = "Task Integration start usage: yui task integration start <task> --work-item <id> --strategy <ff|cherry-pick|merge|manual> [--project <project>] [--target <ref>] [--check <command> ...].";
+  const usage = "Task Integration start usage: yui task integration start <task> --work-item <id> --strategy <ff|cherry-pick|merge|manual> [--project <project>] [--target <ref>] [--check <command> ...] [--rerun-checks].";
   const parsed = parseRepeatable(
     args,
     new Set(["--check"]),
     new Set(["--work-item", "--strategy", "--project", "--target"]),
-    usage
+    usage,
+    new Set(["--rerun-checks"])
   );
   if (parsed.positionals.length !== 1) throw usageError(usage);
   let task = store.getTask(parsed.positionals[0]);
@@ -200,7 +201,8 @@ async function start(
         resultCommit,
         strategy
       },
-      checkCommands: parsed.many.get("--check") ?? []
+      checkCommands: parsed.many.get("--check") ?? [],
+      rerunChecks: parsed.one.has("--rerun-checks")
     }, now());
     tx.saveIntegrationAttempt(task.id, created);
     return created;
@@ -428,6 +430,9 @@ function show(
       `Candidate: ${integration.candidateCommit ?? "-"}`,
       `After commit: ${integration.afterCommit ?? "-"}`,
       `Job: ${integration.jobId ?? "-"}`,
+      `Check execution: ${integration.rerunChecks ? "explicit rerun"
+        : integration.checkCommands.length > 0 ? "explicit check commands"
+          : "reuse exact successful evidence when available"}`,
       `Source: ${integrationSourceLabel(integration)}`,
       `Status: ${integration.status}`,
       `Summary: ${integration.summary ?? "-"}`,

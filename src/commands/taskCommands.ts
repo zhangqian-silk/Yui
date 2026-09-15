@@ -294,10 +294,6 @@ import {
   managedWorkspaceKey,
   type ManagedWorkspace
 } from "../worktree/managedWorkspace.js";
-import {
-  runDeliveryGuardPreflight,
-  withGuardWarnings
-} from "./deliveryGuardPreflight.js";
 import { runGrantCommand } from "./grantCommands.js";
 import {
   hasAgentConfigOptions,
@@ -4047,15 +4043,6 @@ function createWork(
     if (new Set(baseRefs.map(({ projectId }) => projectId)).size !== baseRefs.length) {
       throw usageError("Each Work Item Project may specify at most one base ref.");
     }
-    const guard = runDeliveryGuardPreflight(tx, task.id, {
-      kind: "create-work-item",
-      scope: {
-        title: parsed.positionals[1]!,
-        objective: parsed.objective ?? parsed.positionals[1]!,
-        acceptance: parsed.acceptance,
-        writeProjectIds
-      }
-    }, { environment: options.environment, budget: true });
     const created = createWorkItem(tx.nextWorkItemId(task.id), task.id, {
       title: parsed.positionals[1],
       objective: parsed.objective ?? parsed.positionals[1],
@@ -4067,12 +4054,12 @@ function createWork(
     }, now);
     tx.saveWorkItem(task.id, created);
     enqueueWork(tx, taskMailbox(task.id), "work-created", now, [workItemRef(task.id, created.id)]);
-    return { item: created, guard };
+    return created;
   });
-  notifyMailbox(options.runtime, taskMailbox(item.item.taskId));
+  notifyMailbox(options.runtime, taskMailbox(item.taskId));
   return output(
-    withGuardWarnings(item.guard, `Created work item ${item.item.id} for ${item.item.taskId}\n`),
-    { workItem: item.item }
+    `Created work item ${item.id} for ${item.taskId}\n`,
+    { workItem: item }
   );
 }
 

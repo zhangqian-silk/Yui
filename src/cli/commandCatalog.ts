@@ -519,8 +519,8 @@ const taskChildren: readonly NodeInput[] = [
       {
         name: "integrate",
         summary: "Rebase Task changes onto the remote development head through Integration.",
-        usage: "yui task upstream integrate <task> (--latest|--project <project>) [--check <command> ...]",
-        options: ["--latest", "--project", "--check"]
+        usage: "yui task upstream integrate <task> (--latest|--project <project>) [--check <command> ...] [--rerun-checks]",
+        options: ["--latest", "--project", "--check", "--rerun-checks"]
       }
     ]
   },
@@ -1035,8 +1035,8 @@ const taskChildren: readonly NodeInput[] = [
       {
         name: "start",
         summary: "Build, validate, and CAS-commit an integration candidate.",
-        usage: "yui task integration start <task> --work-item <id> --strategy <ff|cherry-pick|merge|manual> [--project <project>] [--target <ref>] [--check <command> ...]",
-        options: ["--work-item", "--strategy", "--project", "--target", "--check"],
+        usage: "yui task integration start <task> --work-item <id> --strategy <ff|cherry-pick|merge|manual> [--project <project>] [--target <ref>] [--check <command> ...] [--rerun-checks]",
+        options: ["--work-item", "--strategy", "--project", "--target", "--check", "--rerun-checks"],
         optionValues: { "--strategy": ["ff", "cherry-pick", "merge", "manual"] }
       },
       {

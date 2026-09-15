@@ -31,6 +31,7 @@ import { migrateArtifactsToGit } from "./migrations/artifactsToGit.js";
 import { migrateIntegrationContinuation } from "./migrations/integrationContinuation.js";
 import { migrateNotificationOnlyWakes } from "./migrations/notificationOnlyWakes.js";
 import { migrateWorkItemHistory } from "./migrations/workItemHistory.js";
+import { migrateVerificationPolicy } from "./migrations/verificationPolicy.js";
 import {
   UNIFY_HOME_LAYOUT_SQL,
   migrateUnifyHomeLayout
@@ -1434,6 +1435,13 @@ WHERE json_type(payload, '$.scope') IS NULL
     introducedIn: "0.16.0",
     sql: "SELECT 1; -- Archive original WorkItem payloads before removing historicalState",
     migrateData: migrateWorkItemHistory
+  },
+  {
+    version: 33,
+    name: "advisory-and-verification-policy",
+    introducedIn: "0.16.0",
+    sql: "SELECT 1; -- Retire rollout modes/shadow metrics; explicit rerun intent; verification proof v3",
+    migrateData: migrateVerificationPolicy
   }
 ]);
 

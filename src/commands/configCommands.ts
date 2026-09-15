@@ -13,19 +13,14 @@ import {
   DEFAULT_AGENT_LAUNCH_INACTIVITY_TIMEOUT_SECONDS,
   DEFAULT_CONTROLLER_TASK_CONCURRENCY,
   DEFAULT_DELIVERY_TIMEOUT_SECONDS,
-  DEFAULT_LEADER_NEXT_ACTION_MODE,
-  DEFAULT_LEADER_SEMANTIC_BUDGET_RUNS,
   DEFAULT_RECONCILIATION_INTERVAL_SECONDS,
   DEFAULT_RESOURCES_GC_MODE,
   DEFAULT_RESOURCES_QUARANTINE_TTL_HOURS,
   DEFAULT_TMUX_HISTORY_LIMIT,
-  LEADER_NEXT_ACTION_MODES,
   reconciliationIntervalMilliseconds,
   resolveAgentLaunchInactivityTimeoutSeconds,
   resolveControllerTaskConcurrency,
   resolveDeliveryTimeoutSeconds,
-  resolveLeaderNextActionMode,
-  resolveLeaderSemanticBudgetRuns,
   resolveResourcesGcAutoQuarantine,
   resolveResourcesGcMode,
   resolveResourcesQuarantineTtlHours,
@@ -34,8 +29,7 @@ import {
   resolveTelemetryRunCap,
   resolveTelemetryTerminalKeep,
   resolveTmuxBin,
-  resolveTmuxHistoryLimit,
-  type LeaderNextActionMode
+  resolveTmuxHistoryLimit
 } from "../config/yuiConfig.js";
 import { usageError } from "../errors/cliError.js";
 import { defaultTableWidth, renderTable } from "../output/table.js";
@@ -66,8 +60,7 @@ type ConfigCommandStore = Readonly<{
 
 /**
  * One uniform key model for every durable setting. Each catalog domain uses
- * the same show/set/clear contract; strategy settings such as `review` and
- * `leader-next-action` are keys like any other.
+ * the same show/set/clear contract, including the explicit review policy.
  */
 export { CONFIG_KEYS } from "../config/configCatalog.js";
 export type { ConfigKey } from "../config/configCatalog.js";
@@ -81,7 +74,6 @@ const TIME_ZONE_SET_USAGE = "System config set usage: yui config system set time
 const RECONCILIATION_SET_USAGE = "Runtime config set usage: yui config runtime set reconciliation-interval-seconds <5-300>.";
 const RESOURCES_GC_MODE_SET_USAGE = "Resources config set usage: yui config resources set resources-gc-mode <report|quarantine>.";
 const RESOURCES_GC_AUTO_QUARANTINE_SET_USAGE = "Resources config set usage: yui config resources set resources-gc-auto-quarantine <true|false>.";
-const LEADER_NEXT_ACTION_SET_USAGE = `Workflow config set usage: yui config workflow set leader-next-action <${LEADER_NEXT_ACTION_MODES.join("|")}>.`;
 const REVIEW_SET_USAGE = "Workflow config set usage: yui config workflow set review --role <global-role> --trigger <always|leader|final>.";
 
 type ConfigKeyHandler = Readonly<{
@@ -149,7 +141,6 @@ export function effectiveConfigData(
     lastTaskId: config.lastTaskId ?? null,
     reconciliationIntervalSeconds: config.reconciliationIntervalSeconds
       ?? DEFAULT_RECONCILIATION_INTERVAL_SECONDS,
-    leaderNextActionMode: resolveLeaderNextActionMode(config.leaderNextActionMode),
     resourcesGcMode: resolveResourcesGcMode(config.resourcesGcMode),
     resourcesGcAutoQuarantine: resolveResourcesGcAutoQuarantine(config.resourcesGcAutoQuarantine),
     resourcesQuarantineTtlHours: resolveResourcesQuarantineTtlHours(config.resourcesQuarantineTtlHours),
@@ -163,7 +154,6 @@ export function effectiveConfigData(
       config.agentLaunchInactivityTimeoutSeconds
     ),
     deliveryTimeoutSeconds: resolveDeliveryTimeoutSeconds(config.deliveryTimeoutSeconds),
-    leaderSemanticBudgetRuns: resolveLeaderSemanticBudgetRuns(config.leaderSemanticBudgetRuns),
     tmuxBin: resolveTmuxBin(config.tmuxBin),
     tmuxHistoryLimit: resolveTmuxHistoryLimit(config.tmuxHistoryLimit),
     telemetryEnabled: resolveTelemetryEnabled(config.telemetryEnabled),
@@ -341,54 +331,6 @@ const CONFIG_KEY_HANDLERS: readonly ConfigKeyHandler[] = [
         return rest;
       });
       return `Reconciliation interval reset to ${DEFAULT_RECONCILIATION_INTERVAL_SECONDS} seconds\n`;
-    }
-  },
-  {
-    key: "leader-next-action",
-    showLabel: "Leader next-action mode",
-    showValue: (config) => resolveLeaderNextActionMode(config.leaderNextActionMode),
-    set(args, store) {
-      if (args.length !== 1) throw usageError(LEADER_NEXT_ACTION_SET_USAGE);
-      let mode: LeaderNextActionMode;
-      try {
-        mode = resolveLeaderNextActionMode(args[0]);
-      } catch (error) {
-        throw usageError(
-          error instanceof Error ? error.message : String(error),
-          LEADER_NEXT_ACTION_SET_USAGE
-        );
-      }
-      saveConfigKey(store, (config) => ({ ...config, leaderNextActionMode: mode }));
-      return `Leader next-action mode set to ${mode}\n`;
-    },
-    clear(store) {
-      saveConfigKey(store, (config) => {
-        const { leaderNextActionMode: _removed, ...rest } = config;
-        return rest;
-      });
-      return `Leader next-action mode reset to ${DEFAULT_LEADER_NEXT_ACTION_MODE}\n`;
-    }
-  },
-  {
-    key: "leader-semantic-budget-runs",
-    showLabel: "Leader semantic budget",
-    showValue: (config) => `${resolveLeaderSemanticBudgetRuns(config.leaderSemanticBudgetRuns)} runs`,
-    set(args, store) {
-      const usage = "Workflow config set usage: yui config workflow set leader-semantic-budget-runs <1-20>.";
-      if (args.length !== 1) throw usageError(usage);
-      const leaderSemanticBudgetRuns = validatedConfigValue(
-        () => resolveLeaderSemanticBudgetRuns(Number(args[0])),
-        usage
-      );
-      saveConfigKey(store, (config) => ({ ...config, leaderSemanticBudgetRuns }));
-      return `Leader semantic budget set to ${leaderSemanticBudgetRuns} runs\n`;
-    },
-    clear(store) {
-      saveConfigKey(store, (config) => {
-        const { leaderSemanticBudgetRuns: _removed, ...rest } = config;
-        return rest;
-      });
-      return `Leader semantic budget reset to ${DEFAULT_LEADER_SEMANTIC_BUDGET_RUNS} runs\n`;
     }
   },
   {

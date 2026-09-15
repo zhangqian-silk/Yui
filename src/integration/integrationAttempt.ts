@@ -70,6 +70,8 @@ export type IntegrationAttempt = Readonly<{
   afterCommit?: string;
   summary?: string;
   checkCommands: readonly string[];
+  /** This attempt must execute checks instead of reusing cached evidence. */
+  rerunChecks: boolean;
   candidateCommit?: string;
   /** Git application cursor. The active action is written before Git and its
    * unique reflog marker proves a completed ref update after an interrupted save.
@@ -117,7 +119,7 @@ export function createIntegrationAttempt(
     "id" | "taskId" | "projectId" | "targetRef" | "source" | "beforeCommit"
   > & Partial<Pick<
     IntegrationAttempt,
-    "checkCommands"
+    "checkCommands" | "rerunChecks"
   >>>,
   now: Date
 ): IntegrationAttempt {
@@ -131,6 +133,7 @@ export function createIntegrationAttempt(
     source: input.source,
     beforeCommit: input.beforeCommit,
     checkCommands: normalizedUniqueText(input.checkCommands ?? [], "Integration check command"),
+    rerunChecks: input.rerunChecks ?? false,
     status: "running",
     createdAt: timestamp,
     updatedAt: timestamp
@@ -308,6 +311,7 @@ export function validateIntegrationAttempt(attempt: IntegrationAttempt): Integra
   requireCommit(attempt.beforeCommit, "Integration before commit");
   validateIntegrationSource(attempt.taskId, attempt.source);
   normalizedUniqueText(attempt.checkCommands, "Integration check command");
+  if (typeof attempt.rerunChecks !== "boolean") throw new Error("Integration rerunChecks must be explicit.");
   if (attempt.candidateCommit !== undefined) {
     requireCommit(attempt.candidateCommit, "Integration candidate commit");
   }

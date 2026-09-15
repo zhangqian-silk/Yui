@@ -40,7 +40,7 @@ async function integrateUpstream(
   home: string,
   options: TaskUpstreamCommandOptions
 ): Promise<TaskUpstreamCommandResult> {
-  const usage = "Task upstream integrate usage: yui task upstream integrate <task> (--latest|--project <project>) [--check <command> ...].";
+  const usage = "Task upstream integrate usage: yui task upstream integrate <task> (--latest|--project <project>) [--check <command> ...] [--rerun-checks].";
   let latest = false;
   const normalized: string[] = [];
   for (const arg of args) {
@@ -59,7 +59,8 @@ async function integrateUpstream(
     normalized,
     new Set(["--check"]),
     new Set(["--project"]),
-    usage
+    usage,
+    new Set(["--rerun-checks"])
   );
   if (parsed.positionals.length !== 1) throw usageError(usage);
   const taskId = parsed.positionals[0]!;
@@ -130,7 +131,8 @@ async function integrateUpstream(
           taskBaseCommit: binding.baseCommit!,
           strategy: "rebase"
         },
-        checkCommands: parsed.many.get("--check") ?? []
+        checkCommands: parsed.many.get("--check") ?? [],
+        rerunChecks: parsed.one.has("--rerun-checks")
       }, now());
       tx.saveIntegrationAttempt(task.id, created);
       return created;

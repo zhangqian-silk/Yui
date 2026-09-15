@@ -8,7 +8,7 @@ import Database from "better-sqlite3";
 import { migrateSqliteSchema } from "../../dist/storage/sqliteSchema.js";
 import { CURRENT_STORAGE_VERSION } from "../../dist/storage/storageVersions.js";
 import { SqliteTaskStore } from "../../dist/storage/sqliteStore.js";
-import { createProject } from "../../dist/repository/project.js";
+import { createProject, addProjectKnowledge } from "../../dist/repository/project.js";
 import { createTask, activateTask, bindTaskWorkspaceIdentity } from "../../dist/task/task.js";
 import { generateTaskWorkspaceIdentity } from "../../dist/repository/taskWorkspaceIdentity.js";
 import { createManagedWorkspace, managedWorkspaceKey } from "../../dist/worktree/managedWorkspace.js";
@@ -16,6 +16,7 @@ import { createIntegrationAttempt } from "../../dist/integration/integrationAtte
 import { GitIntegrationService } from "../../dist/integration/gitIntegrationService.js";
 import { createDurableJob, startDurableJob, completeDurableJob, durableJobIdempotencyKey } from "../../dist/job/durableJob.js";
 import { runTaskIntegrationCommand } from "../../dist/commands/taskIntegrationCommands.js";
+import { resolveVerificationGate } from "../../dist/verification/verificationGateService.js";
 
 const now = new Date("2026-09-12T00:00:00Z");
 const git = (path, ...args) => execFileSync("git", ["-C", path, ...args], {
@@ -130,6 +131,59 @@ export function integrationFixture(t, strategy = "merge") {
     }
   };
 }
+
+test("Integration reuses exact checks, reruns explicitly, and cannot bypass equivalent unfinished verification", async t => {
+  const f = integrationFixture(t);
+  const count = join(f.root, "gate-count");
+  const fail = join(f.root, "gate-fail");
+  const script = `const fs=require("fs"); const p=${JSON.stringify(count)};
+    fs.writeFileSync(p,String((fs.existsSync(p)?Number(fs.readFileSync(p)):0)+1));
+    console.log("actual gate"); process.exit(fs.existsSync(${JSON.stringify(fail)})?1:0);`;
+  const plan = { schemaVersion: 1, kind: "verification-plan", id: "checks", version: "1",
+    bootstrap: [], l1: { categories: [] }, l2: { steps: [{ name: "check", argv: [process.execPath, "-e", script] }] } };
+  const project = addProjectKnowledge(f.store.getProject("project-1"), "knowledge-1", "Checks", JSON.stringify(plan), now);
+  f.store.saveProject(project);
+  const service = new GitIntegrationService(f.home, f.store, undefined, () => now, { PATH: process.env.PATH });
+  const request = (number, rerunChecks = false, checkCommands = []) => {
+    const attempt = createIntegrationAttempt({ id: `integration-${number}`, taskId: "task-1", projectId: "project-1",
+      targetRef: "main", beforeCommit: f.before, rerunChecks, checkCommands,
+      source: { kind: "work-item", workItemId: "work-item-1", startCommit: f.base, resultCommit: f.before, strategy: "ff" } }, now);
+    f.store.saveIntegrationAttempt("task-1", attempt);
+    return attempt;
+  };
+  const first = request(2);
+  assert.equal((await service.integrate("task-1", first.id)).status, "committed");
+  const reused = await service.integrate("task-1", request(3).id);
+  assert.equal(reused.status, "committed");
+  assert.ok(reused.attempt.checks.some(check => check.details?.startsWith("Reused exact-SHA")));
+  assert.equal(Number(readFileSync(count)), 1);
+  writeFileSync(fail, "explicitly exercise a failure");
+  const failed = await service.integrate("task-1", request(4, true).id);
+  assert.equal(failed.status, "failed");
+  assert.ok(failed.attempt.checks.some(check => check.outcome === "failed"));
+  assert.equal(Number(readFileSync(count)), 2);
+  assert.equal(f.git("rev-parse", "HEAD"), f.before);
+  rmSync(fail);
+  const additional = await service.integrate("task-1", request(8, false, ["false"]).id);
+  assert.equal(additional.status, "failed", "An explicitly requested diagnostic cannot be ignored by a configured plan.");
+  assert.ok(additional.attempt.checks.some(check => check.name === "check-1" && check.outcome === "failed"));
+  assert.equal(Number(readFileSync(count)), 3);
+  const gate = resolveVerificationGate(project);
+  const blocked = { ...request(5), candidateCommit: f.before, status: "validating",
+    gatePlanDigest: gate.planDigest, gateToolchainDigest: gate.toolchainDigest };
+  f.store.saveIntegrationAttempt("task-1", blocked);
+  const refused = await service.integrate("task-1", request(6, true).id);
+  assert.equal(refused.status, "blocked");
+  assert.match(refused.attempt.summary, /unsettled/);
+  assert.equal(Number(readFileSync(count)), 3);
+  assert.deepEqual(f.store.getIntegrationAttempt("task-1", blocked.id), blocked);
+  await assert.rejects(runTaskIntegrationCommand(["continue", "task-1/integration-5", "--rerun-checks"],
+    f.store, f.home), error => error.code === "USAGE_ERROR");
+  const revision = f.store.getRevision();
+  await assert.rejects(runTaskIntegrationCommand(["start", "task-missing", "--work-item", "work-item-1",
+    "--strategy", "ff", "--rerun-checks"], f.store, f.home), /Task not found/);
+  assert.equal(f.store.getRevision(), revision);
+});
 
 test("ordinary conflict continues without resolve and consumes one exact check Job", async t => {
   const f = integrationFixture(t);

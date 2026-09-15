@@ -13,8 +13,10 @@ import { projectFirstProgressAdvisory } from "../runtime/firstProgressAdvisory.j
 import type { Task } from "../task/task.js";
 import type { ManagedWorkspace } from "../worktree/managedWorkspace.js";
 import type { WorkItem } from "../workItem/workItem.js";
+import { parseGateArtifactRef } from "../verification/gateArtifact.js";
 
 export type OrchestrationAdvisoryCode =
+  | "work-item-scope-overlap"
   | "bugfix-workitem-overhead"
   | "repeated-integration-check"
   | "repeated-full-review"
@@ -141,7 +143,7 @@ export function projectTaskOrchestration(
       failed: facts.integrations.filter(({ status }) => status === "failed").length,
       repeatedIdentities,
       evidenceReuses: facts.integrations.filter((attempt) => (
-        (attempt.checks ?? []).some(({ details }) => details?.startsWith("Reused successful check evidence from "))
+        (attempt.checks ?? []).some(check => check.outcome === "passed" && parseGateArtifactRef(check.name) !== undefined)
       )).length
     },
     providerSessionsBeforeFirstProgress: firstProgress.sessionsBeforeFirstProgress,
@@ -160,6 +162,26 @@ function projectAdvisories(
   firstProgressAttention: boolean
 ): OrchestrationAdvisory[] {
   const result: OrchestrationAdvisory[] = [];
+  const scopes = new Map<string, string[]>();
+  for (const item of facts.workItems) {
+    if (item.status !== "open") continue;
+    const key = JSON.stringify([
+      item.title.trim().toLowerCase(), item.objective.trim().toLowerCase(),
+      item.acceptance.map(value => value.trim().toLowerCase()).filter(Boolean).sort(),
+      [...item.writeProjectIds].sort()
+    ]);
+    const refs = scopes.get(key) ?? [];
+    refs.push(`work-item:${item.id}`);
+    scopes.set(key, refs);
+  }
+  for (const refs of scopes.values()) {
+    if (refs.length < 2) continue;
+    result.push({
+      code: "work-item-scope-overlap",
+      reason: "Open WorkItems have matching scope text. Inspect their original intent and decide whether they are independent; this advisory grants or denies no operation.",
+      refs
+    });
+  }
   if (facts.task.type === "bugfix" && facts.workItems.length > 0) {
     result.push({
       code: "bugfix-workitem-overhead",

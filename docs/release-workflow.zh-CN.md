@@ -24,7 +24,7 @@ Agent 选择一个预先声明的计划，设施从持久状态驱动该计划�
 
 当前开发步骤先清退运行时兼容分支，尚未执行最终 1.0 基线切换，也不发布版本或重置
 存储编号。存储 `27→28` 只规范化可明确识别的单条 Role 调度去重键，旧迁移账本、
-Message、Task 结果和不确定外部效果保持不变。普通打开要求存储 32；已有 Home 只通过
+Message、Task 结果和不确定外部效果保持不变。普通打开要求存储 33；已有 Home 只通过
 显式升级入口前进，不增加运行时双读。
 
 这是一次 1.0 前的破坏性变更：
@@ -61,6 +61,16 @@ scope 转为 `work-item`，Task-final 候选证据和原迁移账本不变。新
 存储 `31→32` 从当前 WorkItem 移除 `historicalState`，移除前将完整原始 payload
 原样保存在 `work-item.execution-state-retired` Task 事件。当前状态、工作范围、
 Candidate 和执行组不变，不生成 Run 或验收。未知历史形态会报错，记录和迁移账本不前进。
+
+存储 `32→33` 清退 Leader 过渡／预算配置以及 VerificationPlan 的模式。
+活动计划显式补上 schema 版本，实际检查保持不变；已退役 Knowledge 原文保留。
+Integration 显式补入 `rerunChecks: false`，缓存 Artifact 移除试运行复用计数。
+原配置可从显式升级备份恢复。这是已确认的行为变更，不将三种旧模式声称为等价。
+
+已接纳且仍为 `running/validating` 的计划验证会阻止预检和迁移，需先用旧版本完成
+结算；不会把运行中的 Job 改标为新证据契约。验证计划摘要使用 v3，使旧缓存不再被
+自动复用，不重写历史 Job／Integration 结果或删除其日志。旧计划解析冻结在迁移
+目录中，早期迁移保持原有语义。
 
 Scheduler 核心读取和持久化操作成为必需接口，缺少 Session／Event 读取不再被当作
 空证据，也不能跳过错误持久化。执行及 Web 投影直接读取当前 Store；

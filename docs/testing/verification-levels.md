@@ -148,6 +148,11 @@ is required.
     admission instead of becoming empty evidence. WorkItem history retirement
     preserves the original payload and current work, advances event IDs safely,
     and refuses unknown old shapes without advancing the migration ledger.
+30. WorkItem overlap is a read-only advisory; exact permission/dependency guards
+    remain. Real local verification proves default reuse, explicit rerun failure,
+    selected-check isolation, incomplete evidence and stale-consumer rejection.
+    An Integration rerun cannot bypass an equivalent unfinished gate. Policy
+    migration preserves historical execution and blocks an admitted old gate.
 
 Keep the test phase seconds-scale; measure TypeScript build separately. Record
 incremental runtime when adding a critical regression. The seven recovery boundary

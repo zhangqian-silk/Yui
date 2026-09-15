@@ -4,7 +4,8 @@ export function parseRepeatable(
   args: readonly string[],
   repeatable: ReadonlySet<string>,
   singular: ReadonlySet<string>,
-  usage: string
+  usage: string,
+  flags: ReadonlySet<string> = new Set()
 ): Readonly<{
   positionals: string[];
   many: Map<string, string[]>;
@@ -17,6 +18,11 @@ export function parseRepeatable(
     const value = args[index];
     if (!value.startsWith("--")) {
       positionals.push(value);
+      continue;
+    }
+    if (flags.has(value)) {
+      if (one.has(value)) throw usageError(`Option may only be specified once: ${value}.`, usage);
+      one.set(value, "true");
       continue;
     }
     if (!repeatable.has(value) && !singular.has(value)) {

@@ -27,18 +27,6 @@ export const VERIFICATION_PLAN_KIND = "verification-plan";
 export const VERIFICATION_PLAN_KNOWLEDGE_KIND = VERIFICATION_PLAN_KIND;
 
 /**
- * Rollout switch for a configured Project.
- *
- * - `record`: always run the plan gate; record the GateArtifact and count
- *   potential reuses (shadow metrics) without skipping execution.
- * - `reuse`: return an existing successful artifact for the same identity
- *   tuple instead of re-running the gate.
- * - `enforce`: `reuse` plus rejecting ad-hoc full-suite shell checks that
- *   duplicate the plan's L2 steps (targeted diagnostic checks stay allowed).
- */
-export type VerificationMode = "record" | "reuse" | "enforce";
-
-/**
  * A structured verification step. `argv` is executed without a shell so a
  * path or flag can never be misinterpreted as a shell token. A step that
  * genuinely needs shell semantics must declare `shell: true` explicitly.
@@ -73,7 +61,6 @@ export type VerificationPlan = Readonly<{
   kind: typeof VERIFICATION_PLAN_KIND;
   id: string;
   version: string;
-  mode: VerificationMode;
   toolchain: VerificationToolchain;
   /** Workspace preparation (e.g. `npm ci`) run before any gate step. */
   bootstrap: readonly VerificationStep[];
@@ -105,22 +92,18 @@ export function normalizeVerificationPlan(raw: unknown): VerificationPlan {
   if (record.kind !== VERIFICATION_PLAN_KIND) {
     throw new Error(`VerificationPlan kind must be "${VERIFICATION_PLAN_KIND}".`);
   }
-  const schemaVersion = record.schemaVersion ?? VERIFICATION_PLAN_SCHEMA_VERSION;
+  const schemaVersion = record.schemaVersion;
   if (schemaVersion !== VERIFICATION_PLAN_SCHEMA_VERSION) {
     throw new Error(
       `VerificationPlan schemaVersion must be ${VERIFICATION_PLAN_SCHEMA_VERSION}.`
     );
   }
-  const mode = record.mode ?? "record";
-  if (mode !== "record" && mode !== "reuse" && mode !== "enforce") {
-    throw new Error(`VerificationPlan mode is invalid: ${String(mode)}.`);
-  }
+  if (Object.hasOwn(record, "mode")) throw new Error("VerificationPlan mode is retired; request an explicit rerun on the operation.");
   const plan: VerificationPlan = {
     schemaVersion: VERIFICATION_PLAN_SCHEMA_VERSION,
     kind: VERIFICATION_PLAN_KIND,
     id: requireIdentity(record.id as string, "VerificationPlan id"),
     version: requireText(record.version as string, "VerificationPlan version"),
-    mode,
     toolchain: normalizeToolchain(record.toolchain),
     bootstrap: normalizeSteps(record.bootstrap, "bootstrap"),
     l1: {
@@ -269,14 +252,14 @@ function normalizedTextList(raw: unknown, label: string): readonly string[] {
 
 /**
  * The stable digest of the gate contract. It deliberately excludes the
- * rollout `mode`, retention window, and documentation fields: changing the
- * rollout switch must not invalidate proven gate evidence.
+ * retention window and documentation fields. Execution semantics belong to
+ * the identity so evidence from a prior contract is never silently reused.
  */
 export function verificationPlanDigest(plan: VerificationPlan): string {
   const canonical = canonicalJson({
     // Old artifacts may have skipped shell commands or run in the wrong cwd.
     // Keep that history, but never reuse it as proof under corrected semantics.
-    executionContract: "workspace-argv-or-shell/v2",
+    executionContract: "workspace-argv-or-shell/v3",
     id: plan.id,
     version: plan.version,
     toolchain: plan.toolchain,

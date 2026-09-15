@@ -5,7 +5,7 @@ import type { IntegrationAttempt } from "../../integration/integrationAttempt.js
 import { durableJobIdempotencyKey, type DurableJob } from "../../job/durableJob.js";
 import type { Project } from "../../repository/project.js";
 import type { Task } from "../../task/task.js";
-import { resolveProjectVerificationPlan } from "../../verification/verificationPlan.js";
+import { resolveHistoricalVerificationPlan } from "./verificationPlanV1.js";
 import type { ManagedWorkspace } from "../../worktree/managedWorkspace.js";
 import {
   historicalGateJobSteps,
@@ -81,7 +81,7 @@ function migrateBoundFastForward(db: Database.Database, attempt: IntegrationAtte
     name: `check-${index + 1}`, command, timeoutMs: 30 * 60_000
   }));
   if (attempt.gatePlanDigest !== undefined) {
-    const plan = resolveProjectVerificationPlan(project);
+    const plan = resolveHistoricalVerificationPlan(project);
     if (plan === undefined || historicalVerificationPlanDigest(plan) !== attempt.gatePlanDigest) return;
     steps = historicalGateJobSteps(plan).map(step => ({
       ...step, timeoutMs: 30 * 60_000

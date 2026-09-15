@@ -623,7 +623,8 @@ export const INTERACTION_POLICIES: readonly InteractionPolicy[] = Object.freeze(
       "--strategy": "value",
       "--project": "value",
       "--target": "value",
-      "--check": "value"
+      "--check": "value",
+      "--rerun-checks": "flag"
     }
   },
   {

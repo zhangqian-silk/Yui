@@ -1492,6 +1492,11 @@ export class SqliteTaskStore implements TaskStore {
     if (attempt.taskId !== taskId) throw new StorageRecordError(`Integration attempt belongs to another Task: ${attempt.taskId}`);
     this.#requireTask(taskId);
     this.#mutate(() => {
+      if (typeof attempt.rerunChecks !== "boolean") throw new StorageRecordError("Integration rerunChecks must be explicit.");
+      const existing = this.getIntegrationAttempt(taskId, attempt.id);
+      if (existing !== null && existing.rerunChecks !== attempt.rerunChecks) {
+        throw new StorageRecordError("Integration check execution intent is immutable; create a new attempt.");
+      }
       this.#db.prepare(
         `INSERT INTO integration_attempts (task_id, integration_id, status, payload, updated_at)
          VALUES (?, ?, ?, ?, ?)
@@ -2227,6 +2232,7 @@ export class SqliteTaskStore implements TaskStore {
            status = excluded.status,
            outcome = excluded.outcome,
            payload = excluded.payload,
+           created_at = excluded.created_at,
            completed_at = excluded.completed_at,
            last_used_at = excluded.last_used_at`
       ).run(
@@ -2265,11 +2271,19 @@ export class SqliteTaskStore implements TaskStore {
   touchGateArtifact(artifact: GateArtifact): void {
     validateGateArtifact(artifact);
     this.#mutate(() => {
+      const current = this.getGateArtifact(artifact.projectId, artifact.key);
+      if (current === null || !isDeepStrictEqual(current, {
+        ...artifact, reuseCount: current.reuseCount, lastUsedAt: current.lastUsedAt
+      })) {
+        throw new StorageConflictError("Gate artifact changed while consuming evidence; retry the exact lookup.");
+      }
+      const updated = { ...current, reuseCount: Math.max(current.reuseCount, artifact.reuseCount),
+        lastUsedAt: Date.parse(artifact.lastUsedAt) > Date.parse(current.lastUsedAt) ? artifact.lastUsedAt : current.lastUsedAt };
       const result = this.#db.prepare(
         `UPDATE gate_artifacts SET payload = ?, last_used_at = ? WHERE key = ?`
       ).run(
-        this.#json(artifact),
-        artifact.lastUsedAt,
+        this.#json(updated),
+        updated.lastUsedAt,
         artifact.key
       );
       if (result.changes === 0) {
@@ -2301,19 +2315,10 @@ export class SqliteTaskStore implements TaskStore {
     const rows = this.#listPayload<GateArtifact>(
       "gate_artifacts",
       `project_id = ? AND commit_sha = ? AND level = 'L2'
-       AND plan_digest = ? AND toolchain_digest = ? AND target_ref = ?
-       AND status = 'complete' AND outcome = 'succeeded'`,
+       AND plan_digest = ? AND toolchain_digest = ? AND target_ref = ?`,
       [query.projectId, query.commit, query.planDigest, query.toolchainDigest, query.targetRef]
     );
-    const valid: GateArtifact[] = [];
-    for (const row of rows) {
-      try {
-        valid.push(validateGateArtifact(row));
-      } catch {
-        // Skip corrupt rows; a direct lookup fails closed.
-      }
-    }
-    return valid;
+    return rows.map(validateGateArtifact);
   }
 
   getGateArtifactLogs(artifactKey: string): ReadonlyMap<string, Buffer> {

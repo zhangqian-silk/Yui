@@ -22,6 +22,10 @@ Task type 描述被请求的结果，而不是强制的执行者。Leader 直接
 有独立价值的 WorkItem。直接执行没有 Group。复制是为了在同一个冻结 Assignment 上
 进行独立尝试而被显式请求的，随后由 Leader 选择综合。
 
+工作范围重叠只在 `task next-action` 中作为只读建议，不再按文本匹配拦截创建。
+Leader 读取原始需求并判断是否属于独立工作。请求身份、权限、依赖、工作区隔离和
+验收校验仍独立强制执行。
+
 ## 受管工作区
 
 稳定的 Project checkout 是只读参考。Task main 是一个逻辑上的多 Project 根，带有
@@ -57,6 +61,35 @@ Integration 在候选 worktree 中套用固定来源提交，运行已配置的�
 当检查是一个 DurableJob 时，Integration 在运行期间保留那个确切的 jobId。Job 结算
 后，`task integration continue <task>/<integration>` 消费其结果并执行带守卫的收尾。
 未结算的 Integration（包括冲突）仍阻止完成，不依赖 Agent 采用了什么执行顺序。
+
+### 验证复用与显式重跑
+
+配置了 VerificationPlan 的项目，默认只复用完整成功、日志可校验，且 Project、
+提交、计划、工具链、目标 ref／基线都精确匹配的证据。L1 还绑定实际选中的检查，
+不同路径类别不能借用对方结果；无匹配证据时正常执行。
+计划必须提供 `schemaVersion: 1`，不再包含 `record/reuse/enforce` 模式。
+
+新建操作时显式要求重跑：
+
+```sh
+yui task integration start <task> --work-item <id> --strategy ff --rerun-checks
+yui task upstream integrate <task> --project <project> --rerun-checks
+```
+
+该选项是本次 Integration 的不可变意图，不是全局配置开关。`continue` 只消费原先
+接纳的 Job，不会变成重跑。再次执行需创建新尝试，并先结算等价的未完成验证。
+重跑只跳过缓存，不绕过权限、Job 身份、工作区检查或最终目标 CAS。
+显式 `--check` 同样要求实际执行。配置了计划时，它们在计划检查后执行，
+不会被忽略，也不会因命令文本相同而被拒绝。
+非结构化检查不再搜索历史 Job 来替代本次执行。
+
+新执行开始前撤下旧成功。失败如实记录；中断或缺失日志不会保留可复用成功。
+过期的缓存使用者不能恢复旧结果。发布查询查看最新匹配证据，不跳过失败去找旧绿灯。
+缓存只表示当前可复用证据，不充当 Task 执行历史；原 Job 和 Integration 记录独立保留。
+
+这些身份只覆盖已声明输入，不是所有外部服务和未跟踪环境的完整指纹。
+外部条件变化、排查偶发失败或用户要求再次检查时，应显式重跑。
+计划不赋予真实模型、付费或共享资源测试授权；复用也不替代 Review、验收或发布权限。
 
 Review 遵循适用的 Candidate 规则或 Task-final 合同以及冻结的 head。确切的 main
 Reviewer Run 持有报告；执行成功不等于语义通过。验收归 Leader。即使默认审查策略

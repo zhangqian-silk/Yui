@@ -70,32 +70,6 @@ export function reconciliationIntervalMilliseconds(value?: unknown): number {
   return seconds * 1_000;
 }
 
-/**
- * Issue 07 (Leader convergence) feature mode. `display` only shows the
- * read-only next-action decision support; `warn` additionally reports
- * duplicate deliveries and semantic-budget warnings; `enforce` hard-blocks
- * only exact duplicates, while semantic-budget exhaustion remains a warning
- * because it must not override Leader judgment. The mode is additive and
- * optional — Homes without it keep the `display` default, so no config
- * migration is required.
- */
-export const LEADER_NEXT_ACTION_MODES = ["display", "warn", "enforce"] as const;
-export type LeaderNextActionMode = typeof LEADER_NEXT_ACTION_MODES[number];
-export const DEFAULT_LEADER_NEXT_ACTION_MODE: LeaderNextActionMode = "display";
-
-export function resolveLeaderNextActionMode(value?: unknown): LeaderNextActionMode {
-  if (value === undefined || value === null) return DEFAULT_LEADER_NEXT_ACTION_MODE;
-  if (typeof value !== "string") {
-    throw new TypeError("leaderNextActionMode must be display, warn, or enforce.");
-  }
-  const normalized = value.trim().toLowerCase();
-  if (normalized.length === 0) return DEFAULT_LEADER_NEXT_ACTION_MODE;
-  if (!(LEADER_NEXT_ACTION_MODES as readonly string[]).includes(normalized)) {
-    throw new TypeError("leaderNextActionMode must be display, warn, or enforce.");
-  }
-  return normalized as LeaderNextActionMode;
-}
-
 // ── Executable paths ──────────────────────────────────────────────────────
 
 export function resolveTmuxBin(value?: unknown): string {
@@ -141,7 +115,6 @@ export const DEFAULT_CONTROLLER_TASK_CONCURRENCY = 4;
 export const MAX_CONTROLLER_TASK_CONCURRENCY = 32;
 export const DEFAULT_AGENT_LAUNCH_INACTIVITY_TIMEOUT_SECONDS = 300;
 export const DEFAULT_DELIVERY_TIMEOUT_SECONDS = 120;
-export const DEFAULT_LEADER_SEMANTIC_BUDGET_RUNS = 3;
 export const DEFAULT_TMUX_HISTORY_LIMIT = 100_000;
 
 export type RuntimeHealthConfig = Readonly<{
@@ -212,16 +185,6 @@ export function resolveDeliveryTimeoutSeconds(value?: unknown): number {
     5,
     600,
     "deliveryTimeoutSeconds"
-  );
-}
-
-export function resolveLeaderSemanticBudgetRuns(value?: unknown): number {
-  return resolveBoundedPositiveInteger(
-    value,
-    DEFAULT_LEADER_SEMANTIC_BUDGET_RUNS,
-    1,
-    20,
-    "leaderSemanticBudgetRuns"
   );
 }
 

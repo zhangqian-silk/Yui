@@ -26,6 +26,11 @@ Leader owns bounded work directly or assigns substantial independent WorkItems.
 Direct execution has no Group. Replication is explicitly requested for independent
 attempts at the same frozen Assignment, followed by Leader-selected synthesis.
 
+Scope overlap is a read-only advisory in `task next-action`, not a text-matching
+creation gate. The Leader inspects original requirements and decides whether
+work is independent. Request identity, permissions, dependencies, workspace
+isolation and acceptance checks remain enforced independently.
+
 ## Managed workspaces
 
 Stable Project checkouts are read-only references. Task main is a logical
@@ -72,6 +77,43 @@ running. Once the Job settles, `task integration continue <task>/<integration>`
 consumes its result and performs the guarded finalization. Existing unsettled
 Integrations, including conflicts, remain completion blockers independently of
 how the Agent ordered them.
+
+### Verification reuse and explicit reruns
+
+A configured VerificationPlan reuses only complete, successful, log-verified
+evidence for the exact Project, commit, plan, toolchain and target/base boundary.
+L1 also binds the selected checks, so a different path category cannot borrow
+another category's result. A plan with no reusable evidence executes normally.
+Plans require `schemaVersion: 1`; there is no `record/reuse/enforce` mode.
+
+Request fresh checks when creating an operation:
+
+```sh
+yui task integration start <task> --work-item <id> --strategy ff --rerun-checks
+yui task upstream integrate <task> --project <project> --rerun-checks
+```
+
+The flag is immutable intent on that Integration, not a global configuration
+switch. `continue` consumes the same admitted Job; it cannot turn into a rerun.
+Create a new attempt for another execution, and settle any equivalent unfinished
+verification first. Rerun affects only cache reuse, never permissions, Job
+identity, workspace checks or the final target CAS.
+Explicit `--check` commands also request fresh execution. With a plan configured,
+they run after its checks; they are neither ignored nor rejected by text matching.
+Unstructured checks do not search historical Jobs for a substitute result.
+
+Fresh execution withdraws the old success before starting. Failure is recorded
+as failure; interruption or missing logs leave no reusable success. A stale
+cache consumer cannot restore an older result. Release lookup considers the
+newest recorded matching proof rather than searching past a failure for an
+older green result. The cache represents current reusable evidence, not Task
+execution history; original Job and Integration records remain separate.
+
+The identity covers declared inputs, not every external service or untracked
+environment condition. Use explicit reruns for changing external inputs,
+flakiness investigation or a user-requested new check. A plan does not authorize
+real-model/paid/shared-resource validation. Reuse never substitutes for Review,
+acceptance or publication authority.
 
 Review follows the applicable Candidate rule or Task-final contract and frozen
 heads. The exact main Reviewer Run holds the report; successful execution is
