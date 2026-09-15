@@ -21,11 +21,8 @@ import { FileRuntimeEventInbox } from "./runtimeEventInbox.js";
 
 type ObserverStore = Pick<
   TaskStore,
-  "listTasks" | "getTask" | "listRuns" | "getActiveRun" | "listEvents"
-> & Readonly<{
-  /** SQLite exposes this bounded production hot-set projection. */
-  listActiveTaskIds?: () => readonly string[];
-}>;
+  "listActiveTaskIds" | "getTask" | "listRuns" | "getActiveRun" | "listEvents"
+>;
 
 type ObserverState = {
   cursor?: AgentRuntimeObserverCursor;
@@ -294,21 +291,14 @@ export class AgentRuntimeObserver implements AgentRuntimeObserverPort {
       source: AgentRuntimeObserverSource;
       persistedState: ObserverState;
     }>> = [];
-    const indexedTaskIds = this.store.listActiveTaskIds?.();
-    // Stores without the indexed projection remain useful for deterministic
-    // tests. The production SQLite store discovers only its indexed hot set.
-    const activeTasks = indexedTaskIds === undefined
-      ? this.store.listTasks().filter((task) => (
-          task.status === "active" && task.executionGate.state === "enabled"
-        ))
-      : [...new Set(indexedTaskIds)]
-        .sort(numericCompare)
-        .map((taskId) => this.store.getTask(taskId))
-        .filter((task): task is NonNullable<typeof task> => (
-          task !== null
-          && task.status === "active"
-          && task.executionGate.state === "enabled"
-        ));
+    const activeTasks = [...new Set(this.store.listActiveTaskIds())]
+      .sort(numericCompare)
+      .map((taskId) => this.store.getTask(taskId))
+      .filter((task): task is NonNullable<typeof task> => (
+        task !== null
+        && task.status === "active"
+        && task.executionGate.state === "enabled"
+      ));
     for (const task of activeTasks) {
       // A Task still incurs one O(E) event projection. Group those observations
       // by AgentRun and sort each group once so every active AgentRun can reuse the same

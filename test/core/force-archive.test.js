@@ -27,7 +27,7 @@ import { acceptProviderTurn, beginProviderTurn, createProviderRuntimeBinding } f
 import { resolveEffectiveLaunch } from "../../dist/executor/effectiveLaunch.js";
 import { createRun } from "../../dist/agentRun/agentRun.js";
 import { createRunInput } from "../../dist/context/runInputContract.js";
-import { createDurableJob } from "../../dist/job/durableJob.js";
+import { createDurableJob, durableJobIdempotencyKey } from "../../dist/job/durableJob.js";
 import { createTaskRemoteDeliveryProof } from "../../dist/task/remoteDeliveryService.js";
 import { buildWebTaskCatalog, buildWebTaskDetail } from "../../dist/web/webSnapshot.js";
 
@@ -279,10 +279,14 @@ test("force retains active Runs and queued Jobs, while plain settled archive sti
     source: { type: "yui", channel: "task-dispatch" }, directive: "Original execution", deltaRefIds: []
   }), now, { effective: resolveEffectiveLaunch({ role, purpose: "execution" }) });
   store.saveActiveRun(run);
-  const job = createDurableJob({
+  const jobInput = {
     id: "job-1", taskId: task.id, owner: { kind: "task" }, projectId: "project-1",
     head, workspace: home, env: {}, steps: [{ name: "original", command: "true" }], artifactsLocator: "artifacts/job-1"
-  }, now);
+  };
+  const job = createDurableJob({ ...jobInput, operation: {
+    requestId: "fixture-request", actorId: "fixture:leader", authorityRef: "fixture:leader",
+    inputDigest: durableJobIdempotencyKey(jobInput)
+  } }, now);
   store.saveDurableJob(task.id, job);
   store.saveTask(task);
   command(["archive", task.id, "--integrated", "--force"]);

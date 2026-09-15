@@ -32,6 +32,7 @@ import { migrateIntegrationContinuation } from "./migrations/integrationContinua
 import { migrateNotificationOnlyWakes } from "./migrations/notificationOnlyWakes.js";
 import { migrateWorkItemHistory } from "./migrations/workItemHistory.js";
 import { migrateVerificationPolicy } from "./migrations/verificationPolicy.js";
+import { migrateCurrentInputContract } from "./migrations/currentInputContract.js";
 import {
   UNIFY_HOME_LAYOUT_SQL,
   migrateUnifyHomeLayout
@@ -1442,6 +1443,13 @@ WHERE json_type(payload, '$.scope') IS NULL
     introducedIn: "0.16.0",
     sql: "SELECT 1; -- Retire rollout modes/shadow metrics; explicit rerun intent; verification proof v3",
     migrateData: migrateVerificationPolicy
+  },
+  {
+    version: 34,
+    name: "current-input-contract",
+    introducedIn: "0.16.0",
+    sql: "SELECT 1; -- Archive retired Message wake policies and activation origin gates",
+    migrateData: migrateCurrentInputContract
   }
 ]);
 

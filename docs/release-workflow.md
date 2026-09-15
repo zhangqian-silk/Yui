@@ -33,7 +33,7 @@ The current development step retires runtime compatibility before the final
 1.0 baseline cutover. It does not publish a release or reset storage numbering.
 Storage 27→28 normalizes only provable singleton Role dispatch dedupe keys;
 the old migration ledger, Messages, Task results and unconfirmed effects remain
-unchanged. Ordinary opens require storage 33. Existing Homes advance only through
+unchanged. Ordinary opens require storage 34. Existing Homes advance only through
 the explicit upgrade boundary; no runtime dual-reader is added.
 
 This is a breaking pre-1.0 change:
@@ -98,11 +98,35 @@ automatic reuse without rewriting historical Job/Integration results or deleting
 their logs. Historical plan interpretation is frozen inside the migration
 directory so earlier migrations keep their original semantics.
 
+Storage 33→34 removes Message `wakePolicy` and activation `origin` from current
+records, preserving their original representations in audit Events. Historical
+save-only Messages become `intent: record`; other user/operator Messages without
+intent become `discuss`. Runtime readers never infer a missing stored intent.
+Editing record-only context does not wake the Leader. Completion reads actual
+pending message references, including an explicit handoff of previously saved context.
+
+An origin-less pending immediate Draft activation blocks preflight and migration,
+including on a stopped Task. Activate or cancel it explicitly with the old release
+first. An admitted current request needs no second origin gate: cancellation,
+planning deferral, execution state and exact Session authority remain enforced.
+Old origin metadata, including settled-request history, remains in
+`task.activation-origin-retired` Events; this never fabricates authorization.
+
+New `job start` calls require `--request-id`; RPC callers supply `requestId`, and
+the capability boundary supplies its invocation identity. There is no implicit
+content-addressed request or anonymous Job constructor. Existing Jobs retain
+their operation evidence and remain addressable by ID. Retrying the same explicit
+request is idempotent, changed input conflicts, and Integration recovery still
+finds its original Job across Session replacement. Choosing a new request ID is
+an explicit new operation, not recovery of an uncertain earlier result.
+
 Core Scheduler readers and persistence operations are required ports. A missing
 Session/event reader cannot be interpreted as empty evidence or skipped error
 persistence. Task execution and Web projections read the current store directly;
 queue admission requires its Task lifecycle read. Exact dispatch settlement
 remains separate and does not gain an archive gate that could lose late evidence.
+Observer, config, Knowledge and workspace-cleanup Store readers are also required;
+test doubles implement those contracts rather than selecting production fallbacks.
 
 Task listing and `/api/dashboard` now expose only the bounded catalog; remove
 `--view compact` from callers and use per-Task reads for detail. Scheduler

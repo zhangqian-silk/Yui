@@ -85,13 +85,10 @@ export type Task = {
    * disposition, oldest first, excluding whichever one currently occupies
    * `activationRequest`.
    *
-   * This exists because the single latest slot cannot answer the question
-   * adoption has to ask: "was this exact requestId already cancelled?" Without
-   * the history, cancelling A and then requesting B evicts A's cancellation, so
-   * replaying A afterwards creates a fresh pending request and the explicit
-   * withdrawal is silently undone. `status` remains the only statement about
-   * whether delivery started; this is per-request evidence, not a second
-   * lifecycle or scheduling ledger.
+   * This is a bounded display of per-request evidence. The never-compacted
+   * activation event ledger is the authority for previously settled request IDs,
+   * including entries no longer in this display. `status` remains the only
+   * statement about delivery; this is not a scheduling ledger.
    */
   settledActivationRequests?: readonly TaskActivationRequest[];
   completedAt?: string;

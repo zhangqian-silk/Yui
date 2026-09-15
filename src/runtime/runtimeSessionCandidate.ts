@@ -10,7 +10,7 @@ import type { RuntimeOwner } from "./runtimeOwner.js";
  * Presence in this projection means active; it deliberately carries no second
  * lifecycle status. Historical and ended Sessions never enter this shape.
  * SQLite persists it in the same transaction as the authoritative
- * RoleSessionSet; the file rollback backend derives it from that aggregate.
+ * RoleSessionSet; it is never an independently writable source of lifecycle.
  */
 export type RuntimeSessionCandidate = Readonly<{
   owner: RuntimeOwner;
@@ -51,14 +51,13 @@ export function projectRuntimeSessionCandidate(
   };
 }
 
-/** Deterministic owner order shared by all storage backends. */
+/** Deterministic owner order for current runtime discovery. */
 export function compareRuntimeSessionCandidates(
   left: RuntimeSessionCandidate,
   right: RuntimeSessionCandidate
 ): number {
   if (left.owner.scope !== right.owner.scope) {
-    // Preserve the historical adapter contract: Task owners precede the
-    // bounded global Role set.
+    // Task owners precede the bounded global Role set.
     return left.owner.scope === "task" ? -1 : 1;
   }
   if (left.owner.scope === "task" && right.owner.scope === "task") {

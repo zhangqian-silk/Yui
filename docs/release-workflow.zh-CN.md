@@ -24,7 +24,7 @@ Agent 选择一个预先声明的计划，设施从持久状态驱动该计划�
 
 当前开发步骤先清退运行时兼容分支，尚未执行最终 1.0 基线切换，也不发布版本或重置
 存储编号。存储 `27→28` 只规范化可明确识别的单条 Role 调度去重键，旧迁移账本、
-Message、Task 结果和不确定外部效果保持不变。普通打开要求存储 33；已有 Home 只通过
+Message、Task 结果和不确定外部效果保持不变。普通打开要求存储 34；已有 Home 只通过
 显式升级入口前进，不增加运行时双读。
 
 这是一次 1.0 前的破坏性变更：
@@ -72,9 +72,28 @@ Integration 显式补入 `rerunChecks: false`，缓存 Artifact 移除试运行�
 自动复用，不重写历史 Job／Integration 结果或删除其日志。旧计划解析冻结在迁移
 目录中，早期迁移保持原有语义。
 
+存储 `33→34` 从当前记录移除 Message `wakePolicy` 与激活 `origin`，原始表达
+保存在审计事件。旧的仅记录消息转换为 `intent: record`，其他缺少意图的
+user/operator 消息转换为 `discuss`；运行时不再解释缺失的持久化意图。
+编辑仅记录内容不会唤醒 Leader。完成检查读取实际待投递消息引用，也涵盖显式交接
+此前仅保存的内容。
+
+Draft 中缺少 origin 且仍 pending 的旧 immediate 激活请求会阻止预检和迁移，即使 Task
+已停止执行。必须先用旧版本显式激活或取消；升级不替用户做这个决定。当前已接纳
+请求不再经过第二次来源门槛，但取消、planning 延后、执行状态与精确 Session 权限
+仍需检查。旧来源及 settled 请求历史保留在 `task.activation-origin-retired` 事件。
+
+新 `job start` 必须带 `--request-id`；RPC 必须提供 `requestId`，capability
+入口使用 invocation 身份。不再从命令内容隐式生成请求，也不再构造匿名 Job。
+已有 Job 的操作证据和按 ID 读取保持不变；相同请求重试防重、不同输入冲突，
+Integration 在 Session 替换后仍找回原 Job。新 request ID 表示明确的新操作，
+不是对旧未知结果的自动重放。
+
 Scheduler 核心读取和持久化操作成为必需接口，缺少 Session／Event 读取不再被当作
 空证据，也不能跳过错误持久化。执行及 Web 投影直接读取当前 Store；
 消息入队必须读取 Task 生命周期。精确投递结算仍独立，不增加会丢失迟到证据的归档门槛。
+Observer、配置、Knowledge 与工作区清理所需 Store 读取也成为必需接口；
+测试替身实现现行合同，不再令生产代码降级。
 
 Task 列表及 `/api/dashboard` 只保留有界目录；调用方去掉 `--view compact`，
 详情使用单 Task 读取。Scheduler 目录索引是必需接口，不再兼容缺失时的全量扫描。

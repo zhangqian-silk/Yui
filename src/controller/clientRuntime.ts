@@ -979,10 +979,10 @@ function foregroundGlobalRoleEnvironment(
   roleName: string,
   source: NodeJS.ProcessEnv
 ): Readonly<Record<string, string>> | undefined {
-  const role = store.getGlobalRole?.(roleName);
-  if (role === null || role === undefined) return undefined;
-  const agent = store.getConfiguredAgent?.(role.activeAgentId);
-  if (agent === null || agent === undefined) return undefined;
+  const role = store.getGlobalRole(roleName);
+  if (role === null) return undefined;
+  const agent = store.getConfiguredAgent(role.activeAgentId);
+  if (agent === null) return undefined;
   const declaredSources = new Set(
     agent.environment.map((binding) => binding.sourceName)
   );

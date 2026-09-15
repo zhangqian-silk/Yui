@@ -529,8 +529,7 @@ export class TaskWorkspaceCoordinator {
    * human/Leader has taken responsibility for the outcome.
    */
   #assertNoActiveWorkItemDurableJobs(item: WorkItem): void {
-    const jobs = this.store.listDurableJobs?.(item.taskId);
-    if (jobs === undefined) return;
+    const jobs = this.store.listDurableJobs(item.taskId);
     const blocking = jobs.filter((job) => (
       job.owner.kind === "work-item"
       && job.owner.workItemId === item.id
@@ -569,12 +568,11 @@ export class TaskWorkspaceCoordinator {
 
   async #stopLiveRoles(taskId: string, roleNames: readonly string[]): Promise<void> {
     const targets = [...new Set(roleNames)];
-    const getActiveRun = this.store.getActiveRun?.bind(this.store);
     for (const roleName of targets) {
-      if (getActiveRun !== undefined && getActiveRun(taskId, roleName) !== null) {
+      if (this.store.getActiveRun(taskId, roleName) !== null) {
         throw new Error(`Role has an active AgentRun: ${taskId}/${roleName}.`);
       }
-      if (this.store.getWorkMailbox !== undefined && hasRuntimeLifecycleWork(
+      if (hasRuntimeLifecycleWork(
         this.store.getWorkMailbox(
           runtimeLifecycleTarget({ scope: "task", taskId, roleName })
         )
@@ -597,11 +595,9 @@ export class TaskWorkspaceCoordinator {
     });
     if (live.length > 0) await this.runtime.stopTaskRoleSessions(taskId, live);
 
-    // The aggregate-16 dormant Claude placeholder is the sole exception to
-    // strict workspace-session retirement. The synchronous pane inspection is
-    // performed while holding the Task store transaction so a normal launch
-    // cannot reserve a AgentRun/Session between absence proof and terminalization.
-    if (inspect === undefined || this.store.transaction === undefined) return;
+    // Recheck exact runtime quiescence under the Task transaction when this
+    // runtime exposes physical panes. Store reads are always authoritative.
+    if (inspect === undefined) return;
     this.store.transaction((tx) => {
       const panes = inspect(taskId);
       for (const roleName of targets) {
@@ -611,7 +607,7 @@ export class TaskWorkspaceCoordinator {
         if (tx.getActiveRun(taskId, roleName) !== null) {
           throw new Error(`Role has an active AgentRun: ${taskId}/${roleName}.`);
         }
-        if (tx.getWorkMailbox !== undefined && hasRuntimeLifecycleWork(
+        if (hasRuntimeLifecycleWork(
           tx.getWorkMailbox(
             runtimeLifecycleTarget({ scope: "task", taskId, roleName })
           )

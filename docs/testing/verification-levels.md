@@ -153,6 +153,12 @@ is required.
     selected-check isolation, incomplete evidence and stale-consumer rejection.
     An Integration rerun cannot bypass an equivalent unfinished gate. Policy
     migration preserves historical execution and blocks an admitted old gate.
+31. Message edits preserve record-only intent; completion still sees explicitly
+    queued input. Input migration preserves raw audit evidence, refuses to
+    auto-authorize old pending immediate activations and keeps the prior ledger.
+    The actual Controller continues admitted requests but not cancellations.
+    Required Store reads fail before config mutation or full-scan fallback.
+    Explicit Job requests replay one operation and reject changed or missing keys.
 
 Keep the test phase seconds-scale; measure TypeScript build separately. Record
 incremental runtime when adding a critical regression. The seven recovery boundary

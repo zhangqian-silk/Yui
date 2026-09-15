@@ -11,7 +11,7 @@ export type TaskMessageKind = typeof TASK_MESSAGE_KINDS[number];
  *
  * - `record`: save only. No Leader wake, no planning, no activation.
  * - `discuss`: save and route to planning (the default when a submission omits
- *   an intent, so an old client keeps its existing Leader-waking behaviour).
+ *   an intent).
  * - `develop`: save the requirement and its activation intent; an unplanned
  *   Draft records an activation request and queues only activation processing.
  *
@@ -36,9 +36,8 @@ export const TASK_MESSAGE_INPUT_CONTROL_OUTCOMES = ["pending", "accepted", "reje
 /**
  * The durable business input action and its stable idempotency key.
  *
- * Absent on historical Messages and on the compatible `send` entry, which keep
- * queue semantics. `queue` is delivered at the recipient's next legal execution
- * opportunity. `steer` targets only the exact current native Turn: it is saved
+ * Absent on ordinary submissions. `queue` is delivered at the recipient's next
+ * legal execution opportunity. `steer` targets only the exact current native Turn: it is saved
  * but is never auto-delivered as a queued continuation, so an unsupported steer
  * cannot silently become a queue.
  *
@@ -169,19 +168,8 @@ export type TaskMessage = {
   author: TaskMessageAuthor;
   body: string;
   /**
-   * Machine-readable wake policy for user/operator messages (Issue 05).
-   * - `leader`: the message is a directive that should wake the Leader.
-   * - `none`: the message is informational context only; it must not wake
-   *   the Leader or create a Leader AgentRun.
-   * Absent on older messages and on role-result/system messages, which keep
-   * their existing routing.
-   */
-  wakePolicy?: "leader" | "none";
-  /**
-   * The submission intent this user/operator Message carried (task-32 A). Absent
-   * on role-result/system Messages, and on historical Messages saved before the
-   * intent existed — a reader treats that absence as `discuss`, never as
-   * `develop`. Persisted so the routing a submission received stays auditable
+   * Required on user/operator Messages; absent on role-result/system Messages.
+   * Persisted so the routing a submission received stays auditable
    * after the fact, independent of the Task's current phase.
    */
   intent?: TaskSubmissionIntent;
@@ -189,7 +177,7 @@ export type TaskMessage = {
    * The client-chosen idempotency key for a user/operator submission (task-32
    * §2.3): the narrow persistent fact that lets a retry replay its original
    * outcome. Absent on role-result/system Messages and on keyless submissions, so
-   * an old client keeps its existing non-idempotent behaviour.
+   * keyless submissions deliberately do not promise retry deduplication.
    */
   submissionKey?: string;
   /**
@@ -199,13 +187,12 @@ export type TaskMessage = {
    * verbatim instead of recomputing from the Task's current phase or activation,
    * so a later gate change or cancelled request can never fabricate a different
    * outcome. Recorded on every keyed submission and absent only on keyless ones,
-   * so an old client keeps its existing non-idempotent behaviour.
+   * without inventing a receipt for an operation that never recorded one.
    */
   submissionReceipt?: SubmissionReceipt;
   /**
    * The durable input action and stable requestId chosen by the authorized
-   * caller (Issue task-30). Absent on historical Messages and on the compatible
-   * `send` entry, which keep queue semantics. Frozen at send time and immutable
+   * caller. Absent on ordinary submissions. Frozen at send time and immutable
    * for a given requestId.
    */
   inputControl?: TaskMessageInputControl;
@@ -239,7 +226,6 @@ export type TaskMessageContext = Readonly<{
   runId?: string;
   resultRef?: Readonly<{ type: "agent-run-result"; runId: string }>;
   workItemId?: string;
-  wakePolicy?: "leader" | "none";
   intent?: TaskSubmissionIntent;
   submissionKey?: string;
   recipient?: TaskMessageRecipient;
@@ -268,12 +254,9 @@ export function createTaskMessage(
     kind,
     author: normalizeAuthor(author),
     body: requireBody(body),
-    ...(context.wakePolicy === undefined
-      ? {}
-      : { wakePolicy: context.wakePolicy }),
-    ...(context.intent === undefined
-      ? {}
-      : { intent: context.intent }),
+    ...(kind === "user" || kind === "operator"
+      ? { intent: context.intent ?? "discuss" }
+      : context.intent === undefined ? {} : { intent: context.intent }),
     ...(context.submissionKey === undefined
       ? {}
       : { submissionKey: requireText(context.submissionKey, "Message submission key") }),
@@ -455,15 +438,11 @@ export function validateTaskMessage(message: TaskMessage): void {
   requireText(message.body, "Message body");
   validateKindAndAuthor(message.kind, message.author);
   normalizeAuthor(message.author);
-  if (message.wakePolicy !== undefined
-    && message.wakePolicy !== "leader"
-    && message.wakePolicy !== "none") {
-    throw new Error(`Message wakePolicy is invalid: ${String(message.wakePolicy)}.`);
+  if (Object.hasOwn(message, "wakePolicy")) {
+    throw new Error("Message contains a retired wake policy; use the storage upgrade boundary.");
   }
-  if (message.wakePolicy !== undefined
-    && message.kind !== "user"
-    && message.kind !== "operator") {
-    throw new Error("Message wakePolicy is only valid for user/operator messages.");
+  if ((message.kind === "user" || message.kind === "operator") && message.intent === undefined) {
+    throw new Error("User/operator Message intent is required.");
   }
   if (message.intent !== undefined
     && !TASK_SUBMISSION_INTENTS.includes(message.intent)) {

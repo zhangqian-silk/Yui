@@ -17,11 +17,45 @@ import { GitIntegrationService } from "../../dist/integration/gitIntegrationServ
 import { createDurableJob, startDurableJob, completeDurableJob, durableJobIdempotencyKey } from "../../dist/job/durableJob.js";
 import { runTaskIntegrationCommand } from "../../dist/commands/taskIntegrationCommands.js";
 import { resolveVerificationGate } from "../../dist/verification/verificationGateService.js";
+import { createDurableJobControl } from "../../dist/controller/jobControl.js";
+import { createRole, createRoleAgentBinding } from "../../dist/role/role.js";
+import { createRoleSessionSet, recordRoleAgentSession } from "../../dist/executor/agentExecutor.js";
+import { resolveEffectiveLaunch } from "../../dist/executor/effectiveLaunch.js";
 
 const now = new Date("2026-09-12T00:00:00Z");
 const git = (path, ...args) => execFileSync("git", ["-C", path, ...args], {
   encoding: "utf8", stdio: ["ignore", "pipe", "pipe"]
 }).trim();
+
+test("explicit Job requests replay their original operation and never fall back to content identity", t => {
+  const fixture = integrationFixture(t);
+  const { store } = fixture;
+  const task = store.getTask("task-1");
+  const workspace = store.getTaskWorkspace(task.id);
+  const binding = createRoleAgentBinding({ id: "codex", adapterId: "codex" });
+  const role = createRole(task.id, "leader", [binding], binding.agentId, workspace.root, now);
+  store.saveRole(task.id, role);
+  store.saveTaskRoleSessionSet(recordRoleAgentSession(
+    createRoleSessionSet({ scope: "task", taskId: task.id, roleName: role.name }, binding.agentId, now),
+    { agentId: binding.agentId, adapterId: binding.adapterId, nativeSessionId: "job-request-fixture",
+      policy: "fixed", status: "active", effective: resolveEffectiveLaunch({ role, purpose: "execution" }) }, now));
+  const params = {
+    taskId: task.id, requestId: "check-1", owner: { kind: "task" }, projectId: "project-1",
+    head: git(workspace.root, "rev-parse", "HEAD"), workspace: workspace.root,
+    env: {}, steps: [{ name: "check", command: "true" }],
+    caller: { scope: "task", taskId: task.id, role: role.name, nativeSessionId: "job-request-fixture" }
+  };
+  const control = createDurableJobControl(store);
+  const first = control.startJob(params, now);
+  assert.equal(first.created, true);
+  const replay = control.startJob(params, now);
+  assert.equal(replay.created, false);
+  assert.deepEqual(replay.job, first.job);
+  assert.throws(() => control.startJob({ ...params, requestId: undefined }, now), /requestId/);
+  assert.throws(() => control.startJob({ ...params, steps: [{ name: "changed", command: "false" }] }, now), /conflicts/);
+  assert.equal(store.listDurableJobs(task.id).length, 1);
+  assert.equal(control.getJob(task.id, first.job.id).operation.requestId, "check-1");
+});
 
 export function integrationFixture(t, strategy = "merge") {
   const root = mkdtempSync(join(tmpdir(), "yui-integration-"));
@@ -86,7 +120,9 @@ export function integrationFixture(t, strategy = "merge") {
         id: "job-1", taskId: input.taskId,
         owner: { kind: "integration-attempt", integrationAttemptId: input.integrationId },
         projectId: input.projectId, head: input.head, workspace: input.workspace,
-        env: input.env, steps: input.steps, artifactsLocator: "artifacts/job-1"
+        env: input.env, steps: input.steps, artifactsLocator: "artifacts/job-1",
+        operation: { requestId: `integration:${input.integrationId}`, actorId: "fixture:leader",
+          authorityRef: "fixture:leader", inputDigest: admitted.checkInputDigest }
       }, now);
       store.saveDurableJob(task.id, job);
       return job;
@@ -349,11 +385,15 @@ test("storage 20 classifies old Git conflicts without fabricating recovery evide
     }, now);
     for (const w of [main, workspace]) db.prepare("INSERT INTO managed_workspaces VALUES (?,?,?,?,?,?,?,?)")
       .run(w.owner.type, managedWorkspaceKey(w.owner), task.id, w.root, JSON.stringify(w), "active", w.createdAt, w.updatedAt);
-    const job = createDurableJob({
+    const jobInput = {
       id: "job-1", taskId: task.id, owner: { kind: "integration-attempt", integrationAttemptId: ff.id },
       projectId: project.id, head: ff.source.resultCommit, workspace: workspace.root,
       env: {}, steps: [{ name: "check-1", command: "true", timeoutMs: 1800000 }], artifactsLocator: "artifacts/job-1"
-    }, now);
+    };
+    const job = createDurableJob({ ...jobInput, operation: {
+      requestId: "fixture-request", actorId: "fixture:leader", authorityRef: "fixture:leader",
+      inputDigest: durableJobIdempotencyKey(jobInput)
+    } }, now);
     db.prepare("INSERT INTO durable_jobs (job_id,task_id,idempotency_key,status,payload,created_at,updated_at) VALUES (?,?,?,?,?,?,?)")
       .run(job.id, task.id, job.idempotencyKey, job.status, JSON.stringify(job), job.createdAt, job.updatedAt);
     insert.run(task.id, ff.id, ff.status, JSON.stringify(ff), ff.updatedAt);

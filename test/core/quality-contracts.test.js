@@ -11,7 +11,7 @@ import { planResourceGc } from "../../dist/resources/resourceGc.js";
 import { normalizeVerificationPlan, planL2JobSteps } from "../../dist/verification/verificationPlan.js";
 import { runGateStepsInProcess } from "../../dist/verification/verificationGateService.js";
 import { parseDurableJobStartParams } from "../../dist/controller/jobControl.js";
-import { createDurableJob } from "../../dist/job/durableJob.js";
+import { createDurableJob, durableJobIdempotencyKey } from "../../dist/job/durableJob.js";
 import { runDurableJobRunner } from "../../dist/job/jobRunner.js";
 import { routeInvocation } from "../../dist/cli/invocationRouter.js";
 import Database from "better-sqlite3";
@@ -43,16 +43,20 @@ test("structured verification survives RPC and both executors preserve cwd, argv
     ] }
   });
   const steps = planL2JobSteps(plan, workspace);
-  const input = parseDurableJobStartParams({
+  const unkeyed = {
     taskId: "task-1", owner: { kind: "task" }, projectId: "project-1",
     head: "a".repeat(40), workspace, env: { PATH: "/usr/bin:/bin" },
     steps, caller: { scope: "user" }
-  });
+  };
+  assert.throws(() => parseDurableJobStartParams(unkeyed), /requestId/);
+  const input = parseDurableJobStartParams({ ...unkeyed, requestId: "explicit-checks" });
   // Parsing a request is not caller authorization, but must preserve its
   // executable specification unchanged for the authenticated Job boundary.
   assert.deepEqual(input.steps, steps);
   const job = createDurableJob({
-    ...input, id: "job-1", artifactsLocator: "jobs/job-1"
+    ...input, id: "job-1", artifactsLocator: "jobs/job-1",
+    operation: { requestId: input.requestId, actorId: "fixture:leader", authorityRef: "fixture:leader",
+      inputDigest: durableJobIdempotencyKey(input) }
   }, now);
   const outcomes = await runGateStepsInProcess(
     workspace, job.steps, job.env, join(root, "local-logs"), job.head

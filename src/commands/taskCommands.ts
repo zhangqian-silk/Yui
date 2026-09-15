@@ -1119,8 +1119,7 @@ function routeUserSubmission(
         requestId: `submit-${message.id}`,
         actorId: identity.actorId,
         authorityRef: identity.authorityRef,
-        environmentPlan: routing.environmentPlan,
-        origin: "submit-develop"
+        environmentPlan: routing.environmentPlan
       }, now);
       activationRef = taskActivationOperationRef(task.id, `submit-${message.id}`);
       enqueueWork(tx, taskMailbox(task.id), "activation-requested", now, [taskRef(task.id)]);
@@ -1182,7 +1181,7 @@ function replayKeyedSubmission(
   const receipt = prior.submissionReceipt;
   if (prior.kind !== kind
     || prior.body !== body
-    || normalizeSubmissionIntent(prior.intent) !== intent
+    || prior.intent !== intent
     || receipt === undefined
     || (target !== undefined && !sameSubmissionTarget(receipt.target, target))) {
     throw new StorageConflictError(
@@ -2811,7 +2810,7 @@ function updateMessage(
       messageId: updated.id,
       updatedBy: actor
     }, now);
-    const queuedForLeader = updated.wakePolicy !== "none";
+    const queuedForLeader = updated.intent !== "record";
     if (queuedForLeader) {
       enqueueWork(tx, leaderMailbox(task.id), actor === "operator" ? "operator-input" : "user-message",
         now, [messageRef(task.id, updated.id)], { source: actor });
@@ -3150,7 +3149,7 @@ function registerInterruptThen(
   // AgentRun's terminal — no extra wake is needed. A no-Run Leader turn owns no
   // AgentRun and is never surfaced by that push path; it is delivered only by
   // being woken to read its own Context. The interrupt itself (and, when the
-  // handoff reuses a Leader self-steer, wakePolicy "none") enqueues no wake, so
+  // handoff reuses a Leader self-steer with record intent) enqueues no wake, so
   // without this the claim would be structurally unreleasable: listPendingWakeups
   // never selects the Task and the busy-gated leader mailbox is never consulted.
   // Enqueue that wake now, keyed to the claimed Message so an idempotent repeat of

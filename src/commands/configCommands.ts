@@ -53,9 +53,9 @@ type ConfigCommandStore = Readonly<{
   transaction<T>(execute: (store: ConfigCommandStore) => T): T;
   getConfig(): YuiConfig;
   saveConfig(config: YuiConfig): void;
-  getGlobalRole?(name: string): Readonly<{ name: string }> | null;
-  getConfiguredAgent?(id: string): Readonly<{ id: string }> | null;
-  rootDirectory?(): string;
+  getGlobalRole(name: string): Readonly<{ name: string }> | null;
+  getConfiguredAgent(id: string): Readonly<{ id: string }> | null;
+  rootDirectory(): string;
 }>;
 
 /**
@@ -256,7 +256,7 @@ const CONFIG_KEY_HANDLERS: readonly ConfigKeyHandler[] = [
         throw usageError("System config set usage: yui config system set default-agent <agent-id>.");
       }
       const defaultAgent = args[0].trim();
-      if (store.getConfiguredAgent?.(defaultAgent) === null) {
+      if (store.getConfiguredAgent(defaultAgent) === null) {
         throw usageError(`Configured Agent not found: ${defaultAgent}.`);
       }
       saveConfigKey(store, (config) => ({ ...config, defaultAgent }));
@@ -637,7 +637,7 @@ const CONFIG_KEY_HANDLERS: readonly ConfigKeyHandler[] = [
         || !REVIEW_TRIGGERS.includes(rawTrigger as ReviewTrigger)) {
         throw usageError(REVIEW_SET_USAGE);
       }
-      if (store.getGlobalRole?.(roleName) === null) {
+      if (store.getGlobalRole(roleName) === null) {
         throw usageError(`Global Role not found: ${roleName}.`);
       }
       const trigger = rawTrigger as ReviewTrigger;
@@ -674,7 +674,6 @@ if (missingConfigHandlers.length > 0 || duplicateConfigHandlers.length > 0) {
 
 function resolveDefaultWorkspace(value: string, store: ConfigCommandStore): string {
   const requested = resolve(value);
-  if (store.rootDirectory === undefined) return requested;
   const requestedHome = resolve(store.rootDirectory());
   assertWorkspaceOutsideHome(requested, requestedHome);
   mkdirSync(requested, { recursive: true, mode: 0o700 });

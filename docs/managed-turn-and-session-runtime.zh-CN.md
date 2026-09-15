@@ -110,7 +110,8 @@ wake 状态记录通知投递，不记录 Message 的实施结果。普通 Leade
 提交意图（`record / discuss / develop`）决定需求如何路由。输入时机决定一条已经
 获授权的输入何时到达 Role；它不激活 Task、不扩大 Assignment，也不提升 planning
 权限。仅保存输入使用 `message send --intent record`，`--wake-policy` 已移除。
-Draft Message 编辑只改正文，保留原始提交意图；要选择另一个动作，应显式提交新输入。
+Draft Message 编辑只改正文，保留原始提交意图；编辑 `record` 内容不会加入 Leader
+通知队列。现行 user/operator 消息必须存有意图。要选择另一个动作，应显式提交新输入。
 [经认证的 Web 控制](architecture/capabilities-and-resources.zh-CN.md#cli-与-web)
 与 CLI 使用同样的三种操作。
 

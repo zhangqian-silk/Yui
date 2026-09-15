@@ -69,8 +69,8 @@ Every persistent schema or payload change appends one immutable, contiguous
 storage migration. The CLI publishes both `storageVersion` and
 `minimumStorageVersion`; every valid Home in that inclusive range can upgrade
 directly to the current version without installing intermediate releases.
-The current source declares storage version **25**, with minimum supported
-migration version **1**, in `src/storage/storageVersions.ts`. Homes below that
+The current version and migration floor are declared only in
+`src/storage/storageVersions.ts` and exposed by CLI identity. Homes below that
 floor are not migration inputs and remain untouched.
 The target binary's `upgrade --update-preflight` and `--update-apply` result
 shapes and parent-owned handover-lock proof remain backward compatible with

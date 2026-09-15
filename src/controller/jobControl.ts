@@ -3,9 +3,10 @@
  * record is created or cancel-requested. The Controller socket layer calls
  * this port for `job.*` requests; nothing else writes queued jobs.
  *
- * Creation is idempotent per (owner, project, head, steps, workspace, env):
- * a repeated `job.start` with the same inputs returns the existing job with
- * `created: false`, so a Leader retry can never spawn duplicate runners.
+ * Creation is idempotent per authenticated actor and explicit request ID.
+ * Repeating that request with identical inputs returns the original Job;
+ * changing its input is a conflict. Integration owner identity additionally
+ * preserves its admitted Job across authorized Session replacement.
  */
 import { execSync } from "node:child_process";
 import { createHash } from "node:crypto";
@@ -64,8 +65,8 @@ export type DurableJobStartParams = Readonly<{
   env: Readonly<Record<string, string>>;
   steps: readonly DurableJobStep[];
   retryOf?: string;
-  /** Explicit request identity; omission uses the canonical content identity. */
-  requestId?: string;
+  /** Explicit operation identity; command content never authorizes a new request. */
+  requestId: string;
   /** rr8: The caller identity the declared owner is bound to. */
   caller: DurableJobCaller;
 }>;
@@ -115,8 +116,7 @@ export function createDurableJobControl(store: TaskStore): DurableJobControlPort
         const inputDigest = params.retryOf === undefined
           ? baseKey
           : retryDurableJobIdempotencyKey(baseKey, params.retryOf);
-        const requestId = params.requestId === undefined ? inputDigest
-          : requiredId(params.requestId, "job.start requestId");
+        const requestId = requiredId(params.requestId, "job.start requestId");
         // An IntegrationAttempt already is a durable operation identity.
         // Recovery by another authorized Role must find its original Job,
         // including the window before Integration persisted the returned id.
@@ -147,12 +147,6 @@ export function createDurableJobControl(store: TaskStore): DurableJobControlPort
             throw jobDomainError(`Job request identity conflicts with its original input: ${existing.id}.`);
           }
           return { job: existing, created: false };
-        }
-        // A historical content-addressed request has no attributable caller.
-        // Do not silently execute it again under a newly attributed identity.
-        const historical = tx.findDurableJobByIdempotencyKey(params.taskId, inputDigest);
-        if (params.requestId === undefined && historical !== null) {
-          throw jobDomainError(`Historical request already exists: ${historical.id}; inspect it or select an explicit new requestId.`);
         }
         authority.authorize(context, params.taskId);
         validateStartParams(tx, params);
@@ -305,7 +299,7 @@ function validateStartParams(store: TaskStore, params: DurableJobStartParams): v
   }
 }
 
-function validateJobTarget(store: TaskStore, params: Omit<DurableJobStartParams, "caller">): void {
+function validateJobTarget(store: TaskStore, params: Omit<DurableJobStartParams, "caller" | "requestId">): void {
   // The Task must be active — a terminal Task cannot run jobs.
   const task = store.getTask(params.taskId);
   if (task === null) {
@@ -525,7 +519,7 @@ function assertCallerAuthorized(
  */
 function resolveManagedWorkspace(
   store: TaskStore,
-  params: Omit<DurableJobStartParams, "caller">
+  params: Pick<DurableJobStartParams, "taskId" | "owner">
 ): ManagedWorkspace | null {
   if (params.owner.kind === "work-item") {
     return store.getManagedWorkspace({
@@ -610,9 +604,7 @@ export function parseDurableJobStartParams(value: JsonValue): DurableJobStartPar
     env,
     steps,
     caller,
-    ...(record.requestId === undefined ? {} : {
-      requestId: requiredId(record.requestId, "job.start requestId")
-    }),
+    requestId: requiredId(record.requestId, "job.start requestId"),
     ...(retryOf === undefined ? {} : { retryOf })
   };
 }

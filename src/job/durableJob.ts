@@ -166,35 +166,14 @@ export function createDurableJob(
     steps: readonly DurableJobStep[];
     artifactsLocator: string;
     retryOf?: string;
-    operation?: Pick<OperationFacts, "requestId" | "actorId" | "authorityRef" | "inputDigest">;
+    operation: Pick<OperationFacts, "requestId" | "actorId" | "authorityRef" | "inputDigest">;
   }>,
   now: Date
 ): DurableJob {
   const timestamp = now.toISOString();
-  const contentKey = input.retryOf === undefined
-    ? durableJobIdempotencyKey({
-        owner: input.owner,
-        projectId: input.projectId,
-        head: input.head,
-        steps: input.steps,
-        workspace: input.workspace,
-        env: input.env
-      })
-    : retryDurableJobIdempotencyKey(
-        durableJobIdempotencyKey({
-          owner: input.owner,
-          projectId: input.projectId,
-          head: input.head,
-          steps: input.steps,
-          workspace: input.workspace,
-          env: input.env
-        }),
-        input.retryOf
-      );
-  const idempotencyKey = input.operation === undefined ? contentKey
-    : createHash("sha256").update(JSON.stringify([
-      input.operation.actorId, input.operation.requestId
-    ])).digest("hex");
+  const idempotencyKey = createHash("sha256").update(JSON.stringify([
+    input.operation.actorId, input.operation.requestId
+  ])).digest("hex");
   return validateDurableJob({
     schemaVersion: CURRENT_DURABLE_JOB_SCHEMA_VERSION,
     id: input.id,
@@ -207,10 +186,7 @@ export function createDurableJob(
     steps: input.steps.map((step) => ({ ...step })),
     idempotencyKey,
     operation: {
-      requestId: input.operation?.requestId ?? idempotencyKey,
-      inputDigest: input.operation?.inputDigest ?? idempotencyKey,
-      actorId: input.operation?.actorId ?? "internal:job",
-      authorityRef: input.operation?.authorityRef ?? "internal:job",
+      ...input.operation,
       targetId: input.workspace,
       capability: "job.start",
       implementation: JOB_RUNNER_IMPLEMENTATION,

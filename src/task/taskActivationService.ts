@@ -16,7 +16,6 @@ import {
   TASK_ACTIVATION_EVENT,
   type SettledActivationRequestFact,
   type TaskActivationRequest,
-  type TaskActivationOrigin,
   type TaskActivationStartMode
 } from "./taskActivation.js";
 import { setTaskActivationRequest, recordTaskActivationRequestEvidence, type Task } from "./task.js";
@@ -53,12 +52,6 @@ export type RequestTaskActivationInput = Readonly<{
   actorId: string;
   authorityRef: string;
   environmentPlan: EnvironmentPlan;
-  /**
-   * The provable source of this request (task-32 §2.4). The explicit activation
-   * boundary passes `explicit`; the shared submission transaction passes
-   * `submit-develop`. Absent only for callers that predate the field.
-   */
-  origin?: TaskActivationOrigin;
   /**
    * Turn the caller is running inside, when it is this Task's planning Turn.
    * Supplying it is what makes the request deferred instead of immediate; the
@@ -178,7 +171,6 @@ export function recordTaskActivationRequestInTransaction(
     actorId: input.actorId,
     authorityRef: input.authorityRef,
     startMode,
-    ...(input.origin === undefined ? {} : { origin: input.origin }),
     ...(planningRun === undefined ? {} : { afterPlanningRun: planningRun }),
     environmentPlan: plan
   }, now);
@@ -192,7 +184,6 @@ export function recordTaskActivationRequestInTransaction(
       startMode: request.startMode,
       environmentPlan: describeEnvironmentPlan(request.environmentPlan),
       actor: request.operation.actorId,
-      ...(request.origin === undefined ? {} : { origin: request.origin }),
       ...(request.afterPlanningRun === undefined
         ? {}
         : { afterPlanningRun: request.afterPlanningRun })

@@ -13,4 +13,4 @@
  * intermediate Yui releases.
  */
 export const MIN_SUPPORTED_STORAGE_VERSION = 1;
-export const CURRENT_STORAGE_VERSION = 33;
+export const CURRENT_STORAGE_VERSION = 34;

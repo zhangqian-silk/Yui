@@ -43,28 +43,6 @@ export const TASK_ACTIVATION_EVENT = Object.freeze({
  */
 export type TaskActivationStartMode = "immediate" | "after-planning-turn";
 
-/**
- * The provable source that authorised an activation request (task-32 §2.4).
- *
- * - `explicit`: an independent, explicit activation action (the `yui task
- *   activate`/activation-request boundary, a Web activate button, or an Operator
- *   carrying out an explicit user instruction).
- * - `submit-develop`: a `develop` submission the shared submission transaction
- *   accepted while the Task was still unplanned, recorded atomically with the
- *   message that carried it.
- *
- * The Controller may continue (auto-adopt) an immediate request only when its
- * origin is one of these recognised sources. A request whose origin is absent —
- * every request migrated from before this field existed — is never auto-adopted:
- * it still requires the explicit activation boundary, so an upgrade can never
- * turn an old pending request into a silent auto-activation. Absence is the
- * safe marker, so no historical row is rewritten to obtain one.
- */
-export type TaskActivationOrigin = "explicit" | "submit-develop";
-
-export const TASK_ACTIVATION_ORIGINS: readonly TaskActivationOrigin[] =
-  Object.freeze(["explicit", "submit-develop"]);
-
 export type TaskActivationDisposition =
   | "pending"
   | "adopted"
@@ -84,12 +62,6 @@ export type TaskActivationRequest = Readonly<{
   schemaVersion: 1;
   operation: OperationFacts;
   startMode: TaskActivationStartMode;
-  /**
-   * The provable source that authorised this request (task-32 §2.4). Absent on
-   * requests created before the field existed; a reader treats that absence as
-   * "not auto-adoptable", never as an implicit `explicit`.
-   */
-  origin?: TaskActivationOrigin;
   /** Turn whose termination releases a deferred request. */
   afterPlanningRun?: string;
   /** Explicit resource configuration; an empty plan is legal. */
@@ -108,7 +80,6 @@ export type TaskActivationRequestInput = Readonly<{
   actorId: string;
   authorityRef: string;
   startMode: TaskActivationStartMode;
-  origin?: TaskActivationOrigin;
   afterPlanningRun?: string;
   environmentPlan: EnvironmentPlan;
 }>;
@@ -165,7 +136,6 @@ export function createTaskActivationRequest(
       partialResultRefs: []
     },
     startMode: input.startMode,
-    ...(input.origin === undefined ? {} : { origin: input.origin }),
     ...(input.afterPlanningRun === undefined
       ? {}
       : { afterPlanningRun: input.afterPlanningRun }),
@@ -341,28 +311,6 @@ export function admitTaskActivationRequest(
 }
 
 /**
- * Whether the Controller may continue (auto-adopt) a released request without an
- * explicit activation boundary call (task-32 §2.4).
- *
- * A deferred request already holds activation authority and is released by its
- * planning Turn ending, so it is adoptable regardless of origin. An immediate
- * request is auto-continued only when it carries a recognised provable origin:
- * an explicit activation action, or a develop submission the shared transaction
- * accepted while the Task was unplanned. A request with no origin — every one
- * migrated from before the field existed — is deliberately held back so an
- * upgrade cannot turn a historical pending request into a silent activation; it
- * still adopts through the explicit `yui task activate` boundary, which does not
- * consult origin. This replaces the old actor heuristic that both dropped legal
- * Operator/user immediate requests and could not distinguish provenance.
- */
-export function activationRequestIsControllerAdoptable(
-  request: TaskActivationRequest
-): boolean {
-  if (request.startMode === "after-planning-turn") return true;
-  return request.origin !== undefined;
-}
-
-/**
  * A requestId's terminal outcome as an authority fact, independent of whether
  * the bounded display payload still carries the full request record.
  */
@@ -419,9 +367,8 @@ export function validateTaskActivationRequest(
   if (!["immediate", "after-planning-turn"].includes(request.startMode)) {
     throw new Error(`Activation start mode is invalid: ${String(request.startMode)}.`);
   }
-  if (request.origin !== undefined
-    && !TASK_ACTIVATION_ORIGINS.includes(request.origin)) {
-    throw new Error(`Activation origin is invalid: ${String(request.origin)}.`);
+  if (Object.hasOwn(request, "origin")) {
+    throw new Error("Activation contains retired origin metadata; use the storage upgrade boundary.");
   }
   if ((request.startMode === "after-planning-turn")
     !== (request.afterPlanningRun !== undefined)) {

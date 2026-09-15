@@ -27,7 +27,7 @@ export type ControllerDurableJobStartParams = Readonly<{
   env: Readonly<Record<string, string>>;
   steps: readonly DurableJobStep[];
   retryOf?: string;
-  requestId?: string;
+  requestId: string;
   /** rr8: The caller identity the declared owner is bound to. */
   caller: DurableJobCaller;
 }>;

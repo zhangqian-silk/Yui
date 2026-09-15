@@ -36,7 +36,7 @@ function fixture(t) {
   store.saveTask(task);
   requestTaskActivation(store, {
     taskId: task.id, requestId: "begin", actorId: "user:local", authorityRef: "test",
-    origin: "explicit", environmentPlan: { kind: "scratch" }
+    environmentPlan: { kind: "scratch" }
   }, now);
   const git = { resolveRemoteHead: async () => assert.fail("must not start Git before admission") };
   return { home, store, project, task, git, now };

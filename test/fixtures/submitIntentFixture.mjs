@@ -1,5 +1,4 @@
 import Database from "better-sqlite3";
-import { createTaskMessage } from "../../dist/message/message.js";
 import { createTaskEvent } from "../../dist/event/taskEvent.js";
 
 /**
@@ -13,10 +12,9 @@ import { createTaskEvent } from "../../dist/event/taskEvent.js";
  * helper is for tests alone. It follows the house fixture convention — a plain
  * .mjs importing the compiled runtime from dist/.
  *
- * Every Message and Event row is built through the same canonical constructors
- * the runtime uses, so the bytes are authentic to what a real v18 database holds
- * (a v18 Message is a schemaVersion-3 Message with no `intent` field, exactly
- * what an omitted intent normalizes to `discuss` today).
+ * Message rows use a frozen v18 encoding, independent of current constructors:
+ * schemaVersion 3, optional wakePolicy, and no intent field. Current constructor
+ * defaults must never rewrite the input of this historical migration test.
  *
  * The migration reads only four tables — `tasks_catalog`, `messages`, `events`,
  * `id_sequences` — so `seedSubmitIntentFixture` seeds exactly those and the
@@ -146,8 +144,11 @@ export function buildSubmitIntentFixtureRows() {
           ? {}
           : { recipient: { roleName: "leader", workItemId: spec.recipientWorkItemId } })
       };
-      const message = createTaskMessage(messageId, kase.taskId, `${kase.taskId} ${messageId} body`,
-        kind, author, now, context);
+      const message = {
+        schemaVersion: 3, id: messageId, taskId: kase.taskId,
+        body: `${kase.taskId} ${messageId} body`, kind, author, ...context,
+        createdAt: now.toISOString()
+      };
       messages.push({
         task_id: kase.taskId, message_id: message.id, seq: index + 1,
         payload: JSON.stringify(message), created_at: message.createdAt

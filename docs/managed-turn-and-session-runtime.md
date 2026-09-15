@@ -131,7 +131,9 @@ routed. Input timing decides when an already-authorized input reaches a Role;
 it does not activate a Task, expand an Assignment or upgrade planning authority.
 Save-only input uses `message send --intent record`; `--wake-policy` is removed.
 Draft Message edits change the body only, preserving their original submission
-intent. To choose a different action, make a new explicit submission.
+intent; editing `record` context never queues a Leader notification. Current
+stored user/operator Messages always have an intent. To choose a different
+action, make a new explicit submission.
 The [authenticated Web controls](architecture/capabilities-and-resources.md#cli-and-web)
 use the same three operations as the CLI.
 

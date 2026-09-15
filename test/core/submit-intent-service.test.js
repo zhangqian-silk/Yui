@@ -7,14 +7,17 @@ import test from "node:test";
 import { SqliteTaskStore } from "../../dist/storage/sqliteStore.js";
 import {
   sendTaskMessageCommand,
+  runTaskCommand,
   submitOperatorMessage
 } from "../../dist/commands/taskCommands.js";
 import { activateTask, createTask } from "../../dist/task/task.js";
 import { stopTaskExecutionCommand } from "../../dist/commands/taskExecutionCommands.js";
-import { activationRequestIsControllerAdoptable } from "../../dist/task/taskActivation.js";
+import { admitStoredTaskActivation } from "../../dist/task/taskActivationService.js";
 import { createConfiguredAgent } from "../../dist/agent/agent.js";
 import { createGlobalRole, createRoleAgentBinding } from "../../dist/role/role.js";
 import { sanitizedTestEnv } from "../helpers/sanitizedEnv.mjs";
+import { pendingCompletionMessages } from "../../dist/task/completionReadiness.js";
+import { enqueueWork } from "../../dist/coordination/workMailboxQueue.js";
 
 /**
  * Integration coverage for the task-32 Requirement A shared submission service,
@@ -96,6 +99,16 @@ test("record submission saves only: no planning-entered event, no Leader wake", 
   const saved = findMessage(store, task.id, result.message.id);
   assert.equal(saved.intent, "record");
   assert.equal(saved.kind, "user");
+  runTaskCommand(["message", "update", `${task.id}/${saved.id}`, "edited context"],
+    store, { environment: userEnv, now });
+  assert.equal(findMessage(store, task.id, saved.id).intent, "record");
+  assert.equal(leaderHasPending(store, task.id), false, "Editing save-only context cannot authorize a Leader wake.");
+  assert.equal(events(store, task.id, "task.planning-entered").length, 0);
+  // A later explicit handoff may queue the saved context. Completion reads
+  // that pending reference rather than treating record intent as a permanent veto.
+  enqueueWork(store, { kind: "role", taskId: task.id, roleName: "leader" },
+    "explicit-handoff", now(), [{ type: "message", taskId: task.id, id: saved.id }]);
+  assert.deepEqual(pendingCompletionMessages(store, task.id).map(message => message.id), [saved.id]);
 });
 
 test("discuss submission enters planning: one planning-entered event, Leader queued", (t) => {
@@ -153,13 +166,11 @@ test("develop on an unplanned Draft records a submit-develop activation and queu
 
   const request = store.getTask(task.id).activationRequest;
   assert.notEqual(request, undefined);
-  assert.equal(request.origin, "submit-develop");
   assert.equal(request.disposition, "pending");
   assert.equal(request.startMode, "immediate");
   assert.equal(request.environmentPlan.kind, "empty");
   assert.equal(request.operation.requestId, `submit-${result.message.id}`);
-  // A submit-develop immediate request is Controller-adoptable (§2.4).
-  assert.equal(activationRequestIsControllerAdoptable(request), true);
+  assert.equal(admitStoredTaskActivation(store, task.id).disposition, "ready");
   // The request is recorded but Task.status is still the only lifecycle: the
   // shared service records the request and queues processing; it does not flip
   // the Task to active inside the submission transaction.

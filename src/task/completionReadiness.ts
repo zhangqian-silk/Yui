@@ -98,7 +98,7 @@ export function pendingCompletionMessages(store: TaskStore, taskId: string): Tas
   const ids = new Set(refs.filter(ref => ref.type === "message" && ref.taskId === taskId).map(ref => ref.id));
   return operationalTaskRecords(store.listMessages(taskId), store.listEvents(taskId), "message")
     .filter(message => ids.has(message.id)
-      && (message.kind === "user" || message.kind === "operator") && message.wakePolicy !== "none");
+      && (message.kind === "user" || message.kind === "operator"));
 }
 
 const ACTIVE_JOB_STATUSES = new Set([

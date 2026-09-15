@@ -57,9 +57,9 @@ export type ProjectCommandStore = Readonly<{
   /** The persistent Home root; managed Project repositories live below it. */
   rootDirectory(): string;
   /** Task evidence for Knowledge promotion proposals. */
-  getTask?(id: string): Task | null;
-  getDecision?(taskId: string, decisionId: string): Decision | null;
-  getMilestone?(taskId: string, milestoneId: string): Milestone | null;
+  getTask(id: string): Task | null;
+  getDecision(taskId: string, decisionId: string): Decision | null;
+  getMilestone(taskId: string, milestoneId: string): Milestone | null;
   /** Task-ledger references to a Project for the lifecycle fail-closed gates. */
   summarizeProjectReferences(projectId: string): ProjectReferenceSummary;
 }>;
@@ -1792,9 +1792,6 @@ function requireProposalEvidence(
   store: ProjectCommandStore,
   parsed: KnowledgeProposalOptions
 ): ProposalEvidence {
-  if (store.getTask === undefined) {
-    throw usageError("Knowledge promotion requires Task evidence, which this store does not provide.");
-  }
   const task = store.getTask(parsed.task);
   if (task === null) throw usageError(`Task not found: ${parsed.task}.`);
   const source: KnowledgeProposalSource = {
@@ -1805,18 +1802,12 @@ function requireProposalEvidence(
   };
   let evidence: string;
   if (parsed.decision !== undefined) {
-    if (store.getDecision === undefined) {
-      throw usageError("Knowledge promotion requires Decision evidence, which this store does not provide.");
-    }
     const decision = store.getDecision(task.id, parsed.decision);
     if (decision === null) {
       throw usageError(`Decision not found: ${parsed.decision} in Task ${task.id}.`);
     }
     evidence = `${decision.title}\n${decision.rationale}`;
   } else if (parsed.milestone !== undefined) {
-    if (store.getMilestone === undefined) {
-      throw usageError("Knowledge promotion requires Milestone evidence, which this store does not provide.");
-    }
     const milestone = store.getMilestone(task.id, parsed.milestone);
     if (milestone === null) {
       throw usageError(`Milestone not found: ${parsed.milestone} in Task ${task.id}.`);

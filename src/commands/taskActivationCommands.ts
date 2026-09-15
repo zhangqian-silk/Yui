@@ -75,10 +75,6 @@ function requestActivation(
     actorId: caller.actorId,
     authorityRef: caller.authorityRef,
     environmentPlan,
-    // The activation-request command is the explicit activation boundary, so
-    // every request it records carries an explicit provable origin (task-32
-    // §2.4). A develop submission records its own request with `submit-develop`.
-    origin: "explicit",
     ...(caller.planningRunId === undefined ? {} : { callerRunId: caller.planningRunId })
   }, now));
   // An immediate request has nothing left to wait for, so ask the Controller to

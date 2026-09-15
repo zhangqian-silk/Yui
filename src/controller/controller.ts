@@ -64,7 +64,6 @@ import {
 } from "../runtime/lifecycleReservation.js";
 import type { SessionHostPort } from "../runtime/ports.js";
 import { formatTaskRecordReference } from "../task/taskRecordReference.js";
-import { activationRequestIsControllerAdoptable } from "../task/taskActivation.js";
 import type {
   AsyncRuntimeEventProcessorPort,
   RuntimeEventDrainMetrics,
@@ -831,9 +830,9 @@ export function compileReconcileSelection(scope: ReconcileScope): ReconcileSelec
 }
 
 /**
- * Adopts activation requests whose deferral has been released.
+ * Continues admitted activation requests once their execution boundaries allow it.
  *
- * The deferral is only ever released by the planning Turn ending, so this phase
+ * A planning deferral is released only by its Turn ending. This phase therefore
  * re-reads the request instead of trusting the signal that woke it: a request
  * cancelled, or a Task retired or stopped, while the Turn was still running is
  * left alone rather than replayed as historical intent. Adoption itself belongs
@@ -862,13 +861,8 @@ async function adoptReleasedTaskActivations(
     if (task?.status !== "draft" || task.executionGate.state !== "enabled") continue;
     const request = task.activationRequest;
     if (request?.disposition !== "pending") continue;
-    // Continue only requests with a provable source: a released deferral, or an
-    // immediate request carrying a recognised origin (explicit action, or a
-    // develop submission accepted while unplanned). This admits legal
-    // Operator/user immediate requests the old actor filter dropped, while
-    // still refusing origin-less historical requests, which stay behind the
-    // explicit `yui task activate` boundary.
-    if (!activationRequestIsControllerAdoptable(request)) continue;
+    // The request was authorized at admission. Recheck its current execution
+    // and Session boundaries without a second provenance-based workflow gate.
     // Later Draft discussion is a Session notification, not another AgentRun.
     // Its durable activation intent is sufficient once the exact native input
     // is settled. Never create a synthetic Run merely to release that intent.

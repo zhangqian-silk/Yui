@@ -41,6 +41,7 @@ import {
 } from "../migrations/collapseWorktreeLayout.js";
 import { preflightNotificationOnlyWakes } from "../migrations/notificationOnlyWakes.js";
 import { preflightVerificationPolicy } from "../migrations/verificationPolicy.js";
+import { preflightCurrentInputContract } from "../migrations/currentInputContract.js";
 import {
   migrateSqliteSchema,
   storageMigrationPlan,
@@ -561,7 +562,8 @@ function preflightMigrationBlockers(
   const relocatesCollapse = plan.some((step) => step.name === "collapse-worktree-layout");
   const retiresRunWakes = plan.some((step) => step.name === "notification-only-wakes");
   const changesVerification = plan.some(step => step.name === "advisory-and-verification-policy");
-  if (!relocatesUnify && !relocatesCollapse && !retiresRunWakes && !changesVerification) return null;
+  const changesInput = plan.some(step => step.name === "current-input-contract");
+  if (!relocatesUnify && !relocatesCollapse && !retiresRunWakes && !changesVerification && !changesInput) return null;
 
   type MigrationBlocker = UnifyHomePreflightBlocker | CollapseWorktreePreflightBlocker;
   let blockers: MigrationBlocker[];
@@ -576,6 +578,7 @@ function preflightMigrationBlockers(
       if (relocatesCollapse) blockers.push(...preflightCollapseWorktreeLayout(database).blockers);
       if (retiresRunWakes) preflightNotificationOnlyWakes(database);
       if (changesVerification) preflightVerificationPolicy(database);
+      if (changesInput) preflightCurrentInputContract(database);
     } finally {
       database.close();
     }

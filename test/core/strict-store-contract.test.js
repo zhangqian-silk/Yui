@@ -13,6 +13,8 @@ import { FileSchedulerStoreAdapter } from "../../dist/controller/fileSchedulerSt
 import { processActiveRoleRunDeliveries } from "../../dist/scheduler/activeRoleRunDelivery.js";
 import { buildTaskExecutionProjection } from "../../dist/scheduler/taskExecutionProjection.js";
 import { enqueueWork } from "../../dist/coordination/workMailboxQueue.js";
+import { AgentRuntimeObserver } from "../../dist/controller/agentRuntimeObserver.js";
+import { runConfigCommand } from "../../dist/commands/configCommands.js";
 
 test("missing authoritative reads cannot become empty evidence or authorize Provider delivery", async t => {
   const home = mkdtempSync(join(tmpdir(), "yui-strict-store-"));
@@ -46,4 +48,14 @@ test("missing authoritative reads cannot become empty evidence or authorize Prov
     getWorkMailbox: () => null, saveWorkMailbox: () => { saved = true; }
   }, { kind: "task", taskId: task.id }, "user-message", at), /getTask/);
   assert.equal(saved, false, "Missing archive authority cannot admit a queued signal.");
+  await assert.rejects(new AgentRuntimeObserver({
+    listTasks: () => assert.fail("A missing hot-set index must not select the full-scan path.")
+  }, {}).sample(at), /listActiveTaskIds/);
+  const config = store.getConfig();
+  const getAgent = store.getConfiguredAgent;
+  store.getConfiguredAgent = undefined;
+  try {
+    assert.throws(() => runConfigCommand("system", ["set", "default-agent", "missing"], store), /getConfiguredAgent/);
+    assert.deepEqual(store.getConfig(), config, "Missing Agent evidence cannot authorize config mutation.");
+  } finally { store.getConfiguredAgent = getAgent; }
 });
