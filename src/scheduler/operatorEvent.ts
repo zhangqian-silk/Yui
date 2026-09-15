@@ -22,7 +22,7 @@ export function enqueueOperatorEvent(
   reason: string,
   now: Date
 ): void {
-  if (store.getTask?.(event.taskId)?.status === "archived") return;
+  if (store.getTask(event.taskId)?.status === "archived") return;
   enqueueWork(store, { kind: "operator" }, reason, now, [
     { type: "event", taskId: event.taskId, id: event.id }
   ], {
@@ -39,7 +39,7 @@ export function routeRoleEvent(
   reason: string,
   now: Date
 ): void {
-  if (store.getTask?.(event.taskId)?.status === "archived") return;
+  if (store.getTask(event.taskId)?.status === "archived") return;
   if (roleName === "leader") {
     enqueueOperatorEvent(store, event, reason, now);
     return;

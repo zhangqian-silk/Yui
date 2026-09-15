@@ -5,7 +5,7 @@ import type { AgentRun } from "../agentRun/agentRun.js";
 import { runtimeObservationFromTaskEvent } from "../runtime/runtimeObservation.js";
 import type { ProviderTurnStatus } from "../runtime/providerRuntimeIdentity.js";
 import { providerRetryProjection } from "../runtime/providerRetry.js";
-import type { Role } from "../role/role.js";
+import type { TaskStore } from "../storage/taskStore.js";
 import { taskOwnsManagedWorkspace, type Task, type TaskStatus } from "../task/task.js";
 import type { TaskBrief } from "../brief/taskBrief.js";
 import type { PendingWakeup } from "./pendingWakeup.js";
@@ -143,30 +143,12 @@ export type TaskExecutionProjection = Readonly<{
 }>;
 
 /** The small read-only source needed to fold a Task projection. */
-export type TaskExecutionReadStore = Readonly<{
-  getTask?(taskId: string): Task | null;
-  getTaskBrief?(taskId: string): TaskBrief | null;
-  listRoles?(taskId: string): readonly Role[];
-  listRuns?(taskId: string): readonly AgentRun[];
-  listWorkItems?(taskId: string): readonly WorkItem[];
-  listInputRequests?(taskId: string): readonly InputRequest[];
-  listReviewRounds?(taskId: string): readonly ReviewRound[];
-  listChangeSets?(taskId: string): readonly ChangeSet[];
-  listIntegrationAttempts?(taskId: string): readonly IntegrationAttempt[];
-  listEvents?(taskId: string): readonly TaskEvent[];
-  getWorkMailbox?(target: WorkMailbox["target"]): WorkMailbox | null;
-  getPendingWakeup?(taskId: string): PendingWakeup | null;
-  getLeaderFailure?(taskId: string): LeaderFailure | null;
-  getRoleSession?(taskId: string, roleName: string, agentId?: string): Readonly<{
-    agentId: string;
-    adapterId: string;
-    nativeSessionId?: string;
-    status?: string;
-  }> | null;
-  getTaskRoleSessionSet?(taskId: string, roleName: string): import("../executor/agentExecutor.js").TaskRoleSessionSet | null;
-  getConfig?(): Readonly<{ runtimeHealth?: unknown }>;
-  listContextSnapshots?(taskId: string): readonly ContextSnapshot[];
-}>;
+export type TaskExecutionReadStore = Pick<TaskStore,
+  | "getTask" | "getTaskBrief" | "listRoles" | "listRuns" | "listWorkItems"
+  | "listInputRequests" | "listReviewRounds" | "listChangeSets" | "listIntegrationAttempts"
+  | "listEvents" | "getWorkMailbox" | "getPendingWakeup" | "getLeaderFailure"
+  | "getRoleSession" | "getTaskRoleSessionSet" | "getConfig" | "listContextSnapshots"
+>;
 
 type TaskExecutionTask = Readonly<Pick<
   Task,
@@ -218,27 +200,28 @@ export type TaskExecutionFacts = Readonly<{
 export function buildTaskExecutionProjection(
   store: TaskExecutionReadStore,
   taskId: string,
-  taskOverride?: TaskExecutionTask,
   now = new Date()
 ): TaskExecutionProjection | null {
-  const task = store.getTask?.(taskId) ?? taskOverride ?? null;
+  const task = store.getTask(taskId);
   if (task === null) return null;
-  const roles = store.listRoles?.(taskId) ?? [];
-  const events = store.listEvents?.(taskId) ?? [];
-  const usageRuns = store.listRuns?.(taskId) ?? [];
+  const roles = store.listRoles(taskId);
+  const events = store.listEvents(taskId);
+  const usageRuns = store.listRuns(taskId);
+  const workItems = store.listWorkItems(taskId);
+  const reviewRounds = store.listReviewRounds(taskId);
   const runs = operationalTaskRecords(
     usageRuns,
     events,
     "run"
   );
-  const leaderMailbox = store.getWorkMailbox?.({
+  const leaderMailbox = store.getWorkMailbox({
     kind: "role",
     taskId,
     roleName: "leader"
-  }) ?? null;
+  });
   const roleSessions = roles.flatMap((role) => {
-    const session = store.getRoleSession?.(taskId, role.name);
-    return session === null || session === undefined
+    const session = store.getRoleSession(taskId, role.name);
+    return session === null
       ? []
       : [{ roleName: role.name, ...session }];
   });
@@ -248,42 +231,28 @@ export function buildTaskExecutionProjection(
     runs,
     usageRuns,
     providerRetries: roles.flatMap(role => {
-      const retry = providerRetryProjection(store.getTaskRoleSessionSet?.(taskId, role.name)?.providerBinding);
+      const retry = providerRetryProjection(store.getTaskRoleSessionSet(taskId, role.name)?.providerBinding);
       return retry === null ? [] : [retry];
     }),
     runDelivery: Object.fromEntries(runs.map((run) => {
-      const observed = store.getTaskRoleSessionSet?.(taskId, run.roleName)?.providerBinding?.run;
+      const observed = store.getTaskRoleSessionSet(taskId, run.roleName)?.providerBinding?.run;
       return [run.id, observed?.runId === run.id ? observed.status : "unobserved"];
     })),
-    executionGroups: store.listWorkItems === undefined && store.listReviewRounds === undefined
-      ? []
-      : collectExecutionGroups(
-          store.listWorkItems?.(taskId) ?? [],
-          store.listReviewRounds?.(taskId) ?? [],
-          runs
-        ),
-    workItems: store.listWorkItems?.(taskId) ?? [],
-    ...(store.listContextSnapshots === undefined
-      ? {}
-      : { contextSnapshots: store.listContextSnapshots(taskId) }),
-    inputRequests: store.listInputRequests?.(taskId) ?? [],
-    ...(store.listReviewRounds === undefined
-      ? {}
-      : { reviewRounds: store.listReviewRounds(taskId) }),
-    ...(store.listChangeSets === undefined
-      ? {}
-      : { changeSets: store.listChangeSets(taskId) }),
-    ...(store.listIntegrationAttempts === undefined
-      ? {}
-      : { integrations: store.listIntegrationAttempts(taskId) }),
-    ...(store.listEvents === undefined ? {} : { events }),
-    ...(store.getTaskBrief === undefined ? {} : { brief: store.getTaskBrief(taskId) }),
-    pendingWakeup: store.getPendingWakeup?.(taskId) ?? null,
+    executionGroups: collectExecutionGroups(workItems, reviewRounds, runs),
+    workItems,
+    contextSnapshots: store.listContextSnapshots(taskId),
+    inputRequests: store.listInputRequests(taskId),
+    reviewRounds,
+    changeSets: store.listChangeSets(taskId),
+    integrations: store.listIntegrationAttempts(taskId),
+    events,
+    brief: store.getTaskBrief(taskId),
+    pendingWakeup: store.getPendingWakeup(taskId),
     leaderMailbox,
-    leaderFailure: store.getLeaderFailure?.(taskId) ?? null,
+    leaderFailure: store.getLeaderFailure(taskId),
     roleSessions,
     now,
-    runtimeHealthPolicy: resolveRuntimeHealth(store.getConfig?.().runtimeHealth)
+    runtimeHealthPolicy: resolveRuntimeHealth(store.getConfig().runtimeHealth)
   });
 }
 

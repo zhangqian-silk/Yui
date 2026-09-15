@@ -55,7 +55,7 @@ export async function processOperatorInputNotifications(
           ? [{ kind: "input" as const, request }]
           : [];
       }
-      if (ref.type !== "event" || store.listEvents === undefined) return [];
+      if (ref.type !== "event") return [];
       const event = store.listEvents(ref.taskId).find(({ id }) => id === ref.id);
       return event === undefined ? [] : [{ kind: "event", event }];
     }

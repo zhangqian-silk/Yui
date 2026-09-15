@@ -56,9 +56,8 @@ export type WebDashboardStore = Pick<TaskStore,
   | "getLeaderFailure"
   | "getRoleSession"
   | "getConfig"
-> & Readonly<{
-  listEvents?: (taskId: string) => readonly TaskEvent[];
-}>;
+  | "listEvents"
+>;
 
 export function buildWebTaskDetail(
   store: WebDashboardStore,
@@ -77,7 +76,7 @@ export function buildWebTaskDetail(
       return name === undefined ? [] : [name];
     });
     const runs = reader.listRuns(taskId);
-    const events = reader.listEvents?.(taskId) ?? [];
+    const events = reader.listEvents(taskId);
     const retiredMessageIds = retiredTaskRecordIds(events, "message");
     const needsAttentionRuns = runs
       .filter((run) => run.status === "active" && isRoleRunStalled(events, run.id))
@@ -138,7 +137,7 @@ export function buildWebTaskDetail(
           && effectiveLaunch.sourceDesiredRevision !== role.launchRevision
       };
     });
-    const execution = buildTaskExecutionProjection(reader, taskId, task, now);
+    const execution = buildTaskExecutionProjection(reader, taskId, now);
     if (execution === null) return null;
     const remoteDelivery = webRemoteDelivery(reader, task);
     const workItems = reader.listWorkItems(taskId);
@@ -182,7 +181,7 @@ function webRemoteDelivery(
 ): TaskRemoteDelivery {
   return projectTaskRemoteDelivery({
     task,
-    events: reader.listEvents?.(task.id) ?? [],
+    events: reader.listEvents(task.id),
     publications: reader.listPublicationReferences(task.id),
     managedWorkspaces: reader.listManagedWorkspaces(task.id),
     runs: reader.listRuns(task.id),

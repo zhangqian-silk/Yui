@@ -137,7 +137,7 @@ export async function reconcileExitedRoleRuns(
 
       const hostExit = batchSnapshot.hostExits.get(`${task.id}\0${role.name}`);
       if (hostExit !== undefined) {
-        store.saveRoleHostExitObservation?.({
+        store.saveRoleHostExitObservation({
           taskId: task.id,
           roleName: role.name,
           runId: run.id,

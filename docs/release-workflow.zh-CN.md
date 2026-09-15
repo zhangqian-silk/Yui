@@ -24,7 +24,7 @@ Agent 选择一个预先声明的计划，设施从持久状态驱动该计划�
 
 当前开发步骤先清退运行时兼容分支，尚未执行最终 1.0 基线切换，也不发布版本或重置
 存储编号。存储 `27→28` 只规范化可明确识别的单条 Role 调度去重键，旧迁移账本、
-Message、Task 结果和不确定外部效果保持不变。普通打开要求存储 31；已有 Home 只通过
+Message、Task 结果和不确定外部效果保持不变。普通打开要求存储 32；已有 Home 只通过
 显式升级入口前进，不增加运行时双读。
 
 这是一次 1.0 前的破坏性变更：
@@ -57,6 +57,14 @@ Message、Task 结果和不确定外部效果保持不变。普通打开要求�
 
 存储 `30→31` 将 Review scope 统一为显式值：有效旧 WorkItem Review 的缺失／null
 scope 转为 `work-item`，Task-final 候选证据和原迁移账本不变。新建和重试均显式写入 scope。
+
+存储 `31→32` 从当前 WorkItem 移除 `historicalState`，移除前将完整原始 payload
+原样保存在 `work-item.execution-state-retired` Task 事件。当前状态、工作范围、
+Candidate 和执行组不变，不生成 Run 或验收。未知历史形态会报错，记录和迁移账本不前进。
+
+Scheduler 核心读取和持久化操作成为必需接口，缺少 Session／Event 读取不再被当作
+空证据，也不能跳过错误持久化。执行及 Web 投影直接读取当前 Store；
+消息入队必须读取 Task 生命周期。精确投递结算仍独立，不增加会丢失迟到证据的归档门槛。
 
 Task 列表及 `/api/dashboard` 只保留有界目录；调用方去掉 `--view compact`，
 详情使用单 Task 读取。Scheduler 目录索引是必需接口，不再兼容缺失时的全量扫描。

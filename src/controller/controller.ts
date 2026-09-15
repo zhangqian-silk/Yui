@@ -555,10 +555,7 @@ async function processSelectedRoleRuntimeCleanups(
             `Role runtime cleanup could not confirm the host stopped: ${runtimeOwnerLabel(owner)}.`
           );
         }
-        if (
-          store.completeRuntimeCleanup === undefined
-          || !store.completeRuntimeCleanup(target, now)
-        ) {
+        if (!store.completeRuntimeCleanup(target, now)) {
           throw new Error(
             `Role runtime cleanup mailbox changed: ${runtimeOwnerLabel(owner)}.`
           );
@@ -876,7 +873,7 @@ async function adoptReleasedTaskActivations(
     // Its durable activation intent is sufficient once the exact native input
     // is settled. Never create a synthetic Run merely to release that intent.
     if (store.getActiveRun(taskId, "leader") !== null) continue;
-    const provider = store.getTaskRoleSessionSet?.(taskId, "leader")?.providerBinding;
+    const provider = store.getTaskRoleSessionSet(taskId, "leader")?.providerBinding;
     if (provider?.run != null
       && ["submitting", "accepted", "delivery-unknown"].includes(provider.run.status)) continue;
     try {

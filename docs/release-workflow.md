@@ -33,7 +33,7 @@ The current development step retires runtime compatibility before the final
 1.0 baseline cutover. It does not publish a release or reset storage numbering.
 Storage 27→28 normalizes only provable singleton Role dispatch dedupe keys;
 the old migration ledger, Messages, Task results and unconfirmed effects remain
-unchanged. Ordinary opens require storage 31. Existing Homes advance only through
+unchanged. Ordinary opens require storage 32. Existing Homes advance only through
 the explicit upgrade boundary; no runtime dual-reader is added.
 
 This is a breaking pre-1.0 change:
@@ -76,6 +76,18 @@ stop execution or fabricate acceptance. Global Session sets use an explicit
 Storage 30→31 makes every Review's scope explicit. Missing/null scope in a valid
 older WorkItem Review becomes `work-item`; Task-final candidate evidence and
 the old ledger are unchanged. New and retried Reviews always write their scope.
+
+Storage 31→32 removes WorkItem `historicalState` from the current record.
+Before removal, the entire original payload is preserved verbatim in a
+`work-item.execution-state-retired` Task event. Current status, scope, Candidates
+and execution groups are unchanged; no Run or acceptance is created. Unrecognized
+historical shapes fail without changing the record or advancing the ledger.
+
+Core Scheduler readers and persistence operations are required ports. A missing
+Session/event reader cannot be interpreted as empty evidence or skipped error
+persistence. Task execution and Web projections read the current store directly;
+queue admission requires its Task lifecycle read. Exact dispatch settlement
+remains separate and does not gain an archive gate that could lose late evidence.
 
 Task listing and `/api/dashboard` now expose only the bounded catalog; remove
 `--view compact` from callers and use per-Task reads for detail. Scheduler

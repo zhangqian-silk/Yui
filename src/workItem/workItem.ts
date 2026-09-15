@@ -140,8 +140,6 @@ export type WorkItem = {
   endedAt?: string;
   acceptedCandidateId?: string;
   currentCandidateId?: string;
-  /** Migration-only diagnostic capture of the previous execution-shaped state. */
-  historicalState?: Readonly<{ status: string; outcome?: string; endedAt?: string }>;
 };
 
 export type WorkItemDefinitionUpdate = Readonly<{
@@ -553,8 +551,7 @@ export function validateWorkItem(workItem: WorkItem): WorkItem {
     "updatedAt",
     "endedAt",
     "acceptedCandidateId",
-    "currentCandidateId",
-    "historicalState"
+    "currentCandidateId"
   ], "WorkItem");
   if (workItem.schemaVersion !== 15) throw new Error("WorkItem must use schemaVersion 15.");
   validateTaskRecordReference({ taskId: workItem.taskId, localId: workItem.id }, "workItem");
@@ -628,14 +625,6 @@ export function validateWorkItem(workItem: WorkItem): WorkItem {
   }
   if (workItem.currentCandidateId !== undefined
     && !candidateIds.has(workItem.currentCandidateId)) throw new Error("Current Candidate is missing.");
-  if (workItem.historicalState !== undefined) {
-    const historical = workItem.historicalState;
-    if (!["pending", "running", "awaiting_acceptance", "completed", "failed", "retired"].includes(historical.status)) {
-      throw new Error("Historical Work Item status is invalid.");
-    }
-    if (historical.outcome !== undefined) requireText(historical.outcome, "Historical outcome");
-    if (historical.endedAt !== undefined) requireTimestamp(historical.endedAt, "Historical endedAt");
-  }
   if (workItem.outcome !== undefined) requireText(workItem.outcome, "Work item outcome");
   requireTimestamp(workItem.createdAt, "Work Item createdAt");
   requireTimestamp(workItem.updatedAt, "Work Item updatedAt");

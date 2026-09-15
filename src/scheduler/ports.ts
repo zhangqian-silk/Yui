@@ -294,7 +294,7 @@ export interface SchedulerStorePort {
     taskIds?: ReadonlySet<string>
   ): readonly AutoResolvedInput[];
   /** Persist exact tmux remain-on-exit evidence before rebuilding an Agent Host. */
-  saveRoleHostExitObservation?(input: Readonly<{
+  saveRoleHostExitObservation(input: Readonly<{
     taskId: string;
     roleName: string;
     runId: string;
@@ -308,24 +308,20 @@ export interface SchedulerStorePort {
     agentId?: string
   ): SchedulerRoleSession | null;
   /** Read-only Session projection used by orchestration observability. */
-  getTaskRoleSessionSet?(
+  getTaskRoleSessionSet(
     taskId: string,
     roleName: string
   ): import("../executor/agentExecutor.js").TaskRoleSessionSet | null;
   /** Immutable runtime facts used by the low-frequency stall projection. */
-  listEvents?(taskId: string): readonly TaskEvent[];
-  /**
-   * Optional durable-record reads used by the actionability projection
-   * (Issue 05). Absent implementations fall back to an empty family, which
-   * yields a coarser digest; the fail-open rule covers computation errors.
-   */
-  listRuns?(taskId: string): readonly SchedulerRun[];
-  listWorkItems?(taskId: string): readonly import("../workItem/workItem.js").WorkItem[];
-  listReviewRounds?(taskId: string): readonly import("../review/reviewRound.js").ReviewRound[];
-  listIntegrationAttempts?(taskId: string): readonly import("../integration/integrationAttempt.js").IntegrationAttempt[];
-  listDurableJobs?(taskId: string): readonly import("../job/durableJob.js").DurableJob[];
-  listInputRequests?(taskId: string): readonly import("../input/inputRequest.js").InputRequest[];
-  listMessages?(taskId: string): readonly import("../message/message.js").TaskMessage[];
+  listEvents(taskId: string): readonly TaskEvent[];
+  /** Required authoritative reads; an unavailable reader is not an empty family. */
+  listRuns(taskId: string): readonly SchedulerRun[];
+  listWorkItems(taskId: string): readonly import("../workItem/workItem.js").WorkItem[];
+  listReviewRounds(taskId: string): readonly import("../review/reviewRound.js").ReviewRound[];
+  listIntegrationAttempts(taskId: string): readonly import("../integration/integrationAttempt.js").IntegrationAttempt[];
+  listDurableJobs(taskId: string): readonly import("../job/durableJob.js").DurableJob[];
+  listInputRequests(taskId: string): readonly import("../input/inputRequest.js").InputRequest[];
+  listMessages(taskId: string): readonly import("../message/message.js").TaskMessage[];
   /** Current fold of WorkItem/Review/Integration progress for a AgentRun. */
   getRunDurableProgress(taskId: string, roleName: string, runId: string): SchedulerRunProgress | null;
   /**
@@ -334,13 +330,13 @@ export interface SchedulerStorePort {
    */
   getRunProgressFacts(taskId: string, runId: string): AgentRunProgressFacts | undefined;
   /** Materializes a newly observed related-record fold as one turn.progress fact. */
-  recordRoleRunProgress?(input: RoleRunProgressPersistence): "recorded" | "already-recorded" | "state-changed";
+  recordRoleRunProgress(input: RoleRunProgressPersistence): "recorded" | "already-recorded" | "state-changed";
   /** Closes one coalesced read-only runtime diagnostic window. */
-  recordRoleRunDiagnostic?(input: RoleRunDiagnosticPersistence): "recorded" | "already-recorded" | "state-changed";
+  recordRoleRunDiagnostic(input: RoleRunDiagnosticPersistence): "recorded" | "already-recorded" | "state-changed";
   /** Atomically records one advisory no-progress episode. */
-  recordRoleRunStall?(input: RoleRunStallPersistence): "raised" | "already-raised" | "state-changed";
+  recordRoleRunStall(input: RoleRunStallPersistence): "raised" | "already-raised" | "state-changed";
   /** Exact durable Provider writer; human/unknown ownership blocks Controller writes. */
-  getProviderAuthorityFence?(input: Readonly<{
+  getProviderAuthorityFence(input: Readonly<{
     taskId: string;
     roleName: string;
     runId: string;
@@ -376,7 +372,7 @@ export interface SchedulerStorePort {
    * After a successful targeted stop, atomically clears both a launch
    * reservation and every coalesced cleanup request in its dedicated lane.
    */
-  completeRuntimeCleanup?(
+  completeRuntimeCleanup(
     target: Extract<
       MailboxTarget,
       { kind: "role-runtime" | "global-role-runtime" }
@@ -384,28 +380,28 @@ export interface SchedulerStorePort {
     now: Date
   ): boolean;
   /** Queues durable owner cleanup, optionally fenced by one dormant Session fact. */
-  enqueueRuntimeCleanup?(
+  enqueueRuntimeCleanup(
     owner: RuntimeRoleOwner,
     now?: Date,
     expectedDormantCandidate?: DormantRuntimeOwnerCandidate
   ): RuntimeLifecycleTarget | null;
   /** Queues physical Host cleanup while preserving its resumable Session. */
-  enqueueRuntimeHostDetach?(
+  enqueueRuntimeHostDetach(
     owner: RuntimeRoleOwner,
     now?: Date,
     expectedDormantCandidate?: DormantRuntimeOwnerCandidate
   ): RuntimeLifecycleTarget | null;
   /** Non-stopped native sessions with no active Task AgentRun or lifecycle work. */
-  listDormantRuntimeOwners?(): readonly DormantRuntimeOwnerCandidate[];
+  listDormantRuntimeOwners(): readonly DormantRuntimeOwnerCandidate[];
   /**
    * Current non-stopped Role Sessions from a storage-owned hot projection.
    * Historical RoleSessionSets must never be scanned to answer this query.
    */
-  listRuntimeSessionCandidates?(
+  listRuntimeSessionCandidates(
     query?: RuntimeSessionCandidateQuery
   ): readonly RuntimeSessionCandidate[];
   /** Persists one provider-neutral failure fact and wakes the responsible Agent. */
-  recordAgentError?(input: Readonly<{
+  recordAgentError(input: Readonly<{
     taskId: string;
     roleName: string;
     runId: string;
@@ -433,13 +429,13 @@ export interface SchedulerStorePort {
   getPendingWakeup(taskId: string): PendingWakeup | null;
   listPendingWakeups(): readonly PendingWakeup[];
   /** Atomically appends one Leader signal without a read/merge/write race. */
-  enqueueLeaderWakeup?(taskId: string, reason: string, now: Date): PendingWakeup | null;
+  enqueueLeaderWakeup(taskId: string, reason: string, now: Date): PendingWakeup | null;
   /**
    * Atomically releases a stranded Leader execution and appends its recovery
    * signal. This prevents a concurrent signal from being lost between those
    * two mailbox transitions.
    */
-  releaseLeaderWakeupAndEnqueue?(
+  releaseLeaderWakeupAndEnqueue(
     taskId: string,
     batchId: string,
     reason: string,
@@ -452,15 +448,15 @@ export interface SchedulerStorePort {
    * (the Role runtime lifecycle lane was busy). The wake stays durable and
    * is retried after the lane settles.
    */
-  recordWakeSuppression?(taskId: string, reason: string, now: Date): void;
+  recordWakeSuppression(taskId: string, reason: string, now: Date): void;
 
   getLeaderFailure(taskId: string): LeaderFailure | null;
   getTaskBrief(taskId: string): TaskBrief | null;
   listDecisions(taskId: string): readonly Decision[];
   listMilestones(taskId: string): readonly Milestone[];
   claimLeaderNotification(taskId: string, now: Date): LeaderNotification | null;
-  prepareMessageContinuations?(taskId: string, now: Date): void;
-  prepareDraftPlanning?(taskId: string, now: Date): boolean;
+  prepareMessageContinuations(taskId: string, now: Date): void;
+  prepareDraftPlanning(taskId: string, now: Date): boolean;
   settleLeaderNotification(taskId: string, attemptId: string,
     outcome: "accepted" | "deferred" | "rejected" | "unknown", now: Date, detail?: string): void;
   /** Persist a fixed Session discovered while preparing an undelivered AgentRun. */

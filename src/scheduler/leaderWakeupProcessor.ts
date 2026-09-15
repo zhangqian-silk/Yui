@@ -41,10 +41,10 @@ export async function processLeaderWakeups(
       && now.getTime() - Date.parse(wakeup.firstRequestedAt) < LEADER_WAKE_AGGREGATION_MS) {
       results.push({ ...base, status: "skipped", reason: "aggregating" }); continue;
     }
-    if (task.status === "draft" && store.prepareDraftPlanning?.(task.id, now)) {
+    if (task.status === "draft" && store.prepareDraftPlanning(task.id, now)) {
       results.push({ ...base, status: "skipped", reason: "not-ready" }); continue;
     }
-    const sessions = store.getTaskRoleSessionSet?.(task.id, role.name) ?? null;
+    const sessions = store.getTaskRoleSessionSet(task.id, role.name);
     const provider = sessions?.providerBinding;
     if (providerRetryPending(provider)) {
       results.push({ ...base, status: "skipped", reason: "not-ready" }); continue;

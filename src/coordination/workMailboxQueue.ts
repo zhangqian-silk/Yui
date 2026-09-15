@@ -14,8 +14,10 @@ import {
 export type WorkMailboxQueueStore = Readonly<{
   getWorkMailbox(target: MailboxTarget): WorkMailbox | null;
   saveWorkMailbox(mailbox: WorkMailbox): void;
-  getTask?(taskId: string): Readonly<{ status: string }> | null;
+  getTask(taskId: string): Readonly<{ status: string }> | null;
 }>;
+
+type WorkMailboxSettlementStore = Pick<WorkMailboxQueueStore, "getWorkMailbox" | "saveWorkMailbox">;
 
 export type RoleRunDispatchIdentity = Readonly<{
   taskId: string;
@@ -49,7 +51,7 @@ export function enqueueWork(
   // Archive is an admission boundary, not an acknowledgement of old input.
   // Runtime cleanup mailboxes remain usable for exact-owner recovery.
   if ((target.kind === "task" || target.kind === "role")
-    && store.getTask?.(target.taskId)?.status === "archived") return mailbox;
+    && store.getTask(target.taskId)?.status === "archived") return mailbox;
   const queued = enqueueSignal(mailbox, {
     reason,
     refs,
@@ -137,7 +139,7 @@ export function captureRoleRunDispatch(
  * normal boundary; terminalization uses the same exact dispatch identity.
  */
 export function settleRoleRunDispatch(
-  store: WorkMailboxQueueStore,
+  store: WorkMailboxSettlementStore,
   input: RoleRunDispatchIdentity,
   expected?: RoleRunDispatchToken | null
 ): RoleRunDispatchSettlement {
@@ -166,7 +168,7 @@ export function settleRoleRunDispatch(
 
 /** Completes only the batch owned by the matching durable execution. */
 export function completeWorkExecution(
-  store: WorkMailboxQueueStore,
+  store: WorkMailboxSettlementStore,
   target: MailboxTarget,
   executionRef: MailboxEntityRef
 ): boolean {
@@ -193,7 +195,7 @@ export function completeWorkExecution(
  * durable work stuck in `processing` after the AgentRun has already ended.
  */
 export function requireCompleteWorkExecution(
-  store: WorkMailboxQueueStore,
+  store: WorkMailboxSettlementStore,
   target: MailboxTarget,
   executionRef: MailboxEntityRef
 ): void {
@@ -225,7 +227,7 @@ export function requireCompleteWorkExecution(
  * recoverable.
  */
 export function settleExactWorkExecution(
-  store: WorkMailboxQueueStore,
+  store: WorkMailboxSettlementStore,
   target: MailboxTarget,
   executionRef: MailboxEntityRef
 ): "processing" | "pending" | "absent" {

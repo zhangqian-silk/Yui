@@ -285,9 +285,8 @@ export function currentRoleRunProgressAt(
 }
 
 /**
- * Computes the current semantic progress fence for an exact AgentRun. The optional
- * related-record readers add Work/Review/Integration evidence to the AgentRun and
- * event facts used by on-demand projections.
+ * Computes the current semantic progress fence for an exact AgentRun from
+ * required Work/Review/Integration readers and the AgentRun's event facts.
  */
 export function latestRunDurableProgressAt(
   store: Readonly<{
@@ -299,21 +298,21 @@ export function latestRunDurableProgressAt(
       workItemId?: string;
     }> | null;
     listEvents(taskId: string): readonly TaskEvent[];
-    getWorkItem?(taskId: string, workItemId: string): Readonly<{
+    getWorkItem(taskId: string, workItemId: string): Readonly<{
       updatedAt: string;
       candidates?: readonly Readonly<{ createdAt: string }>[];
     }> | null;
-    listReviewRounds?(taskId: string): readonly Readonly<{
+    listReviewRounds(taskId: string): readonly Readonly<{
       workItemId?: string;
       createdAt: string;
       endedAt?: string;
     }>[];
-    listChangeSets?(taskId: string): readonly Readonly<{
+    listChangeSets(taskId: string): readonly Readonly<{
       workItemId: string;
       createdAt: string;
       id: string;
     }>[];
-    listIntegrationAttempts?(taskId: string): readonly Readonly<{
+    listIntegrationAttempts(taskId: string): readonly Readonly<{
       updatedAt: string;
       source: Readonly<
         | { kind: "work-item"; workItemId: string }
@@ -321,7 +320,7 @@ export function latestRunDurableProgressAt(
         | { kind: "historical-change-sets" }
       >;
     }>[];
-    listInputRequests?(taskId: string): readonly Readonly<{
+    listInputRequests(taskId: string): readonly Readonly<{
       updatedAt: string;
       requester: Readonly<{ runId?: string }>;
       blockedRefs: readonly Readonly<{ type: string; id: string }>[];
@@ -353,24 +352,20 @@ export function latestRunDurableProgressAt(
     return { progressAt: baseline };
   }
 
-  const workItem = store.getWorkItem?.(taskId, run.workItemId) ?? null;
-  const reviewRounds = store.listReviewRounds?.(taskId)
-    .filter(({ workItemId }) => workItemId === run.workItemId)
-    ?? [];
-  const changeSets = store.listChangeSets?.(taskId)
-    .filter(({ workItemId }) => workItemId === run.workItemId)
-    ?? [];
-  const integrations = store.listIntegrationAttempts?.(taskId)
+  const workItem = store.getWorkItem(taskId, run.workItemId);
+  const reviewRounds = store.listReviewRounds(taskId)
+    .filter(({ workItemId }) => workItemId === run.workItemId);
+  const changeSets = store.listChangeSets(taskId)
+    .filter(({ workItemId }) => workItemId === run.workItemId);
+  const integrations = store.listIntegrationAttempts(taskId)
     .filter(({ source }) => (
       source.kind === "work-item" && source.workItemId === run.workItemId
-    ))
-    ?? [];
-  const inputProgress = store.listInputRequests?.(taskId)
+    ));
+  const inputProgress = store.listInputRequests(taskId)
     .filter((request) => (
       request.requester.runId === run.id
       || request.blockedRefs.some((ref) => ref.type === "run" && ref.id === run.id)
-    ))
-    ?? [];
+    ));
   const related = [
     workItem?.updatedAt,
     ...reviewRounds.map(({ endedAt, createdAt }) => endedAt ?? createdAt),
@@ -631,7 +626,6 @@ export async function reconcileStalledRoleRuns(
   // reconcile owns the all-active-AgentRun scan; dirty passes may still route the
   // existing mailbox work without manufacturing another episode.
   if (selection !== undefined && !selection.full) return [];
-  if (store.recordRoleRunStall === undefined) return [];
   // A Draft planning Turn can stall exactly like any other admitted Turn, so it
   // is selected here too; the episode stays diagnostic-only either way.
   const candidates = selectedActiveSchedulerTasks(store, selection, {
@@ -656,7 +650,7 @@ export async function reconcileStalledRoleRuns(
   const diagnosticEvents = (taskId: string): readonly TaskEvent[] => {
     const existing = eventsByTask.get(taskId);
     if (existing !== undefined) return existing;
-    const events = store.listEvents?.(taskId) ?? [];
+    const events = store.listEvents(taskId);
     eventsByTask.set(taskId, events);
     return events;
   };
@@ -689,7 +683,7 @@ export async function reconcileStalledRoleRuns(
   const diagnosticStartedAt = now.toISOString();
   const finishDiagnostics = (outcome: "observed" | "observation-error"): void => {
     for (const { task, role, run } of stallCandidates) {
-      store.recordRoleRunDiagnostic?.({
+      store.recordRoleRunDiagnostic({
         taskId: task.id,
         roleName: role.name,
         runId: run.id,
@@ -923,7 +917,7 @@ export async function reconcileStalledRoleRuns(
       // A new semantic progress point closes the previous episode first. It
       // may itself already be older than the window, in which case the same
       // pass records the next AgentRun+progressAt episode below.
-      store.recordRoleRunProgress?.({
+      store.recordRoleRunProgress({
         taskId: candidate.task.id,
         roleName: candidate.role.name,
         runId: candidate.run.id,
@@ -995,7 +989,7 @@ export async function reconcileStalledRoleRuns(
       previous !== undefined
       && Date.parse(progressAt) > Date.parse(previous.progressAt)
     ) {
-      store.recordRoleRunProgress?.({
+      store.recordRoleRunProgress({
         taskId: candidate.task.id,
         roleName: candidate.role.name,
         runId: candidate.run.id,
@@ -1141,7 +1135,7 @@ function latestLeaderActionProgressAt(
   if (!Number.isFinite(startedMs)) return "";
   let latest = startedAt;
   let latestMs = startedMs;
-  for (const event of store.listEvents?.(taskId) ?? []) {
+  for (const event of store.listEvents(taskId)) {
     if (!LEADER_ACTION_PROGRESS_TYPES.has(event.type)) continue;
     if (event.payload.taskId !== undefined && event.payload.taskId !== taskId) continue;
     if (!leaderActionEventMatches(event, taskId, runId, batch)) continue;

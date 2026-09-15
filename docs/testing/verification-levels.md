@@ -144,6 +144,10 @@ is required.
     without its database. Default CLI/HTTP discovery stays bounded and retains
     off-page Task detail; unknown writer leases diagnose without mutation.
     Review migration preserves candidate evidence while making scope explicit.
+29. Missing authoritative readers fail before Provider preparation or queue
+    admission instead of becoming empty evidence. WorkItem history retirement
+    preserves the original payload and current work, advances event IDs safely,
+    and refuses unknown old shapes without advancing the migration ledger.
 
 Keep the test phase seconds-scale; measure TypeScript build separately. Record
 incremental runtime when adding a critical regression. The seven recovery boundary

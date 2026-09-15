@@ -63,7 +63,7 @@ export function runTaskNextActionCommand(
     // read path cheap during execution.
     const facts = reader.readNextActionFacts(taskId);
     if (facts === null) throw taskNotFound(taskId);
-    const execution = buildTaskExecutionProjection(reader, taskId, undefined, now);
+    const execution = buildTaskExecutionProjection(reader, taskId, now);
     if (execution === null) throw taskNotFound(taskId);
     const actionFacts: NextActionFacts = {
       ...facts,

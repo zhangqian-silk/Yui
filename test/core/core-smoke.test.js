@@ -1045,6 +1045,7 @@ test("Role dispatch settlement preserves merged work and Leader wakes", () => {
   const workerTarget = { kind: "role", taskId: "task-1", roleName: "worker" };
   let workerMailbox = createWorkMailbox(workerTarget);
   const workerStore = {
+    getTask: () => ({ status: "active" }),
     getWorkMailbox: () => workerMailbox,
     saveWorkMailbox: (updated) => { workerMailbox = updated; }
   };
@@ -1123,6 +1124,7 @@ test("Role dispatch settlement preserves merged work and Leader wakes", () => {
 test("Reviewer availability ignores Role delivery residue", () => {
   const target = { kind: "role", taskId: "task-1", roleName: "reviewer" };
   const mailbox = enqueueRoleRunDispatch({
+    getTask: () => ({ status: "active" }),
     getWorkMailbox: () => createWorkMailbox(target),
     saveWorkMailbox: () => {}
   }, {
@@ -3434,7 +3436,7 @@ test("Controller begin-handover accepts a null fromReleaseId", async (t) => {
 
 test("production storage exposes one current version and one migration floor", () => {
   assert.equal(MIN_SUPPORTED_STORAGE_VERSION, 1);
-  assert.equal(CURRENT_STORAGE_VERSION, 31);
+  assert.equal(CURRENT_STORAGE_VERSION, 32);
   for (const retiredExport of [
     "FileTaskStore",
     "STORAGE_STATE_FILE",

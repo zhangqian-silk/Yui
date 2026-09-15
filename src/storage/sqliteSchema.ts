@@ -30,6 +30,7 @@ import { migrateAgentRunContract } from "./migrations/agentRunContract.js";
 import { migrateArtifactsToGit } from "./migrations/artifactsToGit.js";
 import { migrateIntegrationContinuation } from "./migrations/integrationContinuation.js";
 import { migrateNotificationOnlyWakes } from "./migrations/notificationOnlyWakes.js";
+import { migrateWorkItemHistory } from "./migrations/workItemHistory.js";
 import {
   UNIFY_HOME_LAYOUT_SQL,
   migrateUnifyHomeLayout
@@ -1426,6 +1427,13 @@ SET payload = json_set(payload, '$.scope', 'work-item')
 WHERE json_type(payload, '$.scope') IS NULL
    OR json_type(payload, '$.scope') = 'null';
 `
+  },
+  {
+    version: 32,
+    name: "work-item-history-as-events",
+    introducedIn: "0.16.0",
+    sql: "SELECT 1; -- Archive original WorkItem payloads before removing historicalState",
+    migrateData: migrateWorkItemHistory
   }
 ]);
 

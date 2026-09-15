@@ -70,7 +70,7 @@ export async function processActiveRoleRunDeliveries(
   for (const task of selectedActiveSchedulerTasks(store, selection, {
     includePlanningDrafts: true
   })) {
-    store.prepareMessageContinuations?.(task.id, now);
+    store.prepareMessageContinuations(task.id, now);
     for (const role of selectedSchedulerRoles(store, task.id, selection)) {
       const run = store.getActiveRun(task.id, role.name);
       if (run === null) continue;
@@ -106,7 +106,7 @@ async function deliverActiveRun(
     roleName: role.name,
     runId: run.id
   });
-  const sessionSet = store.getTaskRoleSessionSet?.(task.id, role.name) ?? null;
+  const sessionSet = store.getTaskRoleSessionSet(task.id, role.name);
   const binding = sessionSet?.providerBinding ?? null;
   if (binding?.retry !== undefined && (binding.retry.successorRunId === run.id
       || binding.retry.successorReviewRoundId !== undefined && binding.retry.successorReviewRoundId === run.reviewRoundId)
@@ -158,7 +158,7 @@ async function deliverActiveRun(
     // report. Keep the exact input fenced; never submit it again.
     return { ...base, status: "skipped", reason: "delivery-uncertain", error: reason };
   }
-  const lastSubmitError = (store.listEvents?.(task.id) ?? []).filter((event) =>
+  const lastSubmitError = store.listEvents(task.id).filter((event) =>
     event.type === "runtime.agent-error" && event.payload.runId === run.id
     && event.payload.roleName === role.name && event.payload.phase === "turn-submit").at(-1);
   if (currentProviderTurn === null && lastSubmitError?.payload.inputDisposition === "unknown") {
@@ -177,7 +177,7 @@ async function deliverActiveRun(
   // The first attempted admission may already have opened this fixed native
   // Session. A busy retry resumes it; it does not repeat the original launch.
   const preparedHere = existingSession?.nativeSessionId !== undefined
-    && (store.listEvents?.(task.id) ?? []).some((event) => event.type === "run.session-prepared"
+    && store.listEvents(task.id).some((event) => event.type === "run.session-prepared"
       && event.payload.runId === run.id && event.payload.nativeSessionId === existingSession.nativeSessionId);
   const mode = (currentProviderTurn?.status === "deferred" || preparedHere) && existingSession?.nativeSessionId !== undefined
     ? "resume" : run.mode;
@@ -257,7 +257,7 @@ async function deliverActiveRun(
     }
     if (outcome.status === "busy" || outcome.status === "unavailable") {
       if (outcome.status === "busy" && outcome.failure?.inputDisposition === "not-accepted") {
-        store.recordAgentError?.({ taskId: task.id, roleName: role.name, runId: run.id,
+        store.recordAgentError({ taskId: task.id, roleName: role.name, runId: run.id,
           source: "host", phase: "turn-submit", message: outcome.failure.detail,
           raw: outcome.failure.raw ?? serializeAgentErrorRaw(outcome.failure),
           inputDisposition: "not-accepted", ...providerDeliveryFailureFacts(outcome.failure),
@@ -282,7 +282,7 @@ async function deliverActiveRun(
         : formatProviderDeliveryFailure(failure);
       // This path is the common Provider write failure and previously left no
       // durable fact at all, so the cause was unrecoverable after the fact.
-      store.recordAgentError?.({
+      store.recordAgentError({
         taskId: task.id,
         roleName: role.name,
         runId: run.id,
@@ -316,7 +316,7 @@ async function deliverActiveRun(
     const message = error instanceof Error ? error.message : String(error);
     // Preserve the structured cause alongside the readable diagnosis.
     const causeName = innermostCauseName(error);
-    store.recordAgentError?.({
+    store.recordAgentError({
       taskId: task.id,
       roleName: role.name,
       runId: run.id,
