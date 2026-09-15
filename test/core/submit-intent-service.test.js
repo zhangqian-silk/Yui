@@ -12,19 +12,21 @@ import {
 } from "../../dist/commands/taskCommands.js";
 import { activateTask, createTask } from "../../dist/task/task.js";
 import { stopTaskExecutionCommand } from "../../dist/commands/taskExecutionCommands.js";
-import { admitStoredTaskActivation } from "../../dist/task/taskActivationService.js";
+import { admitStoredTaskActivation, cancelTaskActivation } from "../../dist/task/taskActivationService.js";
 import { createConfiguredAgent } from "../../dist/agent/agent.js";
-import { createGlobalRole, createRoleAgentBinding } from "../../dist/role/role.js";
+import { createGlobalRole, createRole, createRoleAgentBinding } from "../../dist/role/role.js";
 import { sanitizedTestEnv } from "../helpers/sanitizedEnv.mjs";
 import { pendingCompletionMessages } from "../../dist/task/completionReadiness.js";
 import { enqueueWork } from "../../dist/coordination/workMailboxQueue.js";
+import { FileSchedulerStoreAdapter } from "../../dist/controller/fileSchedulerStoreAdapter.js";
+import { processLeaderWakeups } from "../../dist/scheduler/leaderWakeupProcessor.js";
 
 /**
  * Integration coverage for the task-32 Requirement A shared submission service,
  * driven end to end through the public commands on a real SqliteTaskStore. The
  * pure decision layer is exhausted in submit-intent-routing.test.js; this file
  * proves the transaction actually saves the message, writes (or withholds) the
- * planning-entered fact, records a develop activation with the right origin and
+ * planning-entered fact, records a develop activation with the right authority and
  * identity, and never pre-enqueues a Draft Leader when it activates (§2.1–2.5).
  */
 
@@ -175,6 +177,42 @@ test("develop on an unplanned Draft records a submit-develop activation and queu
   // shared service records the request and queues processing; it does not flip
   // the Task to active inside the submission transaction.
   assert.equal(store.getTask(task.id).status, "draft");
+});
+
+test("Draft message edits preserve activation routing and only discuss edits may start planning", async t => {
+  const store = newStore(t);
+  const task = newDraft(store);
+  const agent = createConfiguredAgent("codex", "codex", "codex", [], [], now());
+  store.saveConfiguredAgent(agent);
+  store.saveRole(task.id, createRole(task.id, "leader", [createRoleAgentBinding(agent)],
+    agent.id, store.workspaceRoot, now()));
+  const edit = (id, body) => runTaskCommand(["message", "update", `${task.id}/${id}`, body],
+    store, { environment: userEnv, now });
+  const reconcile = () => processLeaderWakeups(new FileSchedulerStoreAdapter(store), {
+    prepareRoleSession: async () => assert.fail("This fixture must not launch a Provider.")
+  }, new Date(now().getTime() + 120_000), { full: false, taskIds: new Set([task.id]) });
+
+  const develop = userSubmit(store, task.id, "Implement this", "develop");
+  const activation = store.getTask(task.id).activationRequest;
+  edit(develop.message.id, "Implement this with clarified wording");
+  await reconcile();
+  assert.deepEqual(store.listRuns(task.id), [], "A develop edit must not create a planning Run.");
+  assert.equal(leaderHasPending(store, task.id), false);
+  assert.deepEqual(store.getTask(task.id).activationRequest, activation);
+
+  const waiting = userSubmit(store, task.id, "Discussion after activation", "discuss");
+  edit(waiting.message.id, "Clarified discussion after activation");
+  assert.equal(leaderHasPending(store, task.id), false, "Discuss edits must respect pending activation too.");
+  assert.equal(events(store, task.id, "task.planning-entered").length, 0);
+
+  cancelTaskActivation(store, task.id, activation.operation.requestId, "Return to planning", now());
+  edit(develop.message.id, "Keep the amended implementation requirement");
+  assert.equal(leaderHasPending(store, task.id), false, "Editing develop cannot restart a cancelled activation or plan.");
+  edit(waiting.message.id, "Discuss the plan now");
+  assert.equal(events(store, task.id, "task.planning-entered").length, 1);
+  await reconcile();
+  assert.deepEqual(store.listRuns(task.id).map(run => run.purpose), ["planning"],
+    "An ordinary editable discussion must still reach the real planning path.");
 });
 
 test("a repeated develop submission never creates a second activation request", (t) => {

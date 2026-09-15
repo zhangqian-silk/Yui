@@ -393,7 +393,8 @@ export function expandTaskMessageResult(
   return { ...message, result: run.result };
 }
 
-/** Replace only the mutable content of a Draft user/operator Message. */
+/** Edit unkeyed Draft context. Once an input has a request identity, its body
+ * is the retry comparison and must stay frozen, including through a handoff. */
 export function updateDraftTaskMessage(
   message: TaskMessage,
   update: TaskMessageDraftUpdate
@@ -402,9 +403,14 @@ export function updateDraftTaskMessage(
   if (message.kind !== "user" && message.kind !== "operator") {
     throw new Error(`Only user/operator Task Messages can be updated: ${message.id}.`);
   }
+  const body = requireBody(update.body);
+  if (body === message.body) return message;
+  if (message.submissionKey !== undefined || message.inputControl !== undefined || message.interruptThen !== undefined) {
+    throw new Error(`Message ${message.id} has a request identity; submit a new Message with a new request ID to change its content.`);
+  }
   const updated: TaskMessage = {
     ...message,
-    body: requireBody(update.body)
+    body
   };
   validateTaskMessage(updated);
   return updated;

@@ -130,10 +130,18 @@ Submission intent (`record / discuss / develop`) decides how a requirement is
 routed. Input timing decides when an already-authorized input reaches a Role;
 it does not activate a Task, expand an Assignment or upgrade planning authority.
 Save-only input uses `message send --intent record`; `--wake-policy` is removed.
-Draft Message edits change the body only, preserving their original submission
-intent; editing `record` context never queues a Leader notification. Current
-stored user/operator Messages always have an intent. To choose a different
-action, make a new explicit submission.
+Unkeyed Draft Message edits preserve submission intent. `record` and `develop`
+edits never start planning or create/retry activation; `discuss` edits use the
+same activation/planning routing as a discussion submission. A pending or failed
+activation therefore keeps the edited discussion waiting.
+
+A Message with a submission key, queue/steer request, or interrupt-then handoff
+has immutable content: submit a new Message with a new request ID to change it.
+This preserves the original retry comparison and receipt without adding a
+second stored representation of input. Updating to the identical body is a
+no-op, with no event, queue change or Controller notification. Current stored
+user/operator Messages always have an intent; changing that intent also requires
+a new explicit submission.
 The [authenticated Web controls](architecture/capabilities-and-resources.md#cli-and-web)
 use the same three operations as the CLI.
 

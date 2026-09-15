@@ -2805,21 +2805,40 @@ function updateMessage(
     const updated = updateDraftTaskMessage(message, {
       body
     });
+    if (updated === message) return { task, message, queuedForLeader: false, changed: false };
     tx.updateMessage(task.id, updated);
     recordTaskEvent(tx, task.id, "message.updated", {
       messageId: updated.id,
       updatedBy: actor
     }, now);
-    const queuedForLeader = updated.intent !== "record";
+    // An edit can continue a discussion, but it is not a new develop request.
+    // Use the submission router's current activation/planning facts so pending
+    // or failed activation cannot be turned into a planning wake by an edit.
+    const routing = decideSubmissionRouting({
+      intent: updated.intent!,
+      status: task.status,
+      enteredPlanning: draftHasEnteredPlanning(tx, task),
+      activation: draftActivationState(task.activationRequest),
+      executionEnabled: task.executionGate.state === "enabled",
+      developEnvironmentPlan: { kind: "empty" }
+    });
+    const queuedForLeader = routing.kind === "enter-planning" || routing.kind === "continue-planning";
+    if (routing.kind === "enter-planning") {
+      recordTaskEvent(tx, task.id, TASK_PLANNING_ENTERED_EVENT, {
+        messageId: updated.id, intent: updated.intent!
+      }, now);
+    }
     if (queuedForLeader) {
       enqueueWork(tx, leaderMailbox(task.id), actor === "operator" ? "operator-input" : "user-message",
         now, [messageRef(task.id, updated.id)], { source: actor });
     }
-    return { task, message: updated, queuedForLeader };
+    return { task, message: updated, queuedForLeader, changed: true };
   });
-  notifyMailbox(options.runtime, result.queuedForLeader
-    ? leaderMailbox(result.task.id) : taskMailbox(result.task.id));
-  return output(`Updated Task Message ${result.task.id}/${result.message.id}\n`, {
+  if (result.changed) {
+    notifyMailbox(options.runtime, result.queuedForLeader
+      ? leaderMailbox(result.task.id) : taskMailbox(result.task.id));
+  }
+  return output(`${result.changed ? "Updated" : "Unchanged"} Task Message ${result.task.id}/${result.message.id}\n`, {
     message: result.message
   });
 }

@@ -578,7 +578,7 @@ const taskChildren: readonly NodeInput[] = [
       },
       {
         name: "update",
-        summary: "Replace the body of a Draft user/operator Message without changing its submission intent.",
+        summary: "Edit unkeyed Draft context without changing intent; inputs with request identities require a new Message.",
         usage: "yui task message update <task>/<message> (<body>|--body-file <path|->)",
         options: ["--body-file"],
         fileOptions: ["--body-file"]

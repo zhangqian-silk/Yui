@@ -153,7 +153,10 @@ is required.
     selected-check isolation, incomplete evidence and stale-consumer rejection.
     An Integration rerun cannot bypass an equivalent unfinished gate. Policy
     migration preserves historical execution and blocks an admitted old gate.
-31. Message edits preserve record-only intent; completion still sees explicitly
+31. Message edits preserve submission intent and immutable request identity;
+    no-op edits do not enqueue work, and an edited develop request cannot create
+    a planning Run. Unkeyed discussions still plan after activation is resolved.
+    Queue identity remains frozen through an interrupt-then handoff; completion sees explicitly
     queued input. Input migration preserves raw audit evidence, refuses to
     auto-authorize old pending immediate activations and keeps the prior ledger.
     The actual Controller continues admitted requests but not cancellations.

@@ -105,6 +105,13 @@ intent become `discuss`. Runtime readers never infer a missing stored intent.
 Editing record-only context does not wake the Leader. Completion reads actual
 pending message references, including an explicit handoff of previously saved context.
 
+Draft editing also preserves request identity: messages bound to submission,
+queue/steer or handoff requests cannot change body in place. Use a new Message
+and request ID; identical-body updates are no-ops. Unkeyed discussion edits
+honor pending/failed activation, while develop edits never start planning or
+create/retry activation. These are operation-boundary fixes, not a new storage
+format or a repair of previously edited historical content.
+
 An origin-less pending immediate Draft activation blocks preflight and migration,
 including on a stopped Task. Activate or cancel it explicitly with the old release
 first. An admitted current request needs no second origin gate: cancellation,

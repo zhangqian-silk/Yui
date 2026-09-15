@@ -7,6 +7,7 @@ import test from "node:test";
 import { SqliteTaskStore } from "../../dist/storage/sqliteStore.js";
 import {
   sendTaskMessageCommand,
+  runTaskCommand,
   submitOperatorMessage
 } from "../../dist/commands/taskCommands.js";
 import {
@@ -84,7 +85,19 @@ test("a same-key discuss retry replays the original message and enters planning 
 test("a same-key retry with different input is a conflict, not an overwrite", (t) => {
   const store = newStore(t);
   const task = newDraft(store);
-  submit(store, task.id, "original body", "discuss", "key-1");
+  const first = submit(store, task.id, "original body", "discuss", "key-1");
+  const eventsBefore = store.listEvents(task.id);
+  const mailboxBefore = store.getWorkMailbox({ kind: "role", taskId: task.id, roleName: "leader" });
+  let notifications = 0;
+  const edit = body => runTaskCommand(["message", "update", `${task.id}/${first.message.id}`, body],
+    store, { environment: userEnv, now, runtime: { notifyMailboxChanged: () => { notifications++; } } });
+  assert.throws(() => edit("different body"), /request.*identity|new.*message/i);
+  edit("original body");
+  assert.deepEqual(store.listEvents(task.id), eventsBefore, "An identical update must not append a new mutation.");
+  assert.deepEqual(store.getWorkMailbox({ kind: "role", taskId: task.id, roleName: "leader" }), mailboxBefore);
+  assert.equal(notifications, 0, "Neither a refused edit nor an identical update may notify the Controller.");
+  const replay = submit(store, task.id, "original body", "discuss", "key-1");
+  assert.deepEqual(replay.message, first.message, "The original request must remain replayable.");
 
   assert.throws(
     () => submit(store, task.id, "different body", "discuss", "key-1"),
@@ -94,6 +107,30 @@ test("a same-key retry with different input is a conflict, not an overwrite", (t
   const messages = store.listMessages(task.id);
   assert.equal(messages.length, 1);
   assert.equal(messages[0].body, "original body");
+});
+
+test("queued input remains immutable after its request identity moves into a handoff", t => {
+  const store = newStore(t);
+  const task = newDraft(store);
+  const command = args => runTaskCommand(args, store, { environment: userEnv, now });
+  command(["message", "queue", task.id, "Original queued input", "--request-id", "queue-1"]);
+  const queued = store.listMessages(task.id)[0];
+  const edit = () => command(["message", "update", `${task.id}/${queued.id}`, "Changed input"]);
+  assert.throws(edit, /request.*identity|new.*message/i);
+
+  const { inputControl, ...rest } = queued;
+  const handoff = { ...rest, interruptThen: {
+    requestId: "handoff-1", targetAttemptId: "attempt-1", targetRoleName: "leader",
+    targetAgentId: "codex", targetAdapterId: "codex", targetNativeSessionId: "session-1",
+    targetAuthorityEpoch: 1, targetAuthorityHolderId: "controller", reusedInput: inputControl
+  } };
+  store.updateMessage(task.id, handoff);
+  assert.throws(edit, /request.*identity|new.*message/i);
+  assert.deepEqual(store.listMessages(task.id)[0], handoff);
+  const replay = sendTaskMessageCommand(store, task.id, queued.body,
+    { environment: userEnv, now }, undefined, undefined, undefined, inputControl);
+  assert.equal(replay.message.id, queued.id);
+  assert.equal(store.listMessages(task.id).length, 1);
 });
 
 test("a same-key retry with a different intent is a conflict", (t) => {
